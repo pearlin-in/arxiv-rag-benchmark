@@ -1,0 +1,1272 @@
+DRIVE: Dual Gradient-Based Rapid Iterative Pruning
+Dhananjay Saikumar 1 Blesson Varghese 1
+Abstract
+Modern deep neural networks (DNNs) consist
+of millions of parameters, necessitating high-
+performance computing during training and in-
+ference.
+Pruning is one solution that signifi-
+cantly reduces the space and time complexities
+of DNNs. Traditional pruning methods that are
+applied post-training focus on streamlining infer-
+ence, but there are recent efforts to leverage spar-
+sity early on by pruning before training. Prun-
+ing methods, such as iterative magnitude-based
+pruning (IMP) achieve up to a 90% parameter re-
+duction while retaining accuracy comparable to
+the original model. However, this leads to im-
+practical runtime as it relies on multiple train-
+prune-reset cycles to identify and eliminate re-
+dundant parameters. In contrast, training agnos-
+tic early pruning methods, such as SNIP and Syn-
+Flow offer fast pruning but fall short of the ac-
+curacy achieved by IMP at high sparsities. To
+bridge this gap, we present Dual Gradient-Based
+Rapid Iterative Pruning (DRIVE), which lever-
+ages dense training for initial epochs to coun-
+teract the randomness inherent at the initializa-
+tion.
+Subsequently, it employs a unique dual
+gradient-based metric for parameter ranking. It
+has been experimentally demonstrated for VGG
+and ResNet architectures on CIFAR-10/100 and
+Tiny ImageNet, and ResNet on ImageNet that
+DRIVE consistently has superior performance
+over other training-agnostic early pruning meth-
+ods in accuracy.
+Notably, DRIVE is 43× to
+869× faster than IMP for pruning.
+1. Introduction
+Pruning deep neural networks (DNNs) reduces the number
+of parameters in the network. The feasibility of pruning
+without significantly affecting accuracy has been known
+1School of Computer Science, University of St Andrews,
+UK. Correspondence to:
+Dhananjay Saikumar <ds304@st-
+andrews.ac.uk>, Blesson Varghese <bv6@st-andrews.ac.uk>.
+Train
+Prune + Reset
+Train
+Prune + Reset
+Train-Prune-Reset cycle
+Figure 1. Progression of Iterative Magnitude Pruning (IMP) that
+starts from a dense DNN and has successive train-prune-reset cy-
+cles. Neurons are shown as circles, yellow lines indicate weights
+at random initialization and teal lines show weights post-training.
+for more than three decades (Mozer & Smolensky, 1989;
+LeCun et al., 1989; Hassibi et al., 1993; Reed, 1993). One
+benefit of pruning is reducing the computational costs dur-
+ing inference (Wang, 2021; Jiang et al., 2022; Li et al.,
+2017; Dong et al., 2017; Zeng & Urtasun, 2019) when com-
+bined with the use of appropriate software libraries (Elsen
+et al., 2020) and specialized hardware that leverage sparse
+matrix operations (Nunez-Yanez & Hosseinabady, 2021;
+Anzt et al., 2020). Typically, pruning occurs after train-
+ing (LeCun et al., 1989; Han et al., 2015; Molchanov
+et al., 2017; Alvarez & Salzmann, 2016; Carreira-Perpinan
+& Idelbayev, 2018; Guo et al., 2016) or gradually dur-
+ing training (You et al., 2020; Zhu & Gupta, 2018; Gale
+et al., 2019; Lin et al., 2020; Jiang et al., 2022) to produce
+a sparse DNN that offers low-cost inference.
+However,
+the computational costs of training modern production-
+level DNNs with complex architectures are substantially
+high (Strubell et al., 2019; Blalock et al., 2020). There-
+fore, more recent research has considered whether pruning
+can be applied early (i.e., before training), since doing so
+may reduce training costs (Frankle & Carbin, 2019; Fran-
+kle et al., 2019; Dey et al., 2019; de Jorge et al., 2021).
+The catalyst for research into early pruning was the lottery
+ticket hypothesis (LTH) (Frankle & Carbin, 2019; Fran-
+kle et al., 2020). It hypothesizes the existence of certain
+sub-networks within a DNN, which when trained in isola-
+tion match the accuracy of the original dense network. It
+has been demonstrated that the sub-networks are as sparse
+as the networks produced by post training pruning meth-
+ods (Renda et al., 2020). Thus, high sparsity levels can
+be maintained throughout training, thereby requiring fewer
+arXiv:2404.03687v1  [cs.LG]  1 Apr 2024
+
+
+0
+1
+2
+3
+4
+5
+6
+7
+55
+60
+65
+70
+75
+80
+85
+90
+Time to obtain the sparse trainable network (hrs)
+Test accuracy (%)
+IMP
+SynFlow
+SNIP
+Unpruned Accuracy
+Figure 2. Comparing test accuracy of sparse networks derived us-
+ing early pruning methods for AlexNet with 99.3% parameters
+removed and trained on the CIFAR-10 dataset.
+resources for training and inference.
+However, a challenge emerges: While LTH highlights that
+high-performing sub-networks exist, the method to identify
+them is underpinned by iterative magnitude-based pruning
+(IMP) (Frankle & Carbin, 2019; Frankle et al., 2020). IMP
+begins by training the network, pruning its parameters, and
+then resetting the remaining parameters to their original
+values, as shown in Figure 1. The train-prune-reset cy-
+cle repeats until the desired sparsity is achieved and then
+a sparse trainable network is returned. This is computa-
+tionally intensive and reduces the runtime benefits of sub-
+sequently training a sparser model. Therefore, IMP is less
+suitable for large-scale and on-demand pruning.
+To surmount the above challenge, pruning research has
+recently considered efficiently identifying sub-networks
+at initialization without any training. Notably, SynFlow,
+using an iterative method, prunes based on the small-
+est ‘synaptic saliency’ (Tanaka et al., 2020), while SNIP
+removes parameters that have a minimal impact on the
+loss when removed (Lee et al., 2019).
+However, while
+pruning-at-initialization methods are faster, they produce
+sub-networks with lower accuracy than IMP (Frankle et al.,
+2021; 2020; Blalock et al., 2020) at extreme sparsities.
+This is highlighted in Figure 2, where AlexNet (Krizhevsky
+et al., 2012) is pruned to a sparsity of 99.3% and trained
+on CIFAR-10 (Krizhevsky, 2009). While SNIP and Syn-
+Flow require less than a minute for pruning, the result-
+ing sub-networks lag behind IMP in accuracy by 18% and
+10%, respectively. IMP, requires a longer pruning time but
+yields sub-networks with higher accuracy. This highlights
+the trade-off between speed and performance that will po-
+tentially be accentuated as dataset and network complexi-
+ties increase. Though IMP can derive high-performing sub-
+networks even at extreme sparsities, methods like SNIP and
+SynFlow do not. This highlights the potential for improv-
+ing early pruning methods, which our work taps into.
+In this paper, we introduce the Dual Gradient-Based Rapid
+Iterative Pruning (DRIVE), designed to bridge the per-
+formance gap between exhaustive and initialization-based
+pruning methods. DRIVE starts by training the unpruned
+model for a few epochs before initiating the pruning pro-
+cess, thus accessing only partial information compared to
+methods, such as IMP that require exhaustive training to
+determine parameter importance. To compensate, DRIVE
+utilizes a distinctive dual gradient metric to rank param-
+eters before iteratively pruning them. This metric incor-
+porates three salient terms: the parameter magnitude, the
+connection sensitivity, and the convergence sensitivity. Be-
+yond evaluating and pruning based on the current impor-
+tance of the parameters (magnitude that is akin to IMP),
+the DRIVE metric avoids premature pruning of currently
+less relevant parameters that may be required in the future.
+The outcome is a sparse, trainable network that achieves
+the efficiency of initialization-based methods while bridg-
+ing the performance gap of exhaustive pruning methods,
+namely IMP. Across diverse architectures such as AlexNet,
+VGG-16, and ResNet-18, and datasets, namely CIFAR-
+10, CIFAR-100, Tiny ImageNet, and ResNet-18 on Ima-
+geNet, DRIVE consistently surpasses the performance of
+training-agnostic pruning methods, namely SNIP and Syn-
+Flow.
+Furthermore, DRIVE boasts an enhancement in
+computational efficiency of atleast, 43× and, at best, 869×
+faster than IMP.
+Our main contributions are:
+• Development of DRIVE: A novel pruning method
+that bridges the advantages of initialization-based and
+exhaustive training-dependent pruning methods.
+• Efficient early pruning with DRIVE: Unlike ex-
+haustive methods, such as IMP, DRIVE streamlines
+pruning as it requires training only for a few epochs.
+• Novel dual gradient metric: We present a novel met-
+ric considering parameter magnitude, connection sen-
+sitivity, and proximity to convergence, to ensure opti-
+mal pruning decisions.
+The rest of this paper is organised as follows: Section 2 re-
+views the state-of-the-art. Section 3 presents the DRIVE
+method. Section 4 presents the results of experiments com-
+paring the performance of DRIVE to the unpruned net-
+work and existing pruning methods such as IMP, SNIP, and
+SynFlow. We conclude the paper in Section 5.
+2. Background & Related Work
+This section presents the mathematical formulation of
+pruning, the existing pruning methods, and the limitations
+of pruning at initialization.
+Formulating Pruning: Given a DNN f(θ; x) with param-
+eters θ and input x, pruning produces a sub-network with
+a set of parameters θ ⊙m, where m ∈{0, 1}d is a bi-
+nary mask, and ⊙is the element-wise product. The degree
+2
+
+
+of sparsity, κ ∈[0, 1], indicates the fraction of parame-
+ters removed from the original network to produce the sub-
+network. All pruning methods assign scores z ∈Rd to the
+parameters θ to rank parameters to identify which ones can
+be discarded.
+Pruning is carried out in the following two ways: (1) One-
+shot pruning by assigning scores and pruning parameters in
+a single step, resulting in a final sparsity of κ. (2) Iterative
+pruning by repeatedly assigning scores and pruning param-
+eters over a series of N iterations. At each iteration n, the
+network is pruned to achieve a sparsity level κn, where κn
+is a pre-defined schedule that monotonically increases from
+a low value to the final desired sparsity κ.
+Early Pruning Methods:
+We now describe the IMP
+method and two early pruning methods from the literature,
+namely SNIP and SynFlow.
+IMP: For a desired sparsity value κ, and an initialized DNN
+f(θ0; x), IMP starts by training the DNN for E epochs,
+transforming it from f(θ0; x) to f(θE; x). After training,
+parameters are assigned scores, represented by z = |θE|.
+ρ% of the parameters are pruned, specifically those with
+the lowest scores:
+ρ = κ1/N
+(1)
+Once pruned, the surviving parameters are reset to their ini-
+tial values. This entire process is repeated for N cycles
+to achieve the target sparsity κ (Frankle & Carbin, 2019;
+Frankle et al., 2019).
+SNIP: For a desired sparsity value of κ, and an initialized
+DNN f(θ0; x), SNIP evaluates the connection sensitivity of
+each parameter within the DNN relative to a training loss L.
+A mini-batch, B is sampled from the training dataset. The
+primary computation in SNIP is to determine the gradient
+of the loss L with respect to each connection mask mj,
+which captures the effect on the loss when the parameter is
+removed from the network.
+gj(θ0; B) = ∂L(θ0 ⊙m; B)
+∂mj
+(2)
+Using these gradients, the score zj for each parameter is
+computed as the normalized magnitude of the gradients:
+zj =
+|gj(θ0; B)|
+Pm
+k=1 |gk(θ0; B)|
+(3)
+The bottom κ% of parameters, in terms of their scores, are
+pruned in a one-shot manner (Lee et al., 2019). This en-
+sures that only parameters with the highest influence on the
+loss, whether positive or negative, are preserved (Frankle
+et al., 2021).
+SynFlow: For a desired sparsity value of κ, and an initial-
+ized DNN f(θ0; x), SynFlow begins by converting the pa-
+rameters θ0 to their absolute values |θ0|. The DNN is then
+95
+96
+97
+98
+99
+−60
+−40
+−20
+0
+Network sparsity (κ%)
+∆Accuracy (%)
+SNIP
+SynFlow
+IMP (Reference)
+Figure 3. Change in test accuracy of trained sparse networks pro-
+duced by SNIP and SynFlow relative to IMP, plotted against the
+network sparsity for ResNet-18 on the CIFAR-100 dataset.
+evaluated using an input matrix where every element is set
+to one (denoted as I). The resulting scalar value A is:
+A =
+X
+f(|θ0|; I)
+(4)
+Following this, scores z are assigned as:
+z = ∂A
+∂θ0 ⊙θ0
+(5)
+Using Equation 1, ρ% of the parameters, specifically
+those with the lowest scores, are pruned from the net-
+work. Issuing scores and pruning are repeated over N it-
+erations (Tanaka et al., 2020; Frankle et al., 2021). Syn-
+Flow was designed to prevent ‘layer collapse’, which oc-
+curs when all parameters in a single layer are pruned, thus
+making the network untrainable (Tanaka et al., 2020; Lee
+et al., 2020; Hayou et al., 2020). To address this, Syn-
+Flow ensures the layer-wise conservation of the scores z
+in a data-agnostic and iterative fashion.
+Limitations of Pruning at Initialization: Parameters in a
+DNN are assigned random values at initialization, provid-
+ing no valuable insight at this stage as to which parame-
+ters are of significance to a specific DNN-dataset combi-
+nation. As a result, IMP (Frankle & Carbin, 2019) and
+magnitude-based pruning after training (Han et al., 2015)
+leverage training to determine essential parameters, but
+they are computationally intensive. In contrast, pruning-
+at-initialization methods, such as SNIP and SynFlow, offer
+faster alternatives at the expense of a performance gap con-
+sidered in Section 1. The reasons for the performance gap
+are discussed next.
+SNIP ranks parameters by evaluating their impact on the
+loss L when removed, and is captured by the transition of
+a binary mask from mj = 1 to mj = 0. To replicate
+this transition, SNIP computes the gradient
+∂L
+∂mj shown in
+Equation 2, and scores parameters based on the normal-
+ized magnitude of these derivatives. Then κ% of the pa-
+rameters with the lowest scores are subsequently pruned in
+a one-shot manner (Lee et al., 2019). A critical limitation
+3
+
+
+of SNIP is its scoring mechanism, which considers only
+the absolute impact of parameters on the loss L, not dis-
+tinguishing between positive or negative impact. Due to
+randomized initialization, several non-essential parameters
+may amplify the loss L, leading them to achieve high scores
+and remain unpruned. When compared to IMP, this method
+adversely affects accuracy, specifically in high-sparsity set-
+tings, as shown in Figure 3. As a result, sub-networks pro-
+duced by SNIP are consistently inferior to those from IMP.
+Additionally, SNIP is also vulnerable to layer collapse at
+higher sparsity levels (Tanaka et al., 2020), as evident from
+the sharp drop in accuracy shown in Figure 3.
+SynFlow leverages a data-agnostic scoring mechanism that
+preserves scores for parameters in a layer-centric man-
+ner. This preserves inter-layer connections, thereby act-
+ing as a safeguard against layer collapse. However, despite
+its demonstrated superiority over SNIP in mitigating layer
+collapse, a notable limitation arises from its data-agnostic
+scoring approach. Specifically, SynFlow cannot determine
+whether parameters are essential to a specific DNN-dataset
+combination. To illustrate, given a DNN and two datasets
+that are dimensionally identical but have drastically differ-
+ent features, SynFlow would yield the same sub-networks
+for both. This leads to suboptimal performance, particu-
+larly at higher sparsity levels. While the performance of
+SynFlow is better than SNIP, it is often lower than IMP, as
+evident in Figure 3.
+Gradual Pruning Methods: The above methods generate
+trainable sparse networks in which the binary mask remains
+static during training. However, there is another class of
+methods, referred to as gradual pruning (Zhu & Gupta,
+2018; Lym et al., 2019; You et al., 2020; Lin et al., 2020;
+Zhang et al., 2021), which incrementally prune the network
+during training. While this method is more cost-effective
+than pruning after completing training, it still requires sub-
+stantial training to identify the optimal sparse sub-network.
+Our research is centred on early identification and training
+of sparse sub-networks with high sparsity, a method that is
+more cost-effective and distinct from gradual pruning.
+3. DRIVE Design
+In this section, we introduce the Dual Gradient-Based
+Rapid Iterative Pruning (DRIVE) method, an early two-
+stage pruning technique.
+Initially, the model undergoes
+brief training to address limitations of early pruning, as
+detailed in Section 2. Then, we iteratively prune param-
+eters to achieve a sparse, trainable model. We will outline
+the parameter ranking criteria and provide an overview of
+DRIVE in Algorithm 1.
+Brief Training
+Prune
+Prune
+Iterative Pruning 
+Figure 4. DRIVE initially trains an unpruned network and then
+iteratively prunes the network. Neurons are circles. Yellow lines
+are initial weights and teal lines are weights after brief training.
+3.1. Pruning Metric
+The choice of a pruning metric is crucial as it determines
+the hierarchical ranking of parameters in the network. The
+IMP method uses the L1 norm of the parameter.
+SNIP
+evaluates the impact on the loss when a parameter is re-
+moved, as presented in Equation 3. SynFlow employs data-
+agnostic synaptic saliency as shown in Equation 5. The
+pruning metric of DRIVE combines the L1 norm of the
+parameter with two distinct gradient-based terms as shown
+below:
+Sj(θ; B) =
+θj ⊙∂L(f(θ ⊙m; x), y)
+∂mj
+⊙∂L(f(θ ⊙m; x), y)
+∂θj
+(6)
+Within this context, Sj denotes the DRIVE metric corre-
+sponding to the parameter θj, with B symbolizing a train-
+ing batch. Parameters are ranked based on their respective
+scores, zj, which are determined by the normalized magni-
+tude of the DRIVE metric:
+zj =
+Sj(θ; B)
+
+Pm
+k=1
+Sk(θ; B)
+
+(7)
+The rationale behind the inclusion of each term in the
+DRIVE metric is considered next.
+L1 Norm: At initialization, parameter values are drawn
+randomly, meaning that the L1 norm (magnitude) of these
+parameters initially offers no insight into their relevance to
+the network. To address this, DRIVE begins by training
+the unpruned model for a few epochs. This step allows es-
+sential parameters to acquire larger magnitudes, indicating
+their significance, while less important parameters tend to
+acquire smaller values. Following the brief training period,
+the L1 norm of these parameters contributes to how the pa-
+rameters are ranked before pruning.
+While IMP subjects the model to a more intensive train-
+ing period to classify and prioritize parameters using the
+4
+
+
+L1 norm before pruning, DRIVE operates with partial in-
+formation relative to IMP due to undergoing brief training.
+To compensate for this shorter training period, DRIVE in-
+tegrates two supplementary gradient-based metrics along
+with the L1 norm, which are described next.
+Connection sensitivity: Let θj represent the jth parameter
+in the network f(θ; x). In a given DNN-dataset combina-
+tion, besides using the L1 Norm, the impact of a parameter
+θj can be determined by assessing the change in loss when
+removed from the network. The change in loss, referred
+to as connection sensitivity, captures how sensitive the per-
+formance of the network is to the presence or absence of
+the parameter θj (Lee et al., 2019; Wang et al., 2020). In
+mathematical terms, to eliminate the parameter θj from the
+network, its value can be set to zero, or a mask (I −ej) can
+be applied. Here, ej is the indicator vector for the param-
+eter θj, being zero-filled except at the jth index, where it
+takes the value one. The matrix I, functioning as a mask,
+has entirely values of one. The change in loss when remov-
+ing θj is calculated in two forward passes:
+∆Lj(f(θ; x), y) =
+L(f(θ ⊙I; x), y) −L(f(θ ⊙(I −ej); x), y)
+(8)
+However, given that modern DNNs have millions of pa-
+rameters, computing the connection sensitivity for each in-
+dividual parameter is computationally intensive since mil-
+lions of forward passes would be required. A more efficient
+approach is to approximate the effect on the loss when a pa-
+rameter θj is excluded. This approximation, as illustrated
+in SNIP (Lee et al., 2019), is shown as:
+∆Lj(f(θ; x), y) ≈
+lim
+δ→0
+L(f(θ ⊙I; x), y) −L(f(θ ⊙(I −δej); x), y)
+δ
+= ∂L(f(θ ⊙m; x), y)
+∂mj
+
+m=I
+(9)
+The connection sensitivity can be approximated for all pa-
+rameters in the network efficiency via a single forward-
+backward pass. Notably, the second term in the DRIVE
+metric, as shown in Equation 6 describes the connection
+sensitivity. A larger connection sensitivity value for a pa-
+rameter implies a significant alteration in loss upon its re-
+moval, emphasizing its essential role in the given DNN-
+dataset combination.
+However, when connection sensitivity is calculated is cru-
+cial. In SNIP, it is calculated at initialization but in DRIVE
+it is after a period of preliminary training.
+The model
+undergoes initial training epochs before any pruning in
+DRIVE, which guides the parameters to minimize the loss,
+allowing essential parameters to obtain larger magnitudes.
+If such parameters are removed, the loss changes would
+be significant. Hence, they are assigned higher sensitivity
+scores. Conversely, the removal of non-essential param-
+eters, which have been guided to smaller values through
+the preliminary training, has a limited effect on the loss.
+As a result, these non-essential parameters are assigned
+lower sensitivity scores.
+In contrast, as previously dis-
+cussed, SNIP evaluates parameters without distinguishing
+between their positive or negative impact on loss. This is
+challenging at initialization since many non-essential pa-
+rameters may have a large impact on the loss. Therefore,
+SNIP may assign them as crucial. Without the guidance
+of initial training, SNIP is subject to the inherent random-
+ness of initialization, leading to the potential preservation
+of non-essential parameters.
+Convergence Sensitivity: The DRIVE approach to prun-
+ing is distinct from that of IMP, which relies on train-
+prune-reset cycles, allowing the network to experience ex-
+tensive training before pruning takes place. In comparison,
+DRIVE prunes after a few initial training epochs, thereby
+considering the emerging state of the network rather than
+its mature state following in-depth training. The L1 Norm
+and Connection Sensitivity can only determine the current
+importance of parameters in this context.
+However, we
+note that parameters exist within the network that are not
+deemed currently impactful but may be important as train-
+ing progresses. This observation leads to the introduction
+of the third term in the DRIVE metric.
+DNN training updates parameter that are guided by the gra-
+dient of the loss with respect to each parameter:
+∆θ = −η ∂L
+∂θ
+(10)
+Here η represents the learning rate. As conventional DNN
+training progresses, the sequence of expected gradient ( ∂L
+∂θ )
+norm approaches zero (Bottou et al., 2018). Therefore, the
+magnitude of the gradient in Equation 10 serves as a proxy
+for the proximity of the parameter to convergence. We refer
+to this gradient as convergence sensitivity. A large conver-
+gence sensitivity value suggests that a parameter is far from
+convergence, and requiring further training to determine its
+significance. Parameters with large convergence sensitivity
+scores are assigned a higher priority to ensure that they are
+not pruned prematurely.
+4. Experiments
+In this section, we detail the experimental setup and present
+the results obtained from our study.
+4.1. Setup
+We empirically evaluate the performance of DRIVE
+against the computationally intensive iterative magnitude-
+5
+
+
+Algorithm 1 Dual Gradient-Based Rapid Iterative Pruning
+1: Input: Training dataset D, Targeted sparsity κ, Prun-
+ing cycles N, Training epochs E, Initial network
+f(θ0; x)
+2: Output: Sparse trainable network f(θE ⊙m; x)
+3: Early Training Phase:
+4: for j = 1 to E do
+5:
+Update parameters: f(θj+1; x) ←f(θj; x)
+6: end for
+7: Apply mask (m = I) to the network: f(θE ⊙m; x) ←
+f(θE; x)
+8: Calculate pruning fraction: ρ ←κ1/N
+9: Iterative Pruning Stage:
+10: for j = 1 to N do
+11:
+Sample a training batch B from D
+12:
+Calculate connection sensitivity ←Eq 9
+13:
+Calculate convergence sensitivity ←Eq 10
+14:
+Compute
+DRIVE
+metric:
+Sj(θ; B)
+=
+θj ⊙∂L(f(x;θ⊙m),y)
+∂mj
+⊙∂L(f(x;θ⊙m),y)
+∂θj
+
+15:
+Assign scores: zj =
+Sj(θ;B)
+Pm
+k=1 Sk(θ;B)
+16:
+Shortlist ρ% parameters (τ) by lowest score z: τ ←
+z
+17:
+Update mask: Set mask elements of τ to 0
+18: end for
+19: return f(θE ⊙m; x)
+based pruning (IMP) and two established early pruning
+methods, namely SNIP and SynFlow. Our tests involve
+three DNN architectures:
+AlexNet (Krizhevsky et al.,
+2012) trained on the CIFAR-10 dataset (Krizhevsky, 2009),
+and VGG-16 (Simonyan & Zisserman, 2015) and ResNet-
+18 (He et al., 2015), both trained on CIFAR-10 and CIFAR-
+100 (Krizhevsky, 2009). Additionally, ResNet-18 is evalu-
+ated on the ImageNet dataset (Deng et al., 2009). All mea-
+surements were averaged over three runs on an NVIDIA
+RTX A6000 GPU.
+Pruning Methods: The pruning methods compared in
+this study generate trainable sparse networks using static
+masks that have constant values and remain unchanged
+during training.
+This approach contrasts with gradual
+pruning methods, which incrementally prune the network
+throughout the training process. Our research is focused on
+the early identification and training of highly sparse sub-
+networks, which is more cost-efficient and distinct from
+gradual pruning techniques.
+Consequently, DRIVE is
+compared only with baselines that are early pruning meth-
+ods, namely IMP, SNIP and SynFlow.
+For AlexNet on CIFAR-10, as well as for ResNet-18 and
+VGG-16 on CIFAR-10/100, Tiny ImageNet, and ResNet-
+18 on ImageNet, the IMP method involves 50 train-prune-
+reset cycles, with each cycle consisting of 20 training
+epochs. SynFlow, maintaining consistency across all ar-
+chitectures and datasets, utilizes 100 pruning iterations.
+SNIP, by its design, applies a one-shot pruning method
+to all architectures across all datasets. For the DRIVE al-
+gorithm, AlexNet on CIFAR-10, ResNet-18, and VGG-16
+on CIFAR-10/100 were pre-trained for 5 epochs followed
+by 100 pruning iterations. For ResNet-18 and VGG-16 on
+Tiny ImageNet and ResNet-18 on ImageNet, the procedure
+initiates with 1 pre-training epoch, followed by 100 pruning
+iterations. To ensure equal total training time across meth-
+ods, networks pruned with DRIVE undergo training for five
+fewer epochs on CIFAR-10/100 and one fewer epoch on
+Tiny ImageNet and ImageNet.
+Training Scheme: Across all architectures and datasets,
+both the unpruned (reference) network and the sparse train-
+able networks generated by the pruning techniques were
+subjected to the following training schemes. For AlexNet
+on CIFAR-10, training lasted 50 epochs, using a batch size
+of 256, an Adam optimizer, and a learning rate of 0.0001.
+Transitioning to the VGG-16 and ResNet-18 models on
+CIFAR-10, they were trained for 150 and 200 epochs, re-
+spectively.
+Both employed a batch size of 128 and the
+SGD optimizer with a learning rate of 0.01. Specifically
+for VGG-16, its learning rate was reduced by a factor of 5
+every 30 epochs, while for ResNet-18, a Cosine Annealing
+approach smoothly decayed the rate across 200 epochs.
+VGG-16 and ResNet-18 models on CIFAR-100 required
+200 epochs of training using a batch size of 128 and an
+initial learning rate of 0.01. Notably, the learning rate of
+VGG-16 was dropped by a factor of 5 at epochs 60, 120,
+and 160. Conversely, the learning rate for ResNet-18 was
+reduced by a factor of 10 at epoch 80 and further reduced
+by a factor of 100 at epoch 120.
+On the Tiny ImageNet dataset, both VGG-16 and ResNet-
+18 underwent 100 epochs of training, utilizing a batch size
+of 128 and an initial learning rate of 0.01 with the SGD
+optimizer. The learning rates were dropped by a factor of
+10 at epochs 30, 60, and 80.
+For ResNet-18 on ImageNet, for consistency in bench-
+marking across the same architecture using CIFAR
+datasets, ImageNet data samples were downsampled from
+224×224 to 32×32. Training for ResNet-18 on ImageNet
+lasted 100 epochs, with a batch size of 256 and an initial
+learning rate of 0.1, employing the SGD optimizer. The
+learning rates were reduced by a factor of 10 at epochs 30,
+60, and 80.
+6
+
+
+4.2. Results
+To showcase performance across a wide range of spar-
+sities, we initially evaluated the accuracy of post-trained
+sub-networks produced by DRIVE and other pruning
+methods on AlexNet for CIFAR-10, spanning sparsities
+{20%, 30%, ..., 98%}.
+Figure 5 compares the perfor-
+mance of DRIVE and other pruning techniques using
+AlexNet trained on CIFAR-10 over these sparsity lev-
+els1. Given the emphasis of our work is in the high spar-
+sity regime, we proceeded to assess the accuracy of post-
+trained sub-networks crafted by DRIVE and other pruning
+techniques on VGG-16 and ResNet-18 for CIFAR-10/100
+and Tiny ImageNet across competitive sparsities spanning
+{90%, 95%, . . . , 99.3%}.
+Furthermore, we measure the
+wall time needed to derive these sub-networks. A com-
+prehensive set of results is presented in Table 1.
+On the CIFAR-10 dataset, DRIVE consistently outper-
+forms SNIP and SynFlow, especially in sparsity levels ex-
+ceeding 98%. DRIVE’s test accuracy demonstrates greater
+stability (i.e., lower volatility in test accuracy with increas-
+ing sparsity), a trait that is closely matched by IMP, an
+exhaustive pruning method. In some cases, DRIVE even
+surpasses the accuracy of the IMP. For low sparsity lev-
+els (with κ ≤70%), the performance difference among
+all methods is minimal, closely aligning with the unpruned
+baseline. In the mid-sparsity range (70% ≥κ ≥90%),
+DRIVE maintains competitive performance, with SNIP
+achieving similar results. It is noteworthy that SNIP expe-
+riences layer collapse in VGG-16 on CIFAR-10 when κ ≥
+99%. For AlexNet on CIFAR-10, SNIP outperforms the
+unpruned baseline until κ ≤80%. Both IMP and Syn-
+Flow outperform the unpruned baseline until κ ≤94%.
+DRIVE, however, outperforms the unpruned baseline until
+κ ≤98%.
+For ResNet-18 on CIFAR-100, DRIVE consistently ex-
+hibits superior performance over both SNIP and SynFlow
+across varying sparsity levels. Until κ ≤97%, the re-
+sults of SNIP closely align with DRIVE. However, beyond
+this threshold, the accuracy of SNIP undergoes a substan-
+tial reduction, especially when κ > 98%. In the regime
+of κ ≤90%, DRIVE outperforms IMP. However, for
+sparsity levels exceeding this, IMP marginally outperforms
+DRIVE. For VGG-16 on CIFAR-100, distinctions among
+the methods are relatively minor up to κ ≤80%, with all
+techniques achieving comparable accuracy to the unpruned
+network. Significantly, DRIVE consistently outperforms
+SynFlow across all sparsity levels. While SynFlow’s per-
+formance remains competitive, especially up to κ ≤98%,
+SNIP experiences a catastrophic drop at κ ≥99%, with its
+accuracy crashing to just 1%, which is a clear indication
+1Due to limited space, we show the figure for one network for
+a range of sparsities. Our focus is on high sparsity.
+20.0
+48.8
+67.2
+79.0
+86.6
+91.4
+94.5
+96.5
+97.7
+98.5
+75
+80
+85
+90
+Network sparsity
+Test accuracy (%)
+AlexNet (CIFAR-10)
+IMP
+SNIP
+SynFlow
+DRIVE
+Figure 5. Accuracy vs. sparsity for AlexNet on CIFAR-10. The
+horizontal line is the accuracy of an unpruned trained network.
+of layer collapse. In contrast, DRIVE sustains its accu-
+racy better, even at elevated sparsity levels, outlasting both
+SNIP and SynFlow.
+For ResNet-18 on Tiny ImageNet, in the low sparsity
+regime (κ ≤70%), the performance difference among all
+methods is minimal.
+DRIVE consistently outperforms
+SNIP and SynFlow across κ ≥90%.
+DRIVE offers
+comparable accuracy to IMP for 90 ≥κ ≥98%, after
+which IMP takes the lead.
+For VGG-16 on Tiny Ima-
+geNet, until κ ≤80%, there is a minimal performance
+difference among all methods. DRIVE consistently out-
+performs SNIP and SynFlow across κ ≥90%. While IMP
+marginally outperforms DRIVE from 90%≥κ > 98%,
+after which DRIVE outperforms IMP for κ ≥99%.
+For ResNet-18 on ImageNet, Table 2 shows that at lower
+sparsity levels (up to 70%), the performance difference
+between IMP, DRIVE, SNIP, and SynFlow is marginal.
+However, DRIVE consistently outperforms both SNIP and
+SynFlow in terms of accuracy for higher sparsities of 90%
+and 95%. While the unpruned model maintains a stable
+accuracy of 54.11%, the accuracy of DRIVE decreases
+less steeply from 49.33% at 70% sparsity to 33.16% at
+95% sparsity. In comparison, IMP shows a similar trend
+for accuracy reduction, closely following DRIVE at lower
+sparsities. SNIP and SynFlow have a larger drop in perfor-
+mance as sparsity increases.
+DRIVE delivers sparse trainable networks with high accu-
+racy but also expedites pruning when compared to IMP by
+being 43× to 869× faster. We also consider the total time,
+including both pruning and training in Figure 6. DRIVE
+achieves a runtime comparable to rapid pruning techniques,
+such as SNIP and SynFlow. In short, DRIVE bridges the
+gap between the speed of pruning and the accuracy of the
+sparse networks produced by exhaustive pruning.
+7
+
+
+Table 1. Test accuracies of AlexNet, VGG-16, and ResNet-18 on different datasets. Here the underlined values indicate an untrainable
+network resulting from layer collapse. Bold values indicate the highest accuracy for the respective sparsity level and model among the
+early pruning techniques: SNIP, SynFlow, and DRIVE.
+Dataset
+Model
+Sparsity
+90%
+95%
+98%
+99.3%
+Pruning time (seconds)
+CIFAR-10
+AlexNet
+Unpruned
+84.20
+IMP
+85.76
+83.58
+80.57
+76.24
+24×103
+SNIP
+83.09
+79.95
+72.95
+58.35
+3
+SynFlow
+86.37
+84.02
+78.61
+66.64
+4
+DRIVE
+86.97
+87.21
+85.37
+74.49
+220
+VGG-16
+Unpruned
+92.40
+IMP
+91.61
+90.20
+90.04
+88.35
+12×103
+SNIP
+92.56
+92.01
+91.31
+10.00
+2
+SynFlow
+91.32
+90.44
+89.79
+87.63
+3
+DRIVE
+92.80
+92.68
+91.36
+89.77
+260
+ResNet-18
+Unpruned
+93.70
+IMP
+91.79
+90.81
+90.71
+88.66
+21×103
+SNIP
+93.56
+92.03
+89.66
+84.56
+2
+SynFlow
+91.05
+90.23
+88.74
+82.62
+3
+DRIVE
+93.59
+92.14
+89.86
+85.90
+270
+CIFAR-100
+VGG-16
+Unpruned
+65.50
+IMP
+65.80
+65.50
+63.60
+61.20
+12.6×103
+SNIP
+65.11
+64.06
+56.78
+1.00
+2
+SynFlow
+63.72
+63.02
+61.45
+54.24
+3
+DRIVE
+65.05
+64.36
+61.58
+59.70
+290
+ResNet-18
+Unpruned
+66.50
+IMP
+64.44
+63.81
+61.94
+61.08
+22×103
+SNIP
+64.05
+62.90
+58.38
+33.97
+2
+SynFlow
+63.29
+61.02
+56.59
+51.27
+3
+DRIVE
+64.34
+63.01
+60.30
+57.44
+320
+Tiny ImageNet
+VGG-16
+Unpruned
+48.74
+IMP
+47.85
+46.79
+44.26
+36.26
+63×103
+SNIP
+44.45
+39.51
+33.21
+16.85
+2
+SynFlow
+47.23
+43.03
+40.46
+30.86
+4
+DRIVE
+48.29
+45.60
+42.25
+37.97
+160
+ResNet-18
+Unpruned
+49.41
+IMP
+46.01
+44.54
+42.35
+40.70
+119×103
+SNIP
+44.45
+39.51
+33.21
+16.85
+2
+SynFlow
+44.04
+39.83
+36.77
+30.64
+3
+DRIVE
+45.32
+43.89
+42.79
+33.01
+190
+Table 2. Test accuracies and pruning time of ResNet-18 on Ima-
+geNet for different sparsity levels. Bold values indicate the high-
+est accuracy for the respective sparsity level and model among the
+early pruning techniques: SNIP, SynFlow, and DRIVE.
+Sparsity
+70%
+80%
+90%
+95%
+Pruning Time (s)
+Unpruned
+54.11
+IMP
+48.30
+45.58
+40.21
+33.94
+428.5×103
+SNIP
+48.90
+45.51
+36.62
+21.83
+3
+SynFlow
+48.39
+45.74
+39.38
+31.27
+4
+DRIVE
+49.33
+46.49
+40.97
+33.16
+493
+5. Conclusions
+This paper highlights a trade-off between accuracy and
+pruning time in network pruning techniques. Iterative Mag-
+nitude Pruning (IMP) achieves high accuracy in sparse net-
+works but is computationally intensive. In contrast, meth-
+ods like SNIP and SynFlow, while faster, fall short in accu-
+racy at high sparsity levels.
+To address this challenge, we introduce Dual Gradient-
+Based Rapid Iterative Pruning (DRIVE), employing a
+novel dual gradient criterion that combines connection sen-
+sitivity and convergence sensitivity. This new pruning tech-
+nique not only efficiently identifies and removes redundant
+parameters but also preserves parameters not yet converged
+that may have potential future relevance. Consequently,
+DRIVE attains desired pruning efficiency with substan-
+tially lower computational demands compared to the ex-
+haustive train-prune-reset cycles of IMP.
+Empirical tests show DRIVE surpasses SNIP and SynFlow
+in accuracy across various networks and datasets, bridg-
+ing the gap between exhaustive and rapid pruning meth-
+ods. Though IMP occasionally produces marginally better
+results, DRIVE efficiently generates high-quality, sparse
+trainable networks, achieving speeds that are at least 43×
+8
+
+
+CIFAR-10
+CIFAR-100
+Tiny ImgNet
+0
+10
+20
+4
+4
+19
+1
+1
+2
+1
+1
+2
+1
+1
+2
+Total time (hrs)
+VGG-16
+CIFAR-10
+CIFAR-100
+Tiny ImgNet
+ImgNet
+0
+50
+100
+150
+7
+7
+36
+131
+1
+1
+3
+12
+1
+1
+3
+12
+1
+1
+3
+12
+Total time (hrs)
+ResNet-18
+IMP
+SNIP
+SynFlow
+DRIVE
+Figure 6. Total pruning and training time of different methods.
+and up to 869× faster than IMP. This underscores the ben-
+efits of DRIVE in rapidly developing high-calibre sparse
+networks and offering a viable solution to addressing the
+energy challenge in training large-scale models by leverag-
+ing sparsity from the onset.
+References
+Alvarez, J. M. and Salzmann, M. Learning the Number
+of Neurons in Deep Networks. In Advances in Neural
+Information Processing Systems, 2016.
+Anzt, H., Tsai, Y. M., Abdelfattah, A., Cojean, T., and
+Dongarra, J. Evaluating the Performance of NVIDIA’s
+A100 Ampere GPU for Sparse and Batched Compu-
+tations. In IEEE/ACM Performance Modeling, Bench-
+marking and Simulation of High Performance Computer
+Systems, 2020.
+Blalock, D. W., Ortiz, J. J. G., Frankle, J., and Guttag, J. V.
+What is the State of Neural Network Pruning? In Pro-
+ceedings of Machine Learning and Systems, 2020.
+Bottou, L., Curtis, F. E., and Nocedal, J.
+Optimization
+Methods for Large-Scale Machine Learning. SIAM Re-
+view, 60(2):223–311, 2018.
+Carreira-Perpinan, M. A. and Idelbayev, Y.
+Learning-
+Compression Algorithms for Neural Net Pruning.
+In
+Proceedings of the IEEE Conference on Computer Vi-
+sion and Pattern Recognition, 2018.
+de Jorge, P., Sanyal, A., Behl, H., Torr, P., Rogez, G., and
+Dokania, P. K. Progressive Skeletonization: Trimming
+More Fat from a Network at Initialization. In Interna-
+tional Conference on Learning Representations, 2021.
+Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., and Fei-
+Fei, L. ImageNet: A Large-Scale Hierarchical Image
+Database. In IEEE Conference on Computer Vision and
+Pattern Recognition, 2009.
+Dey, S., Huang, K.-W., Beerel, P. A., and Chugg, K. M.
+Pre-Defined Sparse Neural Networks With Hardware
+Acceleration. IEEE Journal on Emerging and Selected
+Topics in Circuits and Systems, 2019.
+Dong, X., Chen, S., and Pan, S. Learning to Prune Deep
+Neural Networks via Layer-wise Optimal Brain Sur-
+geon.
+In Advances in Neural Information Processing
+Systems, 2017.
+Elsen, E., Dukhan, M., Gale, T., and Simonyan, K. Fast
+Sparse ConvNets. In Proceedings of the IEEE/CVF Con-
+ference on Computer Vision and Pattern Recognition,
+2020.
+Frankle, J. and Carbin, M. The Lottery Ticket Hypothesis:
+Finding Sparse, Trainable Neural Networks. In Interna-
+tional Conference on Learning Representations, 2019.
+Frankle, J., Dziugaite, G. K., Roy, D. M., and Carbin,
+M.
+The Lottery Ticket Hypothesis at Scale.
+CoRR,
+abs/1903.01611, 2019.
+Frankle, J., Dziugaite, G. K., Roy, D. M., and Carbin, M.
+Linear Mode Connectivity and the Lottery Ticket Hy-
+pothesis. In Proceedings of the 37th International Con-
+ference on Machine Learning, 2020.
+Frankle, J., Dziugaite, G. K., Roy, D., and Carbin, M.
+Pruning Neural Networks at Initialization: Why Are We
+Missing the Mark?
+In International Conference on
+Learning Representations, 2021.
+Gale, T., Elsen, E., and Hooker, S. The State of Sparsity in
+Deep Neural Networks. CoRR, abs/1902.09574, 2019.
+Guo, Y., Yao, A., and Chen, Y. Dynamic Network Surgery
+for Efficient DNNs. In Advances in Neural Information
+Processing Systems, 2016.
+Han, S., Pool, J., Tran, J., and Dally, W. J. Learning Both
+Weights and Connections for Efficient Neural Networks.
+In Advances in Neural Information Processing Systems,
+2015.
+9
+
+
+Hassibi, B., Stork, D., and Wolff, G. Optimal Brain Sur-
+geon: Extensions and Performance Comparisons. In Ad-
+vances in Neural Information Processing Systems, 1993.
+Hayou, S., Ton, J.-F., Doucet, A., and Teh, Y. W. Prun-
+ing Untrained Neural Networks: Principles and Analy-
+sis. ArXiv, abs/2002.08797, 2020.
+He, K., Zhang, X., Ren, S., and Sun, J. Deep Residual
+Learning for Image Recognition. IEEE Conference on
+Computer Vision and Pattern Recognition, 2015.
+Jiang, Y., Wang, S., Valls, V., Ko, B. J., Lee, W.-H., Leung,
+K. K., and Tassiulas, L. Model Pruning Enables Efficient
+Federated Learning on Edge Devices. IEEE Transac-
+tions on Neural Networks and Learning Systems, 2022.
+Krizhevsky, A. Learning Multiple Layers of Features from
+Tiny Images. Technical Report, 2009. https://www.
+cs.toronto.edu/∼kriz/cifar.html.
+Krizhevsky, A., Sutskever, I., and Hinton, G. E.
+Im-
+ageNet Classification with Deep Convolutional Neural
+Networks. In Advances in Neural Information Process-
+ing Systems, 2012.
+LeCun, Y., Denker, J., and Solla, S. Optimal Brain Dam-
+age. In Advances in Neural Information Processing Sys-
+tems, 1989.
+Lee, N., Ajanthan, T., and Torr, P. SNIP: Single-shot Net-
+work Pruning Based on Connection Sensitivity. In Inter-
+national Conference on Learning Representations, 2019.
+Lee, N., Ajanthan, T., Gould, S., and Torr, P. H. S. A Signal
+Propagation Perspective for Pruning Neural Networks at
+Initialization. In International Conference on Learning
+Representations, 2020.
+Li, H., Kadav, A., Durdanovic, I., Samet, H., and Graf,
+H. P. Pruning Filters for Efficient ConvNets. In Interna-
+tional Conference on Learning Representations, 2017.
+Lin, T., Stich, S. U., Barba, L., Dmitriev, D., and Jaggi,
+M. Dynamic Model Pruning with Feedback. In Interna-
+tional Conference on Learning Representations, 2020.
+Lym, S., Choukse, E., Zangeneh, S., Wen, W., Sanghavi,
+S., and Erez, M. PruneTrain: Fast Neural Network Train-
+ing by Dynamic Sparse Model Reconfiguration. In Pro-
+ceedings of the International Conference for High Per-
+formance Computing, Networking, Storage and Analy-
+sis, 2019.
+Molchanov, P., Tyree, S., Karras, T., Aila, T., and Kautz,
+J.
+Pruning Convolutional Neural Networks for Re-
+source Efficient Inference. In International Conference
+on Learning Representations, 2017.
+Mozer, M. C. and Smolensky, P. Skeletonization: A Tech-
+nique for Trimming the Fat from a Network via Rele-
+vance Assessment. 1989.
+Nunez-Yanez, J. and Hosseinabady, M.
+Sparse and
+Dense Matrix Multiplication Hardware for Heteroge-
+neous Multi-precision Neural Networks. Array, 2021.
+Reed, R. Pruning Algorithms: A Survey. IEEE Transac-
+tions on Neural Networks, 1993.
+Renda, A., Frankle, J., and Carbin, M. Comparing Rewind-
+ing and Fine-tuning in Neural Network Pruning. In Inter-
+national Conference on Learning Representations, 2020.
+Simonyan, K. and Zisserman, A. Very Deep Convolutional
+Networks for Large-Scale Image Recognition.
+In 3rd
+International Conference on Learning Representations,
+2015.
+Strubell, E., Ganesh, A., and McCallum, A. Energy and
+Policy Considerations for Deep Learning in NLP.
+In
+Proceedings of the 57th Annual Meeting of the Associ-
+ation for Computational Linguistics, 2019.
+Tanaka, H., Kunin, D., Yamins, D. L. K., and Ganguli,
+S. Pruning Neural Networks without Any Data by Itera-
+tively Conserving Synaptic Flow. In Advances in Neural
+Information Processing Systems, 2020.
+Wang, C., Zhang, G., and Grosse, R.
+Picking Winning
+Tickets Before Training by Preserving Gradient Flow. In
+International Conference on Learning Representations,
+2020.
+Wang, Z. SparseDNN: Fast Sparse Deep Learning Infer-
+ence on CPUs. ArXiv, abs/2101.07948, 2021.
+You, H., Li, C., Xu, P., Fu, Y., Wang, Y., Chen, X., Bara-
+niuk, R. G., Wang, Z., and Lin, Y. Drawing Early-Bird
+Tickets: Toward More Efficient Training of Deep Net-
+works. In International Conference on Learning Repre-
+sentations, 2020.
+Zeng, W. and Urtasun, R. MLPrune: Multi-Layer Pruning
+for Automated Neural Network Compression. In Inter-
+national Conference on Learning Representations, 2019.
+Zhang, C., Yuan, G., Niu, W., Tian, J., Jin, S., Zhuang,
+D., Jiang, Z., Wang, Y., Ren, B., Song, S. L., and
+Tao, D. ClickTrain: Efficient and Accurate end-to-end
+Deep Learning Training via Fine-Grained Architecture-
+Preserving Pruning. In Proceedings of the ACM Interna-
+tional Conference on Supercomputing, 2021.
+Zhu, M. and Gupta, S. To Prune, or Not to Prune: Ex-
+ploring the Efficacy of Pruning for Model Compression.
+In Proceedings of the 6th International Conference on
+Learning Representations Workshop, 2018.
+10

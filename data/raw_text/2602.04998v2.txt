@@ -1,0 +1,4881 @@
+Learning Rate Matters: Vanilla LoRA May Suffice for
+LLM Fine-tuning
+Yu-Ang Lee1
+Ching-Yun Ko2
+Pin-Yu Chen2
+Mi-Yen Yeh1,3
+1National Taiwan University
+2IBM Research
+3Academia Sinica
+Project Page: § yuang-lee/lr-matters-lora
+Abstract
+Low-Rank Adaptation (LoRA) is the prevailing approach for efficient large lan-
+guage model (LLM) fine-tuning. Building on this paradigm, recent studies have
+proposed alternative initialization strategies, architectural modifications, and op-
+timization adjustments, reporting substantial improvements over vanilla LoRA.
+However, these gains are often demonstrated under fixed or narrowly tuned hyper-
+parameter settings, despite the known sensitivity of neural networks to training
+configurations. In this work, we systematically re-evaluate nine representative
+LoRA variants alongside vanilla LoRA through extensive hyperparameter searches
+over learning rate, batch size, rank, and training duration. Across tasks spanning
+mathematical reasoning, commonsense reasoning, code generation, and instruction
+following at diverse model scales, we find that different LoRA methods favor
+distinct learning rate ranges. Crucially, once learning rates are properly tuned,
+all methods achieve similar peak performance (within 1–2%), with only subtle
+rank-dependent behaviors. These results suggest that vanilla LoRA remains a com-
+petitive baseline and that improvements reported under a single training configura-
+tion may not reflect consistent methodological advantages. Finally, a second-order
+analysis attributes the differing optimal learning rate ranges to variations in the
+largest Hessian eigenvalue, aligning with classical learning theories.
+1
+Introduction
+Despite the rapidly growing capabilities of pretrained large language models (LLMs), fine-tuning
+remains a fundamental step for adapting these models to specialized applications in diverse domains
+such as medicine [1] and finance [2]. However, modern LLMs typically contain billions of parameters,
+making full-parameter fine-tuning (Full FT) prohibitively expensive in terms of memory and compu-
+tation. These constraints have motivated sustained research interest in developing parameter-efficient
+fine-tuning (PEFT) methods, which allow task-specific learning while updating only a small fraction
+of parameters.
+Even though PEFT methods span diverse design paradigms, ranging from prompt-based approaches [3,
+4] to adapter-based methods [5], low-rank adaptation (LoRA), introduced by Hu et al. [6], has emerged
+as the de facto standard. Inspired by the low intrinsic dimensionality observed in pretrained models [7],
+Hu et al. [6] hypothesized that task-specific parameter updates can be well approximated by low-
+dimensional structures. Consequently, they inject pairs of trainable decomposition matrices into
+selected layers while keeping the pretrained weights frozen. After training, these learned low-rank
+adapters can be merged into the original backbone, thereby incurring no additional inference latency.
+Yu-Ang Lee is in the Data Science Degree Program, National Taiwan University and Academia Sinica.
+Emails: r12946015@ntu.edu.tw, cyko@ibm.com, pin-yu.chen@ibm.com, miyen@iis.sinica.edu.tw
+Preprint.
+arXiv:2602.04998v2  [cs.LG]  19 May 2026
+
+
+2.0e-6
+3.6e-6
+6.3e-6
+1.1e-5
+2.0e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2.0e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2.0e-3
+Learning Rate
+GraLoRA
+(NeurIPS, 2025)
+LoFT
+(ICLR, 2026)
+LoRA
+(ICLR, 2022)
+DoRA
+(ICML, 2024)
+Init[AB]
+(ICML, 2025)
+MiLoRA
+(NAACL, 2025)
+PiSSA
+(NeurIPS, 2024)
+RandLoRA
+(ICLR, 2025)
+OLoRA
+(arXiv, 2024)
+LoRA-GA
+(NeurIPS, 2024)
+49.92
+49.59
+49.60
+49.45
+49.29
+49.17
+49.43
+49.82
+49.08
+49.90
+10
+20
+30
+40
+Accuracy (%)
+Figure 1: Performance of Qwen3-0.6B fine-tuned on mathematical reasoning tasks under rank 128
+and batch size 64 across learning rates. Different methods reach a similar performance level once the
+learning rate is properly tuned. Each point is averaged over three training runs. We annotate the peak
+accuracy of each method and sort methods by their optimal learning rate ranges. Results for other
+model–task combinations and training setups are reported in Sec. 3.3 and Appendix Sec. A.
+Even with its popularity, LoRA has been shown to underperform Full FT on challenging tasks in
+programming and mathematics [8]. This gap has in turn spurred recent efforts toward advanced
+LoRA variants [9], with promising performance improvements reported. On Llama [10], for example,
+PiSSA [11] presented around a 10% accuracy improvement on GSM8K [12] by modifying LoRA
+initialization strategies, while DoRA [13] reported substantial gains of 37.2% on commonsense
+reasoning tasks by separately learning magnitude and directional updates of pretrained weight
+matrices. More recently, LoFT [14] reported a further 40.0% improvement over DoRA in the same
+evaluation setting by aligning LoRA’s optimizer dynamics with those of full FT.
+Learning Rate Batch Size
+Rank
+All Three
+0
+10
+20
+30
+40
+50
+60
+70
+Number of Papers
+46
+62
+24
+63
+18
+2
+40
+1
+Fixed
+Tuned
+Figure 2: Frequency of advanced LoRA-
+based PEFT studies, categorized by whether
+learning rate or batch size tuning was applied
+and whether comparisons with vanilla LoRA
+across different ranks were conducted. Refer
+to Appendix Sec. B for detailed data counts.
+Yet, the results in a majority of work along this line
+were obtained with hyperparameters directly inher-
+ited from prior studies, or only tuned in a narrow
+range. To be specific, in Figure 2, we collect 54 LoRA
+publications from major AI conferences and journals
+over the past three years, and additionally include
+10 more high-impact or recently released preprints,
+to investigate whether their training involved tuning
+key hyperparameters—namely, learning rate, batch
+size, and rank. The statistics over a total of 64 prior
+studies clearly reveal that hyperparameter search is
+not a standard practice in the field, with only one
+paper simultaneously considering three hyperparam-
+eters and fewer than 30% tuning the learning rate.
+These findings raise questions about the extent to
+which the reported gains can be attributed to genuine
+methodological improvements, particularly given the
+well-known sensitivity of neural networks to training configurations [15, 16]1. This is especially
+critical when it comes to LoRA on LLMs, where careful learning rate tuning has been demonstrated
+to be essential for eliciting strong performance, and optimal settings are contingent on both the base
+model and the target problem [8, 17, 18].
+To address the above concern, we select nine representative advanced LoRA variants and conduct
+a large-scale hyperparameter search, benchmarking them against vanilla LoRA in a head-to-head
+manner. Under a unified evaluation protocol, we surprisingly find that once the learning rate is
+1Among prior LoRA studies involving hyperparameter tuning, we also observed that many reported only the final optimal
+performance, leaving it unclear whether the adopted search ranges covered the optimal configurations for each method.
+2
+
+
+properly tuned, all methods peak at similar performance levels, exhibiting no systematic advantages
+over vanilla LoRA. For example, in Figure 1, we fine-tune Qwen3 [19] using all ten LoRA methods,
+with the learning rate varied over three orders of magnitude; under a fixed rank of 128 and batch size of
+64, all methods achieve accuracies within a narrow 0.84% range. Moreover, different methods operate
+within disparate learning rate ranges (e.g., a 10× difference between PiSSA and LoRA in Figure 1),
+suggesting that success under a single training configuration cannot be taken as evidence of robust and
+reliable improvements. This phenomenon is not isolated; we consistently observe such performance
+parity across four task types over diverse LoRA ranks, training durations, and model scales ranging
+from 0.6B to 13B (e.g., Appendix Figure 6 presents similar results on commonsense reasoning
+tasks with Gemma-3 [20]). Notably, within these marginal performance variations, rank-dependent
+behaviors emerge: some advanced variants may slightly outperform LoRA at higher ranks while
+lagging behind at lower ones (or vice versa), highlighting the importance of verifying improvements
+across the entire rank spectrum. By delving into the fundamentals of learning theories [21, 22], we
+provide an explanation for the importance of tuning learning rates during LoRA fine-tuning and
+uncover the reasons behind different desirable learning rate ranges among various LoRA methods.
+Specifically, we demonstrate that PiSSA [11], OLoRA [23], and LoRA-GA [24] exhibit significantly
+larger maximum Hessian eigenvalues compared to vanilla LoRA, which theoretically justifies their
+requirement for a lower learning rate. Based on the extensive tuning experiments, we also derive
+five practical heuristics for hyperparameter tuning in LoRA-based methods, particularly regarding
+how desirable learning-rate ranges interact with batch size (I–II) and how such ranges can be inferred
+from the eigenvalues of the loss Hessian (III). In addition, we show how performance improvements
+can be expected across LoRA ranks (IV) and training durations (V).
+In summary, our work reveals the insufficiency of hyperparameter tuning in many prior LoRA
+studies and provides a systematic empirical re-evaluation of their best achievable performance. By
+explaining the observed performance trends and differences in optimal learning rate ranges via Hessian
+analysis, we hope to encourage future LoRA research to adopt more comprehensive hyperparameter
+tuning protocols. Meanwhile, with the provided practical guidelines on LoRA hyperparameters,
+we aim to help practitioners with limited computational resources avoid unnecessarily exhaustive
+hyperparameter searches. Concretely, the main contributions of this paper are organized around the
+following questions:
+• What is the problem? We conduct a comprehensive audit of advanced LoRA PEFT studies and
+identify a recurring issue: the majority of works lack thorough hyperparameter tuning, despite this
+being a standard requirement. In fact, according to Figure 2, only 1 out of 64 papers simultaneously
+considers three hyperparameters, while 46 present results under a fixed learning rate.
+• Why does it matter? Without proper hyperparameter tuning, conclusions may be ungrounded.
+Concretely, through extensive experimentation, we demonstrate that while different methods require
+distinct optimal learning rate ranges, they yield comparable peak performance when configured to
+their optimal settings. For example, on Qwen3-0.6B, averaged over three runs, the top-performing
+method (GraLoRA) leads the runner-up (LoRA-GA) by only 0.02%, and the least effective method
+(OLoRA) by 0.84% (cf. Figure 1).
+• Which learning rate to use? By analyzing the eigenvalues of the loss Hessian across various
+initialization-based LoRA variants, we find that the optimal learning rate is generally negatively
+correlated with the maximum eigenvalue, aligning with classical learning theories.
+• How can we tune LoRA methods efficiently? Since fair comparison requires method-specific
+tuning but exhaustive searches are computationally expensive, we identify practical heuristics
+across learning rate, batch size, LoRA rank, and training duration. Together with the Hessian
+eigenvalue analysis, these findings help narrow the hyperparameter search space.
+2
+Related Work and Background
+2.1
+Related Work
+2.1.1
+Systematic Empirical Re-evaluation of Prior Claims
+Incomplete performance evaluation remains a persistent concern [25, 26]. For instance, Melis et al.
+[27] revealed that two published improvements to the vanilla LSTM [28], originally attributed to
+complex network designs, were in fact due to more careful hyperparameter tuning. Under a fair
+3
+
+
+tuning protocol, the standard LSTM emerged as the best-performing architecture. In the same
+vein, Lin et al. [29] pointed out that simple baselines such as linear SVM [30] are competitive
+with BERT [31]-based methods for text classification, sometimes even outperforming them with a
+clear gap. More recently, Rheude et al. [32] reported a striking finding in the multimodal learning
+literature: although new multimodal architectures are continually proposed with claims that they
+outperform prior baselines, they often fail to surpass standard unimodal approaches given fair
+comparisons and statistical correctness. Such systematic empirical re-evaluation has also been done
+across diverse machine learning subfields. Examples include not only traditional topics such as
+image classification [33], graph neural networks [34, 35], generative adversarial networks [36],
+recommender systems [37–39], metric learning [40], and neural network pruning [41], but also more
+recent areas like optimizers [42–44], reinforcement learning [45], preference optimization [46], and
+model merging [47, 48].
+While empirical studies benchmarking LoRA with other PEFT methods such as prefix tuning [3] and
+BitFit [49] exist [50–55], few prior studies specifically focus on comparing LoRA and its advanced
+variants. More concerning, training hyperparameters in many of these works were kept fixed without
+method-specific optimization. Therefore, practitioners are left without clear and reliable guidance
+when choosing LoRA-based methods.
+2.1.2
+LoRA Hyperparameter Tuning
+Theories regarding LoRA’s lack of Lipschitz smoothness [56, 57] and its spurious loss landscape [58]
+point toward its intrinsic sensitivity to hyperparameter variations. Consequently, many research
+efforts have been invested in finding optimal training setups, such as learning rate [59, 60], rank [61],
+initializations [62], scaling factor [63], dropout [64, 65], and adapter placements [66, 67]. Despite
+these insights into individual hyperparameters, establishing unified configuration guidelines remains
+an ongoing pursuit. For example, recent works have sought to derive practical “rules of thumb”
+through extensive, joint evaluations across multiple hyperparameter dimensions [8, 17]. Addressing
+the computational bottleneck of such extensive searches, another line of work has focused on
+improving the efficiency of LoRA hyperparameter tuning, either by developing hyperparameter
+optimization algorithms [68–71] or by adopting system-level approaches that optimize hardware
+resources to maximize training throughput [18, 72]. Although prior work has optimized LoRA
+hyperparameters, only a few concurrent studies have begun to examine whether LoRA and its variants
+require distinct hyperparameter settings [73–75]. These studies, however, differ from ours in scope.
+Specifically, Zhang et al. [73] noted that LoRA and two of its initialization variants, PiSSA [11] and
+MiLoRA [76], exhibit performance shifts across two learning rates (2e−4 and 2e−5). He et al. [74]
+also concluded that, with proper learning rate tuning, vanilla LoRA consistently matches or surpasses
+most of its variants under a single LLM scale with fixed rank and training duration. Meanwhile, Lee
+et al. [75] demonstrated that the reported advantages of PiSSA and MiLoRA could be driven by batch
+size bias. Our paper differs from these studies by expanding the investigation to a broader set of
+recent LoRA variants and conducting comprehensive multivariate hyperparameter tuning to identify
+the best-performing configuration for each method. Moreover, our work compares methods across
+varying ranks and training durations, and further leverages Hessian analysis to provide theoretical
+insight into the underlying factors driving the observed performance differences and trends.
+2.2
+Vanilla LoRA and Its Variants
+2.2.1
+Low-Rank Adaptation
+Given a pretrained neural network layer parameterized by Wpre ∈Rm×n, LoRA introduced two train-
+able matrices: the down-projecting A ∈Rr×n and the up-projecting B ∈Rm×r (r ≪min(m, n)).
+For layer input x ∈Rn, the output h ∈Rm is computed as:
+h = Wprex + γrBAx,
+(1)
+where γr = α
+r serves as a rank-dependent scaling factor with α being a tunable hyperparameter.
+At initialization, the two trainable matrices B and A are set to B0 = 0 and A0 ∼N(0, σ2) (i.e.,
+Kaiming initialization [77]), ensuring that fine-tuning starts exactly from the pretrained checkpoint.
+4
+
+
+2.2.2
+Representative LoRA Variants
+In this paper, we consider nine representative LoRA variants spanning diverse optimization mecha-
+nisms, which we organize into three categories: (1) Initialization Variants (OLoRA [23], PiSSA [11],
+MiLoRA [76], Init[AB] [78], LoRA-GA [24]), (2) Architecture Modifications (DoRA [13],
+GraLoRA [79], RandLoRA [80]), and (3) Optimization Adjustments (LoFT [14]). We describe their
+key design principles below and defer the detailed design rationales and formulas to Appendix Sec. C.
+Initialization Variants.
+This category comprises methods that explore improved initialization
+strategies for LoRA [11, 23, 24, 76, 78, 81–83]. Methods along this line can be further distinguished
+by whether their initialization requires task data, yielding data-free and data-informed subcategories,
+both of which are considered in this work. Specifically, within the data-free subcategory, OLoRA [23]
+applies QR decomposition to Wpre to initialize B and A using the first-r columns of Q and the first-r
+rows of R, respectively. PiSSA [11] and MiLoRA [76], on the other hand, leverage the singular value
+decomposition (SVD) of Wpre to inform the initialization of LoRA adapters, with PiSSA selecting
+the top-r principal components and MiLoRA adopting the minor ones. Several works have also
+theoretically analyzed the initialization strategies of LoRA [62, 84, 78]. In particular, Init[AB] [78]
+showed that randomly initializing both LoRA matrices using Kaiming initialization can be more
+advantageous by balancing stability, training efficiency, and hyperparameter robustness. Turning to
+the data-informed subcategory, LoRA-GA [24] uses one-step full-gradient information to initialize
+LoRA adapters. Let G = −∇WpreL ∈Rm×n denote the sampled full gradient with respect to Wpre.
+LoRA-GA computes the SVD of G and initializes LoRA adapters in a disjoint manner, using the
+top-r right singular vectors for A and the (r + 1)-th through 2r-th left singular vectors for B.
+Note that since B0A0̸ = 0 for all the initialization variants discussed above, the base weight is
+replaced by a residual matrix so that fine-tuning starts from the pretrained weights. Specifically,
+the residual matrix is defined as Wres = Wpre −B0A0, and the modified forward pass becomes:
+h = Wresx + γrBAx.
+Architectural Modifications.
+Besides investigating initialization strategies, a large body of litera-
+ture has also focused on architecture-level improvements, e.g., [79, 80, 85–87] available in the PEFT
+library [88]. By modifying vanilla LoRA’s forward design (i.e., Eq. 1), these methods improve fine-
+tuning effectiveness either by sustaining performance with greater parameter efficiency [85, 89–92]
+or by achieving higher accuracy under a similar trainable-parameter budget [13, 79, 80, 93, 94]. We
+focus on methods in the latter category, as large differences in trainable-parameter counts relative
+to LoRA make direct head-to-head comparisons non-trivial; e.g., VeRA [85] substantially reduces
+the number of trainable parameters from (m + n)r to m + r per layer. In particular, we select
+DoRA [13], RandLoRA [80], and GraLoRA [79], as they require no more than one additional
+architectural hyperparameter. This contrasts with other modification strategies such as BoFT [86]
+and PEANuT [87], which involve multiple architectural choices, namely (m, b) and depth/activation
+function, respectively, and could therefore rapidly expand the hyperparameter search space. Due to
+space constraints, we defer the details of their forward designs to Appendix Sec. C.2.
+Optimization Adjustments.
+More recent studies have started to improve LoRA by directly ad-
+justing its optimization dynamics. For example, LoRA+ [59] assigns different learning rates to
+A and B, while scaled AdamW [95] introduces an r × r preconditioner into each gradient step.
+LoRA-Pro [96] further adjusts the gradients of LoRA so that the induced update better approximates
+the full fine-tuning gradient. More recently, LoFT [14] aligns the optimizer’s internal dynamics with
+full fine-tuning by projecting Adam [97]’s first- and second-moment estimates into the same low-rank
+subspace, narrowing the performance gap between LoRA and full fine-tuning.
+3
+Learning Rate Matters, Really
+3.1
+Motivation
+For the trainable LoRA parameters across layers, collectively denoted as θ, the update rule of
+Stochastic Gradient Descent (SGD) at step t is:
+θt+1 = θt −ηg(θt),
+5
+
+
+where η is the learning rate and g(θt) ≜∇L(θt) is the gradient of the loss function L. While setting
+η too large causes the optimization step to overshoot, leading to instability or divergence, a value
+that is too small is insufficient to escape suboptimal local minima or affect the convergence rate. To
+analyze this formally, consider the local geometry characterized by the Hessian H(θt) ≜∇2L(θt).
+According to classical learning theories [21], the optimal learning rate η∗for efficient learning is
+intrinsically tied to the curvature of the loss landscape at θ, typically scaling inversely with the
+Hessian’s maximum eigenvalue:
+η∗∝
+1
+λmax(H(θ)).
+(2)
+Notably, LoRA initialization variants establish specific training starting points θ0, resulting in
+distinct g(θ0), H(θ0), and subsequent training trajectories compared to vanilla LoRA. Similarly,
+while LoRA variants based on architectural modifications or optimization adjustments could share
+the same g(θ0) and H(θ0) as vanilla LoRA, their subsequent gradient and Hessian evolution
+throughout training may naturally deviate from LoRA due to the unique forward designs or update
+rules. Therefore, different methods theoretically require their respective calibrations of η to ensure
+efficient convergence, motivating our decision to perform learning rate tuning for a fair and reliable
+head-to-head comparison across methods.
+3.2
+Experimental Setup
+Since model choices, training configurations, and dataset partitioning vary across papers, we establish
+a unified experimental framework that accommodates all methods fairly. We describe the key
+components below, with additional implementation details deferred to Appendix D.
+Pretrained Models.
+We consider four decoder-only models spanning diverse scales: Qwen3-
+0.6B [19], Gemma-3-1B [20], Llama-2-7B, and Llama-2-13B [10]. This selection includes both
+recently released ones (Qwen3, Gemma-3) and an older but widely used model family (Llama-2)
+in prior art on this subject, enabling us to validate results across LLMs with diverse pretrained
+capabilities.
+Fine-tuning Tasks.
+We train models on four canonical tasks: commonsense reasoning, mathemat-
+ical reasoning, code generation, and instruction following. The dataset setup follows prior LoRA
+studies. Specifically, for commonsense reasoning, we leverage the 15k training examples compiled
+by Hu et al. [51], which comprise eight general question-answering subtasks. For mathematical
+reasoning, we use 100k subsampled training examples from MetaMathQA [98] and evaluate models
+on GSM8K [12] and MATH [99]. For code generation, we use 104k subsampled training examples
+from CodeFeedback [100] and evaluate models on HumanEval [101] and MBPP [102]. For instruc-
+tion following, we train models on 52k Alpaca [103] examples and evaluate them using the IFEval
+framework [104]. Unless otherwise specified, we report mean accuracy over the testing datasets.
+Hyperparameter Settings.
+We consider batch sizes (B) in {16, 32, 64, 128, 256, 512} and ranks
+(r) in {4, 8, 16, 32, 64, 128, 256}. The learning rates (η) are tuned uniformly on a logarithmic scale
+from 10−6 to 10−3, with four values per order of magnitude: 1.1247×10∗, 2.0000×10∗, 3.5566×10∗,
+6.3246×10∗, yielding up to 16 grid points for the learning rate alone. To maintain the computational
+feasibility of this study, batch size and rank are tuned only for selected model-task combinations;
+conversely, learning rates are tuned across all combinations, with ranges defined to ensure inclusion of
+optimal performance. See Appendix Table 4 for a summary of models, tasks, and their corresponding
+hyperparameter search ranges. Other configurations, such as epoch, adapter placement, and learning
+rate scheduler, remain fixed across all experiments and are listed in Appendix Table 5. Specifically
+for the scaling factor γr, we follow Meng et al. [11] by setting α equal to r in all our experiments.
+This results in γr = 1 for all r, effectively factoring out the need to tune this hyperparameter (refer to
+Appendix Sec. E for further discussion).
+3.3
+Results and Observations
+We begin by discussing results under fixed rank r = 128 in Sec. 3.3.1, and then in Sec. 3.3.2, we
+analyze how the methods perform across different ranks.
+6
+
+
+Methods Batch
+Size
+Learning Rate
+1.1e-5
+2e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+3.6e-3
+6.3e-3
+LoRA
+16
+9.78±0.36 11.16±0.2813.58±0.1815.48±0.1518.43±0.1420.00±0.26 19.93±0.65 17.99±0.55 11.71±0.49 1.52±0.19 1.27±0.591.07±0.27
+64
+6.88±0.04 9.12±0.39 10.79±0.3713.23±0.2515.65±0.57 17.54±0.29 19.73±0.16 20.46±0.79 19.83±0.91 13.33±0.81 1.48±0.480.00±0.00
+128
+5.70±0.34 6.95±0.23 9.41±0.44 11.43±0.4013.68±0.77 15.92±0.45 18.58±0.44 19.60±0.09 20.32±0.28 16.95±2.70 0.09±0.160.00±0.00
+DoRA
+16
+9.89±0.24 11.16±0.5113.84±0.4115.61±0.1118.21±0.45 20.11±0.26 20.96±0.57 18.34±0.20 11.90±0.29 4.89±0.99 0.93±0.121.16±0.15
+64
+6.72±0.09 9.19±0.19 10.53±0.2013.45±0.3115.72±0.32 17.66±0.20 19.96±0.05 20.82±0.32 19.87±0.91 13.53±1.64 1.52±0.450.34±0.23
+128
+5.55±0.11 7.21±0.18 9.72±0.17 11.58±0.2513.98±0.33 16.19±0.46 18.25±0.23 19.67±0.71 20.33±0.64 12.86±10.030.13±0.230.02±0.03
+Init[AB]
+16
+9.73±0.35 12.10±0.1414.41±0.4916.73±0.3718.38±0.53 20.39±0.38 20.55±0.40 18.34±0.48 11.94±0.31 1.48±0.24 1.16±0.311.45±0.17
+64
+6.51±0.22 9.15±0.12 11.28±0.2013.20±0.2415.88±0.39 17.89±0.30 20.08±0.26 20.98±0.33 19.31±0.75 13.97±0.03 2.74±3.830.07±0.12
+128
+6.06±0.35 7.05±0.33 9.53±0.22 11.81±0.0813.98±0.79 16.46±0.39 18.36±0.21 20.37±0.39 20.66±0.39 17.85±0.84 4.40±7.460.00±0.00
+MiLoRA
+16
+12.44±0.0713.77±0.2516.28±0.2418.45±0.4720.04±0.19 20.63±0.67 19.40±0.80 15.72±0.49 10.22±0.42 2.03±0.95 1.35±0.431.56±0.65
+64
+8.82±0.40 11.25±0.2013.16±0.1115.54±0.2917.43±0.24 19.56±0.33 20.03±0.59 19.60±0.78 17.93±0.90 13.65±0.07 4.97±0.400.00±0.00
+128
+7.32±0.33 9.57±0.24 11.76±0.3313.54±0.1216.02±0.16 18.39±0.26 19.70±0.34 19.99±0.66 19.53±0.47 16.83±0.73 7.45±1.000.57±0.81
+PiSSA
+16
+14.30±0.1816.10±0.2718.31±0.1219.90±0.2120.61±0.28 19.09±0.20 16.10±0.64 13.25±0.55 8.41±0.13
+4.67±0.29 2.50±1.270.96±0.15
+64
+11.11±0.0513.67±0.1715.56±0.3318.11±0.2319.52±0.48 20.68±0.77 20.59±0.32 19.11±0.86 15.53±0.37 9.57±0.72 5.78±0.370.33±0.46
+128
+9.42±0.38 11.80±0.2814.40±0.1116.23±0.3818.60±0.21 19.61±0.44 20.65±0.44 19.21±1.15 16.91±0.19 13.87±0.97 6.28±0.491.19±0.36
+Table 1: Performance of Gemma-3-1B on mathematical reasoning task across varying batch sizes and
+learning rates (r = 128). Results are reported as mean ± standard deviations over three independent
+runs. Best results are highlighted in bold, and configurations achieving ≥18.5% accuracy (i.e.,
+≈90% of the maximum) are shaded in green (
+). While all methods achieve comparable peak
+accuracies, the optimal learning rates vary depending on both the fine-tuning method and batch size.
+3.3.1
+Similar Performance Levels
+To further examine whether the performance parity among LoRA methods observed on Qwen3-
+0.6B (Figure 1 and Appendix Figure 6) generalizes to diverse model–task combinations, Table 1,
+Figure 3, and Appendix Figure 7 present the results for Gemma-3-1B, Llama-2-7B, and Llama-2-13B,
+respectively. To maintain the computational feasibility of this study, we select four popular and
+recently published LoRA variants from the nine methods considered previously, namely PiSSA,
+MiLoRA, Init[AB], and DoRA. Through comprehensive hyperparameter searches, we consistently
+observe across different model scales and tasks that these methods peak at performance levels similar
+to vanilla LoRA. Specifically, the performance gaps across all methods remain small: 0.52% for
+Gemma-3-1B on math, 0.43% and 1.75% for Llama-2-7B on math and code, respectively, and 1.81%
+for Llama-2-13B on math. It is also important to note that while peak performance is similar, the
+optimal learning rates vary. In particular, PiSSA requires a lower learning rate compared to vanilla
+LoRA across all model-task combinations, while other methods fall within a similar range to LoRA,
+typically within the same order of magnitude.
+Beyond the optimal learning rates, a closer inspection of the full learning rate spectrum reveals
+intriguing method-specific behaviors. For instance, we observe that PiSSA tends to remain effective
+at larger learning rates where other methods diverge: in Figure 3 at η =1.1×10−3, PiSSA maintains
+accuracies of 27.83% and 26.90% on math and code tasks, respectively, while other methods collapse
+to near-zero performance on at least one of the tasks.
+Note that in Table 1, the joint optimization of learning rate and batch size indicates that tuning the
+learning rate is significantly more critical than tuning the batch size for obtaining the best performance
+in both LoRA and its variants, consistent with early findings for neural networks [16]. For example,
+with PiSSA, fixing the learning rate at 2×10−5 and tuning only the batch size yields a suboptimal
+maximum accuracy of 16.1%. In contrast, by fixing the batch size to any value in {16, 64, 128}
+and tuning the learning rate, the model achieves substantially higher performance around 20.6%.
+Moreover, we observe that the optimal learning rate scales proportionally with batch size, aligning
+with the “scaling rule” established in SGD literature [105, 106]. This offers several practical
+heuristics for LoRA hyperparameter tuning: I. Under limited computational resources, one may
+consider prioritizing learning rate tuning while fixing the batch size to a small or medium value.2 II. If
+additional resources are available and practitioners wish to explore different batch sizes, even though
+further performance gains are likely to be marginal once the learning rate has been properly tuned,
+we remind practitioners to keep in mind the scaling relationship between batch size and learning rate,
+which can help guide initial learning rate selection when configuring different batch sizes. More
+2When the batch size is set too large, the best achievable performance of LoRA methods under comprehensive learning
+rate tuning starts to decay, as we show in Appendix A.4.
+7
+
+
+2e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+Learning Rate ( )
+LoRA
+DoRA
+Init[AB]
+MiLoRA
+PiSSA
+35.66
+35.57
+35.57
+35.23
+35.31
+0
+10
+20
+30
+Accuracy (%)
+(a) Mathematical Reasoning
+2e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+Learning Rate ( )
+LoRA
+DoRA
+Init[AB]
+MiLoRA
+PiSSA
+36.68
+38.12
+38.43
+37.42
+36.77
+0
+10
+20
+30
+Accuracy (%)
+(b) Code Generation
+Figure 3: Performance of Llama-2-7B on mathematical reasoning and code generation tasks across
+varying learning rates (r = 128, B = 128). Notably, PiSSA peaks at lower learning rates but remains
+effective at larger learning rates on both tasks (e.g., 1.1×10−3), where other methods diverge. Results
+scaling up to Llama-2-13B are provided in Appendix Figure 7.
+4
+8
+16
+32
+64
+128
+256
+Adapter rank (r)
+12
+14
+16
+18
+20
+22
+24
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+(a) Mathematical Reasoning
+4
+8
+16
+32
+64
+128
+256
+Adapter rank (r)
+12
+14
+16
+18
+20
+22
+24
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+(b) Code Generation
+Figure 4: Best achievable performance of LoRA and its advanced variants across adapter ranks on
+Gemma-3-1B (B = 64). With properly tuned learning rates, all methods exhibit similar performance
+improvement trends as the rank increases, though subtle rank-dependent behaviors emerge. Results
+are reported with means and standard deviations over three independent runs. Additional rank-tuning
+results for Llama-2-7B are deferred to Appendix Sec. A.2.
+numerical results, example model responses, and practical learning heuristics (III–V) are provided in
+Appendix F, Sec. G, and Sec. H, respectively.
+3.3.2
+Performance Comparison Across Ranks
+Next, we extend our analysis by varying adapter ranks for Gemma-3-1B, as shown in Figure 4.
+The results indicate that the previously observed performance parity persists across a wide range of
+rank settings, with the maximum performance differences among methods being only 1.67% (Math,
+r = 32) and 2.15% (Code, r = 4). Interestingly, however, we observe that the relative performance
+of variants compared to LoRA fluctuates across different ranks within these margins.
+In particular, PiSSA initially underperforms vanilla LoRA before gradually overtaking it as the rank
+increases. Taking the math task as an example (Figure 4a), PiSSA exhibits performance deficits of up
+to 1.67% at low ranks (r ≤32), but narrows the gap to within 0.11% at r = 64 and shifts to a slight
+gain of 0.22% and 0.33% at r = 128 and 256, respectively. In contrast, MiLoRA shows an opposite
+trend, where it tends to outperform vanilla LoRA at lower ranks but fails to sustain this advantage
+as the rank increases. Figure 4b indicates that these rank-dependent dynamics extend to the coding
+task. For Init[AB], we observe that it tends to outperform LoRA at medium ranks, e.g., achieving
+maximal gains of 0.52% on math and 1.26% on code at r = 128. Yet, the success does not translate
+to either lower or higher rank scenarios, where Init[AB] typically performs similarly to vanilla LoRA.
+As for DoRA, we observe performance gains against LoRA specifically in low-rank regimes, peaking
+at 1.1% on math and 0.95% on code at r = 8. Similar performance comparisons across ranks were
+8
+
+
+also conducted on Llama-2-7B, with results deferred to Appendix Sec. A.2. Beyond adapter ranks,
+we also validate our findings under different numbers of training samples and training epochs, with
+results deferred to Appendix Sec. A.3.
+4
+Understanding the Optimal Learning Rate via Hessian Analysis
+4.1
+Sharpness-Learning Rate Relationship
+The Hessian of the loss function has been the subject of numerous studies. Geometrically, its top
+eigenvalue (denoted as λmax for brevity) at a given point represents the maximal curvature of the
+loss landscape along any direction, commonly referred to as sharpness [107–109]. This metric is
+closely linked to the optimal learning rate, a connection that originates from the Gauss-Newton
+method for convex optimization and was further elucidated by LeCun et al. [21] in the context of
+neural networks. Specifically, it was shown that an efficient learning rate theoretically falls within
+1/λmax ≤η∗< 2/λmax under quadratic approximation, whereas rates exceeding 2/λmax lead to
+divergence. More recently, Lewkowycz et al. [22] identified a “catapult” learning regime characterized
+by 2/λmax ≤η∗≤12/λmax, in which modern architectures achieve optimal performance. Further
+research has explored the intricacies of the interplay between λmax and η∗with a consensus that
+these two quantities exhibit an inversely proportional relationship [110–112].
+4.2
+Sharpness Analysis in LoRA
+For our LoRA fine-tuning problem, we leverage the downstream MetaMathQA dataset to compute
+the Hessian matrix of the loss function and focus exclusively on the trainable LoRA parameters [113–
+115]. Instead of concatenating LoRA parameters across all layers, we follow standard LLM practices
+to estimate λmax in a block-wise manner [116–118] at the initialization point. Formally, we calculate
+the layer-wise metric as λl
+max = λmax(Hl), where Hl represents the Hessian corresponding to
+parameters θl = {Bl
+0, Al
+0}, with l indexing matrix types and Transformer layers. The Lanczos
+algorithm [119] and Hessian-vector products are used to estimate the top eigenvalue without explicitly
+forming H. Implementation details are provided in Appendix I.1. While LoRA architectural
+modifications and optimization adjustments may share LoRA’s initialization, implying identical
+initial Hessians, their unique forward designs and update rules may lead to distinct Hessian evolution
+throughout training. We thus defer their investigation to future work.
+100
+101
+102
+max (Normalized by LoRA)
+Density
+LoRA
+PiSSA
+Init[AB]
+OLoRA
+MiLoRA
+LoRA-GA
+Figure 5: Distributions of the ratios of
+the top loss Hessian eigenvalues relative to
+LoRA for Query projection matrices across
+Transformer layers on Qwen3 (r = 128).
+Dashed lines indicate the medians.
+Specifically, let the Hessian for the Query projection
+matrix in the i-th layer be HQ,i
+t
+, where t indexes differ-
+ent LoRA methods. We further denote their correspond-
+ing maximum eigenvalues by λQ,i
+max,t. Then, we normal-
+ize the maximum eigenvalues from LoRA initialization
+variants by that from LoRA, and plot the distribution
+across layers in Figure 5, i.e. λQ,i
+max,t/λQ,i
+max,LoRA for
+t =Init[AB], MiLoRA, PiSSA, OLoRA, LoRA-GA
+and i = 1, . . . , L. The results reveal that all meth-
+ods initialize trainable parameters in a higher curvature
+state than vanilla LoRA. Most notably, OLoRA and
+LoRA-GA exhibit up to 100× higher curvature, ex-
+plaining the reason behind their requirement for a much
+lower learning rate (18.2× lower) in Figure 1. Similar
+patterns apply to other methods. In particular, PiSSA
+exhibits ≈10× higher curvature, which is consistent
+with its requirement for a 10× lower learning rate. For
+Init[AB] and MiLoRA, however, the eigenvalue mag-
+nitudes are more similar to those of vanilla LoRA (≈2× higher), supporting their lower optimal
+learning rates by factors of 1.8× and 3.2× in Figure 1, respectively. Detailed λmax values and
+Hessian analyses on other models and matrix types are provided in Appendix Sec. I.2 and Sec. I.3.
+9
+
+
+5
+Conclusion
+Motivated by the increasing number of LoRA variants and the insufficient hyperparameter tuning in
+many studies, in this work, we conducted a systematic re-evaluation of ten LoRA PEFT methods
+under a unified evaluation protocol. Based on the comprehensive hyperparameter experiments,
+we conclude that improper learning rates give a false sense of LoRA advancements. In our
+studies, we also pointed out the scenarios where one might be in favor of a specific variant that,
+albeit likely to produce generally comparable performance, marginally outperforms other variants.
+It is worth noting that these improvements often lack universality, with vanilla LoRA frequently
+matching or even outperforming them. By elucidating the disparate optimal learning rate ranges
+through Hessian analysis, we hope our study encourages future PEFT research to adopt a more
+comprehensive hyperparameter search protocol, ensuring reliable advancements in the field. We also
+hope that the five practical heuristics derived from our experimentation will help practitioners reduce
+the computational burden associated with LoRA tuning. We acknowledge that this paper is subject to
+several limitations, primarily due to computational constraints, which we discuss in detail below.
+Limitations and Future Work
+In this paper, we focused our investigation on decoder-only LLMs from 0.6B to 13B parameter scale.
+Hence, the scalability of our findings to larger foundation models remains to be verified. Additionally,
+the computational costs required for hyperparameter searches for each LoRA method on diverse
+model–task combinations and training durations precluded an exhaustive search over relatively minor
+hyperparameters. In particular, while key hyperparameters (learning rate, batch size, LoRA rank)
+were tuned, other secondary training setups, such as learning rate schedulers, warmup steps, and
+LoRA adapter placements, remained fixed. It may be possible that fine-grained tuning of these
+configurations could yield further performance gains or distinct convergence behaviors.
+We also highlight that our findings may not extend to untested model architectures (e.g., encoder-
+only LLMs [31], Vision Transformers [120], and Vision-Language Models [121]) or to all existing
+advanced LoRA variants. For instance, several methods have originally reported higher peak per-
+formance than LoRA under comprehensive learning rate sweeps—such as LoRA-One [83], which
+initializes adapters via the SVD of the one-step full gradient, with ≈2% performance improvement
+on Llama (cf. Zhang et al. [83] Table 3). Moreover, fine-tuned accuracy on standard benchmarks is
+not the sole criterion for evaluating PEFT algorithms; specific variants may offer distinct advantages
+in other dimensions, e.g., mitigating catastrophic forgetting of pretrained knowledge [8, 76, 81, 122–
+124].
+While the landscape of LoRA variants continues to expand, our results suggest that vanilla LoRA
+already suffices as a competitive baseline, potentially indicating that weight-based low-rank adaptation
+strategies may be approaching saturation. Looking ahead, we posit that further investigation into
+alternative adaptation mechanisms may unlock new dimensions of efficiency. Examples of such
+mechanisms include hidden representation fine-tuning [125, 126] and approaches that adapt non-
+linear functions within layers [127]. We leave the exploration of these orthogonal paradigms as future
+work.
+Acknowledgements
+This work was supported in part by National Science and Technology Council, Taiwan, R.O.C.,
+under grant 113-2628-E-001-003-MY4, and by National Taiwan University and Academia Sinica
+Innovative Joint Program, under grant AS-NTU-114-06. We thank the authors of prior LoRA studies
+for open-sourcing their work, and all contributors to the official PEFT package for their detailed
+documentation, continued maintenance, and prompt handling of issues. Y.-A. Lee would like to
+thank the academic training and support received from the Data Science Degree Program at NTU and
+Academia Sinica, as well as the NTU Overseas Internship Program and IBM Research.
+References
+[1] DM Anisuzzaman, Jeffrey G Malins, Paul A Friedman, and Zachi I Attia. Fine-tuning large language
+models for specialized use cases. Mayo Clinic Proceedings: Digital Health, 3(1):100184, 2025.
+10
+
+
+[2] Prudence Djagba and Abdelkader Y Saley. Exploring large language models for financial applications:
+Techniques, performance, and challenges with finma. arXiv preprint arXiv:2510.05151, 2025.
+[3] Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation. arXiv
+preprint arXiv:2101.00190, 2021.
+[4] Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient prompt
+tuning. arXiv preprint arXiv:2104.08691, 2021.
+[5] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, An-
+drea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning for nlp. In
+International conference on machine learning, pages 2790–2799. PMLR, 2019.
+[6] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR, 1(2):3, 2022.
+[7] Chunyuan Li, Heerad Farkhoor, Rosanne Liu, and Jason Yosinski. Measuring the intrinsic dimension of
+objective landscapes. arXiv preprint arXiv:1804.08838, 2018.
+[8] Dan Biderman, Jacob Portes, Jose Javier Gonzalez Ortiz, Mansheej Paul, Philip Greengard, Connor
+Jennings, Daniel King, Sam Havens, Vitaliy Chiley, Jonathan Frankle, et al. Lora learns less and forgets
+less. arXiv preprint arXiv:2405.09673, 2024.
+[9] Mengyao Zhu and Phuc Huu Nguyen. A survey of lora algorithm variations for language models. In
+International Conference on Applications of Natural Language to Information Systems, pages 275–290.
+Springer, 2025.
+[10] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and
+fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+[11] Fanxu Meng, Zhaohui Wang, and Muhan Zhang. Pissa: Principal singular values and singular vectors
+adaptation of large language models. Advances in Neural Information Processing Systems, 37:121038–
+121072, 2024.
+[12] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve math word
+problems. arXiv preprint arXiv:2110.14168, 2021.
+[13] Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-Ting
+Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation. In Forty-first International
+Conference on Machine Learning, 2024.
+[14] Nurbek Tastan, Stefanos Laskaridis, Martin Takác, Karthik Nandakumar, and Samuel Horváth. Loft:
+Low-rank adaptation that behaves like full fine-tuning. arXiv preprint arXiv:2505.21289, 2025.
+[15] Yann LeCun, Léon Bottou, Genevieve B Orr, and Klaus-Robert Müller. Efficient backprop. In Neural
+networks: Tricks of the trade, pages 9–50. Springer, 2002.
+[16] Yoshua Bengio. Practical recommendations for gradient-based training of deep architectures. In Neural
+networks: Tricks of the trade: Second edition, pages 437–478. Springer, 2012.
+[17] John Schulman and Thinking Machines Lab. Lora without regret. Thinking Machines Lab: Connectionism,
+2025. doi: 10.64434/tml.20250929. https://thinkingmachines.ai/blog/lora/.
+[18] Minghao Yan, Zhuang Wang, Zhen Jia, Shivaram Venkataraman, and Yida Wang. Plora: Efficient lora
+hyperparameter tuning for large models. arXiv preprint arXiv:2508.02932, 2025.
+[19] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+[20] Gemma Team, Aishwarya Kamath, Johan Ferret, Shreya Pathak, Nino Vieillard, Ramona Merhej, Sarah
+Perrin, Tatiana Matejovicova, Alexandre Ramé, Morgane Rivière, et al. Gemma 3 technical report. arXiv
+preprint arXiv:2503.19786, 2025.
+[21] Yann LeCun, Patrice Simard, and Barak Pearlmutter. Automatic learning rate maximization by on-line
+estimation of the hessian’s eigenvectors. Advances in neural information processing systems, 5, 1992.
+[22] Aitor Lewkowycz, Yasaman Bahri, Ethan Dyer, Jascha Sohl-Dickstein, and Guy Gur-Ari. The large
+learning rate phase of deep learning: the catapult mechanism. arXiv preprint arXiv:2003.02218, 2020.
+11
+
+
+[23] Kerim Büyükakyüz. Olora: Orthonormal low-rank adaptation of large language models. arXiv preprint
+arXiv:2406.01775, 2024.
+[24] Shaowen Wang, Linxi Yu, and Jian Li. Lora-ga: Low-rank adaptation with gradient approximation.
+Advances in Neural Information Processing Systems, 37:54905–54931, 2024.
+[25] David Sculley, Jasper Snoek, Alex Wiltschko, and Ali Rahimi. Winner’s curse? on pace, progress, and
+empirical rigor. 2018.
+[26] Zachary C Lipton and Jacob Steinhardt. Troubling trends in machine learning scholarship: Some ml
+papers suffer from flaws that could mislead the public and stymie future research. Queue, 17(1):45–77,
+2019.
+[27] Gábor Melis, Chris Dyer, and Phil Blunsom. On the state of the art of evaluation in neural language
+models. arXiv preprint arXiv:1707.05589, 2017.
+[28] Sepp Hochreiter and Jürgen Schmidhuber. Long short-term memory. Neural computation, 9(8):1735–
+1780, 1997.
+[29] Yu-Chen Lin, Si-An Chen, Jie-Jyun Liu, and Chih-Jen Lin. Linear classifier: An often-forgotten baseline
+for text classification. arXiv preprint arXiv:2306.07111, 2023.
+[30] Bernhard E Boser, Isabelle M Guyon, and Vladimir N Vapnik. A training algorithm for optimal margin
+classifiers. In Proceedings of the fifth annual workshop on Computational learning theory, pages 144–152,
+1992.
+[31] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+bidirectional transformers for language understanding. In Proceedings of the 2019 conference of the
+North American chapter of the association for computational linguistics: human language technologies,
+volume 1 (long and short papers), pages 4171–4186, 2019.
+[32] Tillmann Rheude, Roland Eils, and Benjamin Wild. Fusion or confusion? multimodal complexity is not
+all you need. arXiv preprint arXiv:2512.22991, 2025.
+[33] Ken Chatfield, Karen Simonyan, Andrea Vedaldi, and Andrew Zisserman. Return of the devil in the
+details: Delving deep into convolutional nets. arXiv preprint arXiv:1405.3531, 2014.
+[34] Oleksandr Shchur, Maximilian Mumme, Aleksandar Bojchevski, and Stephan Günnemann. Pitfalls of
+graph neural network evaluation. arXiv preprint arXiv:1811.05868, 2018.
+[35] Yuankai Luo, Lei Shi, and Xiao-Ming Wu. Can classic GNNs be strong baselines for graph-level tasks?
+simple architectures meet excellence. In Forty-second International Conference on Machine Learning,
+2025. URL https://openreview.net/forum?id=ZH7YgIZ3DF.
+[36] Mario Lucic, Karol Kurach, Marcin Michalski, Sylvain Gelly, and Olivier Bousquet. Are gans created
+equal? a large-scale study. Advances in neural information processing systems, 31, 2018.
+[37] Joseph A Konstan and Gediminas Adomavicius. Toward identification and adoption of best practices
+in algorithmic recommender systems research. In Proceedings of the international workshop on Repro-
+ducibility and replication in recommender systems evaluation, pages 23–28, 2013.
+[38] Maurizio Ferrari Dacrema, Paolo Cremonesi, and Dietmar Jannach. Are we really making much progress?
+a worrying analysis of recent neural recommendation approaches. In Proceedings of the 13th ACM
+conference on recommender systems, pages 101–109, 2019.
+[39] Michael Benigni, Maurizio Ferrari Dacrema, and Dietmar Jannach. Diffusion recommender models
+and the illusion of progress: A concerning study of reproducibility and a conceptual mismatch. ACM
+Transactions on Recommender Systems, 4(3):1–69, 2026.
+[40] Kevin Musgrave, Serge Belongie, and Ser-Nam Lim. A metric learning reality check. In European
+Conference on Computer Vision, pages 681–699. Springer, 2020.
+[41] Davis Blalock, Jose Javier Gonzalez Ortiz, Jonathan Frankle, and John Guttag. What is the state of neural
+network pruning? Proceedings of machine learning and systems, 2:129–146, 2020.
+[42] Dami Choi, Christopher J Shallue, Zachary Nado, Jaehoon Lee, Chris J Maddison, and George E Dahl.
+On empirical comparisons of optimizers for deep learning. arXiv preprint arXiv:1910.05446, 2019.
+12
+
+
+[43] Prabhu Teja Sivaprasad, Florian Mai, Thijs Vogels, Martin Jaggi, and François Fleuret. Optimizer
+benchmarking needs to account for hyperparameter tuning. In International conference on machine
+learning, pages 9036–9045. PMLR, 2020.
+[44] Robin M Schmidt, Frank Schneider, and Philipp Hennig.
+Descending through a crowded valley-
+benchmarking deep learning optimizers. In International Conference on Machine Learning, pages
+9367–9376. PMLR, 2021.
+[45] Theresa Eimer, Marius Lindauer, and Roberta Raileanu. Hyperparameters in reinforcement learning and
+how to tune them. In International conference on machine learning, pages 9104–9149. PMLR, 2023.
+[46] Kian Ahrabian, Xihui Lin, Barun Patra, Vishrav Chaudhary, Alon Benhaim, Jay Pujara, and Xia Song.
+A practical analysis of human alignment with* po. In Findings of the Association for Computational
+Linguistics: NAACL 2025, pages 8013–8021, 2025.
+[47] O˘guz Ka˘gan Hitit, Leander Girrbach, and Zeynep Akata. A systematic study of model merging techniques
+in large language models. arXiv preprint arXiv:2511.21437, 2025.
+[48] Pau de Jorge, César Roberto de Souza, Björn Michele, Mert Bülent Sarıyıldız, Philippe Weinzaepfel,
+Florent Perronnin, Diane Larlus, and Yannis Kalantidis. Task alignment: A simple and effective proxy
+for model merging in computer vision. arXiv preprint arXiv:2604.12935, 2026.
+[49] Elad Ben Zaken, Yoav Goldberg, and Shauli Ravfogel. Bitfit: Simple parameter-efficient fine-tuning
+for transformer-based masked language-models. In Proceedings of the 60th Annual Meeting of the
+Association for Computational Linguistics (Volume 2: Short Papers), pages 1–9, 2022.
+[50] Junxian He, Chunting Zhou, Xuezhe Ma, Taylor Berg-Kirkpatrick, and Graham Neubig. Towards a
+unified view of parameter-efficient transfer learning. arXiv preprint arXiv:2110.04366, 2021.
+[51] Zhiqiang Hu, Lei Wang, Yihuai Lan, Wanyu Xu, Ee-Peng Lim, Lidong Bing, Xing Xu, Soujanya Poria,
+and Roy Lee. Llm-adapters: An adapter family for parameter-efficient fine-tuning of large language
+models. In Proceedings of the 2023 conference on empirical methods in natural language processing,
+pages 5254–5276, 2023.
+[52] Yaowei Zheng, Richong Zhang, Junhao Zhang, Yanhan Ye, Zheyan Luo, Zhangchi Feng, and
+Yongqiang Ma. Llamafactory: Unified efficient fine-tuning of 100+ language models. arXiv preprint
+arXiv:2403.13372, 2024.
+[53] Johanna Männistö, Joseph Attieh, and Jörg Tiedemann. A comparative study of peft methods for python
+code generation. In Proceedings of the Joint 25th Nordic Conference on Computational Linguistics and
+11th Baltic Conference on Human Language Technologies (NoDaLiDa/Baltic-HLT 2025), pages 390–396,
+2025.
+[54] Robert Belanec, Branislav Pecher, Ivan Srba, and Maria Bielikova. Peft-bench: A parameter-efficient
+fine-tuning methods benchmark. In Proceedings of the 19th Conference of the European Chapter of the
+Association for Computational Linguistics (Volume 1: Long Papers), pages 3035–3054, 2026.
+[55] Lingling Xu, Haoran Xie, S Joe Qin, Xiaohui Tao, and Fu Lee Wang. Parameter-efficient fine-tuning
+methods for pretrained language models: A critical review and assessment. IEEE Transactions on Pattern
+Analysis and Machine Intelligence, 2026.
+[56] Youbang Sun, Zitao Li, Yaliang Li, and Bolin Ding. Improving lora in privacy-preserving federated
+learning. arXiv preprint arXiv:2403.12313, 2024.
+[57] Grigory Malinovsky, Umberto Michieli, Hasan Abed Al Kader Hammoud, Taha Ceritli, Hayder Elesedy,
+Mete Ozay, and Peter Richtárik. Randomized asymmetric chain of lora: The first meaningful theoretical
+framework for low-rank adaptation. arXiv preprint arXiv:2410.08305, 2024.
+[58] Xu-Hui Liu, Yali Du, Jun Wang, and Yang Yu. On the optimization landscape of low rank adaptation meth-
+ods for large language models. In The Thirteenth International Conference on Learning Representations,
+2025.
+[59] Soufiane Hayou, Nikhil Ghosh, and Bin Yu. Lora+: Efficient low rank adaptation of large models. arXiv
+preprint arXiv:2402.12354, 2024.
+[60] Nan Chen, Soledad Villar, and Soufiane Hayou. Learning rate scaling across lora ranks and transfer to
+full finetuning. arXiv preprint arXiv:2602.06204, 2026.
+13
+
+
+[61] Chuyan Zhang, Kefan Wang, and Yun Gu. Beyond low-rank tuning: Model prior-guided rank allocation
+for effective transfer in low-data and large-gap regimes. arXiv preprint arXiv:2507.00327, 2025.
+[62] Soufiane Hayou, Nikhil Ghosh, and Bin Yu. The impact of initialization on lora finetuning dynamics.
+Advances in Neural Information Processing Systems, 37:117015–117040, 2024.
+[63] Damjan Kalajdzievski. A rank stabilization scaling factor for fine-tuning with lora. arXiv preprint
+arXiv:2312.03732, 2023.
+[64] Yang Lin, Xinyu Ma, Xu Chu, Yujie Jin, Zhibang Yang, Yasha Wang, and Hong Mei. Lora dropout as a
+sparsity regularizer for overfitting control. arXiv preprint arXiv:2404.09610, 2024.
+[65] Sheng Wang, Liheng Chen, Jiyue Jiang, Boyang Xue, Lingpeng Kong, and Chuan Wu. Lora meets
+dropout under a unified framework. In Findings of the Association for Computational Linguistics: ACL
+2024, pages 1995–2008, 2024.
+[66] Vlad Fomenko, Han Yu, Jongho Lee, Stanley Hsieh, and Weizhu Chen. A note on lora. arXiv preprint
+arXiv:2404.05086, 2024.
+[67] Soufiane Hayou, Nikhil Ghosh, and Bin Yu. Plop: Precise lora placement for efficient finetuning of large
+models. arXiv preprint arXiv:2506.20629, 2025.
+[68] Christophe Tribes, Sacha Benarroch-Lelong, Peng Lu, and Ivan Kobyzev. Hyperparameter optimization
+for large language model instruction-tuning. arXiv preprint arXiv:2312.00949, 2023.
+[69] Michael Oliver and Guan Wang. Crafting efficient fine-tuning strategies for large language models. arXiv
+preprint arXiv:2407.13906, 2024.
+[70] Ayan Sengupta, Vaibhav Seth, Arinjay Pathak, Aastha Verma, Natraj Raman, Sriram Gopalakrishnan,
+Niladri Chatterjee, and Tanmoy Chakraborty. Robust and efficient fine-tuning of llms with bayesian
+reparameterization of low-rank adaptation. arXiv preprint arXiv:2411.04358, 2024.
+[71] Baek Seong-Eun, Lee Jung-Mok, Kim Sung-Bin, and Tae-Hyun Oh. Efficient hyper-parameter search for
+lora via language-aided bayesian optimization. arXiv preprint arXiv:2602.11171, 2026.
+[72] Jingwei Zuo, Xinze Feng, Zien Liu, Kaijian Wang, Fanjiang Ye, Ye Cao, Zhuang Wang, and Yuke Wang.
+Alto: Adaptive lora tuning and orchestration for heterogeneous lora training workloads. arXiv preprint
+arXiv:2604.05426, 2026.
+[73] Zicheng Zhang, Haoran Li, Yifeng Zhang, Guoqiang Gong, Jiaxing Wang, Pengzhang Liu, Qixia Jiang,
+and Junxing Hu. The primacy of magnitude in low-rank adaptation. arXiv preprint arXiv:2507.06558,
+2025.
+[74] Haonan He, Jingqi Ye, Minglei Li, Zhengbo Wang, Tao Chen, Lei Bai, and Peng Ye. A unified study of
+lora variants: Taxonomy, review, codebase, and empirical evaluation. arXiv preprint arXiv:2601.22708,
+2026.
+[75] Sangyoon Lee and Jaeho Lee. Beware of the batch size: Hyperparameter bias in evaluating lora. arXiv
+preprint arXiv:2602.09492, 2026.
+[76] Hanqing Wang, Yixia Li, Shuo Wang, Guanhua Chen, and Yun Chen. Milora: Harnessing minor singular
+components for parameter-efficient llm finetuning. arXiv preprint arXiv:2406.09044, 2024.
+[77] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Delving deep into rectifiers: Surpassing
+human-level performance on imagenet classification. In Proceedings of the IEEE international conference
+on computer vision, pages 1026–1034, 2015.
+[78] Shiwei Li, Xiandi Luo, Xing Tang, Haozhao Wang, Hao Chen, Weihong Luo, Yuhua Li, Xiuqiang He,
+and Ruixuan Li. Beyond zero initialization: Investigating the impact of non-zero initialization on lora
+fine-tuning dynamics. arXiv preprint arXiv:2505.23194, 2025.
+[79] Yeonjoon Jung, Daehyun Ahn, Hyungjun Kim, Taesu Kim, and Eunhyeok Park. GraloRA: Granular
+low-rank adaptation for parameter-efficient fine-tuning. In The Thirty-ninth Annual Conference on Neural
+Information Processing Systems, 2026. URL https://openreview.net/forum?id=8wvOMQ2Olw.
+[80] Paul Albert, Frederic Z Zhang, Hemanth Saratchandran, Cristian Rodriguez-Opazo, Anton van den
+Hengel, and Ehsan Abbasnejad. Randlora: Full-rank parameter-efficient fine-tuning of large models.
+arXiv preprint arXiv:2502.00987, 2025.
+14
+
+
+[81] Yibo Yang, Xiaojie Li, Zhongzhu Zhou, Shuaiwen Song, Jianlong Wu, Liqiang Nie, and Bernard
+Ghanem. Corda: Context-oriented decomposition adaptation of large language models for task-aware
+parameter-efficient fine-tuning. Advances in Neural Information Processing Systems, 37:71768–71791,
+2024.
+[82] Fabian Paischer, Lukas Hauzenberger, Thomas Schmied, Benedikt Alkin, Marc Peter Deisenroth, and
+Sepp Hochreiter. Parameter efficient fine-tuning via explained variance adaptation. arXiv preprint
+arXiv:2410.07170, 2024.
+[83] Yuanhe Zhang, Fanghui Liu, and Yudong Chen. Lora-one: One-step full gradient could suffice for
+fine-tuning large language models, provably and efficiently. arXiv preprint arXiv:2502.01235, 2025.
+[84] Ziqing Xu, Hancheng Min, Lachlan Ewen MacDonald, Jinqi Luo, Salma Tarmoun, Enrique Mallada,
+and René Vidal. Understanding the learning dynamics of lora: A gradient flow perspective on low-rank
+adaptation in matrix factorization. arXiv preprint arXiv:2503.06982, 2025.
+[85] Dawid J Kopiczko, Tijmen Blankevoort, and Yuki M Asano. Vera: Vector-based random matrix adaptation.
+arXiv preprint arXiv:2310.11454, 2023.
+[86] Weiyang Liu, Zeju Qiu, Yao Feng, Yuliang Xiu, Yuxuan Xue, Longhui Yu, Haiwen Feng, Zhen Liu,
+Juyeon Heo, Songyou Peng, et al. Parameter-efficient orthogonal finetuning via butterfly factorization.
+arXiv preprint arXiv:2311.06243, 2023.
+[87] Yibo Zhong, Haoxiang Jiang, Lincan Li, Ryumei Nakada, Tianci Liu, Linjun Zhang, Huaxiu Yao, and
+Haoyu Wang. Peanut: Parameter-efficient adaptation with weight-aware neural tweakers. In Proceedings
+of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining V. 1, pages 2054–2065,
+2026.
+[88] Sourab Mangrulkar, Sylvain Gugger, Lysandre Debut, Younes Belkada, Sayak Paul, Benjamin Bossan,
+and Marian Tietz. PEFT: State-of-the-art parameter-efficient fine-tuning methods. https://github.
+com/huggingface/peft, 2022.
+[89] Klaudia Bałazy, Mohammadreza Banaei, Karl Aberer, and Jacek Tabor. Lora-xs: Low-rank adaptation
+with extremely small number of parameters. arXiv preprint arXiv:2405.17604, 2024.
+[90] Yang Li, Shaobo Han, and Shihao Ji. Vb-lora: Extreme parameter efficient fine-tuning with vector banks.
+Advances in Neural Information Processing Systems, 37:16724–16751, 2024.
+[91] Ziqi Gao, Qichao Wang, Aochuan Chen, Zijing Liu, Bingzhe Wu, Liang Chen, and Jia Li. Parameter-
+efficient fine-tuning with discrete fourier transform. arXiv preprint arXiv:2405.03003, 2024.
+[92] Yifan Yang, Jiajun Zhou, Ngai Wong, and Zheng Zhang. Loretta: Low-rank economic tensor-train
+adaptation for ultra-low-parameter fine-tuning of large language models. arXiv preprint arXiv:2402.11417,
+2024.
+[93] Qiushi Huang, Tom Ko, Zhan Zhuang, Lilian Tang, and Yu Zhang. Hira: Parameter-efficient hadamard
+high-rank adaptation for large language models. In The Thirteenth International Conference on Learning
+Representations, 2025.
+[94] Ting Jiang, Shaohan Huang, Shengyue Luo, Zihan Zhang, Haizhen Huang, Furu Wei, Weiwei Deng, Feng
+Sun, Qi Zhang, Deqing Wang, et al. Mora: High-rank updating for parameter-efficient fine-tuning. arXiv
+preprint arXiv:2405.12130, 2024.
+[95] Fangzhao Zhang and Mert Pilanci. Riemannian preconditioned lora for fine-tuning foundation models.
+arXiv preprint arXiv:2402.02347, 2024.
+[96] Zhengbo Wang, Jian Liang, Ran He, Zilei Wang, and Tieniu Tan. Lora-pro: Are low-rank adapters
+properly optimized? arXiv preprint arXiv:2407.18242, 2024.
+[97] Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+arXiv:1412.6980, 2014.
+[98] Longhui Yu, Weisen Jiang, Han Shi, Jincheng Yu, Zhengying Liu, Yu Zhang, James T Kwok, Zhenguo
+Li, Adrian Weller, and Weiyang Liu. Metamath: Bootstrap your own mathematical questions for large
+language models. arXiv preprint arXiv:2309.12284, 2023.
+[99] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song,
+and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset. arXiv preprint
+arXiv:2103.03874, 2021.
+15
+
+
+[100] Tianyu Zheng, Ge Zhang, Tianhao Shen, Xueling Liu, Bill Yuchen Lin, Jie Fu, Wenhu Chen, and Xiang
+Yue. Opencodeinterpreter: Integrating code generation with execution and refinement. arXiv preprint
+arXiv:2402.14658, 2024.
+[101] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde De Oliveira Pinto, Jared Kaplan,
+Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models
+trained on code. arXiv preprint arXiv:2107.03374, 2021.
+[102] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan,
+Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large language models.
+arXiv preprint arXiv:2108.07732, 2021.
+[103] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy Liang,
+and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model. https://github.
+com/tatsu-lab/stanford_alpaca, 2023.
+[104] Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha Brahma, Sujoy Basu, Yi Luan, Denny Zhou, and
+Le Hou. Instruction-following evaluation for large language models. arXiv preprint arXiv:2311.07911,
+2023.
+[105] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola, Andrew
+Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet in 1 hour.
+arXiv preprint arXiv:1706.02677, 2017.
+[106] Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the generalization
+gap in large batch training of neural networks. Advances in neural information processing systems, 30,
+2017.
+[107] Laurent Dinh, Razvan Pascanu, Samy Bengio, and Yoshua Bengio. Sharp minima can generalize for deep
+nets. In International Conference on Machine Learning, pages 1019–1028. PMLR, 2017.
+[108] Kaifeng Lyu, Zhiyuan Li, and Sanjeev Arora. Understanding the generalization benefit of normalization
+layers: Sharpness reduction. Advances in Neural Information Processing Systems, 35:34689–34708,
+2022.
+[109] Haocheng Luo, Tuan Truong, Tung Pham, Mehrtash Harandi, Dinh Phung, and Trung Le. Explicit
+eigenvalue regularization improves sharpness-aware minimization. Advances in Neural Information
+Processing Systems, 37:4424–4453, 2024.
+[110] Rui Pan, Haishan Ye, and Tong Zhang. Eigencurve: Optimal learning rate schedule for sgd on quadratic
+objectives with skewed hessian spectrums. arXiv preprint arXiv:2110.14109, 2021.
+[111] Jeremy M Cohen, Simran Kaur, Yuanzhi Li, J Zico Kolter, and Ameet Talwalkar. Gradient descent on
+neural networks typically occurs at the edge of stability. arXiv preprint arXiv:2103.00065, 2021.
+[112] Dayal Singh Kalra and Maissam Barkeshli. Why warmup the learning rate? underlying mechanisms and
+improvements. Advances in Neural Information Processing Systems, 37:111760–111801, 2024.
+[113] Adam X Yang, Maxime Robeyns, Xi Wang, and Laurence Aitchison. Bayesian low-rank adaptation for
+large language models. arXiv preprint arXiv:2308.13111, 2023.
+[114] Yanjun Zhao, Sizhe Dang, Haishan Ye, Guang Dai, Yi Qian, and Ivor W Tsang. Second-order fine-tuning
+without pain for llms: A hessian informed zeroth-order optimizer. arXiv preprint arXiv:2402.15173,
+2024.
+[115] Xin Yu, Cong Xie, Ziyu Zhao, Tiantian Fan, Lingzhou Xue, and Zhi Zhang. Prunedlora: Robust gradient-
+based structured pruning for low-rank adaptation in fine-tuning, 2025. URL https://arxiv.org/abs/
+2510.00192.
+[116] Yushun Zhang, Congliang Chen, Tian Ding, Ziniu Li, Ruoyu Sun, and Zhiquan Luo. Why transformers
+need adam: A hessian perspective. Advances in neural information processing systems, 37:131786–
+131823, 2024.
+[117] Jinbo Wang, Mingze Wang, Zhanpeng Zhou, Junchi Yan, Lei Wu, et al. The sharpness disparity principle
+in transformers for accelerating language model pre-training. arXiv preprint arXiv:2502.19002, 2025.
+[118] Ivan Ilin. Hessian of perplexity for large language models by pytorch autograd (open source). arXiv
+preprint arXiv:2504.04520, 2025.
+16
+
+
+[119] Cornelius Lanczos. An iteration method for the solution of the eigenvalue problem of linear differential
+and integral operators. Journal of research of the National Bureau of Standards, 45(4):255–282, 1950.
+[120] Alexey Dosovitskiy. An image is worth 16x16 words: Transformers for image recognition at scale. arXiv
+preprint arXiv:2010.11929, 2020.
+[121] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel Lenc,
+Arthur Mensch, Katherine Millican, Malcolm Reynolds, et al. Flamingo: a visual language model for
+few-shot learning. Advances in neural information processing systems, 35:23716–23736, 2022.
+[122] Juzheng Zhang, Jiacheng You, Ashwinee Panda, and Tom Goldstein. LoRA without forgetting: Freezing
+and sparse masking for low-rank adaptation. In Sparsity in LLMs (SLLM): Deep Dive into Mixture of
+Experts, Quantization, Hardware, and Inference, 2025. URL https://openreview.net/forum?id=
+aGOQYJfz6H.
+[123] Yifeng Xiong and Xiaohui Xie. Oplora: Orthogonal projection lora prevents catastrophic forgetting
+during parameter-efficient fine-tuning. arXiv preprint arXiv:2510.13003, 2025.
+[124] Alessio Quercia, Arya Bangun, Ira Assent, and Hanno Scharr. Least but not last: Fine-tuning intermediate
+principal components for better performance-forgetting trade-offs. arXiv preprint arXiv:2602.03493,
+2026.
+[125] Zhengxuan Wu, Aryaman Arora, Zheng Wang, Atticus Geiger, Dan Jurafsky, Christopher D Manning, and
+Christopher Potts. Reft: Representation finetuning for language models. Advances in Neural Information
+Processing Systems, 37:63908–63962, 2024.
+[126] Fangcong Yin, Xi Ye, and Greg Durrett. Lofit: Localized fine-tuning on llm representations. Advances in
+Neural Information Processing Systems, 37:9474–9506, 2024.
+[127] Bo Yin, Xingyi Yang, and Xinchao Wang. Don’t forget the nonlinearity: Unlocking activation functions
+in efficient fine-tuning. arXiv preprint arXiv:2509.13240, 2025.
+[128] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text transformer.
+Journal of machine learning research, 21(140):1–67, 2020.
+[129] Qingru Zhang, Minshuo Chen, Alexander Bukharin, Nikos Karampatziakis, Pengcheng He, Yu Cheng,
+Weizhu Chen, and Tuo Zhao. Adalora: Adaptive budget allocation for parameter-efficient fine-tuning.
+arXiv preprint arXiv:2303.10512, 2023.
+[130] Jia-Chen Zhang, Yu-Jie Xiong, Chun-Ming Xia, Dong-Hai Zhu, and Hong-Jian Zhan. Lora2: Multi-scale
+low-rank approximations for fine-tuning large language models. Neurocomputing, 650:130859, 2025.
+[131] Ali Edalati, Marzieh Tahaei, Ivan Kobyzev, Vahid Partovi Nia, James J Clark, and Mehdi Rezagholizadeh.
+Krona: Parameter-efficient tuning with kronecker adapter. In Enhancing LLM Performance: Efficacy,
+Fine-Tuning, and Inference Techniques, pages 49–65. Springer, 2025.
+[132] Shen Yuan, Haotian Liu, and Hongteng Xu. Bridging the gap between low-rank and orthogonal adaptation
+via householder reflection adaptation. Advances in Neural Information Processing Systems, 37:113484–
+113518, 2024.
+[133] Vladislav Lialin, Namrata Shivagunde, Sherin Muckatira, and Anna Rumshisky. Relora: High-rank
+training through low-rank updates. arXiv preprint arXiv:2307.05695, 2023.
+[134] Xiao Wang, Tianze Chen, Qiming Ge, Han Xia, Rong Bao, Rui Zheng, Qi Zhang, Tao Gui, and Xuan-
+Jing Huang. Orthogonal subspace learning for language model continual learning. In Findings of the
+Association for Computational Linguistics: EMNLP 2023, pages 10658–10671, 2023.
+[135] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong Tian.
+Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint arXiv:2403.03507,
+2024.
+[136] Mao-Lin Luo, Zi-Hao Zhou, Yi-Lin Zhang, Yuanyu Wan, Min-Ling Zhang, and Tong Wei. KeeploRA:
+Continual learning with residual gradient adaptation. In The Fourteenth International Conference on
+Learning Representations, 2026. URL https://openreview.net/forum?id=T3Vc5fkTzV.
+[137] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient finetuning of
+quantized llms. Advances in neural information processing systems, 36:10088–10115, 2023.
+17
+
+
+[138] Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng Chang, Hengheng Zhang, Zhengsu Chen, Xiaopeng
+Zhang, and Qi Tian. Qa-lora: Quantization-aware low-rank adaptation of large language models. arXiv
+preprint arXiv:2309.14717, 2023.
+[139] Shaowen Wang, Linxi Yu, and Jian Li. Lora-ga: Low-rank adaptation with gradient approximation.
+Advances in Neural Information Processing Systems, 37:54905–54931, 2024.
+[140] haonan he, Peng Ye, Yuchen Ren, yuan yuan, LuyangZhou, ShucunJu, and lei chen. GoRA: Gradient-
+driven adaptive low rank adaptation. In The Thirty-ninth Annual Conference on Neural Information
+Processing Systems, 2026. URL https://openreview.net/forum?id=d1dL1ymD6N.
+[141] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis,
+Luke Zettlemoyer, and Veselin Stoyanov. Roberta: A robustly optimized bert pretraining approach. arXiv
+preprint arXiv:1907.11692, 2019.
+[142] Mojtaba Valipour, Mehdi Rezagholizadeh, Ivan Kobyzev, and Ali Ghodsi. Dylora: Parameter-efficient
+tuning of pre-trained models using dynamic search-free low-rank adaptation. In Proceedings of the 17th
+Conference of the European Chapter of the Association for Computational Linguistics, pages 3274–3287,
+2023.
+[143] Arnav Chavan, Zhuang Liu, Deepak Gupta, Eric Xing, and Zhiqiang Shen. One-for-all: Generalized lora
+for parameter-efficient fine-tuning. arXiv preprint arXiv:2306.07967, 2023.
+[144] Longteng Zhang, Lin Zhang, Shaohuai Shi, Xiaowen Chu, and Bo Li. Lora-fa: Memory-efficient low-rank
+adaptation for large language models fine-tuning. arXiv preprint arXiv:2308.03303, 2023.
+[145] Dawid J Kopiczko, Tijmen Blankevoort, and Yuki M Asano. Vera: Vector-based random matrix adaptation.
+arXiv preprint arXiv:2310.11454, 2023.
+[146] Bojia Zi, Xianbiao Qi, Lingzhi Wang, Jianan Wang, Kam-Fai Wong, and Lei Zhang. Delta-lora: Fine-
+tuning high-rank parameters with the delta of low-rank matrices. arXiv preprint arXiv:2309.02411,
+2023.
+[147] Adithya Renduchintala, Tugrul Konuk, and Oleksii Kuchaiev. Tied-lora: Enhancing parameter efficiency
+of lora with weight tying. In Proceedings of the 2024 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers),
+pages 8694–8705, 2024.
+[148] Ruiyi Zhang, Rushi Qiang, Sai Ashish Somayajula, and Pengtao Xie. Autolora: Automatically tuning
+matrix ranks in low-rank adaptation based on meta learning. arXiv preprint arXiv:2403.09113, 2024.
+[149] Zequan Liu, Jiawen Lyn, Wei Zhu, Xing Tian, and Yvette Graham. Alora: Allocating low-rank adaptation
+for fine-tuning large language models. arXiv preprint arXiv:2403.16187, 2024.
+[150] Mahdi Nikdan, Soroush Tabesh, Elvir Crnˇcevi´c, and Dan Alistarh. Rosa: Accurate parameter-efficient
+fine-tuning via robust adaptation. arXiv preprint arXiv:2401.04679, 2024.
+[151] Yongchang Hao, Yanshuai Cao, and Lili Mou. Flora: Low-rank adapters are secretly gradient compressors.
+arXiv preprint arXiv:2402.03293, 2024.
+[152] Shuhua Shi, Shaohan Huang, Minghui Song, Zhoujun Li, Zihan Zhang, Haizhen Huang, Furu Wei,
+Weiwei Deng, Feng Sun, and Qi Zhang. Reslora: Identity residual mapping in low-rank adaption. arXiv
+preprint arXiv:2402.18039, 2024.
+[153] Xiangdi Meng, Damai Dai, Weiyao Luo, Zhe Yang, Shaoxiang Wu, Xiaochen Wang, Peiyi Wang, Qingxiu
+Dong, Liang Chen, and Zhifang Sui. Periodiclora: Breaking the low-rank bottleneck in lora optimization.
+arXiv preprint arXiv:2402.16141, 2024.
+[154] Seyedarmin Azizi, Souvik Kundu, and Massoud Pedram. Lamda: Large model fine-tuning via spectrally
+decomposed low-dimensional adaptation. arXiv preprint arXiv:2406.12832, 2024.
+[155] Baohao Liao and Christof Monz. 3-in-1: 2d rotary adaptation for efficient finetuning, efficient batching
+and composability. Advances in Neural Information Processing Systems, 37:35018–35048, 2024.
+[156] Hongyun Zhou, Xiangyu Lu, Wang Xu, Conghui Zhu, Tiejun Zhao, and Muyun Yang. Lora-drop:
+Efficient lora parameter pruning based on output evaluation. In Proceedings of the 31st International
+Conference on Computational Linguistics, pages 5530–5543, 2025.
+18
+
+
+[157] Qingchen Wang and Shengyu Shen. Activation-guided low-rank parameter adaptation for efficient model
+fine-tuning. IEEE Access, 2025.
+[158] Chongjie Si, Zhiyi Shi, Shifan Zhang, Xiaokang Yang, Hanspeter Pfister, and Wei Shen. Unleashing
+the power of task-specific directions in parameter efficient fine-tuning. In The Thirteenth International
+Conference on Learning Representations, 2024.
+[159] Fan Wang, Juyong Jiang, Chansung Park, Sunghun Kim, and Jing Tang. Kasa: Knowledge-aware
+singular-value adaptation of large language models. arXiv preprint arXiv:2412.06071, 2024.
+[160] Massimo Bini, Leander Girrbach, and Zeynep Akata. Decoupling angles and strength in low-rank
+adaptation. In The Thirteenth International Conference on Learning Representations, 2025.
+[161] Jiayang Yu, Yihang Zhang, Bin Wang, Peiqin Lin, Yongkang Liu, and Shi Feng. Ssmlora: Enhancing
+low-rank adaptation with state space model. arXiv preprint arXiv:2502.04958, 2025.
+[162] Yibo Zhong, Jinman Zhao, and Yao Zhou. Low-rank interconnected adaptation across layers. In Findings
+of the Association for Computational Linguistics: ACL 2025, pages 17005–17029, 2025.
+[163] Aochuan Chen, Jiashun Cheng, Zijing Liu, Ziqi Gao, Fugee Tsung, Yu Li, and Jia Li. Parameter-efficient
+fine-tuning via circular convolution. In Findings of the Association for Computational Linguistics: ACL
+2025, pages 2004–2019, 2025.
+[164] Chenhao Ding, Jiangyang Li, Songlin Dong, Xinyuan Gao, Yuhang He, and Yihong Gong. Sulora:
+Subspace low-rank adaptation for parameter-efficient fine-tuning. In Findings of the Association for
+Computational Linguistics: ACL 2025, pages 5334–5349, 2025.
+[165] Peijia Qin, Ruiyi Zhang, and Pengtao Xie. BidoRA: Bi-level optimization-based weight-decomposed
+low-rank adaptation. Transactions on Machine Learning Research, 2025. ISSN 2835-8856. URL
+https://openreview.net/forum?id=v2xCm3VYl4.
+[166] Yiding Wang, Fanxu Meng, Xuefeng Zhang, Fan Jiang, Pingzhi Tang, and Muhan Zhang. Hd-pissa:
+High-rank distributed orthogonal adaptation. In Proceedings of the 2025 Conference on Empirical
+Methods in Natural Language Processing, pages 6526–6539, 2025.
+[167] Xujia Wang, Yunjia Qi, and Bin Xu. Losia: Efficient high-rank fine-tuning via subnet localization
+and optimization. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language
+Processing, pages 6707–6726, 2025.
+[168] Hao Zhang, Bo Huang, Zhenjia Li, Xi Xiao, Hui Yi Leong, Zumeng Zhang, Xinwei Long, Tianyang
+Wang, and Hao Xu. Sensitivity-lora: Low-load sensitivity-based fine-tuning for large language models.
+arXiv preprint arXiv:2509.09119, 2025.
+[169] Xin Zhang, Guang-Ze Chen, Shuzhen Li, Zhulin Liu, CL Philip Chen, and Tong Zhang. An orthogonal
+high-rank adaptation for large language models. In Proceedings of the 2025 Conference on Empirical
+Methods in Natural Language Processing, pages 18826–18844, 2025.
+[170] Haonan Dong, Wenhao Zhu, Guojie Song, and Liang Wang. Aurora: Breaking low-rank bottleneck of
+lora with nonlinear mapping. arXiv preprint arXiv:2505.18738, 2025.
+[171] Heming Zou, Yunliang Zang, Wutong Xu, Yao Zhu, and Xiangyang Ji. Flylora: Boosting task decoupling
+and parameter efficiency via implicit rank-wise mixture-of-experts. arXiv preprint arXiv:2510.08396,
+2025.
+[172] Haojie Zhang. Droplora: Sparse low-rank adaptation for parameter-efficient fine-tuning. arXiv preprint
+arXiv:2508.17337, 2025.
+[173] Qingyue Zhang, Chang Chu, Tianren Peng, Qi Li, Xiangyang Luo, Zhihao Jiang, and Shao-Lun Huang.
+Lora-da: Data-aware initialization for low-rank adaptation via asymptotic analysis. arXiv preprint
+arXiv:2510.24561, 2025.
+[174] Dongha Lee, Jinhee Park, Minjun Kim, and Junseok Kwon. Abm-lora: Activation boundary matching for
+fast convergence in low-rank adaptation. arXiv preprint arXiv:2511.19145, 2025.
+[175] Jiale Kang and Qingyu Yin. Miss: Revisiting the trade-off in lora with an efficient shard-sharing structure,
+2025. URL https://arxiv.org/abs/2409.15371.
+[176] Muqing Liu, Chongjie Si, and Yuheng Jia. Flexlora: Entropy-guided flexible low-rank adaptation. arXiv
+preprint arXiv:2601.22905, 2026.
+19
+
+
+[177] Yize Wu, KE GAO, Ling Li, and Yanjun Wu. Stable-loRA: Stabilizing feature learning of low-rank
+adaptation. In The Fourteenth International Conference on Learning Representations, 2026. URL
+https://openreview.net/forum?id=xSa19DAieH.
+[178] Jingqi Ye, haonan he, Minglei Li, Fujun Han, Tao Chen, and Peng Ye. Gradient intrinsic dimensionality
+alignment: Narrowing the gap between low-rank adaptation and full fine-tuning. In The Fourteenth
+International Conference on Learning Representations, 2026. URL https://openreview.net/forum?
+id=kObvnQ6pUx.
+[179] Neeraj Gangwar, Rishabh Deshmukh, Michael Shavlovsky, Hancao Li, Vivek Mittal, Lexing Ying,
+and Nickvash Kani.
+Giva: Gradient-informed bases for vector-based adaptation.
+arXiv preprint
+arXiv:2604.21901, 2026.
+[180] Yuren Mao, Yuhang Ge, Yijiang Fan, Wenyi Xu, Yu Mi, Zhonghao Hu, and Yunjun Gao. A survey on
+lora of large language models. Frontiers of Computer Science, 19(7):197605, 2025.
+[181] Menglin Yang, Jialin Chen, Jinkai Tao, Yifei Zhang, Jiahong Liu, Jiasheng Zhang, Qiyao Ma, Harshit
+Verma, Regina Zhang, Min Zhou, et al. Low-rank adaptation for foundation models: A comprehensive
+review. arXiv preprint arXiv:2501.00365, 2024.
+[182] Chia Xin Liang, Ziqian Bi, Tianyang Wang, Ming Liu, Xinyuan Song, Yichao Zhang, Junhao Song,
+Qian Niu, Benji Peng, Keyu Chen, et al. Low-rank adaptation for scalable large language models: A
+comprehensive survey. Authorea Preprints, 2025.
+[183] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi, Pierric
+Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, et al. Huggingface’s transformers: State-of-the-art
+natural language processing. arXiv preprint arXiv:1910.03771, 2019.
+[184] Ilya Loshchilov and Frank Hutter.
+Decoupled weight decay regularization.
+arXiv preprint
+arXiv:1711.05101, 2017.
+[185] Shibo Wang and Pankaj Kanwar. Bfloat16: The secret to high performance on cloud tpus. Google Cloud
+Blog, 4(1), 2019.
+[186] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+performance deep learning library. Advances in neural information processing systems, 32, 2019.
+[187] Jeff Rasley, Samyam Rajbhandari, Olatunji Ruwase, and Yuxiong He. Deepspeed: System optimizations
+enable training deep learning models with over 100 billion parameters. In Proceedings of the 26th ACM
+SIGKDD international conference on knowledge discovery & data mining, pages 3505–3506, 2020.
+[188] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving
+with pagedattention. In Proceedings of the 29th symposium on operating systems principles, pages
+611–626, 2023.
+[189] Jiawei Liu, Chunqiu Steven Xia, Yuyao Wang, and Lingming Zhang. Is your code generated by chatGPT
+really correct? rigorous evaluation of large language models for code generation. In Thirty-seventh
+Conference on Neural Information Processing Systems, 2023. URL https://openreview.net/forum?
+id=1qvx610Cu7.
+[190] Chenghao Fan, Zhenyi Lu, Sichen Liu, Chengfeng Gu, Xiaoye Qu, Wei Wei, and Yu Cheng. Make lora
+great again: Boosting lora with adaptive singular values and mixture-of-experts optimization alignment.
+arXiv preprint arXiv:2502.16894, 2025.
+[191] Zhewei Yao, Amir Gholami, Kurt Keutzer, and Michael W Mahoney. Pyhessian: Neural networks through
+the lens of the hessian. In 2020 IEEE international conference on big data (Big data), pages 581–590.
+IEEE, 2020.
+[192] Eamonn Cahill, Alan Irving, Christopher Johnston, James Sexton, Ukqcd Collaboration, et al. Numerical
+stability of lanczos methods. Nuclear Physics B-Proceedings Supplements, 83:825–827, 2000.
+[193] Christopher C Paige. Practical use of the symmetric lanczos process with re-orthogonalization. BIT
+Numerical Mathematics, 10(2):183–195, 1970.
+[194] Gene H Golub, Richard R Underwood, and James H Wilkinson. The lanczos algorithm for the symmetric
+ax= λ bx problem., 1972.
+20
+
+
+Contents
+A Additional Experiments
+22
+A.1
+Learning Rate Tuning on More Model–task Combinations
+. . . . . . . . . . . . .
+22
+A.2 Varying Adapter Ranks on Llama . . . . . . . . . . . . . . . . . . . . . . . . . . .
+23
+A.3 Varying Training Duration
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+24
+A.4
+Scaling Batch Size to 512 for LoRA and PiSSA . . . . . . . . . . . . . . . . . . .
+25
+A.5
+Fine-tuning on Instruction Following Tasks for LoRA and DoRA . . . . . . . . . .
+25
+B
+Comprehensive Study of Hyperparameters in Prior Work
+26
+B.1
+Survey Criteria
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+B.2
+Comprehensive List of Papers
+. . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+C Detailed Formulas of Selected LoRA Variants
+31
+C.1
+Initialization Variants . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+31
+C.2
+Architectural Modifications . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+32
+C.3
+Optimization Adjustments
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+33
+D Fine-tuning Implementation Details
+34
+D.1
+Models
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+34
+D.2 Training Hyperparameter Search Ranges . . . . . . . . . . . . . . . . . . . . . . .
+34
+D.3
+Fixed Training Hyperparameters . . . . . . . . . . . . . . . . . . . . . . . . . . .
+34
+D.4
+Data, Code, Libraries, and Hardware . . . . . . . . . . . . . . . . . . . . . . . . .
+35
+E
+On LoRA Scaling Factor
+36
+F
+Details of Hyperparameter Search Results
+37
+F.1
+Qwen3-0.6B . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+37
+F.2
+Gemma-3-1B . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+38
+F.3
+Llama-2-7B . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+38
+G Example Model Responses
+41
+H Practical Heuristics for LoRA Hyperparameter Tuning
+44
+I
+Hessian Computation Details
+46
+I.1
+Lanczos Algorithm Implementation Details . . . . . . . . . . . . . . . . . . . . .
+46
+I.2
+Hessian Results on Gemma and Llama . . . . . . . . . . . . . . . . . . . . . . . .
+48
+I.3
+Detailed λmax Values . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+48
+21
+
+
+A
+Additional Experiments
+In this section, we present fine-tuning results for various LoRA methods under additional model–task com-
+binations (Sec. A.1), different LoRA ranks (Sec. A.2), and diverse training durations (Sec. A.3). Moreover,
+we scale up the batch size in Sec. A.4 to examine performance under lower-stochasticity regimes and include
+instruction-following tasks in Sec. A.5 to cover diverse task types.
+A.1
+Learning Rate Tuning on More Model–task Combinations
+Analogously to Figure 1, where we present all ten LoRA methods for Qwen3-0.6B on mathematical reasoning
+tasks, Figure 6 presents the corresponding comparison for Gemma-3-1B on commonsense reasoning tasks. With
+proper learning rate tuning, all methods consistently peak at a similar performance level (≈37%). We note that,
+although the detailed ordering of the optimal learning rate ranges across methods may differ slightly from that
+shown in Figure 1, the overall trend remains broadly similar. For example, {DoRA, LoFT, GraLoRA} share
+slightly higher or comparable learning rate ranges relative to LoRA, whereas {PiSSA, Init[AB], RandLoRA,
+OLoRA, MiLoRA} tend to exhibit lower ranges. Notably, LoRA-GA consistently requires substantially lower
+learning rate ranges than LoRA, by more than 10× in both Figure 1 and Figure 6. This relatively stable
+relationship between each LoRA variant and vanilla LoRA across different model–task combinations suggests
+that practitioners who wish to use different LoRA variants may leverage their known relative learning rate
+ranges with respect to LoRA as a practical prior to guide learning rate tuning, without necessarily conducting an
+exhaustive learning rate tuning as in our study or re-estimating Hessian using new downstream task samples as
+in Sec. 4.
+2.0e-6
+6.3e-6
+2.0e-5
+6.3e-5
+2.0e-4
+6.3e-4
+2.0e-3
+6.3e-3
+2.0e-2
+Learning Rate
+DoRA
+(ICML, 2024)
+LoFT
+(ICLR, 2026)
+LoRA
+(ICLR, 2022)
+GraLoRA
+(NeurIPS, 2025)
+PiSSA
+(NeurIPS, 2024)
+OLoRA
+(arXiv, 2024)
+Init[AB]
+(ICML, 2025)
+RandLoRA
+(ICLR, 2025)
+MiLoRA
+(NAACL, 2025)
+LoRA-GA
+(NeurIPS, 2024)
+37.43
+37.43
+37.40
+37.40
+37.59
+37.12
+37.23
+37.28
+37.20
+37.59
+37.16
+0
+5
+10
+15
+20
+25
+30
+35
+Accuracy (%)
+Figure 6: Performance of Gemma-3-1B fine-tuned on commonsense reasoning tasks across learning
+rates (r = 4, B = 64). Different methods reach a similar performance level once the learning rate is
+properly tuned. Each point is averaged over three independent training runs, and methods are sorted
+by their optimal learning rate ranges.
+Similarly to Figure 3, where we present the performance of Llama-2-7B for LoRA, DoRA, Init[AB], MiLoRA,
+and PiSSA, Figure 7 scales the analysis up to Llama-2-13B. The results validate the generalizability of our
+conclusions to larger model scales, where the largest gains over vanilla LoRA are 0.61% for Init[AB] when
+r = 8 and 0.53% for DoRA when r = 128.
+22
+
+
+2e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+Learning Rate ( )
+LoRA
+DoRA
+Init[AB]
+MiLoRA
+PiSSA
+39.70
+40.10
+40.31
+39.22
+38.50
+0
+10
+20
+30
+40
+Accuracy (%)
+(a) r = 8
+2e-5
+3.6e-5
+6.3e-5
+1.1e-4
+2e-4
+3.6e-4
+6.3e-4
+Learning Rate ( )
+LoRA
+DoRA
+Init[AB]
+MiLoRA
+PiSSA
+42.23
+42.76
+41.62
+41.26
+41.25
+0
+10
+20
+30
+40
+Accuracy (%)
+(b) r = 128
+Figure 7: Performance of Llama-2-13B on mathematical reasoning tasks across varying learning
+rates and ranks r ∈{8, 128} (B = 64).
+A.2
+Varying Adapter Ranks on Llama
+In Sec. 3.3.2, we analyzed the behavior of LoRA PEFT methods as the adapter rank varies on Gemma across
+math and code tasks. Here, we present a corresponding analysis on Llama in Figure 8, reporting the best
+performance achieved under joint optimization of learning rate and batch size (B ∈{16, 128}). Similar trends
+can be observed, where all methods exhibit comparable performance improvement trends as the rank increases.
+Although under specific tasks or rank settings, one might favor a particular variant that marginally outperforms
+others, it is worth noting again that these improvements often lack universality, with vanilla LoRA frequently
+matching or even outperforming them.
+8
+32
+128
+Adapter rank (r)
+30
+32
+34
+36
+38
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+(a) Mathematical Reasoning
+8
+32
+128
+Adapter rank (r)
+32
+34
+36
+38
+40
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+(b) Code Generation
+Figure 8: Best achievable performance of LoRA and its advanced variants across adapter ranks on
+Llama-2-7B (B ∈{16, 128}).
+23
+
+
+A.3
+Varying Training Duration
+We examine whether different methods consistently peak at comparable performance levels under varying
+training durations. Specifically, we vary the training duration by (1) scaling the number of MetaMathQA training
+samples from 5k up to the full 395k (Figure 9), and (2) varying the number of training epochs in {1, 2, 3} with a
+fixed 100k MetaMathQA training samples (Figure 10). With accuracies averaged over three independent runs,
+the results show that vanilla LoRA and its variants exhibit similar improvement trends as the training duration
+increases, with their performance generally falling within one another’s standard deviation range.
+5
+10
+25
+100
+395
+Number of training samples (k)
+4
+8
+12
+16
+20
+24
+28
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+Figure 9: Best achievable performance of LoRA and its variants across different training sample sizes
+on mathematical reasoning with Gemma-3-1B (r = 128, B = 64). Once the learning rate is properly
+tuned, all methods exhibit nearly identical improvement trends as the number of training samples
+increases. Results are reported with mean and standard deviation over three runs.
+1
+2
+3
+Number of training epochs
+20
+22
+24
+26
+Accuracy (%)
+LoRA
+PiSSA
+MiLoRA
+Init[AB]
+DoRA
+Figure 10: Best achievable performance of LoRA and its variants across different numbers of training
+epochs on mathematical reasoning with Gemma-3-1B (r = 128, B = 64). Results are reported with
+means and standard deviations over three independent runs. Once the learning rate is properly tuned,
+all methods exhibit nearly identical improvement trends as the number of training epochs increases,
+with their performance largely falling within each other’s standard deviation ranges.
+24
+
+
+A.4
+Scaling Batch Size to 512 for LoRA and PiSSA
+In Table 1, we jointly optimize the learning rate and batch size for Gemma-3-1B on mathematical reasoning
+tasks. However, the batch sizes considered there remain within standard stochastic training regimes (B ∈
+{16, 64, 128}). To further examine the behavior of LoRA methods under larger-batch, lower-stochasticity
+regimes, we scale B up to 512 in Figure 11. The results reveal an intriguing phenomenon: even after learning-
+rate tuning, the best achievable performance of both LoRA and PiSSA begins to decay when the batch size
+reaches B ≥256. This suggests that, while learning-rate tuning should be prioritized, the batch size should still
+be kept within a relatively small-to-medium range, as stated in practical heuristic I.
+16
+32
+64
+128
+256
+512
+Batch Size (B)
+16
+17
+18
+19
+20
+21
+Accuracy (%)
+LoRA
+PiSSA
+Figure 11: Best achievable performance of LoRA and PiSSA across different batch sizes on mathe-
+matical reasoning tasks with Gemma-3-1B (r = 128). While at B ≤128, both LoRA and PiSSA
+can reach ≈20% accuracy with proper learning rate tuning, the performance upper bound gradually
+decays when B increases to 512.
+A.5
+Fine-tuning on Instruction Following Tasks for LoRA and DoRA
+Beyond the commonsense reasoning, mathematical reasoning, and code generation tasks considered previously,
+we extend our evaluation to instruction-following tasks. Specifically, we train Qwen3-0.6B on Alpaca [103],
+while evaluating models’ prompt-level strict accuracy under the IFEval [104] framework.
+2e-06
+6.3e-06
+2e-05
+6.3e-05
+2e-04
+6.3e-04
+2e-03
+LoRA
+26.84
+26.63
+26.93
+28.20
+27.32
+26.97
+15.30
+DoRA
+26.99
+26.41
+26.41
+26.44
+27.42
+26.54
+16.86
+Table 2: The prompt-level strict accuracy on IFEval with Qwen3-0.6B (r = 128, B = 64). Both
+DoRA and LoRA achieve a similar performance level under proper learning rate tuning.
+25
+
+
+B
+Comprehensive Study of Hyperparameters in Prior Work
+B.1
+Survey Criteria
+To generate the statistics presented in Figure 2, we curated a dataset comprising 64 papers, consisting of 54
+studies published at major AI conferences or journals, 6 high-impact arXiv preprints (exceeding 40 citations),
+and 4 recent preprints released within the last six months. For each paper, we examined whether the authors
+reported performance metrics under learning rate or batch size tuning, and whether comparisons across different
+ranks were provided. The selection criteria for inclusion were as follows:
+1. The primary objective of the proposed method is to enhance fine-tuning effectiveness (i.e., aiming
+for higher accuracy with equivalent trainable parameter counts or sustained performance with greater
+parameter efficiency).
+2. Vanilla LoRA is explicitly employed as a baseline for performance comparison.
+In assessing hyperparameter tuning, our analysis focuses exclusively on decoder-only LLMs, excluding
+encoder-only [31], encoder-decoder [128] architectures, Vision Transformers [120], and Vision-Language
+Models [121], as these lie outside the scope of this work. Consequently, papers lacking experiments on
+decoder-only LLMs are excluded from our statistics (e.g., [129, 86, 84, 130–132]). Moreover, we exclude
+papers focusing on objectives other than standard PEFT efficiency, such as parameter-efficient pretraining [133],
+continual learning [134–136], and quantization [137, 138].
+Given that some studies may tune hyperparameters only for their proposed methods while leaving baselines
+untuned (e.g., by adopting settings from prior work without modification), we rigorously verified whether
+the vanilla LoRA baseline underwent tuning. Specifically, we consider the learning rate and batch size to be
+“tuned” only if they are evaluated across at least three distinct values. Consequently, studies such as MiLoRA
+(which compared two sets of hyperparameter setups) or LoRA-GA [139] (which tested learning rate in {1e-5,
+5e-5}) do not qualify as tuning under our criteria. For rank, we require comparisons across at least two distinct
+values. Crucially, if a study varies the rank for its proposed method but benchmarks against a fixed-rank vanilla
+LoRA, we do not classify the baseline rank as tuned (e.g., [132, 89, 90, 140]).
+During the data curation process, we observed that verifying specific hyperparameter tuning details can be
+non-trivial in some cases. The difficulty arises from discrepancies between paper versions (e.g., ablation studies
+on hyperparameters added to the Appendix post-publication), incomplete descriptions of experimental setups, or
+underspecified hyperparameter settings. Additionally, we frequently observed papers performing hyperparameter
+tuning only on smaller encoder-only LLMs (e.g., RoBERTa [141]). In strict adherence to our inclusion criteria,
+we do not categorize these instances as tuned. Moreover, we observed that many prior LoRA studies that did
+involve hyperparameter tuning reported only the final optimal performance, leaving unclear whether the adopted
+search ranges covered the optimal configurations for each method. While these ambiguities complicate binary
+categorization, we have made every effort to ensure accuracy. We emphasize that the statistics is curated solely
+to present the current state of hyperparameter tuning practices in LoRA PEFT research, and we welcome future
+contributions or corrections to further refine this collection.
+B.2
+Comprehensive List of Papers
+A comprehensive list of the reviewed papers is detailed in Table 3. Specifically, “arXiv Date” marks the release
+date of the first version on arXiv (denoted as “–” if unavailable). “Pub. Date” refers to the formal publication
+date of the venue, where “–” indicates the paper has not yet been formally published. Note that the table is sorted
+primarily by Pub. Date, followed by arXiv Date.
+Table 3: Publication dates, venues, and experimental configurations in prior LoRA PEFT studies.
+The table summarizes decoder-only LLMs and tasks, noting whether the vanilla LoRA baseline
+involved learning rate (LR) or batch size (BS) tuning and offered comparisons across different
+Ranks. A positive entry (✓) indicates the configuration was provided for at least one model-task
+combination; ✗denotes otherwise.
+Method
+arXiv Date Pub. Date
+Venue
+Decoder-only LLM
+Fine-tuned Task
+LR BS Rank
+DyLoRA [142]
+2022-10
+2023-05
+EACL
+GPT-2 Medium
+NLG
+✗
+✗
+✓
+GLoRA [143]
+2023-06
+–
+arXiv
+Llama-1-7B
+Llama-2-7B
+NLG
+✗
+✗
+✗
+26
+
+
+Method
+arXiv Date Pub. Date
+Venue
+Decoder-only LLM
+Fine-tuned Task
+LR BS Rank
+LoRA-FA [144]
+2023-08
+–
+arXiv
+Llama-1-7B
+Llama-2-7B
+Commonsense
+✗
+✗
+✗
+Laplace-LoRA
+[113]
+2023-08
+2024-05
+ICLR
+Llama-1-7B
+Llama-2-7B
+Commonsense
+✗
+✗
+✗
+VeRA [145]
+2023-10
+2024-05
+ICLR
+GPT-2 Medium/Large
+Llama-1-7B/13B
+Llama-2-7B/13B
+NLG
+Instruction Following
+✓
+✗
+✓
+BoFT [86]
+2023-11
+2024-05
+ICLR
+Llama-2-7B
+Instruction Following
+Math
+✗
+✗
+✓
+MoRA [94]
+2024-05
+–
+arXiv
+Llama-2-7B/13B
+UUID
+Math
+Instruction Following
+✓
+✗
+✓
+Delta-LoRA [146]
+2023-09
+–
+arXiv
+GPT-2 Medium
+NLG
+✗
+✗
+✗
+Tied-LoRA [147]
+2023-11
+2024-06
+NAACL
+GPT-2B-001
+Llama-2-7B
+NLG
+Commonsense
+Math
+✗
+✗
+✓
+LoRETTA [92]
+2024-02
+2024-06
+NAACL
+Llama-2-7B/13B/70B NLG
+GLUE
+✗
+✗
+✗
+AutoLoRA [148]
+2024-03
+2024-06
+NAACL
+GPT-2 Medium
+NLG
+✗
+✗
+✗
+ALoRA [149]
+2024-03
+2024-06
+NAACL
+GPT2-Large
+Llama-2-7B
+NLG
+GLUE
+Instruction Following
+✗
+✗
+✓
+RoSA [150]
+2024-01
+2024-07
+ICML
+Llama-2-7B
+NLG
+Math
+Code
+Instruction Following
+✓
+✗
+✗
+LoRA+ [59]
+2024-02
+2024-07
+ICML
+GPT-2
+Llama-1-7B
+GLUE
+Instruction Following
+✓
+✗
+✗
+scaled AdamW
+[95]
+2024-02
+2024-07
+ICML
+GPT-2 Medium
+Mistral-7B-V0.1
+NLG
+GLUE
+✓
+✗
+✓
+DoRA [13]
+2024-02
+2024-07
+ICML
+Llama-1-7B/13B
+Llama-2-7B
+Llama-3-8B
+Commonsense
+✗
+✗
+✓
+FLORA [151]
+2024-02
+2024-07
+ICML
+GPT-2 -base/XL
+Summarization
+Translation
+✓
+✗
+✓
+FourierFT [91]
+2024-05
+2024-07
+ICML
+GPT-2 Medium/Large
+Llama-1-7B/13B
+Llama2-7B/13B
+NLG
+Instruction Following
+✓
+✓
+✓
+ResLoRA [152]
+2024-02
+2024-08
+ACL
+Llama-2-7B
+Math
+Commonsense
+✗
+✗
+✓
+PLoRA [153]
+2024-02
+–
+arXiv
+Llama-1-7B
+Instruction Following
+Math
+✓
+✗
+✓
+OLoRA [23]
+2024-06
+–
+arXiv
+Mistral-7B
+LLaMA-2-7B
+Tiny Llama-1.1B
+Gemma-2B
+OPT-1.3B
+Commonsense
+Instruction Following
+✗
+✗
+✓
+LamDA [154]
+2024-06
+2024-11
+EMNLP
+Llama-2-7B
+NLG
+Math
+Commonsense
+✗
+✗
+✓
+27
+
+
+Method
+arXiv Date Pub. Date
+Venue
+Decoder-only LLM
+Fine-tuned Task
+LR BS Rank
+PiSSA [11]
+2024-04
+2024-12
+NeurIPS
+Llama-2-7B/13B
+Llama-3-8B/70B
+Mistral-7B-v0.1
+Gemma-7B
+Qwen1.5-7B
+Yi-1.5-34B
+DeepSeek-MoE-16B
+Mixtral-8x7B
+Math
+Code
+Instruction Following
+✗
+✗
+✓
+VB-LoRA [90]
+2024-05
+2024-12
+NeurIPS
+GPT-2 Medium/Large
+Llama-2-7B/13B
+Mistral-7B-v0.1
+Gemma-7B
+NLG
+Math
+Instruction Following
+✗
+✗
+✗
+HRA [132]
+2024-05
+2024-12
+NeurIPS
+Llama-2-7B
+Math
+✗
+✗
+✗
+CorDA [81]
+2024-06
+2024-12
+NeurIPS
+Llama-2-7B/13B
+Llama-3-8B
+Gemma-2-9B
+Math
+Code
+Instruction Following
+World Knowledge
+✗
+✗
+✓
+LoRA-GA [139]
+2024-07
+2024-12
+NeurIPS
+Llama-2-7B
+Math
+Code
+Instruction Following
+✗
+✗
+✗
+RoAd [155]
+2024-09
+2024-12
+NeurIPS
+Llama-1-7B/13B
+Llama-2-7B
+Llama-3-8B
+Math
+Commonsense
+✗
+✗
+✓
+LoRA-drop [156]
+2024-02
+2025-01
+COLING
+Llama-2-7B
+NLG
+Summarization
+GLUE
+Math
+✗
+✗
+✗
+AG-LoRA [157]
+–
+2025-01
+IEEE Access Llama-1-7B
+Commonsense
+✗
+✗
+✓
+LoRA-Pro [96]
+2024-07
+2025-04
+ICLR
+Llama-1-7B
+Llama-2-7B
+Llama-3-8B
+Llama-3.1-8B
+Math
+Code
+Code
+Instruction Following
+✓
+✗
+✓
+LoRA-Dash
+[158]
+2024-09
+2025-04
+ICLR
+Llama-1-7B
+Llama-2-7B
+Llama-3-8B
+Qwen2.5-7B
+GLUE
+Commonsense
+✗
+✗
+✓
+KaSA [159]
+2024-09
+2025-04
+ICLR
+Llama-1-7B
+Llama-2-7B
+Llama-3-8B
+Qwen2.5-7B
+GLUE
+Commonsense
+Instruction Following
+✗
+✗
+✓
+RandLoRA [80]
+2025-02
+2025-04
+ICLR
+GPT-2 Medium
+Qwen2-0.5B
+Phi3-3B
+Llama3-8B
+NLG
+Commonsense
+✗
+✗
+✓
+DeLoRA [160]
+2025-03
+2025-04
+ICLR
+Llama-2-7B
+Llama3-8B
+Commonsense
+✓
+✗
+✓
+HiRA [93]
+–
+2025-04
+ICLR
+Llama-2-7B
+Llama-3-8B
+Math
+Commonsense
+Dialogue Generation
+✗
+✗
+✓
+MiLoRA [76]
+2024-06
+2025-04
+NAACL
+Llama-2-7B
+Llama-3-8B
+Qwen2.5-7B
+Math
+Commonsense
+Instruction Following
+✗
+✗
+✗
+SSMLoRA [161]
+2025-02
+2025-04
+NAACL
+GPT-2
+Llama-2-7B/13B
+GLUE
+✓
+✗
+✓
+LoRA-One [83]
+2025-02
+2025-07
+ICML
+Llama-2-7B
+Math
+Code
+Instruction Following
+✓
+✓
+✗
+28
+
+
+Method
+arXiv Date Pub. Date
+Venue
+Decoder-only LLM
+Fine-tuned Task
+LR BS Rank
+Init[AB] [78]
+2025-05
+2025-07
+ICML
+Llama-3-8B
+Arithmetic
+Commonsense
+✓
+✗
+✗
+Lily [162]
+2024-07
+2025-07
+ACL
+Llama-3-8B
+Commonsense
+✗
+✗
+✗
+C3A [163]
+2024-07
+2025-07
+ACL
+Llama-2-7B
+Llama-3-8B/70B
+Mistral-7B
+Mistral-8x7B
+Math
+Code
+Commonsense
+✗
+✗
+✗
+SuLoRA [164]
+–
+2025-07
+ACL
+Llama-2-7B
+Instruction Following
+✗
+✗
+✓
+BiDoRA [165]
+2024-10
+2025-08
+TMLR
+GPT-2 Medium
+NLG
+✗
+✗
+✗
+HD-PiSSA [166]
+2025-05
+2025-11
+EMNLP
+Llama-2-7B
+Llama-3-8B
+Mistral-7b-v0.1
+Math
+Code
+✗
+✗
+✓
+LoSiA [167]
+2025-07
+2025-11
+EMNLP
+Gemma 2B
+Llama-2-7B/13B
+Math
+Code
+Commonsense
+Instruction Following
+✓
+✗
+✓
+Sensitivity-LoRA
+[168]
+2025-09
+2025-11
+EMNLP
+GPT-2 Large
+Qwen2.5-7B/32B
+Llama-3.1-8B
+NLG
+Instruction Following
+✗
+✗
+✗
+OHoRA [169]
+–
+2025-11
+EMNLP
+Llama-2-7B
+Llama-3-8B
+Gemma-7B
+Llama-3.1-8B-Inst
+Math
+Code
+Commonsense
+Instruction Following
+✗
+✗
+✓
+EVA [82]
+2024-10
+2025-12
+NeurIPS
+Llama-2-7B
+Gemma-2-70B
+Llama-3.1-8B/70B
+Math
+Code
+Commonsense
+✓
+✗
+✓
+GoRA [140]
+2025-02
+2025-12
+NeurIPS
+Llama-3.1-8B
+Llama-2-7B
+Math
+Code
+Instruction Following
+✗
+✗
+✗
+AuroRA [170]
+2025-05
+2025-12
+NeurIPS
+Llama-3-8B
+Commonsense
+✗
+✗
+✓
+GraLoRA [79]
+2025-05
+2025-12
+NeurIPS
+Llama-3.1-8B/70B
+Llama-3.2-3B
+Qwen-2.5-1B/7B
+Math
+Code
+Commonsense
+✗
+✗
+✓
+FlyLoRA [171]
+2025-10
+2025-12
+NeurIPS
+Llama-3.1-8B
+Qwen-2.5-7B/14B
+MMLU
+Science
+Math
+Code
+✗
+✗
+✓
+DropLoRA [172]
+2025-08
+–
+arXiv
+Llama-2-7B
+Llama-3-8B
+Math
+Code
+Commonsense
+Instruction Following
+✗
+✗
+✓
+PrunedLoRA [115]
+2025-09
+–
+arXiv
+Llama-3-8B
+Math
+Commonsense
+✓
+✗
+✓
+LoRA-DA [173]
+2025-10
+–
+arXiv
+Llama-2-7B
+Math
+Commonsense
+✗
+✗
+✓
+ABM-LoRA [174]
+2025-11
+–
+arXiv
+Llama-2-7B
+Instruction Following
+✗
+✗
+✓
+MiSS [175]
+2024-09
+2026-04
+ICLR
+Llama-2-7B/13B
+Mistral-7B
+Qwen3-4B
+Llama-3.2-3B
+Math
+Code
+Instruction Following
+✗
+✗
+✓
+29
+
+
+Method
+arXiv Date Pub. Date
+Venue
+Decoder-only LLM
+Fine-tuned Task
+LR BS Rank
+LoFT [14]
+2025-05
+2026-04
+ICLR
+GPT-2-base/Large
+Llama-1-7B
+Llama-2-7B
+Llama-3-8B
+Llama-3.1-70B
+NLG
+Math
+Code
+Commonsense
+✗
+✗
+✓
+FlexLoRA [176]
+2026-01
+2026-04
+ICLR
+Llama-3-8B
+Commonsense
+✗
+✗
+✗
+Stable-LoRA [177]
+2026-03
+2026-04
+ICLR
+Qwen-2-0.5B/1B
+Llama-1-7B
+Llama-3.1-8B
+Llama-3.2-1B/3B
+Math
+Commonsense
+✓
+✗
+✗
+RaLoRA [178]
+–
+2026-04
+ICLR
+LLaMA-3.1-8B
+Math
+Code
+Instruction Following
+✗
+✗
+✓
+GiVA [179]
+2026-04
+2026-05
+AISTATS
+Qwen-2-0.5B
+OLMo-2-7B
+Phi-3-3.8B
+Mistral-7B
+Math
+Code
+Commonsense
+Instruction Following
+✓
+✗
+✗
+PEANuT [87]
+2024-10
+2026-08
+KDD
+Llama-2-7B
+Llama-3-8B
+Qwen-3-8B
+Math
+Commonsense
+✗
+✗
+✗
+30
+
+
+C
+Detailed Formulas of Selected LoRA Variants
+We describe the detailed formulas of LoRA variants we select in this paper in the following. For readers who wish
+to explore more LoRA variants, we refer them to Appendix Table 3 and existing LoRA surveys [9, 74, 180–182]
+for more comprehensive coverage.
+C.1
+Initialization Variants
+OLoRA.
+Büyükakyüz [23] proposed to improve the convergence behavior of LoRA by initializing the
+adaptation subspace with an orthonormal basis obtained from QR decomposition of pretrained weight matrices.
+OLoRA first performs QR decomposition:
+Wpre = QR,
+where Q ∈Rm×m is orthogonal and R ∈Rm×n is upper triangular. Let Qr ∈Rm×r denote the first r columns
+of Q, and Rr ∈Rr×n denote the first r rows of R. OLoRA initializes LoRA adapters as
+B0 = Qr,
+A0 = Rr,
+(3)
+such that the initialized adapter component satisfies
+B0A0 = QrRr.
+(4)
+To start fine-tuning from the pretrained weights, the residual matrix is defined as
+Wres = Wpre −B0A0 = Wpre −QrRr,
+(5)
+and the forward pass becomes:
+h = Wresx + BAx.
+(6)
+PiSSA.
+Aiming to address the potential slow convergence of LoRA, Meng et al. [11] proposed to initialize
+BA with the top-r principal components of the pretrained weight matrix and showed that this approach achieves
+faster convergence with loss and gradient norm curves similar to those of full fine-tuning. Suppose Wpre admits
+SVD into P
+i σiuivT
+i where σi are singular values in descending order, the LoRA adapter is initialized as:
+B0A0 =
+r
+X
+i=1
+σiuivT
+i ,
+with
+B0 =
+r
+X
+i=1
+√σiuieT
+i ,
+A0 =
+r
+X
+i=1
+√σieivT
+i ,
+(7)
+where ei ∈Rr denotes the i-th standard basis vector. To start fine-tuning from the pretrained weights, the
+residual matrix is defined as
+Wres = Wpre −B0A0 =
+min(m,n)
+X
+i=r+1
+σiuivT
+i .
+MiLoRA.
+Concurrent to PiSSA, Wang et al. [76] proposed an analogous approach targeting adaptation to
+new tasks while maximally retaining the pretrained model’s knowledge. Instead of using principal components,
+MiLoRA initializes the low-rank adapters using bottom-r minor components:
+B0A0 =
+min(m,n)
+X
+i=min(m,n)−r+1
+σiuivT
+i ,
+with B0 and A0 defined analogously to Eq. 7. The residual matrix retains principal components:
+Wres = Wpre −B0A0 =
+min(m,n)−r
+X
+i=1
+σiuivT
+i .
+Wang et al. [76] showed experimentally that MiLoRA achieves superior downstream performance with less
+catastrophic forgetting.
+Init[AB].
+Several works have theoretically analyzed the initialization strategies of LoRA [62, 84]. In
+particular, Hayou et al. [62] confirmed that Init[A] (i.e., randomly initializing A only, the default LoRA setting)
+generally leads to better performance than Init[B] (randomly initializing B only). Li et al. [78] further showed
+that initializing both matrices (i.e., Init[AB]) can provide even better advantage by balancing stability, training
+efficiency, and hyperparameter robustness. Specifically, Init[AB] initializes both matrices as B0 ∼N(0, σ2)
+and A0 ∼N(0, σ2). Since B0A0̸ = 0 in this case, the residual matrix Wres is similarly introduced and utilized.
+Note that Li et al. [78] also proposed a variant, Init[AB+], which does not require Wres and shows no discernible
+performance difference.
+31
+
+
+LoRA-GA.
+Wang et al. [24] proposed to accelerate LoRA convergence by aligning the first-step update of
+the low-rank product with the full fine-tuning gradient. Let G = ∇W L(Wpre) denote the gradient of the loss
+with respect to the full weight matrix, computed on a sampled downstream batch. Instead of decomposing the
+pretrained weight matrix as in PiSSA and MiLoRA, LoRA-GA performs SVD on the gradient matrix:
+G = UΣV T .
+The goal is to initialize A and B such that the update of the low-rank product approximates the full fine-tuning
+update:
+∆(BA) ≈ζ∆W,
+for some positive scaling constant ζ. Following the solution derived in LoRA-GA, the adapter matrices are
+initialized using selected singular directions of G:
+B0 =
+√ζ
+η UIB,
+A0 =
+√ζ
+η V T
+IA,
+where η denotes the scaling factor in LoRA-GA, and IA and IB are selected index sets of singular directions
+with |IA| = |IB| = r. Since B0A0̸ = 0, the residual matrix is introduced as
+Wres = Wpre −ηB0A0,
+and the forward pass becomes:
+h = Wresx + ηBAx.
+A notable follow-up is LoRA-One [83], which aims to address several limitations of LoRA-GA identified
+through theoretical analysis by using the top-r singular directions of G together with additional preconditioning
+and scaling choices.
+C.2
+Architectural Modifications
+DoRA.
+Liu et al. [13] proposed to learn magnitude and directional updates of Wpre separately. Formally, the
+modified forward pass becomes:
+h = γr
+
+m
+∥Wpre + BA∥c ⊙(Wpre + BA)
+
+x,
+(8)
+where B and A are responsible for directional updates and initialized as vanilla LoRA, while m ∈R1×n is
+an additional trainable magnitude vector initialized with m0 = ∥Wpre∥c. Note that ∥.∥c denotes taking the
+column-wise norm of a matrix, while ⊙denotes element-wise multiplication with broadcasting across columns.
+With only a marginal increase in trainable parameters introduced by the vector m, DoRA has been shown to
+consistently outperform LoRA, especially in regimes where the rank is small.
+GraLoRA.
+Jung et al. [79] proposed GraLoRA to address the structural bottleneck of vanilla LoRA, where
+increasing the rank does not always lead to better performance and may even distort gradient propagation under
+skewed input-channel statistics. Instead of applying a single global low-rank adapter to the entire weight matrix,
+GraLoRA partitions the weight matrix into a k × k grid of sub-blocks, each equipped with its own local low-rank
+adapter. Let k denote the number of splits along both the output and input dimensions. For Wpre ∈Rm×n, the
+update is written as:
+∆WGraLoRA =
+
+
+B1,1A1,1
+B1,2A1,2
+· · ·
+B1,kA1,k
+B2,1A2,1
+B2,2A2,2
+· · ·
+B2,kA2,k
+...
+...
+...
+...
+Bk,1Ak,1
+Bk,2Ak,2
+· · ·
+Bk,kAk,k
+
+,
+where
+Bi,j ∈R
+m
+k × r
+k ,
+Ai,j ∈R
+r
+k × n
+k .
+The forward pass becomes:
+h = Wprex + γr∆WGraLoRAx.
+When k = 1, GraLoRA reduces to vanilla LoRA. When k > 1, the total number of trainable parameters remains
+identical to vanilla LoRA under the same overall rank:
+k2 m
+k
+r
+k + r
+k
+n
+k
+
+= (m + n)r.
+By introducing localized adapters, GraLoRA provides more fine-grained control over different subregions of
+the weight matrix and reduces global gradient distortion caused by input outliers. Moreover, the effective rank
+of the resulting update can increase up to kr, thereby enhancing expressive capacity without increasing the
+trainable parameter count. Jung et al. [79] showed that this design consistently improves over vanilla LoRA
+across multiple tasks, especially under larger-rank settings.
+32
+
+
+RandLoRA.
+Albert et al. [80] proposed RandLoRA to examine whether the performance gap between LoRA
+and full fine-tuning stems from the reduced number of trainable parameters or from the low-rank constraint
+itself. The key idea is to maintain parameter efficiency while enabling full-rank updates through fixed random
+low-rank bases and trainable diagonal scaling matrices. Following their notation, let Wpre ∈Rm×n with n ≤m.
+RandLoRA represents the update as a sum of low-rank random basis components:
+∆WRandLoRA =
+q
+X
+j=1
+BjΛjAΓj,
+where Bj ∈Rm×rb and A ∈Rrb×n are non-trainable random matrices, while Λj ∈Rrb×rb and Γj ∈Rn×n
+are trainable diagonal matrices. The forward pass becomes:
+h = Wprex + γr∆WRandLoRAx.
+Since only the diagonal scaling matrices are optimized, the number of trainable parameters is substantially
+restricted. When q = n/rb, RandLoRA can form a full-rank update with
+q(rb + n) = n + n2
+rb
+trainable parameters. This differs from vanilla LoRA, which directly learns a single rank-r product BA and is
+therefore constrained to rank at most r. RandLoRA’s design rationale is to trade the flexibility of learning an
+arbitrary low-rank basis for broader spectral coverage through multiple fixed random bases. Albert et al. [80]
+showed that RandLoRA can reduce or even eliminate the gap between LoRA and full fine-tuning in settings
+where full-rank updates are beneficial, while maintaining parameter and memory efficiency during training.
+C.3
+Optimization Adjustments
+LoFT.
+Tastan et al. [14] proposed LoFT to reduce the optimization gap between LoRA and full fine-tuning by
+aligning the optimizer’s internal dynamics with those of updating all model weights. Following their notation,
+write the adapted weight as
+W = W0 + UV T ,
+where U ∈Rm×r and V ∈Rn×r are trainable low-rank factors. For a scalar loss f(W), a full fine-tuning
+gradient descent step is:
+W + = W −η∇W f(W).
+In contrast, simultaneous updates of U and V induce the full-space update:
+W + = W −η
+
+∇W f(W)V V T + UU T ∇W f(W)
+
++ η2∇W f(W)V U T ∇W f(W),
+where the last term is absent in full fine-tuning. LoFT therefore uses alternating updates, updating only one
+low-rank factor at a time. When updating U, this gives:
+W + = W −η∇W f(W)V V T .
+To address the scale ambiguity UV T = (cU)(V/c)T , LoFT applies scaled gradients:
+e∇Uf(W) = ∇Uf(W)(V T V )−1,
+e∇V f(W) = ∇V f(W)(U T U)−1,
+which yield the projected full-space update
+W + = W −η∇W f(W)PV ,
+PV = V (V T V )−1V T .
+Beyond gradient alignment, LoFT calibrates Adam-style optimizer states in the same low-rank subspace. For the
+first moment, when updating U, it uses:
+mU
+k = β1mU
+k−1CV
+k + (1 −β1)e∇Uf(Wk),
+CV
+k = (V T
+k−1Vk)(V T
+k Vk)−1.
+An analogous update is applied when updating V . For the second moment, LoFT similarly accumulates
+cross-terms for variance recalibration after projection:
+pU
+k = β2pU
+k−1(CV
+k ⊗CV
+k ) + (1 −β2)
+
+e∇Uf(Wk) • e∇Uf(Wk)
+
+,
+where ⊗denotes the Kronecker product and • denotes the transposed Khatri–Rao product. Together, alternating
+updates, scaled gradients, and optimizer-state calibration allow LoFT to better approximate full fine-tuning
+dynamics. Tastan et al. [14] showed that LoFT narrows the performance gap between LoRA and full fine-tuning
+without increasing inference cost.
+33
+
+
+D
+Fine-tuning Implementation Details
+D.1
+Models
+Following standard practice in PEFT research to ensure results purely reflect the training data, we use base
+versions (not instruction-tuned) for all models. Specifically, we utilize the official checkpoints hosted on Hugging
+Face [183]: Qwen3-0.6B-Base3, gemma-3-1b-pt4, Llama-2-7b-hf5, and Llama-2-13b-hf6.
+D.2
+Training Hyperparameter Search Ranges
+See Table 4 for hyperparameter search ranges for each model-task combination. For all experiments on Qwen
+and Gemma, we conduct three independent trainings and report the mean and standard deviation.
+Model
+Task
+Rank (r)
+Batch (B)
+Learning Rate (η)
+Qwen3-0.6B
+Math
+8
+{16, 64, 128}
+1.1247e-5 – 6.3246e-3
+128
+64
+2.0000e-6 – 2.0000e-3
+Inst
+128
+64
+2.0000e-6 – 2.0000e-3
+Gemma-3-1B
+CS
+4
+64
+2.0000e-6 – 2.0000e-2
+Math
+{4, 8, 16, 32, 64, 128, 256}
+64
+1.1247e-5 – 6.3246e-3
+128
+{16, 64, 128}
+1.1247e-5 – 6.3246e-3
+Code
+{4, 8, 16, 32, 64, 128, 256}
+64
+1.1247e-5 – 6.3246e-3
+Llama-2-7B
+Math
+{8, 32, 128}
+{16, 128}
+2.0000e-5 – 3.5566e-3
+Code
+{8, 32, 128}
+{16, 128}
+2.0000e-5 – 3.5566e-3
+Llama-2-13B
+Math
+{8, 128}
+64
+2.0000e-5 – 2.0000e-3
+Table 4: Summary of models, tasks, ranks, and hyperparameter search ranges. Learning rates are
+tuned evenly in logarithmic scale: {1.1247e*, 2.0000e*, 3.5566e*, 6.3246e*} per order of magnitude.
+D.3
+Fixed Training Hyperparameters
+Except for tunable hyperparameters (i.e., learning rate and batch size), all other training configurations remain
+fixed and the same for all experiments; the values are summarized in Table 5. Note that these configurations
+primarily follow PiSSA, thus may differ from those of other considered PEFT methods. For example, MiLoRA,
+DoRA, and Init[AB] employ linear decay instead of cosine annealing for learning rate scheduling. Additionally,
+MiLoRA and DoRA use fixed warmup steps (100) rather than 3% of total training steps, and apply a dropout
+rate of 0.05 instead of no dropout. Furthermore, while we place low-rank adapters on all linear layers, these
+methods exclude output projections (out_proj) or gate matrices (gate_proj) in several of their experiments.
+3https://huggingface.co/Qwen/Qwen3-0.6B-Base
+4https://huggingface.co/google/gemma-3-1b-pt
+5https://huggingface.co/meta-llama/Llama-2-7b-hf
+6https://huggingface.co/meta-llama/Llama-2-13b-hf
+7Following PiSSA’s codebase, normalization layers and gate_proj matrices of the pretrained model are converted back to
+Float32 after the BFloat16 sampling and before training.
+34
+
+
+Configuration
+Value
+Epoch
+1
+α
+r
+Optimizer
+AdamW [184]
+LR scheduler
+Cosine annealing with warmup
+Warmup ratio
+3%
+Dropout
+None
+Weight Decay
+None
+Adapter placement
+All linear layers (except for the LM head)
+Base model precision
+BFloat16 [185]7
+Adapter precision
+Float32
+Max sequence length
+512
+Table 5: Fixed training configurations across all experiments. α equals the LoRA rank r, resulting
+in a scaling factor γr = 1. Adapters are applied to all linear projection layers except for the final
+language modeling head (i.e., q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj).
+D.4
+Data, Code, Libraries, and Hardware
+We use the PiSSA codebase [11] as the core framework and extend it into a unified implementation covering all
+ten LoRA-based methods considered in this study. Specifically, LoRA, OLoRA, PiSSA, LoRA-GA, DoRA,
+GraLoRA, and RandLoRA are implemented using the built-in interfaces of the official PEFT library [88]. For
+MiLoRA, Init[AB], and LoFT, we refer to their official codebases8 for essential functions and implementation
+details, which are then integrated into the same unified experimental codebase.
+Note that while the original LoRA paper used Kaiming Normal initialization, we follow its official implemen-
+tation and the widely-used PEFT library to use Kaiming Uniform instead in our experiments. The results are
+expected to be similar (cf. Meng et al. [11, Table 2]). Additionally, while Li et al. [78] also proposed a variant,
+Init[AB+], which does not require Wres and shows no discernible performance difference, we chose to implement
+the default Init[AB].
+For commonsense reasoning tasks, we leveraged the dataset released by Hu et al. [51]9. For mathematical
+reasoning and code generation tasks, we used the preprocessed dataset released by Meng et al. [11]10. For
+instruction-following tasks, we trained models on Alpaca-cleaned, which is publicly available on HuggingFace11.
+PyTorch [186] version 2.7.1 is used for implementation. All experiments are conducted on four GPUs (either
+4× Nvidia RTX 3090 or 4× Nvidia A6000). We employ DeepSpeed [187] for parallel training and vLLM [188]
+for parallel inference. During inference, we apply greedy decoding (i.e., temperature set to 0), and utilize the
+EvalPlus [189] framework to evaluate pass@1 for code generation tasks.
+All fine-tuning experiments (except those for Llama) are conducted with three independent runs and reported
+with means and standard deviations. The sources of randomness are controlled by explicitly fixing random seeds
+across Python, NumPy, and PyTorch using the code snippet shown below.
+def seed_everything(seed):
+random.seed(seed)
+os.environ[’PYTHONHASHSEED ’] = str(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
+8https://github.com/sufenlp/MiLoRA
+https://github.com/Leopold1423/non_zero_lora-icml25
+https://github.com/tnurbek/loft
+9https://github.com/AGI-Edgerunners/LLM-Adapters/blob/main/ft-training_set/commonsense_15k.json
+10https://huggingface.co/datasets/fxmeng/pissa-dataset
+11https://huggingface.co/datasets/yahma/alpaca-cleaned
+35
+
+
+E
+On LoRA Scaling Factor
+The configuration of the LoRA alpha parameter (α) generally follows two paradigms: (1) setting it to a fixed
+constant across LoRA ranks (typically 32 or 64), or (2) scaling it with the LoRA rank, often following α = r or
+α = 2r, which results in a scaling factor γr of 1 or 2, respectively. The configurations adopted for decoder-LLMs
+in the considered core LoRA variants are summarized as follows:
+• PiSSA: γr = 1 (α = r for all r).
+• MiLoRA: γr = 2 for vanilla LoRA; γr = 1 for both MiLoRA and PiSSA.
+• Init[AB]: γr = 1 (r = 16 and α = 16).
+• DoRA: γr = 2 (α = 2r for all r).
+Evidently, the methods considered in this paper adhere to the second paradigm. Consequently, we adopt the
+setting α = r (γr = 1) for all our experiments. We refer readers to several prior studies that have explored
+the optimal LoRA scaling factor: Kalajdzievski [63] argued that γr should scale with the square root of r
+(γr = α/√r), rather than linearly (γr = α/r), though the optimal α setup remains unclear. Empirically,
+Biderman et al. [8] demonstrated through joint sweeps of α and learning rates that α = 2r (γr = 2) is the
+optimal choice, with α = r (γr = 1) performing only marginally worse (cf. Biderman et al. [8, Appendix B.2,
+Figure S3]). Notably, Zhang et al. [73] recently unified the learning rate, scaling factor, and initialization under a
+single theoretical framework, suggesting that tuning the learning rate is theoretically equivalent to tuning the
+scaling factor [190]. This further validates our decision to fix the scaling factor in our experiments.
+36
+
+
+F
+Details of Hyperparameter Search Results
+Sections F.1, F.2, and F.3 present several detailed hyperparameter search results on Qwen3-0.6B, Gemma-3-1B,
+and Llama-2-7B, respectively. Note that Tables 7, 11, and 14 correspond to the detailed numerical results for
+Figures 1, 3a, and 3b in the main text, respectively. Additionally, Tables 9, 10, and 11 provide the hyperparameter
+search details across adapter ranks for Appendix Figure 8a, while Tables 12, 13, and 14 correspond to Appendix
+Figure 8b.
+F.1
+Qwen3-0.6B
+F.1.1
+Mathematical Reasoning
+Methods Batch
+Size
+Learning Rate
+1.12e-05
+2.00e-05
+3.56e-05
+6.32e-05
+1.12e-04
+2.00e-04
+3.56e-04
+6.32e-04
+1.12e-03
+2.00e-03
+3.56e-03
+6.32e-03
+LoRA
+16
+38.94±1.02 46.49±1.17 47.78±0.47 47.85±0.42 48.13±0.40 48.90±0.41 48.41±0.59 49.05±0.49 47.64±0.86 44.00±0.45 26.59±21.82 5.03±5.33
+64
+29.53±0.18 33.02±0.28 39.15±0.33 46.49±0.25 48.16±0.24 48.39±0.29 48.95±0.23 48.99±0.40 48.73±0.10 48.14±0.42 43.92±0.48
+1.28±0.05
+128 22.30±0.30 30.22±1.63 33.64±0.13 40.64±1.48 47.88±0.61 48.38±0.19 48.38±0.01 48.69±0.57 48.72±0.04 48.33±0.54 31.32±26.20 1.13±0.58
+DoRA
+16
+42.03±1.63 47.36±0.59 48.10±0.12 48.10±0.48 48.29±0.08 48.80±0.64 48.60±0.17 48.70±0.05 46.30±0.29 42.67±0.19 35.93±0.44
+1.31±0.19
+64
+38.69±1.24 37.60±1.22 40.65±1.58 47.06±0.50 48.41±0.31 48.03±0.18 49.07±0.03 48.87±0.82 48.55±0.43 47.31±0.48 44.61±0.00
+1.10±0.31
+128 33.37±1.56 36.85±0.98 36.56±0.41 43.03±1.11 48.46±0.54 47.94±0.30 48.30±0.24 48.41±0.72 48.59±0.10 47.75±0.47 46.08±0.10 14.91±23.56
+Init[AB]
+16
+36.53±2.20 41.67±1.99 45.47±1.30 48.07±0.70 48.28±0.72 48.66±0.31 48.53±0.48 48.18±0.49 46.79±0.19 42.32±0.39 38.65±0.80 20.67±27.96
+64
+35.78±0.54 35.15±1.09 37.85±0.08 40.04±1.50 45.03±1.13 48.34±0.29 48.53±0.07 48.45±0.50 48.68±0.15 47.11±0.43 43.13±0.80
+1.36±0.06
+128 31.34±1.30 32.44±0.70 36.21±0.32 35.29±1.90 41.73±1.33 47.06±1.29 48.38±0.60 48.57±0.39 48.12±0.01 48.34±0.66 46.79±0.22
+0.99±0.52
+MiLoRA
+16
+39.42±0.87 45.09±0.19 44.76±0.78 45.92±0.81 49.16±0.37 49.36±0.09 48.93±0.37 48.08±0.06 46.09±0.55 43.39±0.52 25.53±20.93 1.47±0.07
+64
+32.25±1.20 38.33±1.24 45.72±0.88 44.08±1.50 47.32±0.05 48.69±0.32 49.40±0.01 49.06±0.18 48.90±0.37 47.02±0.38 43.98±1.06
+1.07±0.50
+128 30.94±0.32 33.71±0.34 35.03±0.69 40.49±0.39 44.27±0.12 48.08±0.42 48.65±0.18 49.37±0.19 49.33±0.52 48.12±0.74 46.91±0.06
+1.24±0.33
+PiSSA
+16
+47.10±0.28 44.80±0.71 46.45±0.61 48.37±0.36 48.30±0.26 47.42±0.22 45.47±0.36 42.43±0.03 38.83±0.40 33.14±0.41 24.63±0.98 14.82±19.10
+64
+44.20±0.12 44.12±0.69 47.54±0.50 48.25±0.14 48.46±0.59 48.43±0.12 47.94±0.39 47.23±0.19 43.94±0.04 40.15±0.20 35.37±0.55 18.90±15.52
+128 39.49±2.26 43.64±0.51 43.61±0.50 46.42±0.10 48.51±0.31 48.24±0.18 48.06±0.72 47.70±0.36 45.56±0.15 43.54±0.41 38.85±0.18 33.36±0.44
+Table 6: Performance of Qwen3-0.6B fine-tuned on mathematical reasoning tasks with rank = 8.
+Methods Batch
+Size
+Learning Rate
+2.00e-06
+3.56e-06
+6.32e-06
+1.12e-05
+2.00e-05
+3.56e-05
+6.32e-05
+1.12e-04
+2.00e-04
+3.56e-04
+6.32e-04
+1.12e-03
+2.00e-03
+LoRA
+64
+21.48±0.53 24.52±0.44 31.94±0.58 43.07±1.16 48.37±0.19 48.81±0.14 49.27±0.34 49.46±0.56 49.60±0.18 48.95±0.20 47.08±0.22 40.76±0.96 1.27±0.15
+DoRA
+64
+36.84±0.86 38.19±1.74 39.29±0.36 44.72±0.96 48.09±0.74 49.01±0.44 49.25±0.33 49.45±0.25 49.33±0.45 49.32±0.71 46.92±0.28 40.24±0.62 10.14±15.64
+Init[AB]
+64
+33.40±2.16 35.81±1.72 41.20±1.83 47.27±0.89 49.27±0.13 49.02±0.11 48.81±0.17 49.29±0.23 48.51±0.44 47.37±0.39 44.81±0.34 39.41±0.49 0.93±0.41
+MiLoRA
+64
+33.62±0.39 38.35±0.46 43.37±0.41 48.30±0.27 49.08±0.23 48.74±0.32 49.17±0.38 49.08±0.14 48.22±0.20 46.57±0.73 43.91±0.58 38.70±0.34 9.48±14.40
+PiSSA
+64
+38.13±0.84 44.51±0.26 48.11±0.14 48.77±0.12 49.43±0.19 49.09±0.16 48.44±0.12 47.10±0.32 43.84±0.28 39.66±0.36 34.37±0.39 27.18±1.29 17.35±0.57
+Table 7: Performance of Qwen3-0.6B fine-tuned on mathematical reasoning tasks with rank = 128.
+37
+
+
+F.2
+Gemma-3-1B
+F.2.1
+Mathematical Reasoning
+Methods Batch
+Size
+Learning Rate
+1.12e-5
+2.00e-5
+3.56e-5
+6.32e-5
+1.12e-4
+2.00e-4
+3.56e-4
+6.32e-4
+1.12e-3
+2.00e-3
+3.56e-3
+6.32e-3
+LoRA
+16
+9.78±0.36 11.16±0.28 13.58±0.18 15.48±0.15 18.43±0.14 20.00±0.26 19.93±0.65 17.99±0.55 11.71±0.49 1.52±0.19 1.27±0.59 1.07±0.27
+64
+6.88±0.04 9.12±0.39 10.79±0.37 13.23±0.25 15.65±0.57 17.54±0.29 19.73±0.16 20.46±0.79 19.83±0.91 13.33±0.81 1.48±0.48 0.00±0.00
+128
+5.70±0.34 6.95±0.23 9.41±0.44 11.43±0.40 13.68±0.77 15.92±0.45 18.58±0.44 19.60±0.09 20.32±0.28 16.95±2.70 0.09±0.16 0.00±0.00
+DoRA
+16
+9.89±0.24 11.16±0.51 13.84±0.41 15.61±0.11 18.21±0.45 20.11±0.26 20.96±0.57 18.34±0.20 11.90±0.29 4.89±0.99 0.93±0.12 1.16±0.15
+64
+6.72±0.09 9.19±0.19 10.53±0.20 13.45±0.31 15.72±0.32 17.66±0.20 19.96±0.05 20.82±0.32 19.87±0.91 13.53±1.64 1.52±0.45 0.34±0.23
+128
+5.55±0.11 7.21±0.18 9.72±0.17 11.58±0.25 13.98±0.33 16.19±0.46 18.25±0.23 19.67±0.71 20.33±0.64 12.86±10.03 0.13±0.23 0.02±0.03
+Init[AB]
+16
+9.73±0.35 12.10±0.14 14.41±0.49 16.73±0.37 18.38±0.53 20.39±0.38 20.55±0.40 18.34±0.48 11.94±0.31 1.48±0.24 1.16±0.31 1.45±0.17
+64
+6.51±0.22 9.15±0.12 11.28±0.20 13.20±0.24 15.88±0.39 17.89±0.30 20.08±0.26 20.98±0.33 19.31±0.75 13.97±0.03 2.74±3.83 0.07±0.12
+128
+6.06±0.35 7.05±0.33 9.53±0.22 11.81±0.08 13.98±0.79 16.46±0.39 18.36±0.21 20.37±0.39 20.66±0.39 17.85±0.84 4.40±7.46 0.00±0.00
+MiLoRA
+16
+12.44±0.07 13.77±0.25 16.28±0.24 18.45±0.47 20.04±0.19 20.63±0.67 19.40±0.80 15.72±0.49 10.22±0.42 2.03±0.95 1.35±0.43 1.56±0.65
+64
+8.82±0.40 11.25±0.20 13.16±0.11 15.54±0.29 17.43±0.24 19.56±0.33 20.03±0.59 19.60±0.78 17.93±0.90 13.65±0.07 4.97±0.40 0.00±0.00
+128
+7.32±0.33 9.57±0.24 11.76±0.33 13.54±0.12 16.02±0.16 18.39±0.26 19.70±0.34 19.99±0.66 19.53±0.47 16.83±0.73 7.45±1.00 0.57±0.81
+PiSSA
+16
+14.30±0.18 16.10±0.27 18.31±0.12 19.90±0.21 20.61±0.28 19.09±0.20 16.10±0.64 13.25±0.55 8.41±0.13
+4.67±0.29 2.50±1.27 0.96±0.15
+64
+11.11±0.05 13.67±0.17 15.56±0.33 18.11±0.23 19.52±0.48 20.68±0.77 20.59±0.32 19.11±0.86 15.53±0.37 9.57±0.72 5.78±0.37 0.33±0.46
+128
+9.42±0.38 11.80±0.28 14.40±0.11 16.23±0.38 18.60±0.21 19.61±0.44 20.65±0.44 19.21±1.15 16.91±0.19 13.87±0.97 6.28±0.49 1.19±0.36
+Table 8: Performance of Gemma-3-1B fine-tuned on mathematical reasoning tasks with rank=128.
+F.3
+Llama-2-7B
+F.3.1
+Mathematical Reasoning
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03 3.56e-03
+LoRA
+16
+23.16
+24.55
+26.05
+28.73
+30.70
+32.18
+32.94
+32.02
+27.71
+0.00
+128
+16.12
+18.60
+21.46
+23.49
+25.91
+28.21
+30.31
+32.28
+32.78
+1.97
+DoRA
+16
+22.74
+24.34
+26.20
+28.44
+30.62
+33.20
+32.71
+32.43
+1.59
+1.98
+128
+16.07
+18.98
+21.57
+23.70
+26.16
+28.54
+30.20
+32.80
+33.62
+0.00
+Init[AB]
+16
+20.89
+23.36
+27.08
+29.25
+31.24
+33.30
+32.78
+31.34
+27.38
+0.04
+128
+15.79
+17.64
+20.17
+22.96
+25.42
+28.03
+30.45
+32.32
+32.96
+31.08
+MiLoRA
+16
+21.12
+23.45
+25.61
+28.38
+30.59
+32.49
+33.22
+32.46
+27.56
+0.00
+128
+15.72
+18.51
+20.70
+22.58
+25.32
+26.76
+29.87
+31.48
+33.55
+0.26
+PiSSA
+16
+22.66
+26.30
+28.20
+30.12
+31.91
+31.62
+30.57
+28.76
+0.84
+0.92
+128
+18.94
+21.60
+22.80
+26.23
+28.14
+30.61
+31.64
+31.86
+31.53
+0.48
+Table 9: Performance of Llama-2-7B fine-tuned on mathematical reasoning with rank=8.
+38
+
+
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03
+LoRA
+16
+25.03
+27.77
+29.67
+32.11
+33.73
+33.84
+34.18
+27.01
+1.31
+128
+19.93
+22.25
+24.08
+26.29
+29.13
+32.19
+33.24
+34.62
+0.00
+DoRA
+16
+25.41
+27.35
+29.78
+31.96
+34.14
+35.16
+33.26
+28.92
+0.55
+128
+20.60
+22.41
+24.02
+26.66
+29.71
+31.96
+33.41
+34.25
+0.00
+Init[AB]
+16
+24.06
+27.68
+28.71
+32.52
+34.10
+34.92
+34.12
+27.16
+0.77
+128
+17.83
+20.96
+23.15
+26.62
+28.34
+30.79
+33.38
+34.59
+0.97
+MiLoRA
+16
+24.53
+27.23
+29.23
+31.44
+33.97
+34.85
+33.85
+28.35
+0.62
+128
+18.23
+21.45
+23.65
+26.54
+27.97
+30.29
+32.39
+34.59
+0.00
+PiSSA
+16
+29.42
+30.68
+32.75
+33.66
+33.62
+32.66
+29.30
+18.36
+0.15
+128
+23.98
+27.02
+29.44
+30.01
+32.89
+33.42
+34.31
+32.92
+0.65
+Table 10: Performance of Llama-2-7B fine-tuned on mathematical reasoning with rank=32.
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03
+LoRA
+16
+29.21
+31.30
+33.25
+35.45
+35.91
+35.10
+27.41
+0.97
+0.00
+128
+22.69
+24.95
+27.79
+30.74
+32.62
+34.85
+35.66
+0.00
+0.00
+DoRA
+16
+29.43
+30.75
+33.14
+35.73
+36.41
+34.54
+1.28
+0.94
+0.79
+128
+23.27
+25.63
+27.87
+30.11
+33.00
+35.10
+35.57
+0.38
+0.00
+Init[AB]
+16
+29.04
+31.52
+31.96
+34.81
+36.72
+35.41
+27.98
+1.54
+0.00
+128
+22.01
+25.03
+28.11
+30.47
+31.80
+34.78
+35.57
+34.45
+0.00
+MiLoRA
+16
+28.23
+31.11
+33.42
+35.22
+36.02
+34.71
+28.03
+0.38
+0.00
+128
+22.14
+24.84
+27.88
+30.33
+31.29
+33.67
+35.23
+0.00
+0.00
+PiSSA
+16
+33.35
+35.03
+35.27
+35.83
+32.89
+27.90
+16.75
+1.45
+0.00
+128
+29.84
+31.64
+33.44
+34.45
+35.31
+34.99
+31.59
+27.83
+0.00
+Table 11: Performance of Llama-2-7B fine-tuned on mathematical reasoning with rank=128.
+F.3.2
+Code Generation
+39
+
+
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03 3.56e-03
+LoRA
+16
+27.20
+29.40
+27.55
+30.00
+31.40
+33.25
+36.10
+32.65
+32.30
+0.00
+128
+24.50
+25.60
+27.05
+28.15
+29.30
+30.90
+30.45
+35.35
+33.35
+0.00
+DoRA
+16
+28.05
+28.45
+28.90
+31.15
+31.80
+33.15
+33.80
+32.00
+29.50
+0.00
+128
+24.65
+26.95
+27.25
+29.65
+29.15
+30.15
+33.15
+33.15
+33.35
+32.55
+Init[AB]
+16
+26.25
+27.30
+30.30
+29.90
+32.90
+34.15
+35.60
+32.70
+31.20
+0.00
+128
+23.00
+25.50
+25.55
+29.15
+30.50
+32.05
+33.55
+34.20
+33.25
+0.00
+MiLoRA
+16
+26.80
+28.60
+27.55
+28.75
+31.60
+33.95
+32.25
+33.30
+29.85
+0.00
+128
+22.50
+25.50
+26.40
+27.20
+29.55
+29.30
+32.35
+32.40
+33.35
+0.00
+PiSSA
+16
+29.05
+29.90
+32.55
+31.90
+34.05
+30.75
+29.85
+29.60
+24.35
+0.00
+128
+27.45
+27.70
+30.15
+30.45
+31.45
+30.10
+33.55
+31.75
+30.75
+29.35
+Table 12: Performance of Llama-2-7B fine-tuned on code generation with rank=8.
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03
+LoRA
+16
+28.30
+29.10
+30.55
+35.30
+37.05
+37.65
+36.85
+28.75
+0.00
+128
+27.60
+27.25
+29.25
+29.30
+30.85
+34.55
+35.45
+35.65
+32.20
+DoRA
+16
+29.00
+29.10
+30.30
+34.75
+34.20
+36.40
+37.40
+29.35
+0.00
+128
+26.75
+27.15
+29.00
+30.30
+31.20
+35.25
+35.45
+35.15
+0.00
+Init[AB]
+16
+27.75
+29.70
+31.10
+34.05
+35.40
+35.20
+33.05
+31.25
+0.00
+128
+26.10
+27.00
+27.75
+29.00
+31.60
+35.70
+37.00
+36.70
+0.00
+MiLoRA
+16
+27.15
+28.55
+30.55
+32.75
+34.10
+35.90
+36.10
+27.40
+0.00
+128
+25.70
+26.50
+26.90
+28.90
+31.05
+31.40
+33.30
+34.75
+0.00
+PiSSA
+16
+32.10
+33.00
+34.00
+32.10
+34.45
+32.30
+27.75
+18.55
+0.00
+128
+29.80
+30.05
+31.75
+32.10
+33.55
+35.00
+33.20
+32.60
+0.00
+Table 13: Performance of Llama-2-7B fine-tuned on code generation tasks with rank = 32.
+Methods Batch
+Size
+Learning Rate
+2.00e-05 3.56e-05 6.32e-05 1.12e-04 2.00e-04 3.56e-04 6.32e-04 1.12e-03 2.00e-03
+LoRA
+16
+30.72
+31.87
+34.23
+37.55
+37.40
+36.68
+29.20
+0.00
+0.00
+128
+29.37
+29.82
+31.18
+33.40
+35.70
+36.48
+36.68
+13.05
+0.00
+DoRA
+16
+30.93
+32.50
+34.72
+36.70
+38.30
+35.82
+30.50
+0.00
+0.00
+128
+29.12
+30.17
+31.22
+32.80
+36.12
+38.12
+37.50
+0.00
+0.00
+Init[AB]
+16
+30.73
+31.48
+34.47
+36.75
+38.07
+35.82
+30.72
+0.00
+0.00
+128
+28.32
+30.00
+30.15
+32.80
+35.83
+36.97
+38.43
+0.00
+0.00
+MiLoRA
+16
+29.72
+32.18
+33.55
+36.53
+37.08
+35.95
+30.03
+0.00
+0.00
+128
+28.67
+29.20
+29.72
+31.93
+34.67
+37.42
+37.07
+0.00
+0.00
+PiSSA
+16
+35.47
+37.35
+35.98
+36.08
+33.92
+28.43
+17.53
+0.00
+0.00
+128
+31.90
+32.33
+34.80
+35.42
+36.77
+36.67
+34.50
+26.90
+0.00
+Table 14: Performance of Llama-2-7B fine-tuned on code generation tasks with rank = 128.
+40
+
+
+G
+Example Model Responses
+We examine the responses of Gemma-3-1B fine-tuned on the mathematical reasoning task using LoRA and
+PiSSA (r = 128, B = 16) under various learning rates. Figure 12 presents a randomly selected testing example
+from the MATH dataset, with the corresponding model responses organized in Table 15. In this example, it is
+easily observed that the two PEFT methods operate in distinct effective learning rate regimes. Specifically, LoRA
+produces correct reasoning paths within the range of 2×10−4 to 6.32×10−4, whereas PiSSA achieves accurate
+results in a slightly lower range of 6.32 × 10−5 to 2 × 10−4. Moreover, the LLM under PiSSA fine-tuning tends
+to continue responding reasonably at larger learning rates, as evident when η = 2 × 10−3 and 3.56 × 10−3,
+where the model produces answers of “6” and “4”, while under LoRA fine-tuning, the model diverges to output
+repetitive gibberish. These qualitative findings correspond to our discussion in Sec. 3.3.1.
+Selected MATH Testing Set Input
+Below is an instruction that describes a task. Write a response that appropriately
+completes the request.
+### Instruction:
+There are eight boys and six girls who are members of the trumpet section in the band.
+From the members of the trumpet section, a quintet is being formed. If the quintet
+must consist of three boys and two girls, how many quintets are possible?
+### Response: Let’s think step by step.
+Figure 12: An example input from the MATH dataset used for testing.
+Table 15: Qualitative comparison of LoRA and PiSSA reasoning paths across learning rates.
+LR (η)
+LoRA Response
+PiSSA Response
+1.12 × 10−5
+We are given that there are 8 boys and
+6 girls in the trumpet section.
+To form a quintet, we need to choose 3
+boys and 2 girls.
+So, we need to choose 3 boys from the
+8 boys and 2 girls from the 6 girls.
+This can be done in
+ 8
+2
+
+=
+8!
+2!6! = 8·7
+2·1 = 16
+ways.
+The answer is: 16
+We have 8 boys and 6 girls, so we need
+to choose 3 boys from the 8 boys and 2
+girls from the 6 girls.
+This can be done in
+ 8
+3
+
+·  6
+2
+
+=
+8!
+3!3! ·
+6!
+2!2! = 8·7
+3·2 = 14
+ways.
+The answer is: 14
+✗Incorrect
+✗Incorrect
+2.00 × 10−5
+We are given that there are 8 boys and
+6 girls in the trumpet section.
+To form a quintet, we need to choose 3
+boys and 2 girls.
+So, the number of quintets that can be
+formed is
+8
+3 × 6
+2 = 8×6
+3×2 = 48
+6 = 8 .
+The answer is: 8
+We have 8 boys and 6 girls, so we need
+to choose 3 boys from the 8 boys and 2
+girls from the 6 girls.
+This can be done in
+ 8
+3
+
+·  6
+2
+
+=
+8!
+3!3! = 8·7
+3·2 = 28 ways.
+Therefore, there are
+28
+quintets
+possible.
+The answer is: 28
+✗Incorrect
+✗Incorrect
+3.56 × 10−5
+We have 8 boys and 6 girls, so there
+are a total of 8 + 6 = 14 members in
+the trumpet section.
+To form a quintet, we need to choose 3
+boys and 2 girls from the 14 members.
+The number of quintets that can be
+formed is the number of ways to choose
+3 boys and 2 girls from a group of 14
+members.
+Using the combination formula, this is
+ 14
+3
+
+=
+14!
+3!11! = 14×13×12
+3×2×1
+= 105 .
+The answer is: 105
+We have 8 boys and 6 girls in the
+trumpet section.
+To form a quintet, we need to choose 3
+boys and 2 girls from the 8 boys and 6
+girls.
+This can be done in
+ 8
+3
+
+·  6
+2
+
+=
+8!
+3!3! = 8·7
+3·2 = 28 ways.
+Therefore, there are
+28
+possible
+quintets.
+The answer is: 28
+✗Incorrect
+✗Incorrect
+41
+
+
+LR (η)
+LoRA Response
+PiSSA Response
+6.32 × 10−5
+We have 8 boys and 6 girls, so we need
+to choose 3 boys from the 8 boys and 2
+girls from the 6 girls.
+This can be done in
+ 8
+3
+
+·  6
+2
+
+=
+8!
+3!3! ·
+6!
+2!4! = 8·7·6
+3·2·1 = 216
+6
+= 36 .
+The answer is: 36
+We need to choose 3 boys from the 8
+members of the trumpet section, and 2
+girls from the 6 members of the
+trumpet section.
+The number of ways to choose 3 boys
+from 8 is  8
+3
+
+= 56.
+The number of ways to choose 2 girls
+from 6 is  6
+2
+
+= 15.
+Therefore, the total number of
+quintets is 56 × 15 = 840 .
+The answer is: 840
+✗Incorrect
+✓Correct
+1.12 × 10−4
+We have 8 boys and 6 girls, so we need
+to choose 3 boys from the 8 boys and 2
+girls from the 6 girls.
+This can be done in
+ 8
+3
+
+·  6
+2
+
+=
+8!
+3!3! ·
+6!
+2!2! = 8·7·6
+3·2·1 = 56 ways.
+Therefore, there are
+56
+possible
+quintets.
+The answer is: 56
+We need to choose 3 boys from the 8
+available boys, and 2 girls from the 6
+available girls.
+The number of ways to choose 3 boys
+from 8 is  8
+3
+
+= 56.
+The number of ways to choose 2 girls
+from 6 is  6
+2
+
+= 15.
+Therefore, the total number of
+quintets is 56 × 15 = 840 .
+The answer is: 840
+✗Incorrect
+✓Correct
+2.00 × 10−4
+We need to choose 3 boys from the 8
+available, and 2 girls from the 6
+available.
+This can be done in  8
+3
+
+= 56 ways.
+Similarly, we need to choose 2 girls
+from the 6 available, and 3 boys from
+the 3 available.
+This can be done in  6
+2
+
+= 15 ways.
+Therefore, there are 56 × 15 = 840
+possible quintets.
+The answer is: 840
+First, we choose 3 boys from the 8
+available boys. This can be done in
+ 8
+3
+
+= 56 ways.
+Next, we choose 2 girls from the 6
+available girls. This can be done in
+ 6
+2
+
+= 15 ways.
+Therefore, the total number of
+quintets is 56 × 15 = 840 .
+The answer is: 840
+✓Correct
+✓Correct
+3.56 × 10−4
+We need to choose 3 boys from the 8
+available, and 2 girls from the 6
+available.
+The number of ways to choose 3 boys
+from 8 is  8
+3
+
+= 56.
+The number of ways to choose 2 girls
+from 6 is  6
+2
+
+= 15.
+Therefore, the total number of
+quintets is 56 × 15 = 840 .
+The answer is: 840
+For the boys, we have 8 choices for
+the quintet.
+For the girls, we have 6 choices for
+the quintet.
+So, the total number of quintets is
+8 × 6 = 48 .
+The answer is: 48
+✓Correct
+✗Incorrect
+6.32 × 10−4
+We have 8 boys and 6 girls, so we need
+to choose 3 boys and 2 girls.
+The number of ways to choose 3 boys
+from 8 is  8
+3
+
+= 56.
+The number of ways to choose 2 girls
+from 6 is  6
+2
+
+= 15.
+Therefore, the total number of
+quintets is 56 × 15 = 840 .
+The answer is: 840
+There are 8 boys and 6 girls, so there
+are a total of 8 + 6 = 14 members in
+the trumpet section.
+We need to choose 3 boys from the 8
+boys, so there are 8 boys.
+We also need to choose 2 girls from
+the 6 girls, so there are 6 girls.
+Therefore, the total number of
+quintets is 8 + 3 + 6 = 17 .
+The answer is: 17
+✓Correct
+✗Incorrect
+42
+
+
+LR (η)
+LoRA Response
+PiSSA Response
+1.12 × 10−3
+From the members of the trumpet
+section, there are 8 boys and 6 girls.
+From the members of the quintet, we
+need to choose 3 boys from the 8 boys
+and 2 girls from the 6 girls.
+This can be done in
+ 8
+3
+
+=
+8!
+3!5! = 8·7·6
+3·2·1 = 35
+ways.
+The answer is: 35
+There are 8 boys and 6 girls in the
+band, so there are a total of
+8 + 6 = 14 members in the band.
+We want to find the number of quintets
+that are possible.
+Since the quintet must consist of
+three boys and two girls, we need to
+choose 3 boys out of the 14 members.
+This can be done in  14
+3
+
+= 46 ways.
+Therefore, there are 46 −14 = 32
+possible quintets.
+The answer is: 32
+✗Incorrect
+✗Incorrect
+2.00 × 10−3
+Since the number of boys is x, we can
+set up the equation:
+Number of boys = x
+Number of boys with the number of boys
+with the two boys with the two boys
+with the two boys with the two
+boys...(repetitive gibberish)
+There are 8 boys and 6 girls, so there
+are a total of 8 + 6 = 14 people in
+the band.
+There are 6 girls and 2 girls, so
+there are a total of 6 + 2 = 8 people
+in the band.
+There are 8 quintet members in the
+band.
+Therefore, the number of quintets
+possible is 14 - 8 = 6.
+#### 6
+The answer is: 6
+✗Incorrect
+✗Incorrect
+3.56 × 10−3
+The total number of students is 1, so
+the number of people is 1, 1, 1, 1, 1,
+1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+1...(repetitive gibberish)
+There are 8 boys and 6 girls, so there
+are a total of 8 + 6 = 14 possible
+outcomes. Out of the 14 girls, 6 are
+girls, so there are 14 −6 = 18
+possible outcomes.
+Therefore, there are 18 −14 = 4
+possible outcomes.
+The answer is: 4
+✗Incorrect
+✗Incorrect
+6.32 × 10−3
+The number of the first circle is 12,
+10 = 10.
+The total number of the number of the
+number of the number of the number of
+the number of the number of the first
+two sides of the first two sides.
+The area of the first two sides is 10 +
+1 = 120 = 100
+The total number of the first two
+sides is 1000.
+The total number of the number of the
+first two sides is 1000, so the total
+number of the first 100000.
+The answer is
+10000000000...(repetitive gibberish)
+We know that the total amount of the
+water is 1.
+We also know that the total number of
+eggs is 1.
+The total number of boys who has not
+the number of students is 1.
+We can set up the equation as follows:
+Number of students who has not the
+pool + Number of students who has not
+the number of students who in the
+pool...(repetitive gibberish)
+✗Incorrect
+✗Incorrect
+43
+
+
+H
+Practical Heuristics for LoRA Hyperparameter Tuning
+Based on the extensive hyperparameter tuning experiments, we derive five practical heuristics for tuning LoRA-
+based methods. While general strategies such as early stopping unpromising learning rate ranges and using
+sparse grid searches before zooming into promising ranges remain useful, our LoRA-specific guidelines provide
+additional heuristics on how learning rate interacts with batch size, LoRA rank, training duration, and loss
+curvature. We summarize them below.
+I. Prioritize Learning Rate Tuning. Based on the joint optimization of batch size and learning rate across diverse
+model–task combinations (Table 1, Appendix Tables 6, 8, 9–14), we suggest that, under limited computational
+resources, practitioners may prioritize learning rate tuning while fixing the batch size. Importantly, when
+the batch size is set too large, the best achievable performance under learning rate tuning may start to decay
+(Appendix Sec. A.4). We therefore suggest using a small or medium batch size as the default choice.
+II. Mind Batch Size Scaling. If additional resources are available and practitioners wish to explore different
+batch sizes, further performance gains are likely to be marginal once the learning rate has been properly tuned
+for each batch size (as shown in Table 1). In practice, however, practitioners should still account for the scaling
+relationship between batch size and learning rate (discussed in Sec. 3.3.1), as it provides a useful initial guess for
+the learning rate when changing the batch size.
+III. Select Learning Rate based on Hessian. As described in Sec. 4.2 and Appendix Sec. I.2, the maximum
+eigenvalue of the loss Hessian can serve as a useful indicator of a variant’s relative operating learning rate range
+compared with vanilla LoRA. In Appendix Sec. I.3, we further show that Hessian trends across different matrix
+types and Transformer layers are typically consistent, in the sense that they are generally either larger or smaller
+than those of vanilla LoRA. Critically, Hessian estimation for LoRA adapters of a single layer requires only
+around 10 minutes on a single RTX A6000. Hence, practitioners with sufficient resources may use Hessian
+analysis to guide initial learning rate tuning ranges before conducting a large scale search.
+We also note that, based on our broad experiments, a given variant typically exhibits a stable relationship in
+optimal learning rate relative to LoRA across different model–task combinations, in terms of being either higher
+or lower (e.g., as discussed in Sec. A.1 for Figure 1 and 6). Practitioners may therefore estimate the Hessian once
+and leverage the known learning-rate range relationships of specific variants across model–task combinations,
+without re-running the Lanczos algorithm every time they switch to a new setting.
+IV. Increase LoRA Ranks. When sufficient effort has been invested in learning rate tuning at a given rank but
+the resulting downstream performance remains unsatisfactory, increasing the LoRA rank can be a reliable way to
+further improve performance, as shown in Figures 4 and 8 for various methods. After switching to a higher rank,
+however, one should still perform learning rate tuning to elicit the best achievable performance at that rank.
+To this end, Tables 9–11 and Tables 12–14 report results for r = {8, 32, 128} on Llama-2-7B for math and
+code, respectively. These results suggest that the optimal learning rate generally decreases as the rank increases.
+With this, we also visualize vanilla LoRA’s performance trends across learning rates for varying adapter ranks in
+Figure 13a in the next page, with r = 4 requiring a 5.6× larger learning rate than r = 256. This observation
+can help practitioners conduct more efficient learning rate tuning across different ranks.
+Although recommending larger ranks for better performance may seem straightforward, we highlight that this
+trend may not be observed in practice if the learning rate is not properly configured for each rank. In fact, we
+find that many prior LoRA studies fail to demonstrate such a consistent performance improvement trend as the
+LoRA rank increases, partly because a fixed learning rate setting was applied (e.g., cf. DoRA [13, Figure 5],
+LoFT [14, Figure 3], GraLoRA [79, Table 2]).
+V. Prolong Training Duration. If practitioners have computational resources to further improve LoRA
+performance after increasing the LoRA rank with proper learning-rate tuning, we suggest prolonging the training
+duration as a final step. In particular, one can increase the training duration by using more training samples or
+training epochs. In both cases, we show in Appendix Sec. A.3 that, with proper learning rate tuning, various
+LoRA methods typically have the capacity to further improve their performance. Interestingly, we observe that
+the optimal learning-rate range shifts slightly downward as the amount of training increases, consistent with
+the tendency described in practical heuristic IV. However, the magnitude of this decay is relatively modest, as
+shown in Figure 13b: the optimal learning rates for N = 5k and N = 395k differ by only 3.1×. This suggests
+that, when extending training duration, practitioners may start from the learning rate range already identified
+under the shorter training setting, rather than restarting the search from scratch.
+44
+
+
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+3.6e-3
+Learning Rate
+12
+16
+20
+Accuracy (%)
+r=4
+r=8
+r=16
+r=32
+r=64
+r=128
+r=256
+(a) Varying LoRA Ranks
+2e-4
+3.6e-4
+6.3e-4
+1.1e-3
+2e-3
+Learning Rate
+4
+8
+12
+16
+20
+24
+28
+Accuracy (%)
+N=5K
+N=10K
+N=25K
+N=100K
+N=395K
+(b) Varying Number of Training Samples
+Figure 13: Vanilla LoRA performance across learning rates with (a) varying ranks and (b) varying
+training-set sizes on mathematical reasoning with Gemma-3-1B (B = 64). Note that panels (a) and
+(b) re-plot the data behind Figures 4a and 9, respectively, with the learning rate on the x-axis. Red
+boxes indicate the learning rate yielding the highest accuracy for each configuration.
+45
+
+
+I
+Hessian Computation Details
+We select the Lanczos algorithm over the Power Iteration method for the presented eigenvalue problem, as
+the latter converges to eigenvalues in descending order of magnitude, whereas our focus is on probing the
+algebraically largest eigenvalue of the Hessian. Sec. I.1 explains implementation details of the Lanczos
+algorithm, and Sec. I.2 and I.3 provide additional Hessian results for diverse model scales and matrix types,
+respectively.
+I.1
+Lanczos Algorithm Implementation Details
+Our implementation is built upon several Hessian-related frameworks, such as PyHessian12 [191] and LLM-
+Hessian13 [118], with several modifications to suit our custom scenario. Algorithm 1 summarizes our implemen-
+tation of the Lanczos Algorithm for estimating λmax(H). We set the Lanczos iterations m = 100 and tolerance
+ϵ = 5 × 10−3. At each Lanczos iteration step, the Hessian-Vector Product (HVP) is applied to calculate Hqk
+without explicitly forming H (Algorithm 2).
+We strictly ensure that the loss is calculated identically to that in supervised fine-tuning, rendering the resulting
+curvature information meaningful. In particular, we ensure that (1) the input prompt (i.e., instruction or question)
+tokens are masked out from the loss calculation, and (2) the loss is averaged over each token instead of each
+sentence14. To ensure computational feasibility, a fixed subset of N = 500 training samples from MetaMathQA
+is selected for loss calculation, and a batch size of B = 5 is utilized. Figure 14 validates that this sample size is
+sufficient for reliably estimating the Hessian of the downstream task. Due to the numerical instability of the
+Lanczos algorithm in finite precision arithmetic [192], we use Float32 precision for both the base model and
+adapters and incorporate re-orthogonalization steps [193, 194].
+10
+50
+100
+500
+1000
+Number of Samples (N)
+8
+10
+12
+14
+λmax
+Target λmax (N=10K)
+λmax Estimates
+Figure 14: Approximately 500 training samples are sufficient for stable Hessian estimation. The
+figure reports the estimated λmax for PiSSA on the first Query projection matrix of Qwen3-0.6B
+(r = 128). We track these estimates across varying sample sizes (N) from the MetaMathQA dataset,
+using N = 10k as the reference baseline. Results represent the mean and standard deviation over 5
+randomly selected subsets for each N.
+12https://github.com/amirgholami/PyHessian
+13https://github.com/vectozavr/llm-hessian
+14This is the default way of calculating loss during LLM supervised fine-tuning; see https://github.com/huggingface/
+transformers/issues/34510
+46
+
+
+Algorithm 1 Estimating Maximum Eigenvalues of Hessian by Lanczos Iterations
+Input: LoRA parameters θ = {B0, A0}, downstream dataset D, sample size N, iterations m, initial vector
+b, tolerance ϵ.
+Output: Approximation of the maximum eigenvalue λmax(H).
+Sampling: Sample a subset S of size N from D.
+Initialization:
+Set β0 = 0, q0 = 0, λprev = −∞.
+Normalize initial vector: q1 = b/∥b∥2.
+Lanczos Iteration:
+for k = 1 to m do
+Compute Hessian-Vector Product:
+v = HVP(θ, S, qk)
+// See Algorithm 2
+Compute diagonal element of T:
+αk = q⊤
+k v
+Orthogonalize (Gram-Schmidt):
+v = v −βk−1qk−1 −αkqk
+Compute off-diagonal element of T:
+βk = ∥v∥2
+Convergence Check:
+Construct symmetric tridiagonal matrix Tk ∈Rk×k using α1:k, β1:k−1.
+eig_vals ←torch.linalg.eigvalsh(Tk)
+λcurr = max(eig_vals)
+if |λcurr −λprev| < ϵ then
+Return λcurr
+end if
+λprev ←λcurr
+if βk ≈0 then
+Return λcurr
+// The Krylov subspace is invariant
+end if
+Normalize: qk+1 = v/βk
+end for
+Return λcurr
+Algorithm 2 Hessian-Vector Product (HVP) Calculation
+Input: LoRA parameters θ = {B0, A0}, vector qk, sample subset S, batch size B.
+Output: The Hessian-Vector product Hqk.
+Initialization:
+Set accumulator u = 0.
+Set total token counter Ctotal = 0.
+Batch Processing:
+for each mini-batch B of size B from S do
+Count supervised tokens in batch: cB = CountTokens(B).
+Ctotal ←Ctotal + cB.
+Forward Pass for Loss Calculation:
+Compute sum of Cross-Entropy losses over all supervised tokens in B:
+Lbatch(θ) = P
+(x,y)∈B ℓ(f(x; θ), y)
+// torch.nn.CrossEntropyLoss(sum)
+Double Backward for HVP:
+g = ∇θLbatch
+s = g⊤qk
+hB = ∇θs
+// Implemented via torch.autograd.functional.vhp
+Accumulate:
+u ←u + hB
+// Summing up batch-wise contributions
+end for
+Normalize:
+u ←u/Ctotal
+// Average over total supervised tokens
+Return u
+47
+
+
+I.2
+Hessian Results on Gemma and Llama
+As discussed earlier in Sec. 4.2, Figure 5 presents the distributions of the top loss Hessian eigenvalues of LoRA
+variants relative to vanilla LoRA on Qwen3-0.6B, providing a theoretical explanation for the optimal learning
+rate trends observed in Figure 1. Analogously, Figure 15 below shows the corresponding distributions on
+Gemma-3-1B and Llama-2-7B. The associated learning rate tuning results for these two models on mathematical
+reasoning tasks under rank r = 128 are reported earlier in Table 1 and Figure 3a, respectively.
+100
+101
+Density
+Gemma-3-1B
+100
+101
+102
+Llama-2-7B
+0.98
+1.00
+1.02
+max (Normalized by LoRA)
+LoRA
+PiSSA
+Init[AB]
+MiLoRA
+Figure 15: Distributions of the ratios of the top loss Hessian eigenvalues relative to LoRA for Query
+projection matrices across Transformer layers (r = 128). Dashed lines indicate the medians.
+It is evident that the Hessian relationship presented here is, again, generally negatively correlated with the
+optimal learning rate of each method. Specifically, PiSSA exhibits substantially larger λmax on both models,
+aligning with its requirement for 1.8–2× smaller learning rates in Table 1 and Figure 3a. MiLoRA and Init[AB],
+on the other hand, have λmax values that largely overlap with those of vanilla LoRA (especially on Llama-2-7B),
+which explains their similar optimal learning rate ranges to vanilla LoRA. These findings further support the use
+of relative Hessian magnitude as a useful indicator for explaining the observed performance differences and
+optimal learning rate ranges across different model scales.
+I.3
+Detailed λmax Values
+Figure 16 presents the detailed λmax values of the Query projection matrix for Qwen across Transformer
+layers, providing a layer-wise breakdown of the results shown in Figure 5. We observe intriguing patterns
+in which all methods tend to exhibit high or low values at similar layer locations. For example, at layer 20,
+λmax = {4.7, 8.5, 8.3, 53.8, 297.3, 264.7} for LoRA, Init[AB], MiLoRA, PiSSA, OLoRA, and LoRA-GA,
+respectively, whereas at layer 26, these values drop to {0.2, 0.7, 0.7, 2.3, 12.3, 17.9}. However, at any given
+layer, OLoRA and LoRA-GA consistently exhibit substantially larger λmax than LoRA, by around two orders of
+magnitude. PiSSA, in contrast, is larger than LoRA by roughly one order of magnitude. Similar trends for the
+Key projection matrix are presented in Figure 17.
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+22
+24
+26
+Layer Index
+LoRA
+Init[AB]
+MiLoRA
+PiSSA
+OLoRA
+LoRA-GA
+0.4
+0.2
+0.4
+0.8
+0.9
+0.9
+1.9
+1.1
+1.0
+2.0
+0.8
+1.7
+0.6
+2.1
+1.3
+0.6
+1.1
+0.8
+0.8
+1.1
+4.7
+0.5
+0.5
+0.4
+0.3
+0.2
+0.2
+1.2
+0.8
+0.4
+0.6
+1.4
+1.3
+2.1
+4.1
+2.0
+2.1
+3.5
+1.6
+3.3
+1.6
+3.7
+1.9
+1.2
+1.9
+1.6
+1.3
+1.5
+8.5
+0.8
+0.8
+0.8
+0.4
+0.3
+0.7
+2.1
+1.1
+0.4
+0.7
+2.1
+2.3
+3.4
+4.6
+2.6
+2.6
+4.7
+2.1
+3.7
+1.8
+3.6
+2.1
+1.2
+1.7
+1.4
+1.2
+1.5
+8.3
+0.6
+0.8
+1.1
+0.5
+0.3
+0.7
+3.1
+8.2
+2.9
+4.5
+13.7
+10.5
+14.8
+32.5
+11.5
+11.7
+26.0
+9.6
+22.5
+11.7
+24.8
+10.0
+7.9
+9.4
+9.5
+13.2
+12.5
+53.8
+5.3
+4.5
+4.5
+3.4
+2.8
+2.3
+10.3
+49.9
+10.2
+16.0
+65.3
+36.5
+56.9
+178.0
+38.6
+50.8
+109.3
+37.1
+119.9
+54.9
+126.1
+44.3
+36.2
+53.0
+47.9
+65.7
+66.1
+297.3
+26.1
+23.3
+22.0
+18.8
+14.7
+12.3
+32.9
+25.7
+12.4
+20.8
+49.3
+52.1
+69.5
+132.6
+66.7
+67.2
+118.5
+51.7
+107.4
+50.2
+119.2
+61.8
+35.6
+67.7
+54.3
+44.6
+55.1
+264.7
+22.5
+25.3
+25.8
+15.4
+8.8
+17.9
+71.5
+100
+101
+102
+max
+Figure 16: Heatmap of the top eigenvalues of the Query projection matrix across Transformer
+layers, i.e., λQ,i
+max for i = 1, . . . , L, for Qwen3-0.6B on MetaMathQA (r = 128). All methods
+exhibit similar distributional patterns across layers, with PiSSA, OLoRA and LoRA-GA consistently
+exhibiting significantly larger values compared to vanilla LoRA.
+48
+
+
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+22
+24
+26
+Layer Index
+LoRA
+Init[AB]
+MiLoRA
+PiSSA
+OLoRA
+LoRA-GA
+0.4
+0.2
+0.2
+0.3
+0.6
+0.8
+0.9
+0.8
+0.8
+1.4
+0.6
+0.8
+0.5
+1.0
+1.1
+0.5
+1.1
+0.5
+0.8
+0.4
+1.3
+0.4
+0.3
+0.3
+0.1
+0.1
+0.4
+0.5
+1.0
+0.3
+0.3
+0.9
+1.3
+1.3
+1.9
+1.4
+1.5
+2.6
+1.1
+1.6
+1.3
+1.7
+1.5
+1.1
+2.1
+1.2
+1.3
+0.9
+2.5
+0.6
+0.8
+0.5
+0.2
+0.2
+0.5
+1.0
+0.4
+0.2
+0.2
+0.4
+0.5
+0.5
+0.5
+0.5
+0.6
+1.1
+0.4
+0.6
+0.5
+0.7
+0.7
+0.5
+0.5
+0.6
+0.5
+0.3
+0.8
+0.4
+0.3
+0.1
+0.1
+0.1
+0.3
+0.4
+5.9
+2.0
+2.6
+5.6
+7.9
+9.5
+9.9
+8.9
+5.0
+12.2
+5.0
+5.8
+4.1
+5.9
+5.2
+3.2
+12.9
+3.7
+4.6
+2.8
+6.6
+1.7
+3.8
+1.7
+1.2
+1.1
+2.1
+5.5
+17.7
+3.9
+6.9
+13.2
+18.0
+21.9
+20.8
+16.1
+15.2
+25.7
+10.9
+12.9
+9.2
+11.6
+10.8
+6.8
+12.7
+7.2
+6.9
+6.2
+14.4
+3.5
+5.2
+3.7
+2.2
+1.7
+3.4
+11.3
+24.3
+8.1
+8.3
+24.4
+29.1
+33.7
+48.7
+33.2
+35.4
+65.6
+26.5
+38.2
+27.0
+41.1
+35.8
+23.4
+52.1
+25.6
+28.6
+20.6
+61.8
+11.8
+22.3
+11.8
+5.6
+4.8
+11.9
+26.8
+100
+101
+max
+Figure 17: Heatmap of the top eigenvalues of the Key projection matrix across Transformer layers,
+i.e., λK,i
+max for i = 1, . . . , L, for Qwen3-0.6B on MetaMathQA (r = 128). All methods exhibit similar
+distributional patterns across layers, with PiSSA, OLoRA and LoRA-GA consistently exhibiting
+significantly larger values compared to vanilla LoRA.
+49

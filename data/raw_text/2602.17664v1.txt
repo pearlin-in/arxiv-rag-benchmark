@@ -1,0 +1,2024 @@
+Sink-Aware Pruning for Diffusion Language Models
+Aidar Myrzakhan, Tianyi Li, Bowei Guo, Shengkun Tang, Zhiqiang Shen
+VILA Lab, MBZUAI
+Abstract
+Diffusion Language Models (DLMs) incur high
+inference cost due to iterative denoising, mo-
+tivating efficient pruning.
+Existing pruning
+heuristics largely inherited from autoregres-
+sive (AR) LLMs, typically preserve attention
+sink tokens because AR sinks serve as stable
+global anchors. We show that this assump-
+tion does not hold for DLMs: the attention-
+sink position exhibits substantially higher vari-
+ance over the full generation trajectory (mea-
+sured by how the dominant sink locations
+shift across timesteps), indicating that sinks
+are often transient and less structurally essen-
+tial than in AR models.
+Based on this ob-
+servation, we propose Sink-Aware Pruning,
+which automatically identifies and prunes un-
+stable sinks in DLMs (prior studies usually
+keep sinks for AR LLMs). Without retraining,
+our method achieves a better quality-efficiency
+trade-off and outperforms strong prior prun-
+ing baselines under matched compute. Our
+code is available at https://github.com/
+VILA-Lab/Sink-Aware-Pruning.
+1
+Introduction
+Diffusion Language Models (DLMs) (Li et al.,
+2025; Nie et al., 2025; Ye et al., 2025; Zhu et al.,
+2025) generate text via iterative denoising over
+multiple timesteps, repeatedly updating the full to-
+ken sequence (or a latent representation) until it
+converges. This contrasts with autoregressive (AR)
+LLMs (Radford et al., 2018, 2019), which gener-
+ate tokens one-by-one with a single forward pass
+per new token. While DLMs recently can achieve
+attractive generation properties, their iterative infer-
+ence substantially increases compute and memory
+cost, making many acceleration, especially prun-
+ing, critical for practical deployment. Most exist-
+ing pruning recipes, however, are adapted from
+AR Transformers and implicitly assume that atten-
+tion behaviors (and their important tokens) transfer
+unchanged to diffusion-style generation.
+Attention Sinks
+Attention Sinks
+Attention Sinks
+Attention Sinks
+Figure 1: Illustration of attention sink behaviors in Dif-
+fusion Language Models. Ours Sink-Aware Pruning
+reduces sink variance by downscaling unstable sinks.
+A key AR-specific phenomenon is the existence
+of attention sink tokens: a small set of positions
+(often early tokens such as BOS, system prompts,
+or a few prefix tokens) that consistently attract dis-
+proportionately large attention mass across layers
+and heads. In AR models, these sinks behave as
+stable global anchors that help propagate condition-
+ing information and stabilize residual-stream dy-
+namics across the long, causal computation graph
+in autoregressive-based attention. Consequently,
+many AR pruning and token-dropping methods
+explicitly preserve sinks (or protect early/prefix
+tokens) to avoid catastrophic quality degradation.
+This practice has become a de facto heuristic: when
+pruning attention structure, do not remove sink po-
+sitions because they are assumed to be universally
+important in AR models.
+We revisit this assumption for DLMs and find
+it does not hold. Because DLMs update all tokens
+at each diffusion timestep, the model’s attention
+organization evolves throughout the denoising tra-
+jectory: early steps must resolve global structure
+under high noise, while later steps refine local syn-
+1
+arXiv:2602.17664v1  [cs.CL]  19 Feb 2026
+
+
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+Llama-3 (step=25%)
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+Llama-3 (step=50%)
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+Llama-3 (step=75%)
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+LLaDA (step=25%)
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+LLaDA (step=50%)
+0
+25
+50
+75
+100
+125
+Key token index
+0
+20
+40
+60
+80
+100
+120
+140
+Query token index
+LLaDA (step=75%)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+Figure 2: Attention sink heatmap dynamics across generation steps for AR LLM (LLaMA-3-8B) and DLM (LLaDA).
+For each model, we show 3 different generation stages (25, 50, and 75% of the total generation steps) and plot
+the attention mass received by each token position (y-axis) across all heads/layers (x-axis). In LLaMA, the sink
+position (deep-blue vertical band) is stable across steps, while in LLaDA, the sink position shifts significantly across
+diffusion steps, indicating higher sink variance. The step in AR model refers to the generation process.
+tax and semantics under lower noise. To quantify
+sink stability, we compute attention statistics at ev-
+ery generation step for every token: for AR models,
+“step” corresponds to each newly generated token;
+for DLMs, “step” corresponds to each diffusion
+timestep (with attention computed over the whole
+sequence each time). We then track the sink posi-
+tion (e.g., the token index receiving maximal aggre-
+gated attention, or the top-k sink indices) across the
+entire generation process and define sink variance
+as the degree to which these sink positions shift
+over steps, as shown in Fig. 2.
+This analysis (as shown in Fig. 1 and Fig. 4a)
+reveals a clear divergence: sink-token variance in
+DLMs is substantially larger than in AR LLMs. In
+AR generation, sink positions tend to be highly per-
+sistent: once a sink emerges (typically near the pre-
+fix), it remains a sink across subsequent token emis-
+sions and across many heads / layers. In DLMs, by
+contrast, the identity and location of the dominant
+sink frequently changes across diffusion timesteps,
+reflecting the model’s shifting needs as denoising
+progresses. Many sinks in DLMs are therefore tran-
+sient: they may attract attention at some timesteps
+(often under high noise or during global structure
+formation) but lose prominence later, and different
+sinks may take over as the sequence becomes more
+refined. This implies that always keep sinks is not a
+diffusion-invariant principle, rather, it is a property
+of causal, prefix-conditioned AR computation.
+Motivated by this, we propose Sink-Aware
+Pruning: a diffusion-specific pruning strategy that
+distinguishes stable anchors from ephemeral sinks,
+and prunes accordingly. Instead of hard-coding
+sink preservation, we (i) estimate sink variance
+over the denoising trajectory, (ii) identify unstable
+sink candidates whose sink positions fluctuate sig-
+nificantly across diffusion timesteps, and (iii) prune
+these unstable sinks to reduce attention / weight
+cost while preserving informative pathways. Cru-
+cially, the method is generation-paradigm aware:
+for AR LLMs, where sink variance is low and sinks
+are structurally important, thus prior work keeps
+sinks, for DLMs in this work, where sink variance
+is high, we allow and encourage sink pruning.
+Empirically, Sink-Aware
+Pruning improves
+the quality-efficiency trade-off over strong prior
+pruning baselines under matched compute. Across
+2
+
+
+multiple DLM settings, pruning transient sinks re-
+duces redundant or global attention that does not
+persist across timesteps, enabling more aggressive
+pruning without the failure modes observed when
+AR-centric sink-preservation heuristics are naively
+applied to DLMs. The results support our central
+claim: attention sinks are not universally must-keep
+tokens, their utility depends on the generation dy-
+namics. By explicitly measuring sink-position vari-
+ance and tailoring pruning decisions to diffusion
+timesteps, Sink-Aware Pruning provides a princi-
+pled and effective route to accelerating DLM infer-
+ence without retraining.
+In summary, our contributions are threefold:
+• We introduce sink-position variance to track
+how attention-sink indices shift over the full
+generation trajectory, and show it is much
+higher in diffusion LLMs than in autoregres-
+sive LLMs when computing attention at every
+AR step / diffusion timestep for each token.
+• We demonstrate that the AR heuristic always
+keep attention sinks does not transfer to dif-
+fusion generation: sinks are stable anchors in
+AR models but are often transient in DLMs,
+so they can be pruned.
+• We propose Sink-Aware
+Pruning, which
+prunes unstable sinks in DLMs (while con-
+ventional AR LLMs preserve sinks) with
+timestep-aware retention of salient attentions,
+and outperforms strong prior pruning base-
+lines under the same compute.
+2
+Related Work
+2.1
+Diffusion Language Models
+Diffusion Language Models (DLMs) (Li et al.,
+2025; Nie et al., 2025; Ye et al., 2025) have re-
+cently emerged as a promising non-autoregressive
+alternative to conventional autoregressive language
+models. Inspired by diffusion models in contin-
+uous domains (Ho et al., 2020; Rombach et al.,
+2022), DLMs formulate text generation as an it-
+erative denoising process, enabling parallel gen-
+eration and naturally incorporating bidirectional
+context. Existing work broadly categorizes DLMs
+into continuous-space and discrete-space formula-
+tions. Continuous DLMs operate on token em-
+beddings or logits and apply Gaussian or flow-
+based diffusion processes (Gong et al., 2022; Li
+et al., 2022), while discrete DLMs define diffu-
+sion directly over categorical token spaces using
+masking or structured transition operators (Austin
+et al., 2021; He et al., 2023; Sahoo et al., 2024).
+Recent advances demonstrate that large-scale dis-
+crete DLMs can achieve performance comparable
+to strong autoregressive baselines while offering
+substantial inference speedups through parallel de-
+coding (Wu et al., 2025; Ni et al., 2025). Moreover,
+hybrid autoregressive-diffusion approaches further
+balance generation quality and efficiency by com-
+bining block-wise autoregression with intra-block
+diffusion refinement (Arriola et al., 2025; Cheng
+et al., 2025).
+2.2
+Attention Sink in LLMs
+Initially identified in LLMs by Xiao et al. (2023),
+attention sinks are a small set of tokens (often early
+in the context) that absorb disproportionate atten-
+tion across many layers / heads despite limited se-
+mantic value (Gu et al., 2024; Barbero et al., 2025).
+Xiao et al. (2023) attribute sinks to Softmax nor-
+malization: when a query has no strong match,
+attention mass must still be assigned somewhere,
+and globally visible early tokens become a natural
+dumping ground for redundant attention.
+Recent work shows sinks also appear in masked
+DLMs but with different behavior (Rulli et al.,
+2025).
+Studying large masked DLMs (e.g.,
+LLaDA (Nie et al., 2025), Dream (Ye et al., 2025),
+MMaDA (Yang et al., 2025a)), they find sink lo-
+cations are step-dependent, emerging, shifting, or
+vanishing as denoising progresses. Moreover, un-
+like autoregressive models where removing sinks
+can severely hurt performance, masked DLMs are
+relatively robust: masking top sinks during genera-
+tion causes only minor drops. This suggests bidi-
+rectional iterative denoising provides alternative
+aggregation pathways, making sink dynamics cen-
+tral to long-context efficiency and stability across
+decoding paradigms.
+2.3
+LLM Pruning
+Network pruning has long been studied as a model
+compression technique that reduces inference cost
+by removing redundant parameters based on im-
+portance criteria (LeCun et al., 1989; Hassibi et al.,
+1993; Han et al., 2015a; Cheng et al., 2024). Exist-
+ing approaches are commonly categorized into un-
+structured and structured pruning. While unstruc-
+tured pruning offers fine-grained flexibility, struc-
+tured pruning removes entire neurons, channels, or
+matrix rows/columns, making it more amenable to
+hardware acceleration but often at the cost of higher
+3
+
+
+5
+18
+9
+22
+7
+1. Find sink score from 
+!! attention mass
+Attention mass "
+Identify sink tokens
+!! >
+1
+$ −1 &
+"#!
+'" + )
+0
+1
+0
+1
+0
+Sink score #
+Sink
+Sink
+$ = 1 −#
+1
+0
+1
+0
+1
+Down-weighting factor
+" = (
+ℓ#$
+%
+(
+&#$
+'
+) ℓ,&
+Attention mass aggregation
+2
+3
+1
+4
+10
+9
+6
+7
+3
+4
+2
+4
+9
+11
+10
+9
+1
+3
+2
+1
+2
+3
+1
+4
+0
+0
+0
+0
+3
+4
+2
+4
+0
+0
+0
+0
+1
+3
+2
+1
+2. Update activation based 
+on sinks
+3. Use pruning metrics with 
+new activation *+
+Activation +
+*+
+|"| ⋅|| $%||!
+14
+21
+10
+21
+21
+34
+17
+31
+10
+17
+9
+14
+21
+31
+14
+33
+Sink-Aware (Wanda)
+Sink-Aware (SparseGPT)
+* ≈,-$ ,-
+|| *+||)
+3.74
+5.83
+3.00
+5.74
+Pruning 
+decision
+(e.g., smallest 
+values
+4. Prune weights based on new 
+Activation *+
+Figure 3: Overview of Sink-Aware Pruning. Given input activations, we compute per-token attention mass
+aggregated across all layers and heads (Step 1), identify sink tokens via a threshold-based criterion, and derive a
+soft down-weighting factor ω = 1 −s. The original activation X is then suppressed at sink positions to produce a
+new activation ˜X (Step 2), which is substituted into existing pruning criteria, Wanda or SparseGPT, to compute
+sink-aware importance scores (Step 3). Final pruning decisions are made based on the updated scores (Step 4).
+accuracy degradation (Han et al., 2015b; Liu et al.,
+2017; Molchanov et al., 2019).
+As large language models continue to scale, ap-
+plying traditional pruning pipelines becomes in-
+creasingly challenging due to the prohibitive cost
+of retraining. This has motivated a shift toward
+post-training pruning methods, which aim to iden-
+tify and remove unimportant weights directly from
+pretrained models using lightweight importance
+metrics, without full retraining (Sun et al., 2023;
+Frantar and Alistarh, 2023; Das et al., 2023; Yang
+et al., 2025b).
+These approaches have demon-
+strated promising results for compressing LLMs
+with minimal performance loss, and highlight prun-
+ing as a practical tool for improving inference effi-
+ciency in large-scale models (Ma et al., 2023).
+3
+Sink-Aware Pruning for DLMs
+3.1
+Preliminaries
+Wanda.
+Wanda (Sun et al., 2023) assigns each
+weight an output-wise importance score that com-
+bines its magnitude with the norm of the cor-
+responding input activation.
+For a linear layer
+with weights W ∈RCout×Cin and input activations
+X ∈RN×Cin collected from a calibration set, the
+importance score of weight Wij is defined as:
+Sij = |Wij| · ∥X·j∥2.
+(1)
+where X·j ∈RN denotes the j-th input feature
+across samples. Pruning is performed indepen-
+dently for each output neuron by comparing scores
+within each row group Gi = {Wi,1, . . . , Wi,Cin}
+and removing the lowest s% weights per output.
+The activation norms ∥X·j∥2 are estimated without
+gradient or Hessian computation, making Wanda
+computationally efficient for large models.
+SparseGPT.
+SparseGPT (Frantar and Alistarh,
+2023) formulates the post-training pruning pro-
+cess as a layer-wise reconstruction problem using
+second-order information. For a layer with orig-
+inal weights W and layer inputs X, the pruning
+objective is defined as:
+min
+M,f
+W
+∥WX −(M ⊙f
+W)X∥2
+F ,
+(2)
+where M is a binary pruning mask and f
+W denotes
+the reconstructed weights. Given a fixed mask
+Mi for the i-th output row, the optimal remain-
+ing weights admit a closed-form linear regression
+solution:
+wi
+Mi =
+
+XMiX⊤
+Mi
+−1
+XMi (wMiXMi)⊤, (3)
+Based on a second-order approximation, the loss
+increase induced by removing a scalar weight wm
+is estimated as:
+εm =
+w2
+m
+[H−1]mm
+.
+(4)
+4
+
+
+where H = XX⊤+λI is the empirical Hessian ap-
+proximation. SparseGPT iteratively prunes weights
+with small εm and updates the remaining weights to
+reduce reconstruction error, enabling high sparsity
+without retraining.
+3.2
+Sink-Aware Pruning
+Variance Statistics in DLMs and AR models.
+To characterize how attention sinks differ between
+diffusion and autoregressive language models, we
+introduce two complementary variance statistics.
+Let A(t) ∈RN×N denote the attention matrix at
+generation step t (a diffusion timestep for DLMs;
+a token emission for AR models), where N is the
+sequence length. We define the incoming attention
+mass at position i and step t as:
+mt(i) =
+N
+X
+j=1
+A(t)
+j,i,
+(5)
+which measures how much total attention all other
+tokens direct toward position i. Positions receiv-
+ing substantially more incoming attention than the
+average act as attention sinks at that step.
+We capture two dimensions of sink behavior.
+Spatial variance measures how unevenly atten-
+tion concentrates across positions when averaged
+over the full trajectory.
+We compute ¯m(i) =
+1
+T
+PT
+t=1 mt(i) and take
+σ2
+spatial = Vari( ¯m(i)) .
+(6)
+A large value indicates that a few positions domi-
+nate the attention landscape on average, but does
+not reveal whether those positions stay fixed over
+time. Temporal variance captures how much the
+sink location shifts across steps. At each step t, we
+compute the attention-weighted centroid over the
+current sink set St (defined below):
+ct =
+P
+i∈St mt(i) · i
+P
+i∈St mt(i) ,
+σ2
+temporal = Vart(ct).
+(7)
+A near-zero temporal variance means the sink re-
+mains locked to the same region throughout gen-
+eration, while a large value indicates substantial
+migration.
+As shown in Fig. 4, these two statistics reveal a
+clear contrast. AR models exhibit high spatial vari-
+ance but near-zero temporal variance: their sinks
+are concentrated on a small, fixed set of early po-
+sitions and remain stationary across all generation
+steps. DLMs show the opposite pattern: lower
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+Variance
+×10−2
+0.0149
+0.0173
+3.4e-06
+1.2e-05
+LLaDA 8B
+Dream 7B
+Llama3.1 8B
+Qwen2.5 7B
+(a) Variance of the sink across generation/denoising steps.
+0
+20
+40
+60
+80
+100
+Variance
+3.6359
+11.2535
+112.4958
+53.1435
+LLaDA 8B
+Dream 7B
+Llama3.1 8B
+Qwen2.5 7B
+(b) Variance of total attention received by each token
+across all the generation/denoising steps.
+Figure 4: Attention sink variance for diffusion LMs
+(LLaDA, Dream) and autoregressive LMs (Llama 3.1,
+Qwen 2.5).
+spatial variance (attention is more distributed) but
+temporal variance that is orders of magnitude larger.
+The sink trajectory (Fig. 5) provides further intu-
+ition: for AR models, the sink stays flat, while
+for DLMs it drifts progressively from earlier to
+later positions as denoising advances, with wide
+step-to-step variability. This drift reflects how early
+diffusion steps focus on global structure under high
+noise, while later steps shift attention toward lo-
+cal, token-level refinement. In short, AR sinks are
+spatially concentrated and temporally stable, while
+DLM sinks are spatially diffuse and temporally
+transient.
+Pruning Metric.
+We now formalize the notion
+of attention sinks used in our pruning criterion. We
+begin by computing the attention mass received
+by each token position. At denoising step t, the
+cumulative attention score of token j in head h of
+layer ℓis:
+¯A(t,ℓ,h)
+j
+= 1
+S
+S
+X
+i=1
+A(t,ℓ,h)
+i,j
+,
+(8)
+5
+
+
+0
+20
+40
+60
+80
+100
+120
+Generation / denoising step
+0.0
+0.2
+0.4
+0.6
+0.8
+Sink position (norm.)
+LLaDA 8B
+Dream 7B
+Llama3.1 8B
+Qwen2.5 7B
+Figure 5: Sink position across generation/denoising
+steps for diffusion and AR LMs. Shaded regions denote
+± std across runs.
+where A(t,ℓ,h)
+i,j
+is the attention weight from query
+position i to key position j and S is the sequence
+length. We aggregate across all layers and heads to
+obtain a position-level attention mass:
+mt(j) =
+L
+X
+ℓ=1
+H
+X
+h=1
+¯A(t,ℓ,h)
+j
+,
+(9)
+A token j is considered a sink token at step t if its
+attention mass significantly exceeds that of other
+positions, i.e.,
+mt(j) >
+1
+S −1
+X
+k̸=j
+mt(k) + ϵ,
+(10)
+where ϵ > 0 controls the detection sensitivity. To
+obtain a differentiable relaxation, we convert this
+criterion into a soft sink score via a sigmoid:
+ϕt(j) = σ
+
+(mt(j) −
+1
+S −1
+X
+k̸=j
+mt(k) −ϵ
+
+,
+(11)
+We evaluate (11) on noised calibration inputs at a
+uniformly spaced set of timesteps T ⊂{1, . . . , T}
+and average to obtain a step-invariant sink estimate:
+¯ϕ(k) =
+1
+|T |
+X
+t∈T
+ϕt(k).
+(12)
+Sink-Aware Importance Reweighting.
+Given
+the soft sink score ¯ϕ(j), we define a per-position
+weight
+ωj = 1 −¯ϕ(j),
+(13)
+which is near zero for sink tokens and near one
+elsewhere. We construct a sink-masked activation
+eX by scaling each row of the original activation
+X ∈RS×Cin by ωj, effectively suppressing the
+contribution of sink positions:
+eXj,: = ωj · Xj,:,
+j = 1, . . . , S.
+(14)
+This masked activation replaces X in existing prun-
+ing criteria. For Wanda base method, we substi-
+tute eX into Eq. (1) yields the sink-aware score
+eSij = |Wij| · ∥e
+X· j∥2, and pruning proceeds as
+before. For SparseGPT as the base approach, the
+empirical Hessian is computed from sink-masked
+inputs, eH =
+1
+|D|
+P
+n eX⊤
+n eXn + λI, where D is the
+calibration dataset, with the pruning and reconstruc-
+tion procedure following Eqs. (2)–(4) identically.
+By suppressing sink tokens in the Hessian, the re-
+construction allocates capacity toward faithfully re-
+producing the layer’s output on semantically mean-
+ingful positions, rather than preserving behavior on
+tokens whose outsized activations would otherwise
+dominate the second-order statistics.
+4
+Experiments
+4.1
+Experimental Setup
+Models and Benchmarks.
+We evaluate our sink-
+aware pruning method on multiple widely adopted
+pretrained diffusion language models (DLMs), in-
+cluding LLaDA (Nie et al., 2025), Dream (Ye et al.,
+2025), and LLaDA-1.5 (Zhu et al., 2025), as well
+as the multimodal unified DLM MMaDA (Yang
+et al., 2025a).
+For text generation and reason-
+ing tasks, we assess the pruned models on a
+diverse set of standard language model bench-
+marks: MMLU (Hendrycks et al., 2020) (5-shot),
+ARC-C (Clark et al., 2018) (0-shot), PIQA (Bisk
+et al., 2020) (0-shot), WinoGrande (Sakaguchi
+et al., 2021) (0-shot), HellaSwag (Zellers et al.,
+2019) (0-shot), RACE (Lai et al., 2017) (0-
+shot), GSM8K (Cobbe et al., 2021) (5-shot), and
+GPQA (Rein et al., 2024) (5-shot).
+Baselines and Implementation Details.
+We
+compare our method against several widely used
+pruning baselines, including Wanda (Sun et al.,
+2023), SparseGPT (Frantar and Alistarh, 2023),
+and magnitude-based pruning. All baselines are
+implemented based on the open-source codebases
+of Wanda and SparseGPT for fair comparison.
+For sink-aware pruning, we derive importance
+scores from attention maps aggregated across all
+layers and heads, and apply the resulting pruning
+masks uniformly to all pruned layers, including
+both feed-forward and attention layers. Importance
+scores are computed using a calibration set drawn
+from WikiText-2 (Merity et al., 2016), consisting
+of 128 randomly sampled sequences each truncated
+to a length of 2048 tokens. The same calibration
+6
+
+
+Sparsity Method
+Avg.
+MMLU ARC-C PIQA WinoG GSM8K HellaSwag GPQA RACE
+Dense
+Base
+57.93
+65.97
+43.00
+74.10
+69.30
+69.29
+72.70
+30.40
+38.70
+0.25
+Wanda
+57.43
+65.20
+43.94
+75.30
+68.59
+66.03
+71.95
+29.85
+38.55
+Sink-Aware 57.62
+65.41
+43.52
+74.97
+68.59
+68.16
+72.30
+29.70
+38.32
+SparseGPT
+57.23
+65.16
+43.09
+74.43
+67.56
+67.17
+72.10
+30.25
+38.10
+Sink-Aware 57.68
+65.33
+43.09
+74.37
+69.53
+68.58
+71.98
+30.12
+38.40
+0.50
+Wanda
+52.70
+61.43
+39.08
+72.63
+64.56
+57.01
+67.52
+27.15
+32.20
+Sink-Aware 53.18
+62.16
+41.38
+73.18
+65.27
+55.88
+67.18
+27.95
+32.45
+SparseGPT
+52.34
+60.97
+39.68
+72.20
+64.64
+53.53
+66.90
+27.70
+33.10
+Sink-Aware 52.36
+60.79
+39.59
+72.95
+65.82
+52.11
+67.35
+27.48
+32.82
+0.75
+Wanda
+29.99
+24.76
+18.52
+56.69
+47.43
+0.99
+45.25
+22.85
+23.45
+Sink-Aware 30.94
+24.01
+18.77
+59.96
+49.17
+1.52
+46.85
+23.10
+24.10
+SparseGPT
+32.57
+28.60
+20.99
+61.75
+50.04
+1.52
+48.20
+23.90
+25.55
+Sink-Aware 32.57
+28.93
+21.08
+60.12
+51.07
+1.90
+48.70
+23.55
+25.20
+Table 1: Pruning results on LLaDA across 8 benchmarks.
+Sparsity Method
+Avg.
+MMLU ARC-C PIQA WinoG GSM8K HellaSwag GPQA RACE
+Dense
+Base
+60.94
+68.25
+55.20
+74.27
+67.72
+67.50
+73.30
+36.60
+44.70
+0.50
+Wanda
+51.58
+60.90
+41.64
+68.12
+60.38
+49.13
+65.40
+30.85
+36.20
+Sink-Aware 51.68
+60.84
+42.83
+68.82
+59.75
+49.66
+65.15
+30.52
+35.85
+SparseGPT
+54.40
+64.13
+44.88
+70.18
+63.54
+52.84
+68.72
+32.48
+38.42
+Sink-Aware 54.58
+64.46
+44.97
+70.18
+64.09
+53.15
+68.35
+32.90
+38.58
+0.75
+Wanda
+30.38
+23.96
+20.65
+53.43
+52.17
+1.06
+45.12
+23.50
+23.15
+Sink-Aware 30.52
+24.10
+21.08
+52.99
+52.25
+1.14
+46.05
+23.72
+22.80
+SparseGPT
+31.72
+26.92
+22.18
+54.52
+51.30
+1.44
+48.20
+24.30
+24.90
+Sink-Aware 31.83
+28.02
+21.25
+54.73
+51.93
+1.59
+47.90
+24.65
+24.55
+Table 2: Pruning results on Dream across 8 benchmarks.
+data is used for all baselines to ensure a controlled
+and fair comparison.
+We evaluate both unstructured and structured
+pruning settings. For unstructured pruning, we
+consider sparsity ratios of 25%, 50%, and 75%.
+For structured pruning, following prior work, we
+evaluate multiple pruning levels corresponding to
+progressively removing structured components of
+the model. All experiments are conducted under
+identical configurations across models and bench-
+marks, and all results are reported using the same
+evaluation protocols.
+4.2
+Pruning Results
+Unstructured Pruning.
+Tables 1–5 report un-
+structured pruning results across all models and
+benchmarks.
+Sink-aware pruning consistently
+matches or surpasses the corresponding baselines at
+every sparsity level, demonstrating that accounting
+for the transient, denoising-step-dependent nature
+of attention sinks in DLMs yields more faithful
+compressed models than criteria designed for static
+AR-style sinks. The gains are most pronounced at
+moderate-to-high sparsity (50%–75%), where ag-
+gressive compression amplifies the cost of naively
+removing weights that serve unstable but function-
+ally critical sink positions. At lower sparsity (25%),
+the advantage narrows and is occasionally marginal,
+consistent with our observation that sink instabil-
+ity is not equally pronounced across all layers and
+model families, when the sparsity budget is gener-
+ous, even standard importance criteria can avoid
+the most harmful removals. At 75% sparsity, all
+methods degrade substantially, yet sink-aware prun-
+ing remains among the top-performing approaches,
+suggesting that discounting transient sinks provides
+a more principled lower bound on model utility
+under extreme compression. Importantly, the im-
+provements are consistent across both Wanda and
+SparseGPT backbones, indicating that sink-aware
+masking acts as a general-purpose correction that
+complements existing importance scoring rather
+than being tied to a specific pruning criterion.
+Structured Pruning.
+Table 4 presents structured
+pruning results on LLaDA. Sink-aware pruning
+7
+
+
+Sparsity Method
+Avg.
+MMLU ARC-C PIQA WinoG GSM8K HellaSwag GPQA RACE
+Dense
+Base
+58.59
+64.07
+50.43
+73.61
+68.90
+65.73
+74.43
+31.75
+39.87
+0.25
+Wanda
+58.09
+63.30
+51.37
+74.81
+68.19
+62.47
+73.68
+31.20
+39.72
+Sink-Aware
+58.22
+63.41
+51.54
+74.97
+68.27
+62.70
+73.55
+31.30
+40.05
+SparseGPT
+58.44
+63.62
+52.05
+74.97
+68.51
+63.08
+73.92
+31.55
+39.85
+Sink-Aware
+58.47
+63.59
+52.05
+74.97
+68.68
+63.23
+73.78
+31.62
+39.80
+0.50
+Wanda
+53.78
+59.04
+47.27
+72.69
+66.85
+51.63
+69.55
+28.35
+34.82
+Sink-Aware
+54.02
+58.67
+48.63
+73.39
+66.93
+52.01
+69.38
+28.48
+34.65
+SparseGPT
+53.91
+59.20
+48.46
+72.63
+65.19
+52.24
+69.20
+28.92
+35.45
+Sink-Aware
+54.10
+59.33
+49.15
+73.12
+65.43
+52.69
+69.15
+28.70
+35.20
+0.75
+Wanda
+31.03
+25.87
+19.62
+59.09
+49.09
+1.14
+46.80
+23.15
+23.50
+Sink-Aware
+32.89
+27.20
+24.91
+61.37
+51.93
+1.29
+48.30
+23.80
+24.35
+SparseGPT
+33.94
+29.85
+26.88
+61.21
+52.09
+1.67
+49.85
+24.05
+25.90
+Sink-Aware
+33.63
+29.08
+25.77
+61.86
+51.38
+1.52
+49.50
+24.25
+25.65
+Table 3: Pruning results on LLaDA1.5 across 8 benchmarks.
+25%
+50%
+75%
+Sparsity
+0
+1
+2
+ Avg (pp)
+(Sink-Aware 
+ baseline)
++0.19
++0.48
++0.95
++0.45
++0.02
++0.00
+LLaDA
+50%
+75%
+Sparsity
++0.10
++0.14
++0.18
++0.11
+Dream
+Wanda
+SparseGPT
+25%
+50%
+75%
+Sparsity
++0.13
++0.24
++1.86
++0.03
++0.19
+-0.31
+LLaDA1.5
+Figure 6: Delta vs. baseline on average accuracy. Average accuracy change (∆Avg, in percentage points) from
+applying Sink-Aware pruning on top of each baseline (WANDA / SPARSEGPT) at different sparsity levels. Bars
+report ∆= Avg(Sink-Aware) −Avg(baseline); positive values indicate improved performance retention after
+pruning. Results are shown for LLaDA, Dream, and LLaDA1.5 over 8 benchmarks.
+Model
+PIQA
+WinoG
+ARC-E
+ARC-C
+LLaDA (Base)
+0.7942
+0.7388
+0.7420
+0.4437
+Structured Pruning 0.3
+LLaDA-structure
+0.6834
+0.6630
+0.6907
+0.3780
+Sink-Aware (Ours)
+0.6955
+0.6740
+0.7175
+0.3820
+Structured Pruning 0.5
+LLaDA-structure
+0.5898
+0.5572
+0.4853
+0.2039
+Sink-Aware (Ours)
+0.6037
+0.5724
+0.5279
+0.2362
+Table 4: Structured pruning results on LLaDA.
+consistently outperforms the structured baseline,
+with the margin growing at higher pruning ratios
+(0.3→0.5). This trend is intuitive: structured prun-
+ing removes entire heads or layers at once, making
+each decision considerably more disruptive than
+removing individual weights, and therefore more
+sensitive to whether sink-critical components are
+retained. The growing improvement at higher ra-
+tios further reinforces our broader observation that
+sink-aware pruning is most valuable precisely when
+compression is aggressive, and the cost of misiden-
+tifying important structures is highest.
+4.3
+Visualization and Analysis
+Fig. 6 reveals a clear and consistent pattern:
+Sink-Aware pruning reliably improves over strong
+baselines across models and sparsity levels, with
+gains that grow as compression becomes more ag-
+gressive. The most notable improvements appear at
+75% sparsity, where preserving structurally critical
+parameters has the greatest impact, most evidently
+on LLaDA-1.5 under Wanda. At lower sparsity
+levels (25% to 50%), gains are smaller but remain
+broadly positive, suggesting that the sink-aware
+signal usefully complements existing importance
+criteria even in less demanding regimes.
+Fig. 7 and Fig. 8 show how Sink-Aware prun-
+ing alters head-level pruning decisions under a
+50% unstructured sparsity setting on LLaDA-8B.
+The result suggests a partial alignment between
+sink strength patterns and mask disagreement
+for Wanda, whereas the correspondence appears
+weaker for SparseGPT. The sparsity difference
+8
+
+
+0
+4
+8
+12
+16
+20
+24
+28
+Layer
+0
+4
+8
+12
+16
+20
+24
+28
+Head
+Sink Strength
+0
+4
+8
+12
+16
+20
+24
+28
+Layer
+Mask Change
+0
+4
+8
+12
+16
+20
+24
+28
+Layer
+Mask Change
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+0.00
+0.01
+0.02
+0.03
+0.04
+0.05
+Figure 7: Sink strength and per-head mask disagreement (XOR) between baseline and sink-aware pruning.
+The left subfigure shows the sink strength of the original LLaDA-8B model, measured as the average attention each
+head allocates to sink tokens. The center and right show the fraction of weights per head whose pruning decision
+differs (XOR) between the baseline and our method, using Wanda (center) and SparseGPT (right), respectively.
+0
+4
+8
+12
+16
+20
+24
+28
+Layer
+0
+4
+8
+12
+16
+20
+24
+28
+Head
+Sparsity Change
+0
+4
+8
+12
+16
+20
+24
+28
+Layer
+Sparsity Change
+0.10
+0.05
+0.00
+0.05
+0.10
+-2e-04
+-1e-04
+0e+00
+1e-04
+2e-04
+Figure 8: Per-head sparsity difference between baseline and sink-aware pruning. The left and right subfigures
+show the signed per-head sparsity difference for Wanda and SparseGPT, respectively. Red indicates that the
+sink-aware variant prunes more aggressively in a given head, while blue indicates it preserves more weights.
+plot also indicates that Sink-Aware Pruning intro-
+duces smaller head-level pruning ratio changes for
+SparseGPT compared to Wanda.
+Discussion.
+Our results suggest that sink behav-
+ior is generation-paradigm dependent. In AR mod-
+els, sinks are typically stable prefix anchors, in
+DLMs, sink positions shift across denoising steps
+and are often transient. This explains why directly
+inheriting AR-style “always keep sinks” heuristics
+can be suboptimal for diffusion pruning. By dis-
+counting unstable sinks, our Sink-Aware Pruning
+preserves a larger fraction of semantically useful
+parameters under the same sparsity budget, espe-
+cially at moderate-to-high pruning levels.
+We also observe that improvements are not
+uniform across all settings.
+On some model-
+benchmark pairs (particularly in low-sparsity
+regimes), sink-aware variants are close to or
+slightly below strong baselines, indicating that sink
+instability is not equally pronounced in every layer,
+task, or model family. This points to a practical
+trade-off: sink-aware pruning is most beneficial
+when compression is aggressive or when diffusion-
+time attention dynamics are highly non-stationary.
+5
+Conclusion
+We revisited pruning for Diffusion Language Mod-
+els from the perspective of attention-sink dynamics.
+Our analysis shows that sink positions in DLMs
+are substantially less stable than in AR models,
+which challenges the common sink-preservation
+heuristic inherited from AR pruning. Based on this
+observation, we proposed Sink-Aware Pruning, a
+diffusion-oriented strategy that discounts unstable
+sinks when estimating pruning importance. Across
+multiple DLM families, benchmarks, and sparsity
+levels, the proposed method consistently improves
+or matches strong baselines while yielding a bet-
+ter quality-efficiency trade-off without retraining.
+These findings highlight that pruning rules should
+be aligned with generation dynamics rather than
+directly transferred across paradigms.
+9
+
+
+Limitations
+Our current study has several limitations. First, sink
+statistics are estimated from a fixed calibration dis-
+tribution, and distribution shift may reduce reliabil-
+ity. Second, we mainly evaluate post-training prun-
+ing without recovery finetuning. Combining sink-
+aware scoring with lightweight post-pruning adap-
+tation may further improve robustness. Moreover,
+while we include one multimodal DLM, broader
+validation on larger multimodal and long-context
+settings is still needed. Future work can explore
+layer-wise timestep-adaptive sink policies and joint
+optimization with quantization to further improve
+the quality-efficiency frontier.
+References
+Marianne Arriola, Aaron Gokaslan, Justin T Chiu, Zhi-
+han Yang, Zhixuan Qi, Jiaqi Han, Subham Sekhar
+Sahoo, and Volodymyr Kuleshov. 2025.
+Block
+diffusion:
+Interpolating between autoregressive
+and diffusion language models.
+arXiv preprint
+arXiv:2503.09573.
+Jacob Austin, Daniel D Johnson, Jonathan Ho, Daniel
+Tarlow, and Rianne Van Den Berg. 2021. Structured
+denoising diffusion models in discrete state-spaces.
+Advances in neural information processing systems,
+34:17981–17993.
+Federico Barbero, Alvaro Arroyo, Xiangming Gu,
+Christos Perivolaropoulos, Michael Bronstein, Petar
+Veliˇckovi´c, and Razvan Pascanu. 2025.
+Why do
+llms attend to the first token?
+arXiv preprint
+arXiv:2504.02732.
+Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi,
+and 1 others. 2020. Piqa: Reasoning about physical
+commonsense in natural language. In Proceedings
+of the AAAI conference on artificial intelligence, vol-
+ume 34, pages 7432–7439.
+Hongrong Cheng, Miao Zhang, and Javen Qinfeng Shi.
+2024. A survey on deep neural network pruning: Tax-
+onomy, comparison, analysis, and recommendations.
+IEEE Transactions on Pattern Analysis and Machine
+Intelligence.
+Shuang Cheng, Yihan Bian, Dawei Liu, Linfeng
+Zhang, Qian Yao, Zhongbo Tian, Wenhai Wang,
+Qipeng Guo, Kai Chen, Biqing Qi, and 1 others.
+2025. Sdar: A synergistic diffusion-autoregression
+paradigm for scalable sequence generation. arXiv
+preprint arXiv:2510.06303.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. 2018. Think you have solved question an-
+swering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+Nakano, and 1 others. 2021.
+Training verifiers
+to solve math word problems.
+arXiv preprint
+arXiv:2110.14168.
+Rocktim Jyoti Das, Mingjie Sun, Liqun Ma, and
+Zhiqiang Shen. 2023. Beyond size: How gradients
+shape pruning decisions in large language models.
+arXiv preprint arXiv:2311.04902.
+Elias Frantar and Dan Alistarh. 2023. Sparsegpt: Mas-
+sive language models can be accurately pruned in
+one-shot. In International conference on machine
+learning, pages 10323–10337. PMLR.
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Bider-
+man, Sid Black, Anthony DiPofi, Charles Foster,
+Laurence Golding, Jeffrey Hsu, Alain Le Noac’h,
+Haonan Li, Kyle McDonell, Niklas Muennighoff,
+Chris Ociepa, Jason Phang, Laria Reynolds, Hailey
+Schoelkopf, Aviya Skowron, Lintang Sutawika, and
+5 others. 2024. The language model evaluation har-
+ness.
+Shansan Gong, Mukai Li, Jiangtao Feng, Zhiyong Wu,
+and LingPeng Kong. 2022. Diffuseq: Sequence to se-
+quence text generation with diffusion models. arXiv
+preprint arXiv:2210.08933.
+Xiangming Gu, Tianyu Pang, Chao Du, Qian Liu,
+Fengzhuo Zhang, Cunxiao Du, Ye Wang, and Min
+Lin. 2024.
+When attention sink emerges in lan-
+guage models: An empirical view. arXiv preprint
+arXiv:2410.10781.
+Song Han, Huizi Mao, and William J Dally. 2015a.
+Deep compression: Compressing deep neural net-
+works with pruning, trained quantization and huff-
+man coding. arXiv preprint arXiv:1510.00149.
+Song Han, Jeff Pool, John Tran, and William Dally.
+2015b. Learning both weights and connections for
+efficient neural network. Advances in neural infor-
+mation processing systems, 28.
+Babak Hassibi, David G Stork, and Gregory J Wolff.
+1993. Optimal brain surgeon and general network
+pruning. In IEEE international conference on neural
+networks, pages 293–299. IEEE.
+Zhengfu He, Tianxiang Sun, Qiong Tang, Kuanning
+Wang, Xuan-Jing Huang, and Xipeng Qiu. 2023. Dif-
+fusionbert: Improving generative masked language
+models with diffusion models. In Proceedings of the
+61st annual meeting of the association for compu-
+tational linguistics (volume 1: Long papers), pages
+4521–4534.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+2020. Measuring massive multitask language under-
+standing. arXiv preprint arXiv:2009.03300.
+10
+
+
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. 2020. De-
+noising diffusion probabilistic models. Advances
+in neural information processing systems, 33:6840–
+6851.
+Guokun Lai, Qizhe Xie, Hanxiao Liu, Yiming Yang,
+and Eduard Hovy. 2017. RACE: Large-scale ReAd-
+ing comprehension dataset from examinations. In
+Proceedings of the 2017 Conference on Empirical
+Methods in Natural Language Processing, pages 785–
+794, Copenhagen, Denmark. Association for Compu-
+tational Linguistics.
+Yann LeCun, John Denker, and Sara Solla. 1989. Opti-
+mal brain damage. Advances in neural information
+processing systems, 2.
+Tianyi Li, Mingda Chen, Bowei Guo, and Zhiqiang
+Shen. 2025. A survey on diffusion language models.
+arXiv preprint arXiv:2508.10875.
+Xiang Li, John Thickstun, Ishaan Gulrajani, Percy S
+Liang, and Tatsunori B Hashimoto. 2022. Diffusion-
+lm improves controllable text generation. Advances
+in neural information processing systems, 35:4328–
+4343.
+Zhuang Liu, Jianguo Li, Zhiqiang Shen, Gao Huang,
+Shoumeng Yan, and Changshui Zhang. 2017. Learn-
+ing efficient convolutional networks through network
+slimming. In Proceedings of the IEEE international
+conference on computer vision, pages 2736–2744.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023.
+Llm-pruner: On the structural pruning of large lan-
+guage models. Advances in neural information pro-
+cessing systems, 36:21702–21720.
+Stephen Merity, Caiming Xiong, James Bradbury, and
+Richard Socher. 2016. Pointer sentinel mixture mod-
+els. arXiv preprint arXiv:1609.07843.
+Pavlo Molchanov, Arun Mallya, Stephen Tyree, Iuri
+Frosio, and Jan Kautz. 2019. Importance estima-
+tion for neural network pruning. In Proceedings of
+the IEEE/CVF conference on computer vision and
+pattern recognition, pages 11264–11272.
+Jinjie Ni, Qian Liu, Longxu Dou, Chao Du, Zili Wang,
+Hang Yan, Tianyu Pang, and Michael Qizhe Shieh.
+2025.
+Diffusion language models are super data
+learners. arXiv preprint arXiv:2511.03276.
+Shen Nie, Fengqi Zhu, Zebin You, Xiaolu Zhang,
+Jingyang Ou, Jun Hu, Jun Zhou, Yankai Lin, Ji-Rong
+Wen, and Chongxuan Li. 2025. Large language dif-
+fusion models. arXiv preprint arXiv:2502.09992.
+Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya
+Sutskever, and 1 others. 2018. Improving language
+understanding by generative pre-training.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan,
+Dario Amodei, Ilya Sutskever, and 1 others. 2019.
+Language models are unsupervised multitask learn-
+ers. OpenAI blog, 1(8):9.
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jack-
+son Petty, Richard Yuanzhe Pang, Julien Dirani, Ju-
+lian Michael, and Samuel R Bowman. 2024. Gpqa:
+A graduate-level google-proof q&a benchmark. In
+First conference on language modeling.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+Patrick Esser, and Björn Ommer. 2022.
+High-
+resolution image synthesis with latent diffusion mod-
+els. In Proceedings of the IEEE/CVF conference
+on computer vision and pattern recognition, pages
+10684–10695.
+Maximo Eduardo Rulli, Simone Petruzzi, Edoardo
+Michielon, Fabrizio Silvestri, Simone Scardapane,
+and Alessio Devoto. 2025.
+Attention sinks
+in diffusion language models.
+arXiv preprint
+arXiv:2510.15731.
+Subham Sahoo, Marianne Arriola, Yair Schiff, Aaron
+Gokaslan, Edgar Marroquin, Justin Chiu, Alexan-
+der Rush, and Volodymyr Kuleshov. 2024. Simple
+and effective masked diffusion language models. Ad-
+vances in Neural Information Processing Systems,
+37:130136–130184.
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+ula, and Yejin Choi. 2021. Winogrande: An adver-
+sarial winograd schema challenge at scale. Commu-
+nications of the ACM, 64(9):99–106.
+Mingjie Sun, Zhuang Liu, Anna Bair, and J Zico
+Kolter. 2023. A simple and effective pruning ap-
+proach for large language models. arXiv preprint
+arXiv:2306.11695.
+Chengyue Wu, Hao Zhang, Shuchen Xue, Zhijian Liu,
+Shizhe Diao, Ligeng Zhu, Ping Luo, Song Han, and
+Enze Xie. 2025. Fast-dllm: Training-free accelera-
+tion of diffusion llm by enabling kv cache and parallel
+decoding. arXiv preprint arXiv:2505.22618.
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. 2023. Efficient streaming
+language models with attention sinks. arXiv preprint
+arXiv:2309.17453.
+An Yang, Baosong Yang, Beichen Zhang, Binyuan
+Hui, Bo Zheng, Bowen Yu, Chengyuan Li, Day-
+iheng Liu, Fei Huang, Haoran Wei, and 1 others.
+2024.
+Qwen2.5 technical report.
+arXiv preprint
+arXiv:2412.15115.
+Ling Yang, Ye Tian, Bowen Li, Xinchen Zhang,
+Ke Shen, Yunhai Tong, and Mengdi Wang. 2025a.
+Mmada: Multimodal large diffusion language mod-
+els. arXiv preprint arXiv:2505.15809.
+Yifan Yang, Kai Zhen, Bhavana Ganesh, Aram Gal-
+styan, Goeric Huybrechts, Markus Müller, Jonas M
+Kübler, Rupak Vignesh Swaminathan, Athanasios
+Mouchtaris, Sravan Babu Bodapati, and 1 others.
+2025b. Wanda++: Pruning large language models via
+regional gradients. arXiv preprint arXiv:2503.04992.
+11
+
+
+Jiacheng Ye, Zhihui Xie, Lin Zheng, Jiahui Gao, Zirui
+Wu, Xin Jiang, Zhenguo Li, and Lingpeng Kong.
+2025. Dream 7b: Diffusion large language models.
+arXiv preprint arXiv:2508.15487.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. 2019.
+Hellaswag: Can
+a machine really finish your sentence? In Proceed-
+ings of the 57th annual meeting of the association for
+computational linguistics, pages 4791–4800.
+Fengqi Zhu, Rongzhen Wang, Shen Nie, Xiaolu Zhang,
+Chunwei Wu, Jun Hu, Jun Zhou, Jianfei Chen,
+Yankai Lin, Ji-Rong Wen, and 1 others. 2025. Llada
+1.5: Variance-reduced preference optimization for
+large language diffusion models.
+arXiv preprint
+arXiv:2505.19223.
+12
+
+
+Appendix
+A
+Results on Additional Models
+Table 5 reports pruning results on MMaDA, a mul-
+timodal unified diffusion language model, comple-
+menting the main-paper results on LLaDA, Dream,
+and LLaDA-1.5.
+B
+Evaluation Details
+For loglikelihood-based evaluations (MMLU,
+ARC-C,
+PIQA,
+WinoGrande,
+HellaSwag,
+RACE, and GPQA), we build on the offi-
+cial model implementations provided in the
+LLaDA1 and Dream2 GitHub repositories. For
+generation-based tasks (GSM8K), we leverage
+Fast-DLLM (Wu et al., 2025) to enable fast
+inference. All evaluations are conducted using
+the lm-evaluation-harness (Gao et al., 2024)
+framework under identical configurations across
+all models and baselines.
+For generation tasks, we use a generation length
+of 256 tokens, a block length of 256, and 256 de-
+noising steps. For loglikelihood-based benchmarks,
+we follow the Monte Carlo estimation protocol with
+128 samples across all tasks, except for MMLU
+where we use a single sample following the evalua-
+tion convention established in the official LLaDA
+codebase.
+C
+Model Architecture Details
+All models use a decoder-only Transformer back-
+bone as the denoising network (mask predictor) in
+1https://github.com/ML-GSAI/LLaDA
+2https://github.com/DreamLM/Dream
+discrete diffusion. For LLaDA, the architecture
+follows a LLaMA-style design with RMSNorm,
+SwiGLU feed-forward blocks, and RoPE positional
+encoding (Nie et al., 2025). Dream-7B adopts the
+same base configuration as Qwen2.5-7B (Ye et al.,
+2025; Yang et al., 2024). MMaDA-8B follows the
+LLaDA configuration for text generation and is
+initialized from an LLaDA-8B checkpoint (Yang
+et al., 2025a). Table 6 shows the total number of
+trainable parameters, the number of Transformer
+layers L, and the model width dmodel.
+Model
+Params
+#Layers
+dmodel
+LLaDA-8B
+8.02B
+32
+4096
+LLaDA-1.5-8B
+8.02B
+32
+4096
+Dream-7B
+7B
+28
+3584
+MMaDA-8B
+8.02B
+32
+4096
+Table 6: Backbone configurations.
+D
+Benchmark Descriptions
+We evaluate text generation and reasoning using a
+diverse suite of established benchmarks:
+• MMLU (Hendrycks et al., 2020) evaluates
+broad factual knowledge and reasoning across
+57 academic subjects using multiple-choice
+questions, and is commonly reported in few-
+shot settings.
+• ARC-C (Clark et al., 2018) (AI2 Reason-
+ing Challenge, Challenge split) consists of
+multiple-choice grade-school science ques-
+tions designed to require non-trivial reasoning
+beyond surface pattern matching.
+Sparsity Method
+Avg.
+MMLU ARC-C PIQA WinoG GSM8K HellaSwag GPQA RACE
+Dense
+Base
+35.63
+33.69
+24.32
+60.50
+50.83
+9.48
+52.50
+25.20
+28.50
+0.25
+Wanda
+35.20
+32.89
+23.98
+60.28
+50.59
+8.72
+52.25
+24.80
+28.12
+Sink-Aware 35.03
+32.99
+24.15
+60.17
+49.64
+8.87
+51.80
+24.72
+27.90
+SparseGPT
+35.48
+33.30
+24.57
+60.39
+50.91
+9.10
+52.05
+25.15
+28.35
+Sink-Aware 35.45
+33.30
+24.83
+60.34
+50.67
+9.17
+52.10
+25.00
+28.20
+0.50
+Wanda
+33.91
+31.14
+23.12
+59.79
+51.14
+5.38
+49.72
+24.18
+26.80
+Sink-Aware 33.54
+30.27
+22.95
+59.90
+49.57
+5.53
+49.45
+24.08
+26.55
+SparseGPT
+34.05
+31.33
+23.81
+59.36
+50.04
+5.84
+50.25
+24.55
+27.20
+Sink-Aware 33.77
+31.24
+23.72
+59.41
+48.86
+5.76
+49.90
+24.30
+26.95
+0.75
+Wanda
+29.85
+23.93
+19.37
+54.79
+50.12
+0.76
+42.55
+23.10
+24.15
+Sink-Aware 30.28
+24.82
+20.65
+55.33
+49.64
+0.91
+42.90
+23.55
+24.40
+SparseGPT
+30.26
+24.01
+20.39
+55.77
+49.01
+1.06
+43.48
+23.40
+24.95
+Sink-Aware 30.19
+24.51
+18.86
+55.82
+50.04
+1.14
+43.15
+23.28
+24.70
+Table 5: Pruning results on MMaDA across 8 benchmarks.
+13
+
+
+• PIQA (Bisk et al., 2020) tests physical com-
+monsense reasoning via multiple-choice ques-
+tions about everyday situations, selecting the
+more plausible solution among two candidate
+answers.
+• WinoGrande (Sakaguchi et al., 2021) mea-
+sures commonsense coreference and pro-
+noun
+resolution
+using
+adversarially
+fil-
+tered, multiple-choice Winograd-style sen-
+tence pairs.
+• HellaSwag (Zellers et al., 2019) assesses com-
+monsense inference by selecting the most
+plausible continuation of a given context from
+multiple candidate endings.
+• RACE (Lai et al., 2017) is a reading compre-
+hension benchmark derived from English ex-
+aminations, requiring multi-sentence reason-
+ing over passages with multiple-choice ques-
+tions.
+• GSM8K (Cobbe et al., 2021) evaluates multi-
+step mathematical reasoning on grade-school
+word problems; performance is typically mea-
+sured by exact match on the final numeric
+answer.
+• GPQA (Rein et al., 2024) is a challeng-
+ing, domain-expert-written benchmark of
+graduate-level multiple-choice questions in
+biology, physics, and chemistry, designed to
+be difficult to solve via simple lookup.
+14

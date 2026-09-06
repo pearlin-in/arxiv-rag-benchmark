@@ -1,0 +1,1156 @@
+decoupleQ: Towards 2-bit Post-Training Uniform Quantization via decoupling
+Parameters into Integer and Floating Points
+Yi Guo, Fanliu Kong, Xiaoyang Li, Hui Li, Wei Chen,
+Xiaogang Tian, Jinping Cai, Yang Zhang, Shouda Liu
+ByteDance
+{guoyi.0, kongfanliu.eng, lixiaoyang.x, lihui.sun, chenwei.gavin, tianxiaogang, caijinping.220, zhangyang.elfin, liushouda}@bytedance.com
+Abstract
+Quantization emerges as one of the most promising com-
+pression technologies for deploying efficient large models
+for various real time application in recent years.
+Con-
+sidering that the storage and IO of weights take up the
+vast majority of the overhead inside a large model, weight
+only quantization can lead to large gains. However, exist-
+ing quantization schemes suffer from significant accuracy
+degradation at very low bits, or require some additional
+computational overhead when deployed, making it difficult
+to be applied to large-scale applications in industry. In this
+paper, we propose decoupleQ, achieving a substantial in-
+crease in model accuracy, especially at very low bits.
+decoupleQ abandons the traditional heuristic quantiza-
+tion paradigm and decouples the model parameters into in-
+teger and floating-point parts, thus transforming the quan-
+tization problem into a traditional mathematical optimiza-
+tion problem with constraints, which is then solved alterna-
+tively by off-the-shelf optimization methods. Quantization
+via decoupleQ is linear and uniform, making it hardware-
+friendlier than non-uniform counterpart, and enabling the
+idea to be migrated to high-bit quantization to enhance
+its robustness. Our method has achieved well on-line ac-
+curacy near fp16/bf16 on the 2-bit quantization of large
+speech models in ByteDance.
+The code is available at
+https://github.com/bytedance/decoupleQ.
+1. Introduction
+Serving large models [36, 1, 37, 2] in industry is budget-
+consuming because of the huge computational, IO and stor-
+age cost. Model compression [11, 10, 16] has therefore be-
+come a necessity to alleviate this pain. Among which, Post-
+Training Quantization (PTQ) [26, 9] has gained more and
+more popularity among researchers and engineers because
+it does not require heavy GPU-hours training with labeled
+datasets. In PTQ, weight-only quantization [19, 9] plays an
+important role, since the storage and IO of model weights
+account for much of the overhead when inference with very
+large models on low-bandwidth GPUs.
+However, previous quantization schemes remain con-
+fined within the traditional heuristic quantization paradigm,
+e.g., how to deal with outliers [34, 32], how to deal
+with sensitive channels [6], how to determine the clipping
+range [28], and so on. These methods have achieved some
+success, but the quantization at extreme low bit often suffers
+from significant accuracy degradation, thus failing to meet
+the launching requirements of industrial practice.
+There
+are also some other options to mitigate the accuracy loss.
+QuIP [4] pushes the accuracy limits of 2-bit quantization
+and can achieve performance close to fp16/bf16. However,
+compared to traditional quantization schemes, its inference
+imposes an additional burden due to the need to multiply
+two random orthogonal matrices to de-quant the weights.
+N2UQ [20] fit the real-value distribution with non-uniform
+grids then quantize them into equidistant output levels. But
+it need to train to get the input thresholds. SpQR [7] and
+SqueezeLLM [14] use mixed-precision quantization or non-
+uniform scheme to safeguard the important channels, but
+they need customized hardware support.
+In order to alleviate the above pains in industry, we pro-
+posed decoupleQ, which completely abandons the tradi-
+tional heuristic quantization paradigm and instead decou-
+ples the model parameters into integer and floating point
+parts, thus transforming the quantization problem into a
+traditional mathematical constrained optimization problem,
+which is then solved alternatively by off-the-shelf solution
+methods. The integer part contains the main weights of the
+model, and the floating-point part contains scales and zero
+points induced via quantization. decoulpeQ starts from an
+abstract objective function and thus does not need to deal
+with the minutiae of traditional quantization paradigm, such
+as outlier, salient weights [19], and so on. Quantization
+via decoupleQ is linear and uniform, making it hardware-
+friendlier than non-uniform counterpart, and enabling the
+idea to be migrated to high-bit quantization to enhance its
+arXiv:2404.12759v1  [cs.LG]  19 Apr 2024
+
+
+robustness.
+decoupleQ contains two stages: 1. layer-wise minimiza-
+tion, defined in Eq. (1), is used to optimize the integer part
+and the floating-point part; 2. block-wise minimization, de-
+fined in Eq. (2), is used to further optimize the floating-point
+part while freezing the integer part1.
+Layer-wise minimization is widely used in many previ-
+ous methods [9, 4, 8] and works well. For a linear layer, the
+minimization of the ℓ2 loss of the outputs between pre- and
+post-quantization can be formulated as:
+min
+f
+W
+∥Xf
+W −XW0∥2
+2
+(1)
+where X ∈Rbatch×din is the input of this layer, W0 ∈
+Rdin×dout is the pre-trained full precision weight, din
+and dout are the input and output dimensions respectively.
+The objective is to find a matrix f
+W with quantized-then-
+dequantized elements to minimize Eq. (1).
+Some works [25, 13] started from Eq. (1) and achieved
+some success, but they still haven’t thought outside the
+box of traditional quantization. GPTQ series [9, 8] fake-
+quantize the first element of W0 and then update the the re-
+maining elements so as to keep Eq. (1) minimized. This pro-
+cess is then continued element by element until all elements
+are fake-quantized. However, on the one hand, they do not
+give any indication of how scale and zero point should be
+calculated, and on the other hand, the optimization prob-
+lem formulated when updating the remaining elements is
+unconstrained (explained in detail later). decoupleQ mod-
+els Eq. (1) as a purely mathematical optimization problem,
+as shown in Eq. (6). It no longer needs to pay attention to
+some of the minutiae unique to quantization, such as out-
+liers, clipping threshold, etc., but abstracts the essence of
+the problem from a higher level and transforms it into a
+mathematical constrained optimization problem.
+In the second stage, block-wise minimization is used to
+further improve the model accuracy:
+min ∥
+^
+Block(X) −Block(X)∥2
+2
+(2)
+where
+^
+Block(·) is a common transformer block [31] with
+quantized weights. In this stage, we freeze the integer part
+of the weights, and train the scales and zeros, as well as the
+parameters in normalization layers.
+decoupleQ implements 2-bit uniform quantization and
+achieves state-of-the-art accuracy in Llama-1/2 [29, 30].
+Like traditional uniform quantization, decoupleQ does not
+incur additional inference burden and only requires a linear
+transformation to convert the quantized weights into float-
+ing point ones.
+Our main highlights are summarized as follows:
+1We define the term “layer” as a linear transformation, “block” as a
+common transformer block containing the multi-head attention, feed for-
+ward, and some layer norm.
+• New insight: We abandoned the traditional quantiza-
+tion paradigm, and no longer need to focus on some of
+the minutiae unique to quantization, but abstracts the
+essence of the problem from a higher level and trans-
+forms it into a constrained optimization problem.
+• Extreme low-bit:
+decoupleQ achieves 2-bit post-
+training uniform quantization with performance close
+to fp16/bf16 for industrial applications in the ASR
+model in ByteDance.
+• Extensibility: If labeled datasets are available, the
+idea of decoupleQ can be easily extended to super-
+vised learning to further improve model accuracy, or
+the adaptation to the downstream sub-tasks.
+2. Related Works
+Quantization can be roughly divided into quantization
+aware training (QAT) [32, 21] and Post-Training Quanti-
+zation (PTQ) [34, 4]. In this paper, we focus on weight-
+only quantization in PTQ, and we will only summarize a
+few works that are closely related to our work.
+PTQ is commonly used for LLM quantization because it
+does not require a lot of GPU hours of training with labeled
+datasets. However, in the traditional quantization paradigm,
+there are many minutiae specific to quantization that need
+to be targeted. AdaRound [25] and BRECQ [18] start from
+the rounding operation and explore whether to round up
+or down is better. SqQR [7] and OWQ [17] use mixed-
+precision quantization strategy to protect sensitive parame-
+ters, while AWQ [19] opts for scaling up the weights of sen-
+sitive channels to reduce the loss of quantization of sensitive
+channels. OmniQuant [28] use gradient decent to optimize
+for the weight clipping threshold and the rescale factors. In
+decoupleQ, we abandon patchwork solutions and transform
+the quantization into a principled traditional optimization
+problem by decoupling the model parameters into integer
+and floating-point parts.
+GPTQ [9] is an influential work, and it quantizes the cur-
+rent weights and then updates the remaining weights to min-
+imize the ℓ2 loss of the output of the layer between pre- and
+post-quantization. As we will see later, this update actually
+approximates much, and GPTQ does not optimize for the
+scale and zero point reduced by quantization.
+QALora [35] also decouples model parameters at a cer-
+tain level and uses labeled datasets to fine-tune the zero
+points. decoupleQ takes this idea a step further, optimizing
+the integer and floating-point parts alternately in the field of
+PTQ.
+3. Methods
+We introduce the details of decoupleQ in this section. In
+decoupleQ, we focus on the linear uniform quantization for
+
+
+better hardware efficiency.
+3.1. Preliminaries
+For a linear layer with input dimension din and output
+dimension dout, quantization maps the weights with high-
+precision into discrete level, and the previous scheme can
+be described as follows:
+c
+W = clip(⌊W0 −z
+s
+⌉, α, β)
+(3)
+f
+W = c
+W ∗s + z
+(4)
+where W0 ∈Rdin×dout is the pre-trained full precision
+weights, s and z are the scale and zero point (what we
+call floating-point part above), ⌊·⌉is the round-to-nearest
+function, c
+W ∈Rdin×dout is the quantized integer-point
+matrix (what we call integer part above), f
+W is the de-
+quantized floating-point matrix, α and β are the lower and
+upper bounds of the range of integer representations, re-
+spectively. For example, in 2-bit weight only linear quanti-
+zation scheme, the value of each entry of c
+W is limited to one
+of {−2, −1, 0, 1}, and α = −2, β = 1 in this case. To get
+the values of f
+W, previous methods [9, 8] show that layer-
+wise ℓ2 loss between the outputs pre- and post-quantization
+is well related to the model accuracy, i.e., to optimize the
+following objective function,
+arg minf
+W ∥Xf
+W −XW0∥2
+2 = tr{(f
+W −W0)T H(f
+W −W0)}
+(5)
+where X ∈Rbatch×din is the input of this linear layer, gen-
+erated by a small set of calibration dataset, and H = XT X.
+In the extreme low-bit quantization regime, the model
+accuracy can be further improved via finer-grained group-
+ing. In this case, the domain of s and z can be expressed as
+Rdout×ng, where ng is the number of groups, with group-
+size din/ng. Then, the operations on s and z in Eq.(3) and
+Eq.(4) need to be broadcasted to each group. Finer-grained
+grouping would impose additional overhead on inference.
+For example, when groupsize=64, it imposes an average
+overhead of 0.5 bit per element (fp16 for scale s and zero
+point z). The extra overhead is acceptable compared to the
+model accuracy gain.
+3.2. decoupleQ
+When a model is quantized, only the integer part c
+W
+and the floating-point part (s, z) in Eq.(4) are delivered to
+the downstream inference engine, and the inference process
+does not need to know how c
+W and (s, z) are computed at
+all. That is, if we can find the values of c
+W and (s, z) to min-
+imize Eq. (5) by other methods, then we don’t need to use
+Eq. (3) at all. So, we can decouple the model parameters
+into integer part c
+W and floating point part (s, z), which are
+then optimized alternatively via off-the-shelf solution meth-
+ods. decoupleQ views the process of solving for c
+W and
+(s, z) in Eq.(4) as an constrained optimization problem in-
+dependent of the previous quantization paradigm! We only
+need to regard Eq.(4) as an ordinary affine transformation,
+in which the value of s can be 0 or even negative. Focus-
+ing only on Eq.(4) and ignoring Eq.(3) is the core difference
+between decoupleQ and previous methods.
+In per-channel quantization, each column of the weight
+matrix is optimized independently of each other. For sim-
+plicity of notation, we only focus on one column in c
+W later
+and re-define the notations. Based on Eq.(5), the optimiza-
+tion problem of decoupleQ in the first stage, layer-wise min-
+imization, can then be formulated as:
+min
+w;s,zg(w; s, z)
+s.t. ∀i = 1, 2, ..., din
+wi −β ≤0
+−wi + α ≤0
+wi ∈Z
+(6)
+where the objective function is:
+g(w; s, z) = 1
+2(w ∗s + z −b)T H(w ∗s + z −b)
+(7)
+w ∈Rdin is one column of c
+W, b ∈Rdin is the correspond-
+ing column of W0, s ∈Rng is the scale and z ∈Rng is
+the zero point, ng is the number of groups when grouping-
+quantization. The operations w.r.t. (s, z), i.e., ∗s and +z,
+need to be broadcasted to each group. In this paradigm,
+we have completely abandoned the traditional framework
+of quantization and instead transformed quantization into a
+mathematical optimization problem (6), which is solved to
+achieve the purpose of quantization. (s, z) in problem (6)
+have lost the meaning of scale and zero point, and are just
+two simple optimization variables.
+Transforming the traditional quantization problem into
+Eq. (6) is the soul of decoupleQ! Having completed this
+shift in thinking, we can then focus on how to solve this op-
+timization problem via off-the-shelf machine learning so-
+lution methods. Problem (6) is a quadratic programming
+problem with an additional non-convex constraints wi ∈Z.
+Quadratic programming has been studied for many years
+and there are now many well-established solution [24, 33].
+The solving process is not the core contribution of this pa-
+per, and we provide one solution in next subsection.
+When Eq. (6) is solved, the model reaches a reasonable
+accuracy, as shown in the experiment part. The core idea of
+decoupleQ is to decouple the model weights into the integer
+part w and the floating-point part (s, z), with the integer
+part occupying most of the model’s expressive power. The
+extensibility of the idea of decoupleQ is that we can freeze
+
+
+the integer part of the entire model, and use labeled data to
+train the (s, z) as well as other floating point parameters.
+The advantage of this is that on the one hand, it can further
+improve the accuracy of the model, on the other hand, it
+can fit specific downstream sub-tasks while maintaining the
+generalization ability of the model. In this paper, we focus
+on PTQ, thus using only unlabeled datasets to do block-
+wise minimization, as shown in Eq. (2), to further improve
+the model accuracy when Eq. (6) is solved.
+3.3. Optimization via Alternative Iteration
+The problem (6) is not easy to solve because of the non-
+convex constraint wi ∈Z. After obtaining a good initial-
+ization (explained in detail later), we solve for w and (s, z)
+alternately and iteratively.
+In each round of alternation,
+the objective function (7) w.r.t. (s, z) is an unconstrained
+quadratic function, thus (s, z) can be readily determined
+analytically: by differentiating the objective function and
+equating the derivative to zero, followed by solving the re-
+sultant linear system of equations. While for w, the problem
+becomes:
+min
+w g(w; s, z)
+s.t. ∀i = 1, 2, ..., din
+wi −β ≤0
+−wi + α ≤0
+wi ∈Z
+(8)
+For Eq. (8), one solution is to round-and-clip one element
+of w to be integer in [α, β] and then update the remain-
+ing. And then this process is then performed sequentially
+for all elements. After the j-th element has been rounded-
+and-clipped, the objective for the updating then becomes:
+min
+wi;i>jg(w; s, z)
+s.t. ∀i = j + 1, ..., din
+wi −β ≤0
+−wi + α ≤0
+wi ∈Z
+(9)
+Eq. (9) is also intractable, and we can make two levels
+of approximation: the first-level approximation is :
+min
+wi;i>jg(w; s, z)
+s.t. ∀i = j + 1, ..., din
+wi −β ≤0
+−wi + α ≤0
+(10)
+and the second-level approximation is:
+min
+wi;i>jg(w; s, z)
+(11)
+Algorithm 1: Alternative Iteration to solve prob-
+lem (6).
+Input: predefined iteration number N.
+Result: w∗, s∗, z∗
+1 Initialize t = 1, w0, s0, z0 (initial values);
+2 while t ≤N do
+3
+Freeze (st−1, zt−1), and optimize
+g(w; st−1, zt−1) to obtain an approximate
+solution wt via solving Eq. (8) via
+Algorithm 2;
+4
+Freeze wt, and solve the unconstraint quadratic
+equation g(wt; s, z) to obtain an analytic
+solution for (st, zt);
+5
+t = t + 1
+6 end
+7 w∗= wN; s∗= sN; z∗= zN
+In the first-level approximation, only the non-convex con-
+straint wi ∈Z is discarded, while in the second-level ap-
+proximation, both the non-convex constraint wi ∈Z and
+the convex constraint wi ∈[α, β] are discarded. Intuitively,
+Eq. (11) is much simpler to solve than Eq. (10), but solving
+Eq. (10) will lead to a better convergence of problem (6)
+than solving Eq. (11). GPTQ [9] provides an efficient an-
+alytical solution for Eq. (11), which we will directly uti-
+lize in our experiments. ( GPTQ updates the remaining ele-
+ments by considering only the second-level approximation
+and ignoring the constrain wi ∈[α, β] in Eq. (10), which
+is what we mentioned in the introduction, that the update of
+GPTQ is unconstrained.) As for Eq. (10), there are many
+mature solutions in the field of convex optimization, such
+as active-set method, projected gradient descent, projected
+coordinate descent and so on [3]. We chose projected gra-
+dient descent because its parallelization is much better than
+the other two methods. In the experimental part, we will
+compare the final accuracy of the model via between solv-
+ing Eq. (10) and solving Eq. (11) on small models, while
+on large models (lager than 7 billion parameters), we have
+to choose Eq. (11) because the intolerable runtime of solv-
+ing Eq. (10) many times. The algorithm is shown in Algo-
+rithm 1 and Algorithm 2.
+3.4. Initialization of w and (s, z)
+Since the values of w are discrete, a good initialization is
+very important in order to obtain a more accurate solution
+to the original problem (6) with a faster convergence. Intu-
+itively, the function g(w; s, z) contains the term w∗s, which
+means that the scales of the initial values of w and s have
+to be reasonably distributed. For example, in the extreme
+case when the initial value of (s, z) have a very large scale,
+the first iteration will make most of the entries of w strictly
+
+
+Algorithm 2: Approximate solution of Eq. (8)
+Input: predefined iteration number K, M, and the
+frozen (s, z).
+Result: w∗
+1 if Eq. (10) is used then
+2
+Ignoring the constraint wi ∈Z in Eq. (8), and
+train Eq. (8) with M iterations via projected
+gradient decent ;
+3 Initialize j = 1;
+4 for j = 1 →din do
+5
+round and clip the j-th element of w to be
+integer in range [α, β], then keep the first j
+elements frozen, and update the remaining
+elements via projected gradient decent to
+optimize Eq. (10) with K iterations or until
+converged, or via the method in GPTQ to
+optimize Eq. (11).
+6 end
+7 w∗= w
+0, which will make the iteration crash. We start by initial-
+izing (s, z). We can use grid search to solve the following
+equation for the initial value of (s, z).
+min
+p
+1
+2(w ∗s + z −b)T H(w ∗s + z −b)
+s.t.
+w = clip(⌊b −z
+s
+⌉, α, β)
+s = p ∗(bmax −bbmin)
+β −α
+z = p ∗bmin −s ∗α
+(12)
+where p is a single number, may be different for different
+columns of W0, bmin and bmax are the minimum and max-
+imum value of b respectively. This step is the same as the
+previous post-training quantization [19] process. Once the
+grid search is complete, we no longer need to concern our-
+selves with the (s, z) inside the ⌊·⌉function. The point of
+this step is simply to find an initial value for (s, z) for the
+optimization problem (6).
+When solving Eq. (8) via the first-level approximation
+(Eq. (10)), before entering the for-loop in Algorithm 2, we
+ignore the constraint wi ∈Z in Eq. (8) and optimize it via
+projected gradient decent with M iterations. The purpose
+of this is to allow Eq. (10) to converge in a small number of
+iterations, i.e., a small K.
+3.5. Block-wise minimization
+After solving problem (6), we obtain a solution for the
+layer-wise minimization stage and a reasonable model accu-
+racy. But minimizing the ℓ2 loss at the layer level does not
+necessarily lead to the minimizing the ℓ2 loss at the block
+level. We found that the model accuracy can be further im-
+proved via optimization Eq. (2). BRECQ [18] also shows
+that block-reconstruction results in a better model accuracy
+than layer-reconstruction. In this stage, we freeze the inte-
+ger part c
+W in the whole block and fine-tuning (s, z) and the
+parameters in norm layer with J epochs.
+4. Experiments
+In this section, we describe in detail the experimental
+results of our method in comparison with other methods.
+All the experiments are conducted on a single A100-SXM-
+80GB. Unless otherwise stated, the default experimental
+setting is as follows:
+ResNet: 10240 images in the training dateloader are
+used as calibration data, with the standard augmentation
+in Pytorch official code2, and the pretrained full precision
+checkpoints are from Torchvision [22]. N = 4, M = 50
+(N and M is defined in Algorithm 1 and Algorithm 2). All
+the convolution layers and fully-connected layers are quan-
+tized into W2 without groups.
+Llama-1/2: 128 2048-token segments from C4 [27]
+are used as calibration data.
+We choose C4 as calibra-
+tion dataset instead of WikiText2 [23] to be consistent with
+GPTQ. If the block-wise minimization is used, we use
+Adam optimizer [15] to finetune the (s, z) and the parame-
+ters in norm layer with J = 4 epochs. The learning rate is
+1e-5, weight decay is 1e-6.
+4.1. Private Experiments
+We applied decoupleQ to ByteDance’s Automatic
+Speech Recognition model(ASR). The input of the model
+is a speech sequence and some prompt, and the output is
+the corresponding text. The part of the model that needs
+to be quantized contains 40 transformer blocks with 13 bil-
+lion parameters. Word Error Rate (WER) is used as metric
+to measure the accuracy of the model (less is better). The
+model is quantized into W2A16g64. In this experiment, we
+use 3200 pieces of speech containing about 8 millions of to-
+kens as calibration dataset, and train 3 epoch in each block-
+wise minimization process. The results are shown in Tab. 1
+4.2. Public Comparison
+As a first comparison, we compare decoupleQ with other
+methods on ImageNet [5] on ResNet [12], which are stan-
+dard benchmarks and are easy to implement. Most impor-
+tantly, its Top-1 is a strong indicator of model accuracy.
+Tab. 4 shows the results of decoupleQ and others.
+The
+results other than decoupleQ are copied from GPTQ [9].
+Tab. 5 shows the results of W2 quantization via decoupleQ.
+2https://github.com/pytorch/examples/blob/master/imagenet/main.py
+
+
+BF16
+GPTQ
+deQ w/o
+deQ w/
+WER(%)
+6.68
+6.83
+6.74
+6.70
+runtime
+-
+10
+15
+25
+Table 1. The WER of our ASR model. “deQ w/o” means decou-
+pleQ without the block-wise minimization; “deQ w” means de-
+coupleQ with both layer-wise minimization and block-wise min-
+imization. The model is quantized into W2A16g64. runtime is
+measured in hours.
+Tab. 2 shows the results on Llama. In this experiment,
+we have to choose Eq. (11) because the intolerable runtime
+of solving Eq. (10) many times. For a fair comparison, the
+calibration dataset contains 128 samples, although a larger
+calibration dataset will result in stronger results. we can
+see that decoupleQ outperforms others in all settings, al-
+though we use a weaker approximation, Eq. (11) instead
+of Eq. (10), to save time. As for the hype-parameters, we
+choose {N = 4, J = 4}.
+4.3. Ablation studies
+4.3.1
+the two approximations
+The soul of decoupleQ is Eq. (6), but when solving Eq. (6),
+we have to take some approximations, Eq. (10) or Eq. (11).
+Obviously, solving Eq. (10) will be much more time con-
+suming than solving Eq. (11). But if solving Eq. (10) yields
+better results, the time cost may be worth it. We first evalu-
+ate these two approximations from the perspective of model
+accuracy. In practice, we don’t have to wait for Eq. (10)
+to fully converge when we solve it via projected gradient
+decent, and only need to iterate some steps to get a sub-
+optimal solution. In Algorithm 2, the for-loop takes up the
+majority of the runtime. So, we first study the influence of
+the number of iterations K (defined in the for-loop) on the
+final accuracy of the model.
+Fig. 1 shows the Top-1 accuracy of ResNet-18 on Ima-
+geNet w.r.t. the number of iterations K. First of all, in the
+blue line, we use only the layer-wise minimization of de-
+cooupleQ to quantize the model. After the quantization is
+finished, in the red line, we use the labelled dataset with
+the common 1.2 millions images to fine-tune (s, z) and pa-
+rameters in norm layers, with the integer part being frozen.
+In this step, we use SGD optimizer with learning rate 1e-6,
+weight decaying rate 1e-4 to train for only one epoch. Fig. 1
+clearly indicates the following conclusions: 1. As the num-
+ber of iterations K increases, the model accuracy increases
+almost monotonically; 2. When K > 4, approximation via
+Eq. (10) is better than via Eq. (11). This is to be expected,
+since Eq. (11) drops the constraint α ≤wi ≤β, lead-
+ing to a looser approximation; 3. By the supervised fine-
+tuning (sft), the model accuracy is further improved. The
+same experimental phenomenon also occurs on the ResNet-
+50 model, which we do not show here.
+In the experiment shown in Fig. 2, we randomly select
+512 2048-token segments from C4 [27]. We chose 512 seg-
+ments here instead of the common 128 in order to reduce the
+effect of overfitting and thus compare the two approxima-
+tions more objectively. In this experiment, we take N = 2,
+and quantize Llama-7B into W2A16 without groups, and
+only the layer-wise minimization is used to exclude the in-
+terference of other factors. The PPL decrease almost mono-
+tonically as the number of iterations K increases.
+However, when block-wise minimization is introduced
+in addition to the experiment in Fig. 2, the situation be-
+comes a little more elusive. The results are shown in Fig. 3.
+The model’s best PPL is where K = 1, and then fluctuates
+within a range as K continues to increase. But all PPLs are
+inferior to when the second-level approximation (Eq. (11))
+is used. We also plot the loss, defined in Eq. (2), of the
+first block between pre-and post quantization on the right
+vertical axis. As K increases, the loss decreases strictly
+monotonically, and when K > 2, the loss falls below the
+case when the approximation Eq. (11) is used. This sug-
+gests that the correlation between PPL and loss is perhaps
+weak, and we will investigate this in the future.
+Figure 1. The solid lines represent the top-1 accuracy of ResNet-
+18 on ImageNet w.r.t. the number of iterations K when using ap-
+proximation Eq. (10); while the dashed lines are for the approxi-
+mation Eq. (11). The blue line represents quantization via decou-
+pleQ, with only the layer-wise minimization used. The red line
+represents the addition of one-epoch sft to the blue line.
+4.3.2
+the size of calibration dataset
+The solution of Eq. (6) is dependent on H and thus on the
+size of the calibration dataset, as does Eq. (2). Smaller cal-
+ibration datasets can easily lead to overfitting. Fig. 4 shows
+the relationship between dataset size and PPL. In this exper-
+iment, the calibration dataset is randomly sampled from C4
+and the model (Llama-7B) is quantized into W2A16g64.
+
+
+Llama
+1-7B
+1-13B
+1-30B
+1-65B
+2-7B
+2-13B
+2-70B
+FP16
+5.68
+5.09
+4.10
+3.53
+5.47
+4.88
+3.31
+GPTQ
+2.1e3
+5.5e3
+499.75
+55.91
+7.7e3
+2.1e3
+77.95
+OmniQuant
+15.47
+13.21
+8.71
+7.58
+37.37
+17.21
+7.81
+decoupleQ
+9.49
+7.86
+6.37
+5.59
+9.74
+13.03
+5.23
+W2A16
+runtime
+2.5
+4.8
+12.7
+27.6
+2.5
+4.5
+33.4
+GPTQ
+44.01
+15.60
+10.92
+9.51
+36.77
+28.14
+-
+OmniQuant
+8.90
+7.34
+6.59
+5.65
+9.62
+7.56
+6.11
+decoupleQ
+8.65
+7.25
+6.04
+5.19
+8.79
+7.44
+4.96
+W2A16g128
+runtime
+3.7
+7.7
+24.3
+55.0
+3.7
+7.9
+70.6
+GPTQ
+22.10
+10.06
+8.54
+8.31
+20.85
+22.44
+-
+OmniQuant
+8.90
+7.34
+6.59
+5.65
+9.62
+7.56
+6.11
+decoupleQ
+8.18
+6.96
+5.81
+5.07
+8.41
+6.98
+5.34
+W2A16g64
+runtime
+4.3
+8.9
+27.9
+64.5
+4.4
+9.0
+98.2
+GPTQ
+8.06
+6.76
+5.84
+5.06
+8.37
+6.44
+4.82
+AWQ
+11.88
+7.45
+10.07
+5.21
+24.00
+10.45
+-
+OmniQuant
+6.49
+5.68
+4.74
+4.04
+6.58
+5.58
+3.92
+W3A16
+decoupleQ
+6.38
+5.60
+4.67
+6.05
+6.22
+5.72
+3.84
+GPTQ
+6.13
+5.40
+4.48
+3.83
+5.83
+5.13
+3.58
+AWQ
+6.08
+5.34
+4.39
+3.76
+6.15
+5.12
+-
+OmniQuant
+5.86
+5.21
+4.25
+3.71
+5.74
+5.02
+3.47
+W4A16
+decoupleQ
+5.85
+5.21
+4.24
+3.67
+5.70
+5.06
+3.45
+Table 2. The results of PPL of wikitext-2 on Llama-1/2. We also report the runtime (measured in hours) for the W2 quantization via
+decoupleQ in the gray background row. The results other than decoupleQ are copied from OmniQuant [28]. All the results of decoupleQ
+use the approximation Eq. (11). The PPL on Llama-2-13B-W2A16 is higher than that on Llama-2-7B-W2A16: This is strange, and as of
+press time, we still don’t know the reason.
+Figure 2. The solid line represents the PPL of Llama-7B on
+WikiText2 w.r.t. the number of iterations K when using approx-
+imation Eq. (10); while the dashed line is for the approxima-
+tion Eq. (11). The horizontal axis represents K, and the verti-
+cal axis represents PPL. The model is quantized into W2A16, and
+block-wise minimization is not used in this experiment. It shows
+that, when K > 1, solving approximation Eq. (10) yields better
+model accuracy than approximation Eq. (11).
+We use the second-level approximation (Eq. (11)) to save
+time, and {N = 4, J = 4}. It is obvious that as the size of
+the dataset increases, the model accuracy increases mono-
+tonically. For runtime reference, when the number of seg-
+ments is 128/2048, the experiment took 4.3/19.5 hours.
+Llama
+1-7B
+1-13B
+1-30B
+2-7B
+2-13B
+w/o
+13.66
+9.68
+7.35
+14.66
+12.93
+w
+9.49
+7.86
+6.37
+9.74
+13.03
+Table 3. The perplexity of Llama on WikiText2 with and without
+the block-wise minimization. All the models are quantized into
+W2A16.
+4.3.3
+the necessity of block-wise minimization
+Tab. 3 shows that block-wise minimization, Eq. (2), can
+further improve the model accuracy. This is obvious be-
+cause minimizing the ℓ2 loss at each layer does not nec-
+essarily result in the minimizing the ℓ2 loss for this block.
+In this experiment, we choose N = 4 and the approxima-
+tion Eq. (11) for the layer-wise minimization, and J = 4 if
+block-wise minimization is used.
+5. Conclusion and Discussion
+deocupleQ decouples the model parameters into the in-
+teger part and a floating point part, and then optimizes them
+alternately. This optimization process contains two stages.
+In the layer-wise minimization, we transform the quantiza-
+tion problem into the purely mathematical constrained op-
+timization problem Eq. (6); while in the block-wise mini-
+
+
+Figure 3. The PPL of Llama-7B on WikiText2 and the loss of the
+first block between pre-and post-quantization w.r.t. the number of
+iterations K when using approximation Eq. (10). The dashed line
+is for the approximation Eq. (11). The model is quantized into
+W2A16, and both the layer-wise minimization and block-wise
+minimization are used. The model’s best PPL is where K = 1,
+and then fluctuates within a range as K increases. But all PPLs
+are inferior to when the approximation Eq. (11) is used. The loss,
+defined in Eq. (2), of the first block between pre-and post quanti-
+zation is plotted on the right vertical axis. As K increases, the loss
+decreases strictly monotonically, and when K > 2, the loss falls
+below the case when the approximation Eq. (11) is used.
+Figure 4. The perplexity of Llama-7B on WikiText2 and C4 dataset
+w.r.t. the number of segments as calibration datasets. The model
+is quantized into W2A16g64.
+mization, we freeze the integer part and then finetune the
+floating point part.
+The risk of decoupleQ comes from two aspects. On the
+one hand, how much the minimization of the ℓ2 loss of the
+layer’s or block’s output correlates with the accuracy of the
+model; on the other hand, decoupleQ is prone to overfitting
+the calibration dataset.
+For the first risk, we find experimentally that the cor-
+relation between Top-1 and the loss is strong in the Ima-
+genet classification task; however, the correlation between
+PPL and the loss is slightly weaker in LLM. This could be
+method
+res18-69.76%
+res50-76.13%
+3bit
+4bit
+3bit
+4bit
+GPTQ
+67.88
+69.37
+74.87
+75.71
+OBQ
+68.69
+69.56
+75.24
+75.72
+BRECQ
+68.47
+69.37
+75.32
+75.88
+decoupleQ
+68.65
+69.58
+75.24
+76.00
+decoupleQ*
+68.94
+69.71
+75.61
+75.97
+Table 4. Comparison of decoupleQ with other methods. In decou-
+pleQ*, we train the (s, z) and parameters in norm layer for one
+epoch, using the regular labeled dataset containing 1.2 million im-
+ages.
+decoupleQ
+decoupleQ*
+ResNet
+res18
+res50
+res18
+res50
+Top-1
+64.13
+71.54
+65.44
+72.72
+Table 5. The results of W2 quantization via decoupleQ. In decou-
+pleQ*, we train the (s, z) and parameters in norm layer for one
+epoch, using the regular labeled dataset containing 1.2 million im-
+ages.
+mainly because of an inherent bias between the loss and the
+accuracy of the model, or because PPL is not a good in-
+dicator of the accuracy of LLM, or for other reasons. For
+the second risk, when H in Eq. (7) is an underdetermined
+matrix, the risk of overfitting rises sharply. In this case, the
+possibility of H being underdetermined can be reduced ei-
+ther by enhancing the diagonal element values of H or by
+increasing the amount of calibration data. In our practice,
+we found that the accuracy of quantization models can rise
+monotonically with the increase of the size of the calibration
+dataset in any situations, but the runtime of quantization rise
+as well.
+The idea of decoupleQ is helpful for the adaptation of
+large model to downstream sub-task. We can quantize a
+large foundation model via decoupleQ, then freeze the in-
+teger part of the model, and finetune the floating-point part
+with labeled dataset from downstream sub-task. Tab. 5 and
+Fig. 1 show that the model accuracy can be further improved
+by end-to-end supervised learning.
+References
+[1] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Sub-
+biah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakan-
+tan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Lan-
+guage models are few-shot learners. Advances in neural in-
+formation processing systems, 33:1877–1901, 2020. 1
+[2] S´ebastien Bubeck, Varun Chandrasekaran, Ronen Eldan, Jo-
+hannes Gehrke, Eric Horvitz, Ece Kamar, Peter Lee, Yin Tat
+Lee, Yuanzhi Li, Scott Lundberg, et al. Sparks of artificial
+general intelligence: Early experiments with gpt-4. arXiv
+preprint arXiv:2303.12712, 2023. 1
+
+
+[3] S´ebastien Bubeck et al. Convex optimization: Algorithms
+and complexity.
+Foundations and Trends® in Machine
+Learning, 8(3-4):231–357, 2015. 4
+[4] Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christo-
+pher De Sa. Quip: 2-bit quantization of large language mod-
+els with guarantees. arXiv preprint arXiv:2307.13304, 2023.
+1, 2
+[5] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+and Li Fei-Fei. Imagenet: A large-scale hierarchical image
+database. In 2009 IEEE conference on computer vision and
+pattern recognition, pages 248–255. Ieee, 2009. 5
+[6] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+Zettlemoyer.
+Llm. int8 (): 8-bit matrix multiplication for
+transformers at scale.
+arXiv preprint arXiv:2208.07339,
+2022. 1
+[7] Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, De-
+nis Kuznedelev, Elias Frantar, Saleh Ashkboos, Alexander
+Borzunov, Torsten Hoefler, and Dan Alistarh.
+Spqr: A
+sparse-quantized representation for near-lossless llm weight
+compression. arXiv preprint arXiv:2306.03078, 2023. 1, 2
+[8] Elias Frantar and Dan Alistarh.
+Optimal brain compres-
+sion: A framework for accurate post-training quantization
+and pruning.
+Advances in Neural Information Processing
+Systems, 35:4475–4488, 2022. 2, 3
+[9] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan
+Alistarh. Optq: Accurate quantization for generative pre-
+trained transformers. In The Eleventh International Confer-
+ence on Learning Representations, 2022. 1, 2, 3, 4, 5
+[10] Yi Guo, Yiqian He, Xiaoyang Li, Haotong Qin, Van Tung
+Pham, Yang Zhang, and Shouda Liu.
+Rdimkd: Generic
+distillation paradigm by dimensionality reduction.
+arXiv
+preprint arXiv:2312.08700, 2023. 1
+[11] Yi Guo, Huan Yuan, Jianchao Tan, Zhangyang Wang, Sen
+Yang, and Ji Liu. Gdp: Stabilized neural network pruning
+via gates with differentiable polarization.
+In Proceedings
+of the IEEE/CVF International Conference on Computer Vi-
+sion, pages 5239–5250, 2021. 1
+[12] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+Deep residual learning for image recognition. In Proceed-
+ings of the IEEE conference on computer vision and pattern
+recognition, pages 770–778, 2016. 5
+[13] Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, and
+Daniel Soudry.
+Accurate post training quantization with
+small calibration sets. In International Conference on Ma-
+chine Learning, pages 4466–4475. PMLR, 2021. 2
+[14] Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong,
+Xiuyu Li, Sheng Shen, Michael W Mahoney, and Kurt
+Keutzer. Squeezellm: Dense-and-sparse quantization. arXiv
+preprint arXiv:2306.07629, 2023. 1
+[15] Diederik P Kingma and Jimmy Ba. Adam: A method for
+stochastic optimization.
+arXiv preprint arXiv:1412.6980,
+2014. 5
+[16] Raghuraman Krishnamoorthi.
+Quantizing deep convolu-
+tional networks for efficient inference: A whitepaper. arXiv
+preprint arXiv:1806.08342, 2018. 1
+[17] Changhun Lee, Jungyu Jin, Taesu Kim, Hyungjun Kim, and
+Eunhyeok Park. Owq: Lessons learned from activation out-
+liers for weight quantization in large language models. arXiv
+preprint arXiv:2306.02272, 2023. 2
+[18] Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi
+Zhang, Fengwei Yu, Wei Wang, and Shi Gu. Brecq: Pushing
+the limit of post-training quantization by block reconstruc-
+tion. arXiv preprint arXiv:2102.05426, 2021. 2, 5
+[19] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu
+Dang, and Song Han. Awq: Activation-aware weight quanti-
+zation for llm compression and acceleration. arXiv preprint
+arXiv:2306.00978, 2023. 1, 2, 5
+[20] Zechun Liu, Kwang-Ting Cheng, Dong Huang, Eric P
+Xing, and Zhiqiang Shen. Nonuniform-to-uniform quantiza-
+tion: Towards accurate quantization via generalized straight-
+through estimation. In Proceedings of the IEEE/CVF Con-
+ference on Computer Vision and Pattern Recognition, pages
+4942–4952, 2022. 1
+[21] Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang,
+Pierre Stock, Yashar Mehdad, Yangyang Shi, Raghuraman
+Krishnamoorthi, and Vikas Chandra.
+Llm-qat: Data-free
+quantization aware training for large language models. arXiv
+preprint arXiv:2305.17888, 2023. 2
+[22] S´ebastien Marcel and Yann Rodriguez.
+Torchvision the
+machine-vision package of torch. In Proceedings of the 18th
+ACM international conference on Multimedia, pages 1485–
+1488, 2010. 5
+[23] Stephen Merity, Caiming Xiong, James Bradbury, and
+Richard Socher.
+Pointer sentinel mixture models.
+arXiv
+preprint arXiv:1609.07843, 2016. 5
+[24] Katta G Murty and Feng-Tien Yu. Linear complementarity,
+linear and nonlinear programming, volume 3. Heldermann
+Berlin, 1988. 3
+[25] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Chris-
+tos Louizos, and Tijmen Blankevoort. Up or down? adap-
+tive rounding for post-training quantization. In International
+Conference on Machine Learning, pages 7197–7206. PMLR,
+2020. 2
+[26] Yury Nahshan, Brian Chmiel, Chaim Baskin, Evgenii
+Zheltonozhskii, Ron Banner, Alex M Bronstein, and Avi
+Mendelson. Loss aware post-training quantization. Machine
+Learning, 110(11-12):3245–3262, 2021. 1
+[27] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee,
+Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and
+Peter J Liu. Exploring the limits of transfer learning with a
+unified text-to-text transformer. Journal of machine learning
+research, 21(140):1–67, 2020. 5, 6
+[28] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu,
+Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Peng Gao, Yu Qiao,
+and Ping Luo.
+Omniquant: Omnidirectionally calibrated
+quantization for large language models.
+arXiv preprint
+arXiv:2308.13137, 2023. 1, 2, 7
+[29] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+Martinet, Marie-Anne Lachaux, Timoth´ee Lacroix, Baptiste
+Rozi`ere, Naman Goyal, Eric Hambro, Faisal Azhar, et al.
+Llama:
+Open and efficient foundation language models.
+arXiv preprint arXiv:2302.13971, 2023. 2
+[30] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,
+Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,
+
+
+Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al.
+Llama 2: Open foundation and fine-tuned chat models. arXiv
+preprint arXiv:2307.09288, 2023. 2
+[31] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-
+reit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia
+Polosukhin. Attention is all you need. Advances in neural
+information processing systems, 30, 2017. 2
+[32] Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang,
+Ruihao Gong, Jinyang Guo, and Xianglong Liu.
+Outlier
+suppression+: Accurate quantization of large language mod-
+els by equivalent and optimal shifting and scaling.
+arXiv
+preprint arXiv:2304.09145, 2023. 1, 2
+[33] Stephen J Wright. Numerical optimization. 2006. 3
+[34] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien
+Demouth, and Song Han. Smoothquant: Accurate and effi-
+cient post-training quantization for large language models.
+In International Conference on Machine Learning, pages
+38087–38099. PMLR, 2023. 1, 2
+[35] Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng Chang,
+Hengheng Zhang, Zhensu Chen, Xiaopeng Zhang, and Qi
+Tian. Qa-lora: Quantization-aware low-rank adaptation of
+large language models.
+arXiv preprint arXiv:2309.14717,
+2023. 2
+[36] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe,
+Moya Chen, Shuohui Chen, Christopher Dewan, Mona Diab,
+Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained trans-
+former language models. arXiv preprint arXiv:2205.01068,
+2022. 1
+[37] Yu Zhang, Wei Han, James Qin, Yongqiang Wang, Ankur
+Bapna, Zhehuai Chen, Nanxin Chen, Bo Li, Vera Axel-
+rod, Gary Wang, et al.
+Google usm: Scaling automatic
+speech recognition beyond 100 languages. arXiv preprint
+arXiv:2303.01037, 2023. 1

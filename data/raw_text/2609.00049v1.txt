@@ -1,0 +1,2483 @@
+REAL-Q: E2E LLM Quantization via Dynamic
+Gradient Descent
+Qian Zhang1∗, Yaoming Li1∗, Zhewen Tan1, Yanshu Wang1, Heng Lu1, Kun Su2,
+Zongwei Lv1, Wenhan Yu1, Yongge Ma1, Yinjun Han3, Ruikuang Liu3, Tong Yang1B
+1 Peking University 2 Northeastern University 3 ZTE Corporation
+∗Equal contribution
+B Correspondence:yangtong@pku.edu.cn
+Abstract
+Post-training quantization (PTQ) is essential for deploying large language models
+(LLMs) under strict resource constraints. State-of-the-art PTQ methods quantize
+each layer with a single closed-form second-order solver: to remain analytically
+tractable, they heavily approximate the global loss (dropping cross-channel cou-
+pling, pooling output rows into groups), and they then freeze the resulting Hessian
+across the entire layer, with no way to refresh it as the loss landscape shifts column
+by column—a phenomenon we call information misalignment. We propose REAL-
+Q (Real-time E2E-loss Aligned LLM Quantization), a novel PTQ paradigm that
+breaks this compromise: instead of diluting the objective for the sake of analytic
+tractability, REAL-Q targets an end-to-end-aligned surrogate of the global loss
+and refines it via fine-grained, dynamic Block-wise Gradient Descent applied after
+every column block (128 columns). By coupling this fine-grained correction with a
+sliding window mechanism for smooth cross-layer transitions, REAL-Q effectively
+mitigates error propagation across the network. On LLaMA-3.1 (8B and 70B) and
+Qwen3 (0.6B–32B) at W4A16, REAL-Q reduces end-to-end KL divergence by up
+to ∼49% relative to state-of-the-art globally-guided methods.
+1
+Introduction
+Large language models (LLMs) have demonstrated remarkable capabilities across a wide range of
+natural language processing tasks [Grattafiori et al., 2024]. However, deploying models with billions
+of parameters incurs substantial compute and memory costs. Post-training quantization (PTQ) offers
+a practical solution by compressing model weights to low-bit representations without requiring costly
+retraining [Gholami et al., 2021].
+Among PTQ methods, GPTQ [Frantar et al., 2023] has emerged as the foundational algorithm for
+weight-only compression. Building upon the Optimal Brain Surgeon (OBS) framework [Hassibi et al.,
+1993], its column-wise solver has been widely integrated into mainstream inference engines (e.g.,
+vLLM, TensorRT-LLM) and extended by a vast lineage of state-of-the-art techniques [Dettmers et al.,
+2024, Li et al., 2025, Kim et al., 2025]. Despite its success, GPTQ has a fundamental limitation:
+Inaccuracy of the Layer-Local Objective. GPTQ minimizes a layer-wise reconstruction MSE
+∥Wx −ˆ
+Wx∥2
+2, where x is the full-precision activation. This local objective suffers from a dual
+misalignment. Upstream, it assumes full-precision input activations x and ignores the perturbed inputs
+ˆx arriving from previously quantized layers, leaving compounding errors uncorrected. Downstream,
+it weights all output-channel perturbations uniformly, ignoring that the true KL divergence depends
+on a strongly non-linear, highly coupled mapping through subsequent transformer blocks and the LM
+head. A surrogate that relies on unperturbed inputs and uniformly weights squared errors is therefore
+misaligned with the true quantization loss.
+Preprint.
+arXiv:2609.00049v1  [cs.LG]  30 Aug 2026
+
+
+Recent works attempt to address these blind spots: GPTAQ [Li et al., 2025] recalibrates inputs to
+correct upstream errors, yet its per-layer loss remains a uniform reconstruction MSE. Conversely,
+GuidedQuant [Kim et al., 2025] incorporates end-to-end gradients to capture downstream sensitivity.
+However, it still leaves upstream errors uncorrected, and it relies on structural approximations such
+as ignoring fine-grained cross-channel coupling and sharing the Hessian across output groups. In
+addition, because the true end-to-end Hessian is prohibitively expensive to recompute, the already-
+approximated matrix remains static within each layer. While the true loss landscape shifts as weights
+are progressively quantized column by column, the misaligned Hessian causes compensation errors
+to accumulate as the column-wise sweep progresses. We refer to this phenomenon as information
+misalignment. Here, "information" refers to first- or second-order information such as the gradient
+and Hessian.
+The shared limitation of these methods is structural: requiring the column-wise update to remain
+analytically solvable forces them to (i) heavily approximate the global loss—dropping cross-channel
+coupling, pooling output rows into groups, and otherwise compressing the second-order information
+until it fits a closed-form solver—and (ii) freeze the resulting Hessian over the entire layer, with no
+way to refresh it at finer granularity as the loss landscape shifts with each column quantization step.
+REAL-Q (Real-time E2E-loss Aligned LLM Quantization) addresses both limitations by interleaving
+fine-grained, dynamic corrections into the column-wise sweep, via two components:
+An end-to-end-aligned objective: Aggregated Fisher MSE. REAL-Q’s surrogate is a transformer-
+block-output Fisher MSE, derived from a second-order Taylor expansion of the global KL divergence
+at the current block’s output. Using the full aggregated Fisher matrix preserves the cross-channel
+coupling that grouped baselines must discard, while the choice of expansion point keeps backpropa-
+gation confined to at most two adjacent blocks. A loss sliding window smooths the objective across
+block boundaries to prevent discontinuous jumps in the optimization landscape.
+Fine-grained, dynamic Block-wise Gradient Descent. Rather than committing the entire layer
+to one frozen second-order solver, REAL-Q interleaves a single Adam [Kingma and Ba, 2014]
+gradient step into the GPTQ sweep after every column block (128 columns). This raises the correction
+granularity from the per-layer level used by prior solvers to the column-block level—roughly two
+orders of magnitude finer—and lets each step react to the most recent quantized state, since the
+gradient is recomputed online against the actual partially quantized weights. Adam’s diagonal
+preconditioner additionally adapts the per-coordinate scale on the fly, providing implicit second-order
+information without ever inverting a Hessian.
+In summary, our main contributions are as follows:
+• Aggregated Fisher MSE with Loss Sliding Window: Within the GPTQ-lineage sequential
+pipeline, we adopt an end-to-end-aligned objective in place of the layer-local MSE. We
+formulate an aggregated Fisher MSE that preserves cross-channel coupling while keeping the
+backpropagation overhead confined to localized block boundaries. To stabilize the sequential
+quantization process, we introduce a loss sliding window mechanism that smooths the
+transition of the objective across consecutive transformer blocks and prevents discontinuous
+jumps in the loss landscape.
+• Dynamic Block-wise Gradient Descent (Block-GD): We address the information mis-
+alignment of prior works by replacing static analytical solvers with a dynamic first-order
+approach. By aligning Adam-driven gradient feedback directly with column-block updates,
+this mechanism adapts to the shifting loss landscape and corrects accumulated upstream
+errors online.
+• Empirical Performance: Experiments on LLaMA-3.1 (8B and 70B) and Qwen3 (0.6B–
+32B) show that REAL-Q achieves the lowest KL on every model evaluated, reducing KL by
+up to ∼49% on Qwen3-1.7B at W4A16 (Figure 1).
+2
+Related Work
+Second-order post-training quantization.
+The Optimal Brain Damage (OBD) [LeCun et al.,
+1989] and Optimal Brain Surgeon (OBS) [Hassibi et al., 1993] frameworks established the foundation
+for using second-order Hessian information in network compression. GPTQ [Frantar et al., 2023]
+successfully scaled OBS to billion-parameter LLMs. By processing weight rows concurrently and
+2
+
+
+Qwen3-0.6B
+( 24% vs. GuidedQuant)
+Qwen3-1.7B
+( 49% vs. GuidedQuant)
+Qwen3-4B
+( 43% vs. GuidedQuant)
+LLaMA-3.1-8B
+( 8% vs. GuidedQuant)
+Qwen3-32B
+( 9% vs. GuidedQuant)
+LLaMA-3.1-70B
+( 5% vs. GuidedQuant)
+0
+5
+10
+15
+20
+25
+30
+KL on WikiText-2  (×10 2, lower is better)
+GPTQ
+GPTAQ
+GuidedQuant
+REAL-Q (ours)
+30.20
+21.30
+13.50
+4.95
+4.98
+18.70
+20.80
+13.20
+11.20
+3.98
+6.62
+16.00
+8.97
+11.90
+9.50
+3.67
+4.66
+15.10
+6.79
+6.07
+5.44
+3.36
+4.24
+14.30
+Figure 1: Headline result. KL divergence (×10−2, lower is better) on WikiText-2 (W4A16, per-row).
+REAL-Q substantially outperforms GuidedQuant, the strongest prior baseline, with exact relative
+reductions annotated per model. Full seven-model results are in Appendix D.2.
+employing a shared, static inverse Hessian to compensate for quantization errors column by column,
+GPTQ established the dominant pipeline for modern sequential PTQ.
+Global-aware extensions of GPTQ.
+Recent advancements attempt to enhance the standard sequen-
+tial GPTQ pipeline by incorporating broader model context into the quantization process. GPTAQ [Li
+et al., 2025] addresses upstream error accumulation by iteratively recalibrating the input activations.
+Instead of relying solely on fixed, full-precision inputs, it dynamically computes calibration activa-
+tions using the outputs from previously quantized layers, thereby incorporating upstream quantization
+drift into the layer-wise reconstruction objective. GuidedQuant [Kim et al., 2025] incorporates
+end-to-end downstream sensitivity into the local solver. It performs an initial backward pass over
+the calibration set to obtain per-token saliency scores, which are subsequently used to weight the
+input covariance matrix. To maintain the computational tractability of the analytical second-order
+update, GuidedQuant partitions the weight matrix rows into groups and computes a shared, static
+approximated Hessian for each group to drive the column-wise quantization.
+Other related directions.
+Extended discussions on rotation pre-processing (e.g., QuaRot [Ashk-
+boos et al., 2024b], which we adopt), weight-only representations, quantization-aware training, and
+classical Fisher applications are deferred to Appendix B. This appendix also provides a detailed
+comparison with BRECQ [Li et al., 2021]; while BRECQ shares conceptual similarities in block-level
+loss modeling, its overall quantization pipeline is fundamentally different from ours.
+3
+Preliminaries
+3.1
+Problem Formulation
+Consider a pre-trained LLM with L transformer blocks, where each block ℓcontains linear modules
+(e.g., Wq, Wk, Wv, Wo for attention and Wup, Wgate, Wdown for the MLP). For a linear module
+with weight matrix W ∈Rm×n, the goal of PTQ is to find a quantized weight ˆ
+W that minimizes the
+degradation in model output quality.
+Given a calibration dataset D = {x1, . . . , xN}, we measure quantization quality via the KL diver-
+gence between the original and quantized model outputs:
+LKL = Ex∼D
+
+DKL
+ pW(· | x) ∥p ˆ
+W(· | x)
+
+.
+(1)
+Following recent studies [Kong et al., 2026], we adopt KL divergence as our primary evaluation metric,
+as it captures the full output distributional shift and correlates more faithfully with quantization-
+induced behavioral degradation than perplexity. For comparability with prior works, we also report
+perplexity and zero-shot task accuracy as secondary metrics.
+3.2
+GPTQ Recap
+GPTQ [Frantar et al., 2023] processes linear modules by quantizing weights column by column. At
+step j, GPTQ quantizes column j to ˆwj, computes the residual δj = wj −ˆwj, and optimally updates
+3
+
+
+the remaining unquantized columns to compensate:
+W:,j+1:n ←W:,j+1:n −
+1
+[H−1]jj
+δjH−1
+j,j+1:n,
+(2)
+where H = 2
+T
+PT
+t=1 xtx⊤
+t is the Hessian of the localized reconstruction MSE. To accelerate compu-
+tation, GPTQ groups columns into blocks of size B. After applying Eq. 2 within the block, a batch
+update compensates all trailing columns globally: W:,bend:n ←W:,bend:n −Eb ·H−1
+b,bend:n (bend denotes
+the end of block b), where Eb is the accumulated block error.
+3.3
+GuidedQuant: Saliency-Weighted Hessian
+While standard GPTQ relies on a uniform layer-wise reconstruction objective, GuidedQuant [Kim
+et al., 2025] improves this by aligning the Hessian with the end-to-end loss. By performing an
+initial end-to-end backward pass over the calibration set, it obtains per-token saliency scores
+s(ℓ)
+t
+= ∥∂L/∂y(ℓ)
+t ∥2, which are then used to weight the GPTQ Hessian computation. To man-
+age computational overhead, the weight matrix rows are partitioned into Ng groups (we use Ng = 4
+in all experiments), and a separate Hessian is maintained for each group:
+H(ℓ)
+g
+=
+T
+X
+t=1
+s(ℓ)
+t,g · xtx⊤
+t ,
+g = 1, . . . , Ng,
+(3)
+where s(ℓ)
+t,g is the saliency score for token t restricted to the output dimensions in group g. While
+computationally feasible, this group-sharing strategy inherently discards exact cross-channel coupling
+and degrades the precision of the second-order matrix.
+4
+REAL-Q
+4.1
+Overview
+REAL-Q augments the saliency-weighted PTQ pipeline with a coarse-to-fine optimization hierarchy.
+We retain the traditional column-wise analytical compensation as a preliminary coarse update, but
+augment the optimization trajectory with: (1) an Aggregated Fisher-Weighted MSE providing
+end-to-end gradient guidance; (2) Dynamic Block-GD, an active first-order correction applied imme-
+diately post-block to reduce residual errors (e.g., upstream perturbations and structural imprecision)
+missed by static solvers; and (3) a Loss Sliding Window to smoothly interpolate objectives across
+consecutive transformer blocks. Together, these components correct residual errors left by static
+second-order updates. Figure 2 presents a comparison between prior methods and REAL-Q. The
+complete pseudocode is provided in Appendix A.
+4.2
+Objective
+A challenge in moving beyond static analytical solvers is defining a tractable, high-fidelity loss
+function to drive dynamic optimization. Using the exact end-to-end KL divergence (Eq. 1) as an
+explicit objective would require a full forward pass through all subsequent layers and the LM head at
+every block step—a computationally prohibitive requirement.
+To break this computational deadlock, we construct a high-fidelity surrogate: the Aggregated Fisher
+MSE loss. Consider the KL divergence LKL as a function of the per-token transformer block output yt.
+By performing a second-order Taylor expansion around the full-precision output y∗
+t , and noting that
+the first-order gradient identically vanishes since y∗
+t minimizes the KL divergence (LKL(y∗
+t ) = 0),
+the expected loss over tokens satisfies:
+Et
+
+LKL(yt)
+
+≈1
+2Et
+
+∆y⊤
+t Ht∆yt
+
+,
+(4)
+where ∆yt = yt −y∗
+t is the per-token output perturbation and Ht = ∇2
+ytLKL
+
+y∗
+t is the per-token
+Hessian. The standard Fisher–Hessian identity gives Et[Ht] = Et[gtg⊤
+t ] in expectation under
+the model distribution, where gt = ∇ytLNLL (noting the shift from LKL, as Fisher information is
+4
+
+
+Figure 2: Comparison of static analytical quantization and REAL-Q. In prior static methods (e.g.,
+standard GPTQ or GuidedQuant), a fixed Hessian approximation is used throughout, allowing
+quantization errors to accumulate unchecked across column blocks (red). In REAL-Q, a dynamic
+Block-GD step is applied immediately after each block, actively correcting accumulated structural
+errors and keeping the end-to-end reconstruction loss tightly bounded (green).
+formally defined via the NLL score function using target labels sampled from the full-precision
+model’s output distribution p). In contrast to the structural approximations used by prior analytical
+solvers, we formulate an objective that operates at the transformer block level and preserves the
+cross-channel coupling structure.
+Aggregated Fisher loss (ours).
+We bypass the structural approximations of prior works by moving
+the expectation inside the quadratic form. We define the aggregated Fisher matrix:
+F = Et
+
+gtg⊤
+t
+
+≈1
+T
+T
+X
+t=1
+gtg⊤
+t ∈Rd×d,
+(5)
+where d is the transformer block output dimension. Our surrogate loss, which acts as the foundational
+objective for our subsequent Block-GD updates (Section 4.3), is formulated as:
+LFisher = 1
+2Et
+
+∆y⊤
+t F∆yt
+
+= 1
+2 · 1
+T
+T
+X
+t=1
+∆y⊤
+t F∆yt.
+(6)
+Here, F is the full Fisher matrix (retaining all cross-channel covariances), aggregated once per
+transformer block over the calibration set. It requires zero per-token storage and removes the need for
+any heuristic grouping hyperparameters. Details regarding the pre-computation of F and the special
+handling of the final transformer block are provided in Appendix D.1.
+Proposition 4.1 (Decoupled Fisher Aggregation). The exact expected second-order penalty is
+Et[∆y⊤
+t Ht∆yt]. By applying a mean-field approximation to decouple the token-wise Hessian from
+the output perturbation, we obtain Et[∆y⊤
+t Et[Ht] ∆yt]. Combined with the Fisher–Hessian identity
+Et[Ht] = Et[gtg⊤
+t ] ≈F, Eq. 6 serves as a tractable surrogate. The approximation error strictly
+amounts to the element-wise covariance P
+i,j Cov
+ (Ht)ij, (∆yt∆y⊤
+t )ij
+
+(see Appendix C.1).
+We adopt this decoupling as a deliberate trade-off: recognizing that cross-channel covariance affects
+LLM behavior more strongly than token-wise correlations, we trade the latter to bypass intractable
+per-token Hessians. This allows materializing the full aggregated Fisher F without memory explosion.
+4.3
+Dynamic Block-wise Gradient Descent
+In REAL-Q, the saliency-weighted analytical update serves as a foundational step. After analytically
+processing column block b, we evaluate our surrogate LFisher(W(b)) via a forward pass through the
+current transformer block using a calibration mini-batch. We explicitly correct the static solver’s
+residual errors by computing the exact gradient with respect to the remaining unquantized weights,
+5
+
+
+updating these trailing columns via a single Adam [Kingma and Ba, 2014] step (whose states are
+tracked per-parameter, as the pool of active unquantized weights continuously shrinks):
+W:,bend:n ←W:,bend:n −η · Adam
+ ∇W:,bend:nLFisher(W(b))
+
+,
+(7)
+where η is the learning rate. Already-quantized weights remain locked. By relying on this first-
+order correction, REAL-Q limits cross-block error accumulation and avoids the prohibitive cost of
+refreshing the analytical Hessian during the quantization loop.
+4.4
+Loss Sliding Window
+Sequential quantization typically suffers from discontinuous objective landscapes when transitioning
+between transformer blocks. To resolve this, we introduce a loss sliding window (Figure 4) that
+smoothly interpolates exact Fisher objectives. When quantizing block ℓat cumulative column-
+block step bglobal (out of Btotal, where Btotal denotes the total number of column-block steps within
+transformer block ℓ, i.e., the sum of column blocks across all linear modules in the block; the
+per-linear-module column-block index b in Eq. 7 is local to its module, while bglobal accumulates
+across all modules in the block), the surrogate is dynamically blended:
+L(bglobal)
+slide
+= α(bglobal) · L(ℓ)
+Fisher +
+ 1 −α(bglobal)
+· L(ℓ+1)
+Fisher ,
+(8)
+where α(bglobal) = 1 −bglobal−1
+Btotal−1 (assuming Btotal > 1). Mechanically, evaluating the gradient of this
+blended loss requires backpropagating from the output of block ℓ+ 1 into block ℓ. While this
+expands the dynamic correction graph to two transformer blocks, it avoids the overhead of full
+end-to-end unrolling. This two-block scope encourages the current layer to anticipate and reduce
+error propagation into its successor, preventing abrupt jumps in the loss landscape between adjacent
+blocks and thereby stabilizing the sequential quantization process.
+5
+Theoretical Analysis
+We present two theoretical results justifying REAL-Q: formalizing the inherent error accumulation of
+static Hessian solvers, and deriving a sufficient cosine condition under which Block-GD descends on
+the true global loss. Full proofs are deferred to Appendix C.2 and C.3.
+Error Accumulation in Static Solvers.
+Globally-guided PTQ methods rely on a static approx-
+imation of the end-to-end Hessian (H). However, as column quantization progresses, the true
+downstream-aware Hessian shifts. Letting ∆H(j) = H(j)
+ideal −H denote this gap, the static solver
+incurs a cumulative penalty. Assuming a linear structural drift, we prove in Appendix C.2 that this
+expected uncompensated error scales as:
+E[E] = Ω(n · ¯ϵ2 · ∥H∥2),
+(9)
+where n is the column dimension and ¯ϵ2 is the expected squared residual. Under the stated assumption,
+this linear error growth with respect to module width n indicates that static analytical solvers cannot
+prevent compounding cross-column errors.
+Descent Condition Analysis under First-Order Updates.
+To overcome this, REAL-Q dynami-
+cally optimizes the surrogate LFisher. Assuming the true end-to-end objective J(W) is β-smooth, the
+true loss after a gradient step W(+) = W −ηgsurr satisfies the descent-lemma upper bound
+J(W(+)) ≤J(W) −η∥∇J(W)∥∥gsurr∥cos θ + η2β
+2 ∥gsurr∥2,
+(10)
+where cos θ is the cosine similarity between the surrogate gradient gsurr and the true gradient ∇J(W).
+Thus, the true global loss strictly decreases (J(W(+)) < J(W)) if:
+cos θ > ηβ
+2 ·
+∥gsurr∥
+∥∇J(W)∥.
+(11)
+This establishes that optimization fails under poor gradient approximations (cos θ ∼0). Conversely,
+REAL-Q maintains cos θ well above this threshold (Figure 3). The above argument is stated for SGD;
+for Adam, the preconditioned step direction is no longer aligned with gsurr, so the inequality does not
+directly transfer, but we observe consistent empirical descent under the learning rates used in our
+experiments (Section 6).
+6
+
+
+6
+Experiments
+6.1
+Experimental Setup
+Setup.
+We evaluate REAL-Q on LLaMA-3.1-8B / LLaMA-3.1-70B [Grattafiori et al., 2024] and
+Qwen3-0.6B / 1.7B / 4B / 8B / 32B [Yang et al., 2025], against RTN, GPTQ [Frantar et al., 2023],
+GPTAQ [Li et al., 2025], and GuidedQuant [Kim et al., 2025]; all methods share QuaRot [Ashkboos
+et al., 2024b] rotation. We report WikiText-2 [Merity et al., 2017] KL divergence, perplexity, and
+zero-shot accuracy on ten tasks. Quantization is symmetric throughout; W4A16 uses per-row weights
+(no grouping); group size 128 is used only for low-bit (W3A16, W2A16) and weight-activation
+(WxA4KV4) settings. Calibration: 2048 WikiText-2 samples for W4A16 and W4A4KV4 (256 for
+LLaMA-3.1-70B due to cost; 256 for low-bit / W2A4KV4 / W3A4KV4). We use Adam with a
+mini-batch size of 32 and a reverse-cosine layer-wise LR schedule. Full setup and learning rates are
+detailed in Appendices D.1 and D.3.
+Why KL is our primary fidelity metric.
+All Qwen3 checkpoints used in our evaluation are
+post-trained models, for which the bf16 reference is generally not at the extremum of perplexity
+or zero-shot task accuracy (post-training optimizes neither metric; cf. Appendix D.1). Consequently,
+any quantization-induced fluctuation in PPL or downstream accuracy—in either direction—does
+not by itself indicate quantization quality; only the KL divergence between the quantized and
+full-precision output distributions directly measures fidelity to the full-precision model’s behavior.
+Furthermore, the calibration set (2048 × 2048 ≈4M tokens) is a small fraction of the full
+WikiText-2 corpus, and KL/PPL are evaluated on the held-out test split, so the consistent KL
+reduction across every evaluated model reflects generalization to unseen text rather than overfitting to
+the calibration sample.
+6.2
+Main Results: W4A16
+Table 1 reports W4A16 results (per-row weight quantization) for REAL-Q and four baselines on four
+representative models—one LLaMA-3.1 base model and three Qwen3 sizes. REAL-Q achieves the
+lowest KL divergence on every model. The full seven-model table (additionally covering LLaMA-
+3.1-70B, Qwen3-0.6B / 8B) is in Appendix D.2.
+Table 1: W4A16 (per-row weight quantization) on four representative models. KL (×10−2) and PPL
+are evaluated on WikiText-2. Downstream columns report zero-shot accuracy (%) on ten tasks and
+their average. KL is the primary fidelity metric; for post-trained Qwen3 models the bf16 reference
+is not at the PPL/accuracy optimum, so PPL or downstream-accuracy fluctuations relative to bf16 do
+not by themselves indicate quality (see §6.1 and Appendix D.1).
+Model
+Method
+KL
+PPL
+ARC-C ARC-E BoolQ C-Eval Hella. LAMB. OBQA PIQA SIQA Wino. Avg.
+LLaMA-3.1-8B
+bf16
+—
+6.25
+53.41
+81.31
+82.17
+48.66
+78.90
+75.33
+44.80
+81.18 50.15 73.80 66.97
+RTN
+16.1
+7.64
+49.23
+76.81
+79.24
+38.86
+75.08
+70.33
+43.60
+78.07 49.85 71.67 63.27
+GPTQ
+4.95
+6.60
+53.75
+80.01
+81.53
+46.51
+78.20
+75.02
+44.20
+80.58 49.59 72.45 66.18
+GPTAQ
+3.98
+6.53
+53.16
+80.60
+79.82
+45.99
+78.11
+74.46
+43.80
+80.20 50.41 73.09 65.96
+GuidedQuant
+3.67
+6.50
+53.07
+79.97
+81.74
+46.95
+77.96
+74.35
+44.20
+80.47 49.69 72.85 66.12
+REAL-Q (ours) 3.36
+6.48
+53.84
+79.97
+81.07
+46.36
+78.08
+74.91
+46.20
+80.96 50.61 72.85 66.48
+Qwen3-1.7B
+bf16
+—
+16.73
+42.75
+69.91
+77.95
+58.62
+60.37
+50.44
+36.80
+72.47 44.22 60.93 57.45
+RTN
+120 75.61
+30.72
+37.67
+64.80
+42.20
+49.67
+24.49
+29.20
+63.00 41.56 54.06 43.74
+GPTQ
+21.3 21.50
+34.13
+56.36
+76.91
+52.23
+56.94
+42.60
+34.40
+67.74 43.30 57.46 52.21
+GPTAQ
+13.2 18.59
+37.71
+60.35
+75.54
+51.11
+57.35
+46.09
+34.00
+70.35 42.73 59.67 53.49
+GuidedQuant
+11.9 17.72
+39.68
+65.87
+76.39
+48.51
+58.23
+41.70
+37.60
+70.40 43.96 60.06 54.24
+REAL-Q (ours) 6.07 16.54
+38.40
+58.67
+77.98
+55.42
+58.67
+48.22
+36.20
+70.29 42.84 59.75 54.64
+Qwen3-4B
+bf16
+—
+13.66
+54.01
+78.41
+85.20
+70.43
+68.40
+59.29
+40.40
+75.03 51.28 66.14 64.86
+RTN
+31.1 17.11
+46.76
+69.82
+80.46
+62.85
+64.80
+50.42
+38.40
+73.29 48.41 62.67 59.79
+GPTQ
+13.5 13.58
+50.26
+74.20
+83.49
+61.89
+66.67
+59.07
+40.20
+74.70 48.46 63.93 62.29
+GPTAQ
+11.2 14.59
+48.89
+73.61
+83.58
+64.12
+65.87
+58.45
+39.60
+74.92 49.33 62.90 62.13
+GuidedQuant
+9.50 14.50
+49.23
+74.16
+82.75
+64.49
+66.55
+57.31
+38.40
+74.43 48.62 62.35 61.83
+REAL-Q (ours) 5.44 13.44
+49.74
+74.62
+83.46
+67.38
+67.06
+60.12
+39.40
+75.90 46.32 65.11 62.91
+Qwen3-32B
+bf16
+—
+7.61
+60.75
+83.38
+86.82
+85.96
+82.58
+67.24
+46.20
+81.94 54.04 72.93 72.18
+RTN
+21.8
+8.57
+58.02
+77.31
+86.67
+82.54
+80.30
+64.45
+47.40
+79.54 50.82 71.90 69.90
+GPTQ
+4.98
+7.74
+58.87
+81.61
+86.39
+85.14
+82.32
+67.05
+46.20
+81.56 53.12 72.14 71.44
+GPTAQ
+6.62
+7.84
+60.92
+83.38
+86.45
+84.84
+81.61
+67.88
+45.00
+81.07 53.53 73.56 71.82
+GuidedQuant
+4.66
+7.74
+62.29
+83.42
+83.88
+84.47
+82.15
+67.71
+48.20
+81.61 54.20 72.30 72.02
+REAL-Q (ours) 4.24
+7.53
+60.84
+83.29
+87.43
+84.92
+82.19
+67.34
+45.40
+81.39 51.84 72.38 71.70
+7
+
+
+6.3
+Low-bit Weight-only Quantization
+Table 2 compares baselines and REAL-Q on Qwen3-8B at W3A16 and W2A16. REAL-Q still beats
+every baseline including GuidedQuant.
+Table 2: Low-bit weight-only quantization on Qwen3-8B. Group size 128, calibration sequence length
+2048, 256 calibration samples. KL (×10−2) and PPL are evaluated on WikiText-2. Downstream
+columns report zero-shot accuracy (%) on ten tasks and their average.
+Model
+Method
+KL
+PPL
+ARC-C ARC-E BoolQ C-Eval Hella. LAMB. OBQA PIQA SIQA Wino. Avg.
+W3A16
+RTN
+74.1
+19.58
+38.14
+62.16
+73.00
+51.11
+56.30
+35.78
+34.60
+70.62 42.27 57.77 52.17
+GPTQ
+13.0
+10.70
+51.96
+77.44
+84.53
+70.06
+70.13
+63.67
+41.00
+75.95 49.95 67.80 65.25
+GPTAQ
+12.2
+10.71
+52.13
+77.57
+85.44
+69.17
+70.23
+62.10
+39.40
+75.24 48.31 67.48 64.71
+GuidedQuant
+11.6
+10.38
+50.68
+78.07
+84.50
+70.36
+70.75
+61.50
+40.20
+76.28 48.93 66.85 64.81
+REAL-Q (ours) 10.8
+10.29
+52.56
+79.12
+85.78
+70.58
+70.79
+61.19
+40.00
+76.66 49.49 68.43 65.50
+W2A16
+RTN
+541 1.09×108
+25.85
+24.24
+39.27
+26.15
+26.66
+0.00
+27.40
+51.47 33.62 50.51 30.52
+GPTQ
+62.6
+17.21
+27.90
+43.39
+52.26
+27.19
+47.03
+27.03
+30.80
+63.06 37.56 54.38 41.06
+GPTAQ
+60.6
+16.60
+29.86
+45.20
+67.80
+25.63
+49.37
+33.75
+31.60
+64.53 38.84 53.99 44.06
+GuidedQuant
+58.8
+15.91
+26.79
+43.56
+60.76
+27.49
+46.37
+24.32
+29.40
+62.24 37.26 52.41 41.06
+REAL-Q (ours) 49.9
+14.94
+34.56
+61.57
+72.05
+26.52
+54.32
+38.35
+36.20
+68.66 41.76 58.80 49.28
+6.4
+Weight-Activation Quantization
+We evaluate REAL-Q in the weight-activation quantization setting on Qwen3-8B with W4A4KV4,
+W3A4KV4 and W2A4KV4 configurations. Activations and KV cache are quantized per-token with
+clipping ratios aclip = kclip = vclip = 0.9; weights use group size 128. As described in Appendix D.1,
+the reverse-cosine learning-rate schedule is disabled specifically in activation-aware settings, ensuring
+that early-block errors are corrected by gradient descent rather than amplified.
+Two activation-quantization variants.
+For each method we report two activation-quantization
+variants. (a) Activation-unaware: weights are quantized using the full-precision activations as
+input; the activations are quantized only after all weights are quantized. (b) Activation-aware: the
+quantization of weights is performed against already-quantized activations, so each weight column
+sees the same input distribution it will face at inference. GPTAQ and GuidedQuant both natively
+support activation-aware quantization, and we therefore enable that variant for those baselines.
+Table 3: Weight-activation quantization on Qwen3-8B (WxA4KV4). KL (×10−2) and PPL are
+evaluated on WikiText-2. Downstream columns report zero-shot accuracy (%) on ten tasks and their
+average. For REAL-Q we report both the activation-unaware (a-unaware) and the activation-aware
+(a-aware) variants. GPTQ / GPTAQ / GuidedQuant baselines use their activation-aware variant (where
+supported).
+Model
+Method
+KL
+PPL
+ARC-C ARC-E BoolQ C-Eval Hella. LAMB. OBQA PIQA SIQA Wino. Avg.
+W4A4KV4
+RTN
+40.8
+13.09
+38.40
+61.99
+76.97
+61.89
+64.17
+52.44
+37.80 71.11 44.78 59.83 56.94
+GPTQ
+27.0
+11.50
+47.95
+71.00
+82.08
+64.64
+67.67
+54.41
+39.20 71.98 47.54 61.40 60.79
+GPTAQ
+27.1
+12.06
+45.48
+69.11
+81.83
+64.49
+67.53
+53.00
+39.40 73.39 48.16 61.72 60.41
+GuidedQuant
+27.0
+11.54
+47.35
+72.81
+81.10
+67.38
+67.25
+55.40
+37.80 73.07 47.54 61.33 61.10
+REAL-Q (a-unaware) 26.2
+11.42
+49.57
+72.14
+80.98
+63.60
+67.66
+54.05
+37.60 74.54 45.70 63.93 60.98
+REAL-Q (a-aware)
+22.8
+11.12
+51.02
+75.63
+83.67
+66.12
+69.05
+58.86
+39.60 75.52 46.88 63.61 63.00
+W3A4KV4
+RTN
+121
+35.16
+29.44
+48.99
+56.36
+33.73
+45.93
+18.69
+29.60 62.57 38.23 52.64 41.62
+GPTQ
+36.7
+12.69
+43.43
+67.59
+74.01
+56.17
+62.98
+51.27
+36.60 70.62 45.85 58.80 56.73
+GPTAQ
+36.4
+13.10
+42.49
+67.21
+79.54
+53.12
+63.65
+48.50
+37.60 72.58 44.01 60.38 56.91
+GuidedQuant
+35.2
+12.40
+44.37
+71.51
+80.80
+56.02
+63.25
+48.81
+37.20 71.60 44.88 58.96 57.74
+REAL-Q (a-unaware) 32.1
+12.00
+44.37
+72.60
+78.65
+57.28
+64.50
+50.05
+37.60 71.60 45.04 61.25 58.29
+REAL-Q (a-aware)
+30.5
+12.01
+45.73
+71.13
+81.38
+58.25
+65.15
+55.11
+39.00 72.36 45.39 62.35 59.59
+W2A4KV4
+RTN
+549 1.45×108
+26.28
+24.20
+38.35
+26.23
+26.49
+0.00
+28.40 52.18 33.98 50.59 30.67
+GPTQ
+133
+48.73
+24.06
+35.77
+40.73
+22.96
+34.27
+6.35
+25.60 56.80 35.11 51.54 33.32
+GPTAQ
+108
+28.13
+24.66
+34.05
+53.06
+25.04
+37.83
+16.24
+26.80 57.83 34.44 55.09 36.50
+GuidedQuant
+106
+30.75
+23.81
+37.25
+47.86
+23.33
+36.90
+7.53
+23.60 56.37 35.01 52.88 34.45
+REAL-Q (a-unaware) 127
+42.56
+27.56
+43.52
+48.90
+23.25
+41.62
+12.71
+25.80 60.50 36.28 52.01 37.21
+REAL-Q (a-aware)
+76.7
+19.68
+29.52
+47.22
+65.50
+27.04
+47.62
+30.53
+31.40 64.36 38.54 51.14 43.29
+6.5
+Ablation on Qwen3-4B
+We ablate four REAL-Q design choices on Qwen3-4B (W4A16, per-row weight quantization,
+scheduled final learning rate 2×10−4, final-block LR 10−5): the loss sliding window (SW, on/off);
+8
+
+
+the output-perturbation clipping ratio aloss_clip; the column block size B (smaller B ⇒more frequent
+gradient corrections); and the number of backward samples per gradient step (controls the variance
+of g(b)). The base configuration is SW on, aloss_clip=0.95, B=128, 32 backward samples per step.
+Table 4: Ablation on Qwen3-4B (W4A16, per-row weight quantization). KL (×10−2) and PPL are
+evaluated on WikiText-2; Avg. is the average zero-shot accuracy across the ten downstream tasks.
+Each row changes one knob from the base; remaining knobs are at the base values.
+Configuration
+SW
+aloss_clip
+B
+samples
+KL
+PPL
+Avg.
+Base
+on
+0.95
+128
+32
+5.44
+13.44
+62.91
+−slide window
+off
+0.95
+128
+32
+5.64
+13.32
+62.95
+−activation clip
+on
+–
+128
+32
+5.74
+13.28
+62.81
+Larger column block size
+on
+0.95
+512
+32
+6.57
+13.76
+62.62
+Fewer backward samples
+on
+0.95
+128
+8
+5.72
+13.45
+63.53
+Notably, the column block size B exhibits the largest single-knob impact, supporting the role of
+fine-grained update granularity (smaller B) in mitigating error accumulation. We use KL as the
+primary metric throughout (§6.1).
+6.6
+Loss Approximation Quality
+To empirically assess the quality of our aggregated Fisher MSE as a surrogate, we evaluate the
+geometric alignment between the surrogate gradients and the true end-to-end KL gradient. Figure 3
+plots this mean cosine similarity on Qwen3-0.6B (W4A16). REAL-Q maintains high alignment with
+the true global trajectory. By contrast, the layer-wise MSE (GPTQ/GPTAQ) and saliency-guided
+MSE (GuidedQuant) hover near zero, consistent with their limited ability to capture the true descent
+direction. Full experimental setup is detailed in Appendix D.4.
+0
+5
+10
+15
+20
+25
+Transformer block index 
+0.0
+0.2
+0.4
+0.6
+Mean cosine vs. true KL grad
+(a) all 7 linear modules
+0
+5
+10
+15
+20
+25
+Transformer block index 
+(b) attention only (q,k,v,o)
+0
+5
+10
+15
+20
+25
+Transformer block index 
+(c) FFN only (gate, up, down)
+REAL-Q (mean-field full Fisher, ours)
+Saliency-guided MSE (diagonal Fisher)
+Layer MSE (GPTAQ)
+Figure 3: Mean cosine similarity between each surrogate’s gradient and the true end-to-end KL
+gradient on Qwen3-0.6B (W4A16). REAL-Q’s full Fisher (blue) remains consistently aligned with
+the true gradient, whereas the saliency-guided MSE (GuidedQuant, orange) and module MSE (GPTQ
+/ GPTAQ, grey) sit near zero alignment.
+Additional results.
+Full W4A16 sweeps, calibration-seed stability on Qwen3-0.6B, and detailed
+wall-clock and GPU memory profiling are deferred to Appendices D.2, D.7, D.5, and D.6.
+7
+Discussion, Limitations, and Future Work
+REAL-Q addresses the precision–tractability trade-off in modern PTQ by replacing static analytical
+solvers with a dynamic, coarse-to-fine optimization hierarchy. By pairing a full Aggregated Fisher
+MSE with Block-GD, our method reduces information misalignment and preserves cross-channel
+coupling. Furthermore, our theoretical analysis shows that, under a linear structural-drift assumption,
+static solvers incur Ω(n) compounding errors, and gives the cosine condition that, when satisfied,
+guarantees descent of our dynamic first-order updates on the true global loss. Shifting to this
+active gradient-based paradigm introduces additional computational and memory overhead during
+calibration; we expect these overheads can be amortized through future system-level optimizations,
+such as custom memory-efficient backward kernels and intermediate activation offloading. An
+extended discussion of limitations and future work is provided in Appendix E.
+9
+
+
+References
+Shun-ichi Amari. Natural gradient works efficiently in learning. Neural Computation, 10(2):251–276,
+1998.
+Saleh Ashkboos, Maximilian L. Croci, Marcelo Gennari do Nascimento, Torsten Hoefler, and
+James Hensman. SliceGPT: Compress large language models by deleting rows and columns. In
+International Conference on Learning Representations (ICLR), 2024a.
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L. Croci, Bo Li, Pashmina Cameron, Martin
+Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman. QuaRot: Outlier-free 4-bit inference in
+rotated LLMs. In Advances in Neural Information Processing Systems (NeurIPS), 2024b.
+Yelysei Bondarenko, Riccardo Del Chiaro, and Markus Nagel. LR-QAT: Low-rank quantization-
+aware training for LLMs. arXiv preprint arXiv:2406.06385, 2024.
+Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher De Sa. QuIP: 2-bit quantization of
+large language models with guarantees. In Advances in Neural Information Processing Systems
+(NeurIPS), 2023.
+Mengzhao Chen, Wenqi Shao, Peng Xu, Jiahao Wang, Peng Gao, Kaipeng Zhang, and Ping Luo.
+EfficientQAT: Efficient quantization-aware training for large language models. In Association for
+Computational Linguistics (ACL), 2025.
+Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, Denis Kuznedelev, Elias Frantar, Saleh Ashk-
+boos, Alexander Borzunov, Torsten Hoefler, and Dan Alistarh. SpQR: A sparse-quantized repre-
+sentation for near-lossless LLM weight compression. In International Conference on Learning
+Representations (ICLR), 2024.
+Zhen Dong, Zhewei Yao, Amir Gholami, Michael W. Mahoney, and Kurt Keutzer. HAWQ: Hessian
+AWare quantization of neural networks with mixed-precision. In International Conference on
+Computer Vision (ICCV), 2019.
+Zhen Dong, Zhewei Yao, Yaohui Cai, Daiyaan Arfeen, Amir Gholami, Michael W. Mahoney, and
+Kurt Keutzer. HAWQ-V2: Hessian aware trace-weighted quantization of neural networks. In
+Advances in Neural Information Processing Systems (NeurIPS), 2020.
+Vage Egiazarian, Andrei Panferov, Denis Kuznedelev, Elias Frantar, Artem Babenko, and Dan
+Alistarh. AQLM: Extreme compression of large language models via additive quantization. In
+International Conference on Machine Learning (ICML), 2024.
+Elias Frantar, Sidak Pal Singh, and Dan Alistarh. Optimal brain compression: A framework for
+accurate post-training quantization and pruning. In Advances in Neural Information Processing
+Systems (NeurIPS), 2022.
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training
+quantization for generative pre-trained transformers. In International Conference on Learning
+Representations (ICLR), 2023.
+Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W. Mahoney, and Kurt Keutzer.
+A survey of quantization methods for efficient neural network inference.
+arXiv preprint
+arXiv:2103.13630, 2021.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad
+Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The Llama 3 herd of
+models. arXiv preprint arXiv:2407.21783, 2024.
+Babak Hassibi, David G. Stork, and Gregory J. Wolff. Optimal brain surgeon and general network
+pruning. In IEEE International Conference on Neural Networks, 1993.
+Jinuk Kim, Marwa El Halabi, Wonpyo Park, Clemens J. S. Schaefer, Deokjae Lee, Yeonhong Park,
+Jae W. Lee, and Hyun Oh Song. GuidedQuant: Large language model quantization via exploiting
+end loss guidance. In International Conference on Machine Learning (ICML), 2025.
+10
+
+
+Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong, Xiuyu Li, Sheng Shen, Michael W.
+Mahoney, and Kurt Keutzer. SqueezeLLM: Dense-and-sparse quantization. In International
+Conference on Machine Learning (ICML), 2024.
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+arXiv:1412.6980, 2014.
+Jason Kong, Nilesh Prasad Pandey, Flavio Ponzina, and Tajana Rosing. A KL lens on quantization:
+Fast, forward-only sensitivity for mixed-precision SSM-transformer models. arXiv preprint
+arXiv:2604.13440, 2026.
+Yann LeCun, John S. Denker, and Sara A. Solla. Optimal brain damage. In Advances in Neural
+Information Processing Systems (NeurIPS), 1989.
+Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang, and
+Shi Gu. BRECQ: Pushing the limit of post-training quantization by block reconstruction. In
+International Conference on Learning Representations (ICLR), 2021.
+Yuhang Li, Ruokai Yin, Donghyun Lee, Shiting Xiao, and Priyadarshini Panda. GPTAQ: Efficient
+finetuning-free quantization for asymmetric calibration. arXiv preprint arXiv:2504.02692, 2025.
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: Activation-aware weight quantization for
+LLM compression and acceleration. In MLSys, 2024.
+Liyang Liu, Shilong Zhang, Zhanghui Kuang, Aojun Zhou, Jing-Hao Xue, Xinjiang Wang, Yimin
+Chen, Wenming Yang, Qingmin Liao, and Wayne Zhang. Group Fisher pruning for practical
+network compression. In International Conference on Machine Learning (ICML), 2021.
+Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad, Yangyang
+Shi, Raghuraman Krishnamoorthi, and Vikas Chandra. LLM-QAT: Data-free quantization aware
+training for large language models. In Findings of the Association for Computational Linguistics
+(ACL), 2024a.
+Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krish-
+namoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. SpinQuant: LLM quantization
+with learned rotations. arXiv preprint arXiv:2405.16406, 2024b.
+Vladimir Malinovskii, Denis Mazur, Ivan Ilin, Denis Kuznedelev, Konstantin Burlachenko, Kai Yi,
+Dan Alistarh, and Peter Richtarik. PV-Tuning: Beyond straight-through estimation for extreme
+LLM compression. In Advances in Neural Information Processing Systems (NeurIPS), 2024.
+James Martens and Roger Grosse. Optimizing neural networks with Kronecker-factored approximate
+curvature. In International Conference on Machine Learning (ICML), 2015.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+models. In International Conference on Learning Representations (ICLR), 2017.
+Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang,
+Peng Gao, Yu Qiao, and Ping Luo. OmniQuant: Omnidirectionally calibrated quantization for
+large language models. In International Conference on Learning Representations (ICLR), 2024.
+Sidak Pal Singh and Dan Alistarh. WoodFisher: Efficient second-order approximation for neural
+network compression. Advances in Neural Information Processing Systems, 33:18098–18109,
+2020.
+Yuxuan Sun, Ruikang Liu, Haoli Bai, Han Bao, Kang Zhao, Yuening Li, Jiaxin Hu, Xianzhi Yu,
+Lu Hou, Chun Yuan, Xin Jiang, Wulong Liu, and Jun Yao. FlatQuant: Flatness matters for LLM
+quantization. In International Conference on Machine Learning (ICML), 2025.
+Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. QuIP#: Even
+better LLM quantization with Hadamard incoherence and lattice codebooks. In International
+Conference on Machine Learning (ICML), 2024.
+11
+
+
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang
+Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388,
+2025.
+Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright, Hamid
+Shojanazeri, Myle Ott, Sam Shleifer, et al. PyTorch FSDP: Experiences on scaling fully sharded
+data parallel. arXiv preprint arXiv:2304.11277, 2023.
+12
+
+
+A
+REAL-Q Algorithm Pseudocode and Sliding-Window Illustration
+Algorithm 1 REAL-Q Quantization
+Require: Pre-trained model with weights {W(ℓ)}, calibration set D, block size B, learning rate η
+1: Stage 0: Run end-to-end backward on D to compute aggregated Fisher matrix F(ℓ) and saliency
+s(ℓ) for all layers ℓ
+2: for layer ℓ= 1, . . . , L do
+3:
+for each linear module in layer ℓdo
+4:
+Compute saliency-weighted Hessian Hg and its inverse (Hg)−1 for all row-groups g
+5:
+for block b = 1, . . . , ⌈n/B⌉do
+6:
+// Standard GPTQ within block (executed parallelly across groups)
+7:
+for column j in block b do
+8:
+ˆwg,j ←quant(Wg,j);
+δg,j ←Wg,j −ˆwg,j
+(∀g)
+9:
+Update remaining columns in block via Eq. 2
+(∀g)
+10:
+end for
+11:
+// Second-order compensation for trailing columns
+12:
+Wg,bend:n ←Wg,bend:n −Eg,b (H−1
+g )b,bend:n
+(∀g)
+13:
+// Block-wise gradient descent (jointly updates the full unquantized matrix)
+14:
+// Note: bglobal is the cumulative column-block step within the current transformer block,
+summed across all linear modules in the block (matches the index b in Eq. 8).
+15:
+if ℓ= L then
+16:
+L(b) ←true KL divergence LKL against the LM head
+17:
+else
+18:
+L(b) ←sliding-window loss L(bglobal)
+slide
+(Eq. 8) using Fisher MSE
+19:
+end if
+20:
+g(b) ←∇W:,bend:nL(b)
+21:
+W:,bend:n ←W:,bend:n −η · Adam(g(b))
+22:
+end for
+23:
+end for
+24: end for
+B
+Extended Related Work
+Weight-only PTQ methods.
+A complementary line of work targets aggressive low-bit weight-only
+quantization, where activations stay in higher precision. AWQ [Lin et al., 2024] scales salient weight
+channels prior to quantization to protect them from rounding error; SqueezeLLM [Kim et al., 2024]
+uses sensitivity-based non-uniform clustering of weights; SpQR [Dettmers et al., 2024] keeps a small
+number of outlier weights at higher precision and quantizes the rest more aggressively; OmniQuant
+[Shao et al., 2024] learns clipping ranges and weight transformations end-to-end on calibration data;
+AQLM [Egiazarian et al., 2024] uses additive vector quantization for sub-3-bit weight compression.
+These methods are largely orthogonal to REAL-Q: they design new representations or optimize auxil-
+iary quantization parameters (scales/shifts), while REAL-Q targets the sequential weight-updating
+solver itself. REAL-Q could in principle be combined with any of these representations.
+Incoherence and rotation-based methods.
+A separate family applies orthogonal transforms to the
+weight and activation matrices before quantization to reduce outlier magnitudes and produce more
+uniform distributions. QuIP [Chee et al., 2023] introduces the incoherence-processing framework
+with random orthogonal matrices and adaptive rounding; QuIP# [Tseng et al., 2024] extends this
+with structured (Hadamard) rotations and lattice codebooks. SliceGPT [Ashkboos et al., 2024a]
+uses orthogonal transformations to enable post-training structural pruning by safely reducing model
+dimensionality. Furthermore, methods like SpinQuant [Liu et al., 2024b] and FlatQuant [Sun et al.,
+2025] actively learn rotation matrices or affine transformations to optimize weight and activation
+distributions. These pre-processing steps are complementary to the OBS-style update used by
+REAL-Q—we adopt QuaRot [Ashkboos et al., 2024b] as a default rotation pre-processing in all
+experiments.
+13
+
+
+Figure 4: Illustration of the loss sliding window mechanism (referenced from Section 4.4). When
+quantizing transformer block ℓ, the weight of L(ℓ)
+Fisher (blue) linearly decreases while L(ℓ+1)
+Fisher (orange)
+linearly increases across the column blocks of the linear modules in transformer block ℓ. Right:
+without the sliding window, the objective exhibits a sharp discontinuity at the transformer-block
+boundary; with it, the transition is a smooth linear interpolation.
+Quantization-aware training and fine-tuning.
+A different class of methods trades calibration
+efficiency for additional training: LLM-QAT [Liu et al., 2024a] performs full quantization-aware
+training with distillation; LR-QAT [Bondarenko et al., 2024] reduces the cost of QAT via low-rank
+adapters; EfficientQAT [Chen et al., 2025] uses block-wise alternating optimization of weights and
+quantization parameters; PV-tuning [Malinovskii et al., 2024] fine-tunes the discrete codebook used
+by extreme low-bit quantization methods. These methods generally achieve higher accuracy than
+PTQ at low bit-widths but require multiple full epochs through training data and substantially more
+compute (typically 10–1000× that of PTQ). REAL-Q sits firmly on the PTQ side of this trade-off: it
+incorporates first-order gradient corrections entirely within the single-pass GPTQ calibration pipeline,
+never updating dequantized weights globally or requiring full training epochs.
+Hessian and Fisher information in compression.
+Second-order information has been extensively
+used for network compression. WoodFisher [Singh and Alistarh, 2020] demonstrated the effectiveness
+of using the empirical Fisher matrix as a tractable proxy for the exact Hessian in OBS-based structural
+pruning. Similarly, Liu et al. [2021] derives Fisher-based metrics for structured pruning. HAWQ
+[Dong et al., 2019] and HAWQ-V2 [Dong et al., 2020] use Hutchinson’s algorithm to efficiently
+estimate Hessian eigenvalues and traces for automated mixed-precision quantization. K-FAC [Martens
+and Grosse, 2015] approximates the Fisher matrix as Kronecker products for efficient natural gradient
+computation [Amari, 1998].
+Comparison with BRECQ.
+BRECQ [Li et al., 2021] was originally proposed for CNN quan-
+tization, using a block-output Fisher-weighted reconstruction loss that is conceptually similar to
+our per-transformer-block Fisher MSE. However, BRECQ operates in a fundamentally different
+continuous optimization regime: it jointly optimizes all weight parameters of a residual block as
+continuous variables with a regularization penalty, rather than operating within a discrete, sequential
+GPTQ-style pipeline. Moreover, even if BRECQ’s token-by-token diagonal Fisher objective were
+directly adapted for a transformer architecture, it would reduce to the same saliency-weighted Hessian
+approximation employed by GuidedQuant. To make this reduction explicit, BRECQ’s per-token
+diagonal-Fisher reconstruction loss for a linear module ˆ
+W takes the form
+LBRECQ = 1
+T
+T
+X
+t=1
+(∆Wxt)⊤diag(gt ⊙gt) (∆Wxt),
+(12)
+14
+
+
+where ∆W = W −ˆ
+W and gt = ∇ytLtask is the per-token output gradient. Expanding the diagonal
+weighting and grouping terms by output row i,
+LBRECQ = 1
+T
+m
+X
+i=1
+T
+X
+t=1
+g2
+t,i (∆Wi,:xt)2 =
+m
+X
+i=1
+∆Wi,:
+
+1
+T
+T
+X
+t=1
+g2
+t,i xtx⊤
+t
+
+|
+{z
+}
+=: Hi
+∆W⊤
+i,:,
+(13)
+which is exactly a per-output-row, saliency-weighted Hessian quadratic. This is the Ng →m limit
+of GuidedQuant’s grouped Hessian (Eq. 3); GuidedQuant simply pools rows into Ng groups for
+tractability. The structural limitations we discuss for GuidedQuant therefore apply identically, and
+the gradient correlation of this objective is shown to be low in our experiments (see Figure 3).
+C
+Theoretical Analysis with Proofs
+C.1
+Proof of Decoupled Fisher Aggregation (Proposition 4.1)
+Here we provide the exact mathematical derivation for the approximation error introduced by the
+mean-field decoupling in Proposition 4.1.
+Using the cyclic property of the trace operator and the linearity of expectation, the exact expected
+second-order penalty can be rewritten as:
+Et
+
+∆y⊤
+t Ht∆yt
+
+= Et
+
+Tr(∆y⊤
+t Ht∆yt)
+
+= Tr
+ Et[Ht∆yt∆y⊤
+t ]
+
+.
+(14)
+Similarly, the decoupled expectation used in our surrogate formulation evaluates to:
+Et
+
+∆y⊤
+t Et[Ht] ∆yt
+
+= Tr
+ Et[Ht] · Et[∆yt∆y⊤
+t ]
+
+.
+(15)
+By utilizing the linearity of the trace operator and the fact that both Ht and ∆yt∆y⊤
+t are symmetric,
+the trace of their product is equivalent to their Frobenius inner product. Consequently, the difference
+between the exact joint expectation and the product of their marginal expectations exactly amounts to
+the sum of their element-wise covariances:
+Tr
+ Et[Ht∆yt∆y⊤
+t ]
+
+−Tr
+ Et[Ht] · Et[∆yt∆y⊤
+t ]
+
+=
+X
+i,j
+Cov
+ (Ht)ij, (∆yt∆y⊤
+t )ij
+
+.
+(16)
+Combined with the standard Fisher–Hessian identity Et[Ht] ≈F, the decoupled formulation directly
+yields our objective LFisher in Eq. 6. The mathematical gap between the exact expected penalty and
+the decoupled surrogate is exactly the trace covariance Tr
+ Cov(Ht, ∆yt∆y⊤
+t )
+
+, which we explicitly
+trade for global cross-channel structural fidelity as discussed in Section 4.2.
+□
+C.2
+Error Accumulation in Column-wise Quantization
+Consider a single linear layer with weight matrix W ∈Rm×n and input x ∈Rn. The standard
+layer-wise quantization objective is:
+min
+ˆ
+W
+Ex
+h
+∥Wx −ˆ
+Wx∥2i
+= min
+ˆ
+W
+Tr
+
+(W −ˆ
+W)H(W −ˆ
+W)⊤
+,
+(17)
+where H = E[xx⊤] ∈Rn×n is the input covariance (Hessian of the quadratic reconstruction loss).
+Theorem C.1 (Reconstruction error of GPTQ; restated from Frantar et al. [2022]). Let W be quan-
+tized column-by-column with GPTQ using a fixed Hessian H. Let ϵj ∈Rm denote the per-column
+quantization residual at step j, defined as ϵj = W(j)
+:,j −Q(W(j)
+:,j ). The total layer-wise reconstruction
+error equals LGPTQ = Pn
+j=1 ∥ϵj∥2
+2/[H−1]jj, exactly under the fixed-Hessian objective.
+Proof of Theorem C.1.
+This follows from the OBS framework [Hassibi et al., 1993, Frantar et al.,
+2022]. At step j, quantizing column j introduces error ϵj and the optimal compensation for remaining
+columns is δW:,j+1:n = −ϵj · [H−1]−1
+jj · H−1
+j,j+1:n. By the Schur complement structure of H−1,
+each row independently incurs a loss increase of ϵ2
+ij/[H−1]jj. Summing over all m rows and n
+columns yields the exact closed-form expression.
+□
+15
+
+
+Lemma C.2 (Static Approximation Penalty). Let H(j)
+ideal denote the true downstream-aware Hessian
+at step j, and ∆H(j) = H(j)
+ideal −H denote the gap of the cached static Hessian. In GPTQ, the
+weight update at step j spans multiple columns via compensation, forming a rank-1 perturbation
+∆W(j) = ϵjv⊤
+j , where vj ∈Rn contains the static Hessian dependencies. Assuming the structural
+drift makes this static compensation increasingly misaligned, such that the projection gap is lower-
+bounded by v⊤
+j ∆H(j)vj ≥c · (j/n) · ∥H∥2 for some constant c > 0, the expected cumulative
+uncompensated penalty scales as:
+E[E] = Ω(n · ¯ϵ2 · ∥H∥2),
+(18)
+where ¯ϵ2 = E[∥ϵj∥2
+2] is the expected squared residual norm.
+Proof of Lemma C.2.
+At step j, quantizing column j introduces an immediate residual ϵj =
+W(j)
+:,j −Q(W(j)
+:,j ) (defined as in Theorem C.1, with W(j) the weight matrix entering step j). Follow-
+ing the OBS framework [Frantar et al., 2022], GPTQ applies a correlated update to the remaining
+unquantized columns to compensate. The exact step-wise weight perturbation (new minus old) is a
+rank-1 matrix ∆W(j) = ϵjv⊤
+j , where the compensation vector vj ∈Rn is strictly defined as:
+[vj]k =
+
+
+
+0
+if k < j
+−1
+if k = j
+−[H−1]j,k/[H−1]jj
+if k > j
+(19)
+Evaluating this exact GPTQ update under the true downstream landscape, the actual step-wise penalty
+gap introduced by the stale Hessian is the quadratic form:
+ξj = Tr
+
+∆W(j)∆H(j)(∆W(j))⊤
+=
+
+v⊤
+j ∆H(j)vj
+
+· ∥ϵj∥2
+2.
+(20)
+In deep neural networks with non-quadratic loss landscapes, the true local Hessian H(j)
+ideal deviates
+from the initial static Hessian H proportional to the accumulated distance traversed in the weight
+space. As the column index j progresses, the accumulated weight displacement grows monotonically.
+It is therefore reasonable to assume that the structural drift penalty along the compensation direction,
+v⊤
+j ∆H(j)vj, worsens at least linearly with the macroscopic quantization progress j/n.
+Formalizing this motivated assumption (v⊤
+j ∆H(j)vj ≥c j
+n∥H∥2 for some c > 0), the step-wise
+penalty gap becomes ξj ≥c j
+n∥H∥2∥ϵj∥2
+2.
+Recognizing that in sequential quantization, the magnitude of the local quantization residual ∥ϵj∥2
+2
+is primarily determined by local weight variance, it can be reasonably modeled as statistically
+independent of the macroscopic structural drift index j. Taking the expectation over the random
+quantization residuals, we can decouple the summation due to linearity:
+E
+
+
+n
+X
+j=1
+ξj
+
+≥c · ∥H∥2
+n
+X
+j=1
+j
+nE
+
+∥ϵj∥2
+2
+
+.
+(21)
+Letting ¯ϵ2 = E[∥ϵj∥2
+2] denote the expected squared residual norm, the cumulative expected penalty
+evaluates to:
+c · ∥H∥2 · ¯ϵ2
+n
+X
+j=1
+j
+n = c · ∥H∥2 · ¯ϵ2 · n(n + 1)
+2n
+.
+(22)
+Since n+1
+2
+≥n
+2 , the expected total cumulative penalty is lower-bounded by c
+2 · n · ¯ϵ2 · ∥H∥2. This
+establishes the asymptotic lower bound E[E] = Ω(n · ¯ϵ2 · ∥H∥2), showing that under the stated
+assumption, static analytical solvers cannot prevent compounding cross-column errors.
+□
+C.3
+Descent Condition Analysis under First-Order Updates
+Prior globally-guided PTQ methods rely on structural approximations to maintain the tractability
+of analytical solvers. In this section, we analyze REAL-Q through the lens of continuous surrogate
+optimization theory, deriving the condition under which descending our surrogate guarantees a
+decrease in the true end-to-end objective.
+16
+
+
+Theorem C.3 (End-to-End Descent Condition). Assume the true end-to-end objective J(W) is
+β-smooth. We update the trailing un-quantized weights using a gradient step driven by our surrogate
+objective: W(+) = W −ηgsurr, where gsurr = ∇˜J(W) ( ˜J denotes the surrogate objective). To
+strictly guarantee descent on the true global loss (J(W(+)) < J(W)), the cosine similarity (cos θ)
+between the surrogate gradient gsurr and the true end-to-end gradient ∇J(W) must satisfy the exact
+strict inequality:
+cos θ > ηβ
+2 ·
+∥gsurr∥
+∥∇J(W)∥.
+(23)
+Proof of Theorem C.3.
+We rely on the standard Descent Lemma for β-smooth functions, which
+establishes a strict quadratic upper bound on the objective value after a parameter update:
+J(W −ηgsurr) ≤J(W) −η⟨∇J(W), gsurr⟩+ η2β
+2 ∥gsurr∥2.
+(24)
+To ensure strict descent, the true loss after the update must be less than the initial loss (J(W −
+ηgsurr) < J(W)). This requires the sum of the linear and quadratic terms to be strictly negative:
+−η⟨∇J(W), gsurr⟩+ η2β
+2 ∥gsurr∥2 < 0.
+(25)
+Moving the inner product to the right side yields:
+η⟨∇J(W), gsurr⟩> η2β
+2 ∥gsurr∥2.
+(26)
+We express the inner product using the cosine similarity between the two gradient vectors:
+⟨∇J(W), gsurr⟩= ∥∇J(W)∥∥gsurr∥cos θ. Substituting this into the inequality:
+η∥∇J(W)∥∥gsurr∥cos θ > η2β
+2 ∥gsurr∥2.
+(27)
+Since the learning rate η > 0 and assuming a non-zero surrogate gradient (∥gsurr∥> 0), we divide
+both sides by η∥∇J(W)∥∥gsurr∥to obtain the exact necessary condition:
+cos θ > ηβ
+2 ·
+∥gsurr∥
+∥∇J(W)∥.
+(28)
+This inequality follows directly from the standard descent lemma without further relaxations. As
+empirically observed in Figure 3, REAL-Q’s full aggregated Fisher matrix yields high cos θ, satisfying
+this condition under the learning rates used in our experiments.
+□
+D
+Additional Experimental Details
+D.1
+Full Setup (continuation of Section 6.1)
+Optimizer.
+We use Adam with β1 = 0.9, β2 = 0.999, ϵ = 10−8, with bias correction applied at
+each block step. The learning rate depends on model and bit-width and is reported in Table 6; the
+final transformer block always uses a separate learning rate (also reported in Table 6) and optimizes
+the true KL loss against the LM head directly with Adam. The learning rate is fixed across all column
+blocks within a transformer block.
+Reverse-cosine layer-wise learning-rate schedule.
+The base learning rate of transformer block i
+(out of L total transformer blocks) is set to
+ηi = ηbase + (ηfinal −ηbase) · sin
+π
+2 · i −1
+L −1
+
+,
+(29)
+which interpolates from ηbase at the first block up to ηfinal at the last block. The motivation is that early
+transformer blocks have not yet accumulated upstream quantization error and therefore require less
+aggressive correction; using a smaller learning rate at early blocks improves stability and prevents
+gradient explosions. For activation-aware quantization, this schedule is disabled (constant ηbase
+throughout): once activation quantization is introduced, error accumulates from the very first block,
+and using a small early-layer learning rate would let this error compound rather than be corrected.
+17
+
+
+Activation clipping (a_loss_clip) for small Qwen3 models.
+On Qwen3-0.6B, Qwen3-1.7B,
+and Qwen3-4B we additionally enable an output-perturbation clipping (a_loss_clip=0.95) when
+computing the Fisher MSE loss: per-token output channels whose ∆y magnitude exceeds the 95th
+percentile are scaled down via a detached scale factor (so the loss is rescaled by the same factor and
+the gradient is not zeroed out). This is necessary because smaller post-trained Qwen3 models exhibit
+a small number of channels with very large ∆y, which can dominate the Fisher MSE and let the
+Adam updates be hijacked by a few outlier directions. Note this is distinct from the Hessian-side
+“saliency clipping” described below.
+Hessian-side saliency clipping.
+To prevent extreme gradient outliers (which can be 10–12 orders of
+magnitude larger than the median in deep layers) from collapsing the Hessian to a near rank-1 matrix,
+we clip per-token saliency values to the 99th percentile before computing the saliency-weighted
+Hessian.
+Note on perplexity for Qwen3 models.
+On the post-trained Qwen3 models we occasionally
+observe quantized perplexities slightly below the bf16 baseline. This is expected: post-training does
+not optimize perplexity, so the bf16 model is no longer at the PPL minimum, and any perturbation—
+including quantization—can move PPL in either direction. KL divergence is the primary metric in all
+cases since it directly measures how far the quantized model’s output distribution has moved from
+the full-precision reference.
+Pre-computation of the aggregated Fisher and last-transformer-block handling.
+The aggre-
+gated Fisher F(ℓ) for each transformer block is computed once via a single end-to-end backward
+pass over the calibration set before quantization begins, with on-the-fly outer-product accumulation
+(no per-token storage; O(d2) memory per block). The final transformer block uses the true KL loss
+against the LM head (no Fisher surrogate, since there are no downstream blocks to traverse) with a
+separate learning rate (reported in Table 6), still using Adam.
+FSDP multi-GPU pipeline for large models.
+For LLaMA-3.1-70B the full-precision model and
+per-layer Fisher matrices do not fit in a single GPU. We use an FSDP-sharded [Zhao et al., 2023]
+end-to-end backward across multiple GPUs (Stage 0) to compute and cache Fisher / saliency to disk;
+Stage 1 then loads the cache and performs the per-layer quantization with Block-GD on a sharded
+model.
+D.2
+Full W4A16 Results (continuation of Section 6.2)
+Table 5 reports the full seven-model W4A16 sweep summarized in Section 6.2. The LLaMA-3.1-70B
+run uses 256 calibration samples (rather than 2048) for tractability of the 70B forward / backward; all
+other rows use 2048 samples. REAL-Q achieves the lowest KL on every model.
+D.3
+REAL-Q Learning Rates
+Table 6 reports the non-final-block learning-rate hyperparameter and the final-transformer-block
+learning rate for every REAL-Q run. For rows using the reverse-cosine schedule, the reported value
+is ηfinal, and the first-block learning rate is fixed to 0.01ηfinal before layer-wise interpolation. For
+rows with the schedule disabled, the reported value is used as a constant learning rate throughout the
+non-final transformer blocks.
+LR selection.
+The per-model LRs in Table 6 were obtained from a coarse log-scale grid search
+over {10−3, 10−4, . . . , 10−7}, conducted on a low-cost proxy of the full pipeline that uses a larger
+column block size and fewer backward samples per gradient step. We did not perform fine-grained
+per-model tuning; the LRs in Table 6 are simply the best-performing point on this loose grid. Even
+with this coarse, low-fidelity LR sweep, REAL-Q already attains the substantial improvements over
+prior methods reported in Section 6, and we expect more careful per-model LR selection to only
+further widen the margin.
+18
+
+
+Table 5: Full seven-model W4A16 (per-row weight quantization) results. KL (×10−2) and PPL are
+evaluated on WikiText-2. Downstream columns report zero-shot accuracy (%) on ten tasks and their
+average. bf16 KL is omitted (the bf16 model is the reference).
+Model
+Method
+KL
+PPL ARC-C ARC-E BoolQ C-Eval Hella. LAMB. OBQA PIQA SIQA Wino. Avg.
+LLaMA-3.1-8B
+bf16
+—
+6.25
+53.41
+81.31
+82.17
+48.66
+78.90
+75.33
+44.80 81.18 50.15 73.80 66.97
+RTN
+16.1 7.64
+49.23
+76.81
+79.24
+38.86
+75.08
+70.33
+43.60 78.07 49.85 71.67 63.27
+GPTQ
+4.95 6.60
+53.75
+80.01
+81.53
+46.51
+78.20
+75.02
+44.20 80.58 49.59 72.45 66.18
+GPTAQ
+3.98 6.53
+53.16
+80.60
+79.82
+45.99
+78.11
+74.46
+43.80 80.20 50.41 73.09 65.96
+GuidedQuant
+3.67 6.50
+53.07
+79.97
+81.74
+46.95
+77.96
+74.35
+44.20 80.47 49.69 72.85 66.12
+REAL-Q (ours) 3.36 6.48
+53.84
+79.97
+81.07
+46.36
+78.08
+74.91
+46.20 80.96 50.61 72.85 66.48
+LLaMA-3.1-70B
+bf16
+—
+2.81
+64.85
+86.53
+85.44
+63.60
+85.06
+78.91
+48.20 84.33 54.86 79.56 73.13
+RTN
+71.0 6.83
+51.79
+76.47
+78.29
+31.43
+75.48
+63.05
+40.20 79.33 43.71 71.35 61.11
+GPTQ
+18.7 3.43
+63.31
+86.32
+85.50
+64.64
+84.50
+78.40
+47.60 84.22 49.74 80.03 72.43
+GPTAQ
+16.0 3.32
+62.12
+86.20
+84.68
+63.97
+84.51
+78.38
+46.80 83.51 49.64 79.16 71.90
+GuidedQuant
+15.1 3.31
+64.42
+86.41
+85.54
+63.60
+84.45
+78.67
+47.40 84.06 50.82 79.87 72.52
+REAL-Q (ours) 14.3 3.30
+63.91
+86.49
+84.83
+62.78
+84.51
+78.44
+47.80 83.79 49.23 79.56 72.13
+Qwen3-0.6B
+bf16
+—
+20.95
+33.70
+55.72
+63.91
+43.76
+47.28
+40.03
+31.20 67.63 43.30 55.96 48.25
+RTN
+55.5 34.37
+28.75
+41.96
+57.68
+31.58
+43.19
+23.64
+29.60 63.11 41.91 53.51 41.49
+GPTQ
+30.2 28.37
+29.01
+49.49
+68.93
+29.64
+42.61
+30.95
+29.40 64.85 42.89 55.01 44.28
+GPTAQ
+20.8 25.88
+29.10
+45.79
+67.98
+33.36
+42.94
+32.54
+30.40 64.20 42.84 56.35 44.55
+GuidedQuant
+8.76 22.31
+31.40
+49.54
+63.52
+26.00
+44.97
+33.73
+31.60 65.72 43.50 56.27 44.62
+REAL-Q (ours) 6.79 21.57
+32.08
+50.63
+56.54
+33.36
+45.18
+34.91
+30.80 66.00 38.74 56.83 44.51
+Qwen3-1.7B
+bf16
+—
+16.73
+42.75
+69.91
+77.95
+58.62
+60.37
+50.44
+36.80 72.47 44.22 60.93 57.45
+RTN
+120 75.61
+30.72
+37.67
+64.80
+42.20
+49.67
+24.49
+29.20 63.00 41.56 54.06 43.74
+GPTQ
+21.3 21.50
+34.13
+56.36
+76.91
+52.23
+56.94
+42.60
+34.40 67.74 43.30 57.46 52.21
+GPTAQ
+13.2 18.59
+37.71
+60.35
+75.54
+51.11
+57.35
+46.09
+34.00 70.35 42.73 59.67 53.49
+GuidedQuant
+11.9 17.72
+39.68
+65.87
+76.39
+48.51
+58.23
+41.70
+37.60 70.40 43.96 60.06 54.24
+REAL-Q (ours) 6.07 16.54
+38.40
+58.67
+77.98
+55.42
+58.67
+48.22
+36.20 70.29 42.84 59.75 54.64
+Qwen3-4B
+bf16
+—
+13.66
+54.01
+78.41
+85.20
+70.43
+68.40
+59.29
+40.40 75.03 51.28 66.14 64.86
+RTN
+31.1 17.11
+46.76
+69.82
+80.46
+62.85
+64.80
+50.42
+38.40 73.29 48.41 62.67 59.79
+GPTQ
+13.5 13.58
+50.26
+74.20
+83.49
+61.89
+66.67
+59.07
+40.20 74.70 48.46 63.93 62.29
+GPTAQ
+11.2 14.59
+48.89
+73.61
+83.58
+64.12
+65.87
+58.45
+39.60 74.92 49.33 62.90 62.13
+GuidedQuant
+9.50 14.50
+49.23
+74.16
+82.75
+64.49
+66.55
+57.31
+38.40 74.43 48.62 62.35 61.83
+REAL-Q (ours) 5.44 13.44
+49.74
+74.62
+83.46
+67.38
+67.06
+60.12
+39.40 75.90 46.32 65.11 62.91
+Qwen3-8B
+bf16
+—
+9.74
+56.23
+80.72
+86.51
+79.42
+74.73
+64.35
+41.80 77.91 52.56 68.03 68.23
+RTN
+19.6 10.85
+51.62
+76.26
+84.53
+73.25
+71.50
+63.26
+39.60 75.84 49.18 67.32 65.24
+GPTQ
+3.96 9.88
+55.46
+79.50
+86.57
+77.71
+73.79
+62.82
+40.60 76.71 51.74 68.19 67.31
+GPTAQ
+3.80 10.01
+54.27
+79.12
+86.61
+77.19
+73.13
+62.86
+40.40 76.77 52.76 67.17 67.03
+GuidedQuant
+3.52 9.92
+55.38
+78.91
+86.51
+78.01
+73.81
+64.45
+40.00 77.37 51.69 67.01 67.31
+REAL-Q (ours) 3.26 9.76
+54.52
+80.64
+86.45
+77.41
+73.88
+63.73
+40.20 77.20 51.59 68.11 67.37
+Qwen3-32B
+bf16
+—
+7.61
+60.75
+83.38
+86.82
+85.96
+82.58
+67.24
+46.20 81.94 54.04 72.93 72.18
+RTN
+21.8 8.57
+58.02
+77.31
+86.67
+82.54
+80.30
+64.45
+47.40 79.54 50.82 71.90 69.90
+GPTQ
+4.98 7.74
+58.87
+81.61
+86.39
+85.14
+82.32
+67.05
+46.20 81.56 53.12 72.14 71.44
+GPTAQ
+6.62 7.84
+60.92
+83.38
+86.45
+84.84
+81.61
+67.88
+45.00 81.07 53.53 73.56 71.82
+GuidedQuant
+4.66 7.74
+62.29
+83.42
+83.88
+84.47
+82.15
+67.71
+48.20 81.61 54.20 72.30 72.02
+REAL-Q (ours) 4.24 7.53
+60.84
+83.29
+87.43
+84.92
+82.19
+67.34
+45.40 81.39 51.84 72.38 71.70
+D.4
+Experimental Details for Loss Approximation Quality
+This section provides the detailed setup for the gradient alignment evaluation presented in Section 6.6
+(Figure 3).
+We evaluate on Qwen3-0.6B at RTN W4A16. The model is processed transformer block by trans-
+former block in the standard sequential quantization order. Immediately after the internal linear
+modules of block ℓare quantized, we freeze the current model state to compute the exact analytical
+gradients. Specifically, for each linear module within block ℓ, we calculate:
+(i) The true end-to-end KL gradient with respect to the module’s weights, obtained via a
+full backward pass through all subsequent layers and the language modeling head over the
+calibration mini-batch.
+(ii) The surrogate gradients produced by the respective proxy losses: REAL-Q Fisher MSE
+(our aggregated full Fisher), Saliency-guided MSE (the saliency-weighted per-module MSE
+optimized by GuidedQuant), and Module MSE (the uniform per-module reconstruction
+MSE optimized by GPTQ / GPTAQ).
+19
+
+
+Table 6: REAL-Q learning rates used across experimental settings. The scheduled final LR is ηfinal
+for reverse-cosine rows and the constant non-final-block LR for rows with the schedule disabled. The
+final-layer LR is used only for the final transformer block, where REAL-Q optimizes the true KL loss
+against the LM head.
+Setting
+Model / variant
+Scheduled final / const. LR
+Final-layer LR
+W4A16
+LLaMA-3.1-8B
+1.0×10−5
+1.0×10−6
+LLaMA-3.1-70B
+3.0×10−6
+1.0×10−6
+Qwen3-0.6B
+3.0×10−4
+1.0×10−5
+Qwen3-1.7B
+5.0×10−4
+1.0×10−5
+Qwen3-4B
+2.0×10−4
+1.0×10−5
+Qwen3-8B
+1.0×10−6
+1.0×10−6
+Qwen3-32B
+2.0×10−6
+1.0×10−6
+W3A16
+Qwen3-8B
+2.0×10−6
+1.0×10−6
+W2A16
+Qwen3-8B
+3.0×10−5
+1.0×10−6
+W4A4KV4
+Qwen3-8B (a-unaware)
+1.0×10−6
+1.0×10−6
+Qwen3-8B (a-aware)
+1.0×10−6
+1.0×10−6
+W3A4KV4
+Qwen3-8B (a-unaware)
+2.0×10−6
+1.0×10−6
+Qwen3-8B (a-aware)
+3.0×10−7
+1.0×10−6
+W2A4KV4
+Qwen3-8B (a-unaware)
+3.0×10−5
+1.0×10−6
+Qwen3-8B (a-aware)
+5.0×10−6
+1.0×10−6
+We then compute the cosine similarity between the surrogate gradients and the true KL gradient.
+As observed in the per-module breakdown in the main text (Figure 3), while REAL-Q maintains
+strong overall alignment, its fidelity degrades slightly on FFN modules (particularly up_proj and
+down_proj) compared to attention modules. This is primarily due to the SwiGLU non-linearity,
+which makes the block-wise truncated second-order expansion a locally poorer approximation of the
+true downstream loss. This architectural heterogeneity directly motivates Limitation (1) discussed in
+Appendix E.
+D.5
+GPU-hour Overhead
+All experiments were conducted using NVIDIA RTX Pro 6000 GPUs (96GB). Table 7 reports the
+total end-to-end wall-clock cost for applying REAL-Q at W4A16. This duration sums both the
+Stage-0 full-precision backward pass (for Fisher and saliency pre-computation) and the Stage-1
+sequential quantization loop with Block-GD.
+Table 7: RTX Pro 6000 end-to-end REAL-Q W4A16 wall-clock per model. “#GPUs” denotes the
+number of GPUs used for the run; “Hours per GPU” is the per-GPU wall-clock time; and “GPU-hours”
+represents the total compute budget consumed by the entire REAL-Q pipeline.
+Model
+#GPUs
+Hours per GPU
+GPU-hours
+LLaMA-3.1-8B
+4
+2.1
+8.4
+LLaMA-3.1-70B
+8
+11.1
+88.8
+Qwen3-0.6B
+4
+0.18
+0.72
+Qwen3-1.7B
+4
+0.5
+2.0
+Qwen3-4B
+4
+1.2
+4.8
+Qwen3-8B
+4
+2.2
+8.8
+Qwen3-32B
+8
+7.4
+59.2
+While the inclusion of dynamic gradient corrections inherently introduces additional computational
+overhead compared to purely static, closed-form PTQ baselines like vanilla GPTQ, the dominant
+Stage-1 cost scales cleanly with the number of (transformer block × linear module × column block)
+triples. Consequently, the overhead grows roughly linearly with model size at a fixed block size B.
+Most importantly, the total compute budget remains comfortably within the practical realm of offline
+20
+
+
+PTQ—requiring only a few GPU-hours for medium-sized models—which is orders of magnitude
+more efficient than quantization-aware training (QAT) or fine-tuning approaches that demand multiple
+full epochs over the training data.
+D.6
+GPU Memory Footprint for Fisher Aggregation
+While REAL-Q preserves the full cross-channel structure of the Fisher (no row grouping), caching the
+full empirical Fisher Information Matrix (F ∈Rd×d) for all transformer blocks requires additional
+memory footprint during the offline calibration stage.
+Since the Fisher matrix is structured per transformer block and decoupled from the context length,
+the total memory required to store the aggregated statistics for the entire model is deterministic.
+Specifically, for a model with L transformer blocks and a hidden dimension d, the storage cost using
+bfloat16 precision (2 bytes per parameter) is exactly 2 × L × d2 bytes.
+In Table 8, we detail the theoretical memory footprint required to cache the full Fisher matrices for
+all seven models evaluated in our experiments.
+Table 8: GPU Memory usage for storing full Fisher Information Matrices across different models (in
+bfloat16 precision). The total memory exactly scales with 2 × L × d2.
+Model Family
+Blocks (L)
+Hidden Dim (d)
+Matrix Size per Block
+Total Memory Cost
+Qwen3-0.6B
+28
+1024
+2.00 MB
+∼56 MB
+Qwen3-1.7B
+28
+2048
+8.00 MB
+∼224 MB
+Qwen3-4B
+36
+2560
+12.50 MB
+∼450 MB
+Qwen3-8B
+36
+4096
+32.00 MB
+∼1.13 GB
+Qwen3-32B
+64
+5120
+50.00 MB
+∼3.13 GB
+LLaMA-3.1-8B
+32
+4096
+32.00 MB
+∼1.00 GB
+LLaMA-3.1-70B
+80
+8192
+128.00 MB
+∼10.00 GB
+Regarding the transient memory required for the end-to-end backward pass in Stage 0, we treat it
+strictly as a standard distributed fine-tuning forward-backward step. By employing Fully Sharded
+Data Parallel (FSDP) combined with activation checkpointing across the calibration GPUs, the
+parameters, gradients, and optimizer states are sharded. This makes the per-GPU memory footprint
+for the calibration backward pass of massive models (e.g., LLaMA-3.1-70B) entirely scalable and
+consistent with standard LLM fine-tuning pipelines, requiring no exotic hardware beyond conventional
+multi-GPU clusters.
+D.7
+Stability Across Random Seeds
+REAL-Q and all baselines are deterministic given a fixed calibration set, so the only stochastic
+source is the random sampling of WikiText-2 sequences used to form the calibration set. To assess
+the sensitivity of REAL-Q to this randomness, we re-run the full W4A16 pipeline on Qwen3-0.6B
+with five different calibration-sampling seeds while holding all other settings (model, bit-width,
+hyperparameters in Table 6, evaluation protocol) fixed. Seed 1 corresponds to the run reported in
+Tables 1 and 5.
+Table 9: REAL-Q W4A16 stability across five calibration-sampling seeds on Qwen3-0.6B. KL
+(×10−2) and PPL are evaluated on WikiText-2. Seed 1 is the run reported in the main W4A16 tables.
+The reported standard deviation is the (sample) 1σ across the five runs.
+Seed
+KL (×10−2)
+PPL
+1 (reported)
+6.79
+21.57
+2
+6.86
+21.64
+3
+6.89
+21.65
+4
+6.92
+21.68
+5
+6.87
+21.60
+Mean ± std
+6.87 ± 0.05
+21.63 ± 0.04
+21
+
+
+The standard deviation is roughly 0.7% of the mean for KL and 0.2% for PPL, indicating that the
+W4A16 result on Qwen3-0.6B is stable under calibration-sample randomness. Notably, even the
+worst of the five REAL-Q seeds (KL = 6.92, PPL = 21.68) remains substantially below the strongest
+prior baseline on this model (GuidedQuant: KL = 8.76, PPL = 22.31; cf. Table 5), so the headline
+ranking is preserved across all seeds.
+E
+Detailed Limitations and Future Directions
+The shift from static analytical solvers to dynamic gradient-based corrections in REAL-Q opens up
+several promising avenues for future research to further refine the methodology:
+(1) Enhancing Surrogate Fidelity for Severe Non-linearities. As shown by the cosine alignment
+results in Appendix D.4, while our aggregated Fisher MSE provides accurate gradient guidance for
+attention modules, its correlation with the true end-to-end gradient degrades on certain FFN linear
+modules (notably up_proj and down_proj). We attribute this to the SwiGLU non-linearity, which
+makes a pure second-order Taylor truncation a less faithful approximation of the downstream loss
+landscape. Future work could explore higher-order Taylor expansions or non-linear proxy functions
+specifically designed to capture FFN activation dynamics.
+(2) Cross-Module Optimizer State Transfer. Currently, the Adam optimizer is re-initialized for each
+new linear module being quantized. Consequently, its first- and second-moment estimates have a very
+limited number of update steps to warm up before the module’s quantization is finalized. Developing
+an optimizer with structured state-transfer mechanisms across linear modules—or designing custom
+optimizers tailored for short, non-stationary sequential trajectories—could significantly accelerate
+convergence and further improve REAL-Q’s correction capabilities.
+(3) System-Level Memory Optimizations. The Stage-0 pre-computation inherently requires tem-
+porarily keeping the full-precision model resident and storing per-layer Fisher matrices (O(d2) each).
+While we successfully mitigate this for 70B-class models using an FSDP two-stage pipeline, the peak
+memory overhead remains higher than that of vanilla, zero-shot GPTQ. We anticipate that this com-
+putational footprint can be systematically amortized in the future through custom memory-efficient
+backward kernels, intermediate activation offloading, and fused Block-GD operators, making the
+method even more accessible for consumer-grade hardware.
+22

@@ -1,0 +1,964 @@
+Probing the Prompt KV Cache: Where It Becomes Dispensable
+Vinayshekhar Bannihatti Kumar
+Manoj Ghuhan Arivazhagan*
+Disha Makhija*
+Rashmi Gangadharaiah
+AWS AI Labs
+{vinayshk,mghuhan,dismakhi,rgangad}@amazon.com
+Abstract
+Prior KV cache compression schemes empiri-
+cally demonstrate that the prompt cache is par-
+tially redundant during decoding, dropping or
+summarising entries with little accuracy loss.
+We ask when and what kind of redundancy. At
+which layers, after how many decoding steps,
+and in what form can the prompt span KV
+cache be replaced without breaking the task. A
+controlled splice intervention swept over layer
+cutoff and decoding steps shows this redun-
+dancy is about form (chat template scaffold-
+ing) rather than content. Replacing the upper
+layer prompt span KV cache with KV cache
+from a chat template scaffold whose user con-
+tent is a neutral filler recovers near clean accu-
+racy, while zeroing the same slots collapses ac-
+curacy. The dissociation replicates across the
+Qwen3, Gemma 3, and Llama 3 families on
+multiple datasets.
+1
+Introduction
+A growing body of work hints that LLMs use
+the prompt differently at different stages of the
+forward pass.
+Attention concentrates on the
+first few positions as a positional sink (Xiao
+et al., 2024), the same massive activations explain
+mid-layer compression valleys (Queipo-de Llano
+et al., 2025), in-context demonstrations are sum-
+marised into compact internal task and function
+vectors (Hendel et al., 2023; Todd et al., 2024),
+and cross-prompt KV substitution attacks show
+that generation can be hijacked by overwriting the
+trailing token positions across all layers of the
+cache with another prompt’s KV (Ganesh et al.,
+2025), though that work studies attack feasibil-
+ity rather than what the cache encodes. KV-cache
+compression schemes (Cai et al., 2024; Li et al.,
+2024; Zhang et al., 2023; Ge et al., 2024; Liu et al.,
+2023) go further and empirically show that large
+fractions of the prompt cache can be dropped or
+*Equal contribution.
+summarised with little accuracy loss, indicating
+partial redundancy. Each line of work, however,
+addresses the question at a narrow scope (four sink
+tokens, BOS-token activations, a single task vec-
+tor, an all-layer-or-nothing swap with one donor
+pair, or a specific pruning policy) and leaves open
+the question: When, and with what replacement,
+can the prompt-span KV cache be replaced: at
+which layers, after how many decoding steps, and
+with what donor content? The answer determines
+whether compression schemes must preserve en-
+tries, drop them, or substitute placeholders.
+We address this with a controlled splice in-
+tervention swept over layer cutoff and decoding
+steps with donor caches varying in how much of
+the prompt’s form (chat-template scaffolding) and
+content (the user’s task) they preserve, tracing a
+phase diagram of when the prompt-span KV cache
+can be replaced without breaking the task.
+Our contributions are: (i) The first systematic
+characterisation of when the decode-time prompt
+KV cache becomes dispensable.
+(ii) What of
+the prompt the cache must retain at upper lay-
+ers, via a form-vs-content dissociation showing
+that chat-template scaffolding is sufficient and task
+content is dispensable, replicated across multiple
+LLMs and datasets.
+(iii) A donor-noise ladder
+over a 180-variant algorithmic-donor benchmark
+we built to systematically vary noise, in which the
+donor cache injects increasing amounts of noise
+(SAME-ALGO →DIFF-ALGO →DIFF-FAMILY).
+Together these give an end-to-end picture suggest-
+ing that at upper layers form alone is sufficient,
+while at lower layers the cache content is causally
+consulted, with recovery cost growing as the donor
+drifts from the target task.
+2
+Models and Datasets
+We
+evaluate
+Qwen3-4B,
+Gemma-3-4B-IT,
+Qwen3-8B, and Llama-3-8B-Instruct (Yang et al.,
+arXiv:2605.30574v1  [cs.CL]  28 May 2026
+
+
+(a) GSM8K BLANK
+(b) GSM8K ZERO
+(c) MBPP BLANK
+(d) MBPP ZERO
+Figure 1: Qwen3-4B heatmaps for ZERO and BLANK on GSM8K (top) and MBPP (bottom). Each cell shows
+pass% at one (L, W). BLANK recovers far faster than ZERO along both L and W.
+2025; Gemma Team, 2025; Grattafiori et al.,
+2024), with greedy decoding on four datasets.
+GSM8K (Cobbe et al., 2021) is a standard
+chain-of-thought arithmetic benchmark, and we
+score answers by exact match on the final numeric
+value. MBPP (Austin et al., 2021) is a standalone
+Python code-completion benchmark, and we score
+completions by passing the test suite shipped with
+each problem. HumanEval (Chen et al., 2021)
+is a Python function-completion benchmark of
+164 hand-written programming problems, each
+with a function signature, docstring, and hidden
+unit tests, and we score completions by test-suite
+pass. From each of the datasets, we sample 100
+problems to keep the experiments manageable.
+Algorithmic-donor benchmark.
+A Python
+benchmark
+spanning
+9
+algorithmic
+families
+(search,
+sort,
+graph traversal,
+shortest path,
+fibonacci, max-subarray, primes, two-sum, string-
+match) with 10 LLM-generated problems per
+family.
+Each problem appears in two prompt
+variants that pose the same underlying problem
+but pin the solution to a different algorithm class
+(e.g., the same search-family problem is asked
+once as linear-search and once as binary-search),
+giving 180 variants indexed by a (problem p,
+algorithm-class c, family f) triple, each shipped
+with a hidden test suite.
+Correctness is scored
+as target-algorithm match (via LLM judge) plus
+test-suite pass.
+3
+Experimental Setup
+Splice intervention.
+We study chat-tuned de-
+coder transformers with N
+layers.
+Prefill-
+ing on a prompt of length Tp yields a KV
+cache K(ℓ), V (ℓ) ∈RTp×d at each layer ℓ∈
+{0, . . . , N−1}, and during decoding step t the
+model attends over the concatenation of these
+prompt-span entries with the generated-span en-
+tries produced by the previous t steps.
+Every experiment in this paper is an instance of
+a single intervention parameterised by three quan-
+tities, a cumulative layer cutoff L, a splice onset
+W (the number of decoding steps performed be-
+fore the intervention), and a donor cache ˜K, ˜V .
+The cutoff L defines the patched layer set P =
+{ℓ: ℓ≥L}, and layers outside P are unmod-
+ified. The onset W defines the intervention tim-
+ing. For decoding steps t < W the unmodified
+cache is used, and at step t = W the prompt-
+span entries at every layer ℓ∈P are replaced
+in place, K(ℓ)
+0:Tp ←˜K(ℓ)
+0:Tp and likewise for V , af-
+ter which decoding continues from the modified
+cache through to completion. Generated-span en-
+tries are never modified. The donor cache ˜K, ˜V
+takes one of five forms (Table 1). For the three
+forms produced from an alternate prompt, we trim
+the longer prompt’s scaffold at the character level
+until target and donor prompts tokenise to the
+same length, so the patched slots are positionally
+aligned.
+Sweep and reporting.
+For every (model, task,
+intervention)
+we
+run
+the
+full
+grid
+L
+∈
+{0, 3, 6, . . . , N−1}, W
+∈
+{0, 5, 10, . . . , 200}
+plus the unintervened clean baseline.
+We sum-
+marise each condition as (i) an L × W phase-
+diagram heatmap and (ii) a recovery frontier
+W ⋆(L; α) = min{W : pass(L, W) ≥α pclean},
+
+
+donor
+cache content
+ZERO
+all-zero K, V at every patched layer
+BLANK
+chat-template scaffolding with user con-
+tent replaced by filler token “a” to length
+Tp
+SAME-ALGO
+donor variant (p′, c, f)
+DIFF-ALGO
+donor variant (p′, ¬c, f)
+DIFF-FAMILY
+donor variant (·, ·, f ′)
+Table 1: Donor caches. All interventions modify the
+same prompt-span positions at the same layers un-
+der the same splice onset; only the content varies.
+Algorithmic-donor variants are indexed by a triple
+(p, c, f) of problem p, algorithm-class c, family f.
+where pclean is the unintervened pass rate of the
+same model on the same task and α ∈(0, 1].
+4
+Results and Analysis
+(R1) Form is sufficient, content is dispensable.
+We probe whether the prompt cache content mat-
+ters at upper layers in two steps.
+We first ask
+whether task content is required at all by run-
+ning the BLANK intervention (Table 1). Recov-
+ery is rapid on both axes (Fig. 1). On Qwen3-4B
+GSM8K (clean = 90%, median length = 147),
+BLANK reaches 88% at L=30, W=0; sweeping
+along W at fixed L=27, it hits 87% by W=25.
+MBPP (clean = 71%, median length = 79) and
+HumanEval (clean = 79%, median length = 121)
+reproduces the shape observed in GSM8K. This
+shows that retaining the prompt’s structural form,
+while discarding its task content, is sufficient at
+upper layers.
+If task content is not required, what is?
+We
+push further and remove the structural scaffold-
+ing too via ZERO. Recovery still happens, but is
+markedly slower on both axes than BLANK. At
+Qwen3-4B GSM8K W = 0, ZERO sits at 1% at
+L=27, climbs to 48% at L=30, and only matches
+clean at L=33; along W at L=27, it crosses 87%
+only near W≈170, seven times the pre-splice de-
+coding steps compared to BLANK. MBPP and Hu-
+manEval both show the same gap. The two in-
+terventions converge at the boundaries. As seen
+in Fig. 1 both match clean at L=33 and both col-
+lapse at shallow L with W=0, where no substi-
+tuted cache can compensate for missing prompt
+context the model has not yet seen. Hence we can
+conclude that at upper layers the prompt’s form
+including chat-template scaffolding and positional
+structure is what must be preserved, while the task
+content carried within can be replaced with a neu-
+tral filler.
+(R2) Phase diagram across models and tasks.
+The (R1) shape generalises beyond a single model
+and task. The recovery frontier W ⋆(L; α = 0.75)
+in Fig. 2 plots ZERO (blue) and BLANK (orange)
+for all four models on GSM8K (top) and MBPP
+(bottom). On both tasks, BLANK recovers perfor-
+mance faster as BLANK sits consistently to the left
+of ZERO across every panel of the figure. At inter-
+mediate L the gap is large, on Qwen3-4B GSM8K,
+∼60 steps at L = 15 widening to ∼115 steps at
+L = 24, and both lines collapse to W = 0 only
+at the topmost cutoffs (BLANK from L ≈N−6
+onwards, ZERO a few layers deeper).
+The gap
+shrinks for the larger Qwen3-8B but does not in-
+vert, and the qualitative pattern of BLANK-to-the-
+left holds in every panel we plot.. We find that the
+same dissociation holds on the algorithmic-donor
+benchmark where the BLANK intervention recov-
+ers faster than any other donor types (Fig. 3).
+(R3) Donor noise determines lower-layer recov-
+ery cost.
+At lower layers the prompt cache is
+no longer dispensable: what gets injected mat-
+ters, and how much it matters tracks how far the
+donor cache is from the target. Fig. 3 plots the
+recovery frontier W ⋆(L; α) on the algorithmic-
+donor benchmark for Qwen3-8B and Llama-3-
+8B-Instruct at two thresholds (α = 0.4, 0.67).
+BLANK, which preserves only the prompt’s struc-
+tural form is closest to the W=0 axis at ev-
+ery L, consistent with (R1): when no task con-
+tent is injected, decoding recovers fastest.
+The
+donor curves degrade as the donor’s content drifts
+from the target task.
+The within-family donors
+(SAME-ALGO and DIFF-ALGO) track each other
+and require modest pre-splice decoding to recover
+even at shallow L; the across-family donor (DIFF-
+FAMILY) sits consistently above them, requiring
+substantially more W to clear the same thresh-
+old. The pattern holds for both Qwen3-8B and
+Llama-3-8B-Instruct and is sharper at the stricter
+α = 0.67, where the gap between DIFF-FAMILY
+and the within-family lines widens to tens of de-
+coding steps.
+Together with (R1), these results
+give an end-to-end picture: at upper layers the
+model needs only the prompt’s structural form,
+while at lower layers it actively processes the
+cache content, with quality degrading as the in-
+jected content moves further from the target task.
+See the appendix for per-model A and per-donor
+heatmaps F, results on HumanEval dataset E,
+
+
+Figure 2: Recovery frontier W ⋆(L; α = 0.75) for ZERO (blue) vs BLANK (orange) on GSM8K (top) and MBPP
+(bottom); columns are the four models. BLANK requires less pre-splice decoding than ZERO at every L.
+Figure 3: Recovery frontier W ⋆(L; α) on the algorithmic-donor benchmark for Qwen3-8B and Llama-3-8B-
+Instruct at α ∈{0.4, 0.67}. Recovery cost grows with donor noise: DIFF-FAMILY (red) is highest, BLANK (blue)
+lowest.
+splice pseudocode C, and example generations D.
+5
+Related Work
+Prior work documents prompt-cache redundancy
+at narrow scopes, including positional sinks at
+the first ∼4 tokens (Xiao et al., 2024), mid-
+layer compression valleys driven by massive ac-
+tivations (Queipo-de Llano et al., 2025), the lost-
+in-the-middle effect in which models underper-
+form on relevant content placed in the middle of
+long contexts (Liu et al., 2024), and ICL sum-
+marisation into compact internal task and func-
+tion vectors (Hendel et al., 2023; Todd et al.,
+2024). A complementary mechanistic line argues
+that in-context copying is implemented by induc-
+tion heads, a distributed attention pattern rather
+than a vector summary (Olsson et al., 2022). KV-
+cache compression schemes (Cai et al., 2024; Li
+et al., 2024; Zhang et al., 2023; Ge et al., 2024;
+Liu et al., 2023) prune by attention magnitude, and
+our results suggest a complementary axis of sub-
+stitution by structural placeholders at upper layers.
+Ganesh et al. (2025) is the closest methodologi-
+cally, an attack feasibility study that hijacks gener-
+ation by overwriting trailing token positions across
+all KV layers with fixed donor. We ask a different
+question and run a graded donor-noise ladder, ex-
+pose an algorithmic-overlap inversion, and add the
+form-vs-content ZERO-vs-BLANK dissociation.
+6
+Conclusion
+A controlled splice intervention across layers and
+decoding steps reveals a depth-dependent split in
+what the prompt KV cache must carry. At upper
+layers, chat-template alone is sufficient: content-
+free filler recovers near-clean accuracy while zero-
+ing the same slots collapses generation. At lower
+layers, content is causally active: donor caches de-
+grade accuracy in proportion to their distance from
+the target task, with cross-family donors requiring
+substantially more decoding steps to recover than
+within-family donors. For KV-cache compression,
+the practical implication is that upper-layer prompt
+entries can be replaced with structural placehold-
+
+
+ers rather than dropped, while lower-layer entries
+must preserve task-specific content.
+Limitations
+Our splice intervention requires write access to
+the prompt-span key/value cache, which restricts
+the analysis to settings where model internals can
+be modified at inference time.
+It does not di-
+rectly characterise behaviour observable through
+standard inference APIs. The study covers four
+chat-tuned decoder-only transformers in the 4B
+to 8B parameter range and three task domains
+alongside an algorithmic-donor benchmark. We
+have not investigated encoder-decoder architec-
+tures, base models without instruction tuning, or
+substantially larger models.
+The absolute layer
+depth at which form alone becomes sufficient is
+reported per model rather than predicted from ar-
+chitectural quantities.
+Finally, our BLANK con-
+struction relies on a chat-template scaffold filled
+with a single neutral filler token.
+This isolates
+form from content cleanly but does not distinguish
+which structural elements such as role markers,
+length, position, or specific template tokens carry
+the load. We leave a finer decomposition of form
+to future work.
+References
+Jacob Austin, Augustus Odena, Maxwell Nye, Maarten
+Bosma, Henryk Michalewski, David Dohan, Ellen
+Jiang, Carrie Cai, Michael Terry, Quoc Le, and
+Charles Sutton. 2021. Program synthesis with large
+language models. arXiv preprint arXiv:2108.07732.
+Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu,
+Yucheng Li, Tianyu Liu, Keming Lu, Wayne Xiong,
+Yue Dong, Junjie Hu, and Wen Xiao. 2024. Pyra-
+midKV: Dynamic KV cache compression based on
+pyramidal information funneling.
+arXiv preprint
+arXiv:2406.02069.
+Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan,
+Henrique Ponde de Oliveira Pinto, Jared Kaplan,
+Harri Edwards, Yuri Burda, Nicholas Joseph, Greg
+Brockman, and 1 others. 2021.
+Evaluating large
+language models trained on code.
+arXiv preprint
+arXiv:2107.03374.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+Nakano, Christopher Hesse, and John Schulman.
+2021. Training verifiers to solve math word prob-
+lems. arXiv preprint arXiv:2110.14168.
+Mukkesh
+Ganesh,
+Kaushik
+Iyer,
+and
+Arun
+Baalaaji Sankar Ananthan. 2025.
+Whose nar-
+rative is it anyway?
+a KV cache manipulation
+attack. arXiv preprint arXiv:2511.12752.
+Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Ji-
+awei Han, and Jianfeng Gao. 2024. Model tells you
+what to discard: Adaptive KV cache compression
+for LLMs. In International Conference on Learning
+Representations (ICLR).
+Gemma Team. 2025. Gemma 3 technical report. arXiv
+preprint arXiv:2503.19786.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+Abhinav Pandey, Abhishek Kadian, Ahmad Al-
+Dahle, Aiesha Letman, Akhil Mathur, Alan Schel-
+ten, Alex Vaughan, and 1 others. 2024. The Llama
+3 herd of models. arXiv preprint arXiv:2407.21783.
+Roee Hendel, Mor Geva, and Amir Globerson. 2023.
+In-context learning creates task vectors.
+In Find-
+ings of the Association for Computational Linguis-
+tics: EMNLP 2023.
+Yuhong Li, Yingbing Huang, Bowen Yang, Bharat
+Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+Patrick Lewis, and Deming Chen. 2024. SnapKV:
+LLM knows what you are looking for before gener-
+ation. arXiv preprint arXiv:2404.14469.
+Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paran-
+jape, Michele Bevilacqua, Fabio Petroni, and Percy
+Liang. 2024.
+Lost in the middle: How language
+models use long contexts. Transactions of the Asso-
+ciation for Computational Linguistics, 12:157–173.
+Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao
+Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyril-
+lidis, and Anshumali Shrivastava. 2023.
+Scis-
+sorhands: Exploiting the persistence of importance
+hypothesis for LLM KV cache compression at test
+time. In Advances in Neural Information Process-
+ing Systems (NeurIPS).
+Catherine
+Olsson,
+Nelson
+Elhage,
+Neel
+Nanda,
+Nicholas Joseph, Nova DasSarma, Tom Henighan,
+Ben Mann, Amanda Askell, Yuntao Bai, Anna Chen,
+Tom Conerly, Dawn Drain, Deep Ganguli, Zac
+Hatfield-Dodds, Danny Hernandez, Scott Johnston,
+Andy Jones, Jackson Kernion, Liane Lovitt, and
+7 others. 2022.
+In-context learning and induction
+heads. Transformer Circuits Thread.
+Enrique Queipo-de Llano, ´Alvaro Arroyo, Federico
+Barbero, Xiaowen Dong, Michael Bronstein, Yann
+LeCun, and Ravid Shwartz-Ziv. 2025.
+Atten-
+tion sinks and compression valleys in LLMs are
+two sides of the same coin.
+arXiv preprint
+arXiv:2510.06477.
+Eric Todd, Millicent L. Li, Arnab Sen Sharma, Aaron
+Mueller, Byron C. Wallace, and David Bau. 2024.
+Function vectors in large language models. In Inter-
+national Conference on Learning Representations
+(ICLR).
+
+
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. 2024.
+Efficient streaming
+language models with attention sinks.
+In Inter-
+national Conference on Learning Representations
+(ICLR).
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+Chengen Huang, Chenxu Lv, Chujie Zheng, Dayi-
+heng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao Ge,
+Haoran Wei, Huan Lin, Jialong Tang, and 41 oth-
+ers. 2025. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388.
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+Yuandong Tian, Christopher R´e, Clark Barrett,
+Zhangyang Wang, and Beidi Chen. 2023.
+H2O:
+Heavy-hitter oracle for efficient generative inference
+of large language models. In Advances in Neural In-
+formation Processing Systems (NeurIPS).
+Appendix
+A
+Per-Model Phase Diagrams
+Fig. 1 in the main text shows phase diagrams for
+Qwen3-4B only.
+Fig. 4 provides the analogous
+per-cell heatmaps for Gemma-3-4B-IT, Qwen3-
+8B, and Llama-3-8B-Instruct on both GSM8K and
+MBPP, for both ZERO and BLANK. Across every
+(model, task) pair, the same pattern holds. BLANK
+cells stay near the clean baseline once L is suffi-
+ciently deep, while ZERO cells form a red region
+at shallow L that contracts only at the topmost cut-
+offs.
+B
+Clean Baselines
+Table 2 reports the unintervened (clean) pass rate
+pclean used as the reference in the recovery frontier
+W ⋆(L; α) = min{W : pass(L, W) ≥α pclean}.
+Each entry is the pass rate of the unmodified
+model on the full benchmark sample (100 items
+for GSM8K, 100 items for MBPP), computed
+once per (model, task) pair and shared across all
+interventions.
+model
+GSM8K
+MBPP
+HumanEval
+Qwen3-4B
+90.0
+71.0
+79.0
+Gemma-3-4B-IT
+87.0
+78.0
+71.0
+Qwen3-8B
+95.0
+71.0
+77.0
+Llama-3-8B-Instruct
+81.0
+59.0
+59.0
+Table 2: Clean baselines pclean (%, exact match for
+GSM8K, test-suite pass for MBPP and HumanEval) for
+the four models evaluated.
+C
+Splice Intervention Pseudocode
+Algorithm 1 restates the splice intervention as a
+modified greedy decoding loop.
+The loop dif-
+fers from a standard greedy decode only in line 5,
+which performs a single in-place replacement of
+the prompt-span entries at the patched layers once
+decoding has reached step W. The patched cache
+is then used for every subsequent decoding step
+until generation terminates.
+D
+Example Generations
+To complement the aggregate pass-rate results, Ta-
+bles 3 and 4 report side-by-side greedy comple-
+tions from Qwen3-4B on representative MBPP
+and GSM8K problems at (L = 27, W = 0), the
+regime where the ZERO vs BLANK gap is largest
+while BLANK is still recoverable. Each row shows
+
+
+(a) Gemma-3-4B-IT, GSM8K, ZERO
+(b) Gemma-3-4B-IT, GSM8K, BLANK
+(c) Gemma-3-4B-IT, MBPP, ZERO
+(d) Gemma-3-4B-IT, MBPP, BLANK
+(e) Qwen3-8B, GSM8K, ZERO
+(f) Qwen3-8B, GSM8K, BLANK
+(g) Qwen3-8B, MBPP, ZERO
+(h) Qwen3-8B, MBPP, BLANK
+(i) Llama-3-8B-Instruct, GSM8K, ZERO
+(j) Llama-3-8B-Instruct, GSM8K, BLANK
+(k) Llama-3-8B-Instruct, MBPP, ZERO
+(l) Llama-3-8B-Instruct, MBPP, BLANK
+Figure 4: Per-cell heatmaps for Gemma-3-4B-IT, Qwen3-8B, and Llama-3-8B-Instruct on GSM8K and MBPP.
+Each cell is a pass-rate percentage at one (L, W) configuration. Rows within a panel are cumulative layer cutoffs,
+columns are pre-splice decoding steps W. The left column shows ZERO and the right column shows BLANK.
+Across every (model, task) pair, BLANK stays near the clean baseline at deep L while ZERO produces a large red
+region at shallow L that only contracts at the topmost cutoffs.
+
+
+Algorithm 1 Splice-intervention greedy decode
+Require: model M with N layers, prefilled cache
+(K, V ) with prompt-span length Tp, donor
+cache ( ˜K, ˜V ), layer cutoff L, splice onset W,
+max new tokens Tmax
+1: P ←{ℓ: ℓ≥L}
+▷patched layers
+2: y0 ←arg maxv Mlogits(K, V )v
+3: tokens ←[y0]
+4: for t = 1 to Tmax −1 do
+5:
+if t = W then
+6:
+for ℓ∈P do
+7:
+K(ℓ)
+0:Tp ←˜K(ℓ)
+0:Tp
+8:
+V (ℓ)
+0:Tp ←˜V (ℓ)
+0:Tp
+9:
+end for
+10:
+end if
+11:
+(K, V ) ←M(tokens[t −1], (K, V ))
+▷
+forward pass, appends generated KV to cache
+12:
+yt ←arg maxv Mlogits(K, V )v
+13:
+if yt = eos then break
+14:
+end if
+15:
+tokens.append(yt)
+16: end for
+17: return tokens
+the output under the unintervened decode, the
+BLANK intervention, and the ZERO intervention.
+Visible characters are verbatim from the decoded
+output, problem statements are paraphrased to a
+single line, and “. . .” marks elided text. In ZERO
+cells this is further token-loop repetition, and in
+CLEAN or BLANK cells this is surrounding prose.
+E
+HumanEval Replication
+The form-vs-content dissociation also replicates
+on HumanEval (Chen et al., 2021). Fig. 5 shows
+the recovery frontier W ⋆(L; α = 0.75) for ZERO
+and BLANK on all four models, and Fig. 6 gives
+the per-cell phase diagrams. Across every model,
+BLANK sits to the left of ZERO and reaches near-
+baseline at deep L while ZERO requires substan-
+tially more pre-splice decoding to recover.
+F
+Per-Model Heatmaps on the
+Algorithmic-Donor Benchmark
+Fig. 7 gives a unified cell-level view of the
+algorithmic-donor benchmark across the four
+models and four donor caches, under both test-
+pass scoring and an algo-aware score that ad-
+ditionally checks whether the emitted solution
+uses the prescribed algorithm class.
+Reading
+across columns reproduces the noise ladder of
+(R3).
+Damage grows from BLANK and SAME-
+ALGO through DIFF-ALGO to DIFF-FAMILY. The
+two scoring rules diverge most under DIFF-ALGO,
+where the model passes the tests but commits to
+the donor’s algorithm class, so the algo-aware col-
+umn develops a large red region that persists to
+deeper L.
+G
+Algorithmic-Donor Benchmark
+Construction
+The algorithmic-donor benchmark is built around
+a hand-written taxonomy of algorithm pairs. Each
+pair shares an input/output contract but admits
+two distinct algorithmic strategies, an A side (typ-
+ically a naive baseline) and a B side (typically
+an optimised alternative). Nine pairs were spec-
+ified in this taxonomy.
+The pairs cover search
+(linear vs binary), sort (bubble vs merge), graph
+traversal (BFS vs DFS), shortest path (Dijkstra
+vs Bellman-Ford), Fibonacci (naive recursion vs
+bottom-up DP), max-subarray (brute force vs
+Kadane), primes (trial division vs Sieve of Eratos-
+thenes), two-sum (nested-loop vs hash-map sin-
+gle pass), and string match (naive vs KMP). Each
+taxonomy entry is paired with a short natural-
+language description of the contract and the strat-
+egy.
+Variant
+generation:
+Sonnet
+4.5
+(max tokens=4096,
+temperature=0.8)
+was used in the dataset construction. The system
+prompt used in this pass is show below.
+Variant Generation System Prompt
+You are a programming problem
+generator.
+Given an algorithm family
+with algorithms A and B, generate
+exactly 10 diverse problem variants.
+Each variant should be a different
+concrete problem (different domain,
+data types, or scenario) that both
+algorithms can solve.
+For each variant, provide:
+1.
+A Python prompt asking for
+algorithm B
+2.
+A Python solution using algorithm
+A
+Return a JSON array of 10 objects,
+each with keys:
+- ‘‘variant name’’:
+short
+description
+- ‘‘python b prompt’’:
+one-sentence
+Python prompt explicitly naming
+algorithm B
+
+
+Figure 5: HumanEval recovery frontier W ⋆(L; α = 0.75) for ZERO (blue) and BLANK (orange), one panel per
+model. BLANK sits consistently to the left of ZERO across every model.
+(a) Qwen3-4B, HumanEval, ZERO
+(b) Qwen3-4B, HumanEval, BLANK
+(c) Gemma-3-4B-IT, HumanEval, ZERO
+(d) Gemma-3-4B-IT, HumanEval, BLANK
+(e) Qwen3-8B, HumanEval, ZERO
+(f) Qwen3-8B, HumanEval, BLANK
+(g) Llama-3-8B-Instruct, HumanEval, ZERO
+(h) Llama-3-8B-Instruct, HumanEval, BLANK
+Figure 6: Per-cell heatmaps on HumanEval for the four models, one row per model. The left column shows ZERO
+and the right column shows BLANK. Each cell is a pass-rate percentage at one (L, W) configuration. Rows within a
+panel are cumulative layer cutoffs, columns are pre-splice decoding steps W. BLANK stays near the clean baseline
+at deep L, while ZERO produces a large red region at shallow L that only contracts at the topmost cutoffs.
+
+
+Figure 7: Unified per-cell heatmaps on the algorithmic-donor benchmark. Rows are models (Qwen3-4B, Gemma-
+3-4B-IT, Qwen3-8B, Llama-3-8B-Instruct), and columns group the four donor caches (BLANK, SAME-ALGO,
+DIFF-ALGO, DIFF-FAMILY) under test-pass scoring and an algo-aware score that also requires the emitted solution
+to use the prescribed algorithm class.
+
+
+problem
+CLEAN
+BLANK
+ZERO
+string to list:
+split
+a
+string
+on
+whitespace
+def string to list(s):
+return s.split()
+def string to list(s):
+return s.split()
+def
+armour arm arm arm arm arm . . .
+find star num:
+nth centered hexago-
+nal number
+def find star num(n):
+# The formula for
+the n’th
+# star number is
+6n(n-1) + 1
+return 6 * n * (n
+- 1) + 1
+def a(n):
+return 6 * n * n -
+6 * n + 1
+def
+get get get get get get . . .
+Table 3: Greedy completions from Qwen3-4B on two MBPP problems under the unintervened (CLEAN) decode,
+the BLANK intervention, and the ZERO intervention, all at L = 27, W = 0. Under BLANK the model emits well-
+formed, mostly correct Python. For string to list the completion is identical to the unintervened output, and
+for find star num it produces an equivalent closed form (6n2−6n+1 vs. 6n(n−1)+1) but under a renamed
+entry point (a), which would fail a strict test harness despite the formula being correct. Under ZERO the decoder
+collapses into a single-token loop and produces no usable solution.
+problem
+CLEAN
+BLANK
+ZERO
+Dog grooming costs
+$100, 30% discount,
+price after?
+. . .discount amount is
+$100 × 0.30 = $30.
+Subtracting. . . $70.
+The answer is 70. ✓
+. . .10% of $100 is $10.
+So the discounted
+price is $100 - $10
+= $90.
+The answer is
+90. ✗
+The original cost of
+the dog dog dog dog
+dog dog dog dog dog
+dog dog dog. . . ✗
+Lily has 50 friends,
+Amy has 20 more, to-
+tal?
+. . .Amy made 50 + 20 = 70
+friends.
+Together
+70 + 50 = 120 friends. ✓
+. . .Ava has 20 more
+friends than Lia. . .
+50 + 20 = 70 . . . (truncated)
+We know that and and
+and and and and and
+and and and and and. . .
+✗
+Table 4: Greedy completions from Qwen3-4B on two GSM8K problems under the unintervened (CLEAN) decode,
+the BLANK intervention, and the ZERO intervention, all at L = 27, W = 0. Reference (gold) answers are 70
+and 120. Under CLEAN the model follows a coherent arithmetic chain and reaches the gold answer in both cases.
+Under BLANK the decoder remains arithmetic and roughly on-topic but introduces small content errors, such as
+misreading the discount rate in the first problem and renaming the protagonists in the second, resulting in incorrect
+final answers. Under ZERO the model emits a degenerate single-token loop and never produces a numeric answer.
+- ‘‘python a code’’:
+complete Python
+function implementing algorithm A
+Return ONLY valid JSON, no prose.
+The user prompt provided the family name, the
+names of algorithms A and B, and an example A-
+side and B-side prompt drawn from the taxonomy.
+The output was constrained to a JSON array of
+ten objects per family. Each call was retried up
+to three times on parse or transport errors with a
+short sleep between retries.
+Flipped halves.
+Using the same model at
+temperature=0.2 and the same other settings,
+the system prompt provided the existing A-side
+Python implementation and the name of algorithm
+B and asked for two outputs, a Python implemen-
+tation of algorithm B with the identical function
+signature, and a Python prompt requesting algo-
+rithm A for the same problem. The user prompt
+repeated the algorithm names, embedded the ex-
+isting A-side Python code, and quoted the original
+B-side Python prompt for context. After this pass
+each variant carries all four artifacts, an A-side
+prompt and reference implementation in Python
+and a B-side prompt and reference implementation
+in Python.
+Ground
+truth
+and
+tests.
+The
+committed
+ground-truth file holds, per variant, two prompt
+sides (A-side and B-side) plus a deterministic
+test suite of five cases (one edge case and four
+normal). Reference Python implementations were
+produced as a generation-pipeline artifact and are
+checked for internal consistency, but the splice
+experiments only use the prompts and test cases.
+Across the nine families with ten variants each,
+this yields ninety problems and one hundred and
+eighty prompt variants in total, indexed by a
+
+
+(problem p, algorithm-class c, family f) triple.
+H
+Example Generations on the
+Algorithmic-Donor Benchmark
+Tables 5 and 6 show greedy completions from
+Qwen3-4B under all four donor interventions at
+(L=12, W=15). Each entry illustrates the char-
+acteristic failure mode of that donor condition.
+
+
+condition
+generated code (truncated)
+BLANK
+Target: Sort file sizes in descending order using merge sort.
+Output:
+def sort_file_sizes_descending(sizes):
+if len(sizes) == 0:
+return []
+return sorted(sizes, reverse=True)
+Result: 5/5 tests pass. Uses built-in sorted() instead of merge sort. The blank
+cache carries no algorithm-class signal, so the model defaults to the simplest correct
+implementation.
+SAME-ALGO
+Target: Sort 2D coordinates by distance from origin (merge sort).
+Donor: Sort RGB colors by brightness (merge sort).
+Output:
+def sort_points_by_distance(points):
+# target name
+def get_brightness(color):
+# donor logic
+return 0.299*color[0] + 0.587*color[1] + ...
+def merge_sort(arr): ...
+# correct algo
+Result: 1/5 tests, exec error. Correct algorithm (merge sort) and target function name,
+but the comparison helper uses the donor’s brightness logic instead of Euclidean dis-
+tance. Hybrid of target signature + donor identifiers →NameError.
+Table 5: Algorithmic-donor examples (1/2): BLANK and SAME-ALGO at L=12, decoding step=15, Qwen3-4B.
+condition
+generated code (truncated)
+DIFF-ALGO
+Target: Sort 2D coordinates by distance from origin (merge sort).
+Donor: Sort email addresses by domain (bubble sort).
+Output:
+def sort_points_by_distance(points):
+# target name
+def bubble_sort(arr):
+# donor algo
+for i in range(len(arr)):
+for j in range(0, len(arr)-i-1):
+domain1 = arr[j].split(’@’)[1]
+# donor logic
+domain2 = arr[j+1].split(’@’)[1]
+...
+Result: 1/5 tests, fail. Switches to the donor’s algorithm (bubble sort) and the donor’s
+domain logic (email parsing). The entire algorithmic strategy flips to the donor’s, not
+just the identifiers.
+DIFF-FAMILY
+Target: Sort 2D coordinates by distance from origin (merge sort).
+Donor: Prime gap calculation (primes family).
+Output:
+def sort_points_by_distance(points):
+# target name
+def is_prime(num):
+# donor family
+if num < 2: return False
+for i in range(3, int(math.isqrt(num))+1, 2):
+if num % i == 0: return False
+return True
+primes = []
+for num in ...
+Result: 0/5 tests, exec error. Retains the target’s function name but implements a
+prime sieve (donor’s family). The donor cache is so distant that the model cannot
+recover any aspect of the target task.
+Table 6: Algorithmic-donor examples (2/2): DIFF-ALGO and DIFF-FAMILY at L=12, decoding step=15, Qwen3-
+4B. Together with Table 5, these illustrate the graded noise ladder: BLANK loses the algorithm class but produces
+correct output; SAME-ALGO preserves the algorithm but leaks donor identifiers; DIFF-ALGO flips the algorithm
+entirely; DIFF-FAMILY produces an unrelated computation.

@@ -1,0 +1,1234 @@
+κ-LoRA:Condition Numbers Reveal
+Which LoRA Matrices Worth Updating
+Jianghui Wang1∗, Silong Yong2∗, Francesco Orabona1, Marco Canini1, Katia P. Sycara2, Yaqi Xie2†
+1King Abdullah University of Science and Technology
+2Carnegie Mellon University
+{jianghui.wang, francesco.orabona, marco}@kaust.edu.sa
+{silongy, sycara, yaqix}@andrew.cmu.edu
+Abstract
+Low-Rank Adaptation (LoRA) has become a widely adopted technique for efficient
+neural network fine-tuning, decomposing model updates into low-rank matrices.
+However, LoRA remains computationally costly because it updates all matrices
+uniformly, regardless of their actual contribution to adaptation. This cost is es-
+pecially prohibitive for large-scale models with billions of parameters and for
+resource-constrained settings such as edge deployment and on-device fine-tuning.
+We show for the first time that not all LoRA matrices are equally worth tuning:
+matrices with smaller condition numbers (the ratio of largest to smallest singular
+value) are already well-balanced across directions and contribute only marginally
+to adaptation, whereas matrices with larger condition numbers contain underdevel-
+oped directions that span richer subspaces and drive most of the performance gains.
+This observation itself is a key contribution of our work, and it motivates a more
+selective approach to fine-tuning. Building on this insight, we propose κ-LoRA, a
+method that optimizes LoRA by focusing updates on the matrices with the largest
+condition numbers, which capture the most informative directions of change. By
+restricting LoRA updates to the top 50% of weight matrices ranked by condition
+number, κ-LoRA halves the trainable parameter count and correspondingly reduces
+compute and memory cost. Extensive experiments across multiple benchmarks
+show that this design cuts fine-tuning time by 16.2% on average while matching the
+accuracy of standard LoRA and reducing memory cost by 4.5%. Further analysis
+reveals that the condition numbers of the selected matrices consistently decrease
+over training, suggesting that κ-LoRA’s effectiveness stems from targeted spectral
+rebalancing rather than parameter selection alone.
+1
+Introduction
+Fine-tuning large-scale pre-trained models has become the cornerstone of state-of-the-art performance
+in Natural Language Processing, Computer Vision, and many other domains [2, 6, 9]. As model sizes
+grow, however, the computational resources required for fine-tuning increase rapidly, creating signif-
+icant challenges in both training time and memory usage [16]. Traditional fine-tuning approaches up-
+date all parameters of the model, incurring high computational and memory costs. Parameter-Efficient
+Fine-Tuning (PEFT) methods have emerged to alleviate this burden, including adapter modules [13],
+prefix tuning [18], prompt tuning [17], and Low-Rank Adaptation (LoRA) [14]. While these tech-
+niques substantially reduce the number of trainable parameters, LoRA has emerged as one of the most
+∗Equal contribution.
+†Corresponding author.
+40th Conference on Neural Information Processing Systems (NeurIPS 2026).
+arXiv:2607.22489v1  [cs.LG]  24 Jul 2026
+
+
+widely adopted PEFT methods due to its simplicity, compatibility with Transformer architectures, and
+strong empirical performance across a broad range of downstream tasks. However, existing LoRA
+methods still leave considerable room for improvement in how adaptation capacity is allocated across
+the model. In particular, LoRA approximates parameter updates with low-rank matrices, significantly
+reducing the number of trainable parameters adapted during fine-tuning [14]. Despite its successes,
+LoRA introduces certain inefficiencies. In current practice, LoRA is applied uniformly across every
+layer of the model, extending to each projection in Transformer architectures [31]. For instance, in the
+self-attention layers, LoRA is added to the query (WQ), key (WK), value (WV ), and output (WO) pro-
+jection matrices, where WQ and WK produce the query and key vectors that determine attention scores
+between tokens, WV projects token features into the values aggregated according to those scores, and
+WO recombines the multi-head outputs back into the residual stream. In the Multi-Layer Perceptron
+(MLP) layers, LoRA is applied to the up- and down-projection matrices, which expand and compress
+feature dimensions, as well as to the gating layers that modulate feature flow. As models grow larger,
+the number of LoRA modules required grows proportionally. This widespread application leads to
+an excessive proliferation of LoRA modules, causing unnecessary computational overhead, wasting
+resources, and potentially hindering convergence. By updating all low-rank matrices, including those
+with minimal impact on model performance, LoRA introduces redundant computations that slow
+down convergence, especially at scale. More importantly, different matrices exhibit highly uneven
+sensitivity to parameter updates, making uniform allocation of LoRA capacity inherently suboptimal.
+To overcome these limitations, we propose κ-LoRA, a method that builds on LoRA while addressing
+its inefficiencies. κ-LoRA introduces a condition number-based selection mechanism that prioritizes
+matrices with greater impact on the model’s behavior. Formally, the condition number of a matrix W
+is defined as the ratio of its largest to its smallest singular value,
+κ(W) = σmax(W)
+σmin(W) ,
+(1)
+and is a standard tool in numerical linear algebra for quantifying the sensitivity to perturbation [30].
+Intuitively, κ(W) measures how unevenly W scales different directions in its input space. A
+well-conditioned matrix (small κ) scales all directions roughly uniformly and produces stable trans-
+formations. An ill-conditioned matrix (large κ) stretches some directions while severely compressing
+others, so that perturbations along certain directions are greatly amplified while information along
+other directions is suppressed. Crucially for our setting, ill-conditioned matrices admit directions
+along which small parameter updates can induce disproportionately large changes in the output,
+which makes them highly responsive to low-rank adaptation.
+Building on this, we hypothesize that ill-conditioned matrices are the primary sources of inefficiency
+and instability during adaptation, and that allocating LoRA capacity to them yields the largest return
+per unit of compute. We support this hypothesis both theoretically, by analyzing how spectral
+properties bound the effect of a low-rank update on the matrix’s action (Section 3), and empirically,
+we observe that LoRA fine-tuning of selected high-κ matrices reduces their condition numbers over
+the course of training, suggesting that the adaptation process actively rebalances the underlying
+transformations toward better-conditioned and more stable representations. The selection procedure
+itself is lightweight and requires no training-time signal: for each candidate projection matrix in the
+pre-trained model, we compute its singular values once before fine-tuning and derive κ(W). We
+then rank matrices within a layer and apply LoRA only to the top fraction of matrices under a given
+adaptation budget, leaving the rest frozen. Because the criterion depends solely on the pre-trained
+weights, the selection step adds negligible overhead and can be reused across downstream tasks.
+The contributions of our study are threefold. First, we identify a spectral asymmetry in pre-trained
+transformers: weight matrices within the same architectural group exhibit a wide range of condition
+numbers, and matrices with larger condition numbers admit directions where bounded low-rank
+updates can induce disproportionately large changes. Second, we introduce κ-LoRA, a method that
+exploits this asymmetry by selectively adapting matrices ranked by condition number, supported by a
+closed-form sensitivity bound and a training-free, one-shot selection procedure. Third, we validate
+κ-LoRA across multiple models and benchmarks, and further show that the condition numbers of
+adapted matrices decrease substantially over the course of fine-tuning, providing empirical evidence
+that our selection mechanism aligns with how LoRA reshapes the underlying transformations.
+2
+
+
+2
+Related work
+Parameter-Efficient Fine-Tuning (PEFT) addresses the cost of adapting large pre-trained models
+by training only a small subset of parameters. Common approaches include adapter modules [13],
+prefix-tuning [18], and prompt-tuning [17]. Low-Rank Adaptation (LoRA) [14] is the most widely
+used: it adds trainable low-rank matrices to existing linear layers, keeps pre-trained weights frozen,
+and incurs no inference overhead after merging. A range of extensions modify LoRA along different
+axes. AdaLoRA [38] reallocates rank budget across layers based on importance scores. Delta-
+LoRA [42] propagates adapter updates back into the original weights. LoSparse [19] combines
+low-rank updates with structured pruning. DoRA [21] decomposes weights into magnitude and
+direction and adapts only the direction. SoRA [7] gates the rank of each adapter during training.
+QLoRA [5] and QA-LoRA [35] combine LoRA with quantization; κ-LoRA is orthogonal to these
+and can be stacked on top. Several recent methods use the spectrum of pre-trained weights to inform
+adaptation. PiSSA [25] initializes the low-rank matrices A and B from the principal singular vectors
+of W to align updates with the dominant subspace. MiLoRA [33] does the opposite, initializing from
+the minor components to preserve pre-trained knowledge. SVFT [20] parameterizes ∆W as a sparse
+combination of outer products of W’s singular vectors. These methods use spectral information
+to shape how LoRA is parameterized; they still adapt every candidate matrix. A closer line of
+work asks which components are worth adapting at all. LISA [26] samples layers to update from a
+layerwise importance distribution. LoRA-Drop [41] prunes adapters whose output activations are
+small. AFLoRA [22] freezes low-rank paths during training using a gradient-and-uncertainty score.
+HiFi [10] ranks attention heads by PageRank importance, though without LoRA. AdaLoRA [38] can
+also be read as a selection method, since it allocates rank budget across modules. All of these signals
+come from training-time statistics or apply at the layer level. κ-LoRA uses a structural property of the
+pre-trained weights, computed once offline, and operates at the level of individual projection matrices.
+To our knowledge, κ-LoRA is the first to use the spectral conditioning of pre-trained weights as a
+selection signal for LoRA.
+3
+Methodology
+In this section, we formally introduce the necessary definitions and our method.
+3.1
+Preliminary
+We summarize the notation used throughout the paper.
+Matrices and norms
+For a matrix M ∈Rm×n, we denote its operator (spectral) norm by
+∥M∥2 :=
+max
+∥x∥2=1 ∥Mx∥2,
+which corresponds to the largest singular value of M. We denote the Frobenius norm by
+∥M∥F :=
+sX
+i,j
+M 2
+ij,
+which measures the overall magnitude of matrix entries. The rank is denoted by rank(M). We write
+Id for the d × d identity matrix. Unless otherwise specified, ∥· ∥2 for vectors denotes the Euclidean
+norm.
+Singular value decomposition
+Every matrix W ∈Rm×n admits a singular value decomposition
+W = UΣV ⊤,
+Σ = diag(σ1, . . . , σr),
+with σ1 ≥σ2 ≥· · · ≥σr > 0 and r = rank(W). The columns ui of U ∈Rm×r and vi of
+V ∈Rn×r are the left and right singular vectors, respectively. We write σmax(W) = σ1 and
+σmin(W) = σr.
+3
+
+
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+up_proj
+down_proj
+101
+102
+103
+104
+105
+106
+107
+cond(W) =
+max/
+min
+attention (q/k/v/o)
+MLP (gate/up/down)
+llama2-7b
+q_proj
+k_proj
+v_proj
+o_proj
+gate_proj
+up_proj
+down_proj
+101
+102
+103
+104
+105
+106
+107
+cond(W) =
+max/
+min
+attention (q/k/v/o)
+MLP (gate/up/down)
+llama2-13b
+Figure 1: Condition numbers of different projection matrices in transformer architectures exhibit
+clear clustering patterns across architectural components. Most importantly, attention projections
+(Query, Key, Value, and Output matrices) and MLP projections (up-, down-, and gate-projection
+matrices) form distinct condition number scales. This observation motivates our group-wise selection
+strategy, where matrices are ranked and selected within each architectural group rather than globally
+across the entire model.
+Spectral summaries
+The condition number of W is
+κ(W) := σmax(W)
+σmin(W) .
+For a matrix W, let σi(W) denote its singular values, and let ui, vi denote the corresponding left
+and right singular vectors satisfying
+Wvi = σiui.
+LoRA parameterization
+A LoRA adapter of rank r on a base matrix W ∈Rm×n replaces W
+during the forward pass with W + ∆W, where
+∆W = BA,
+B ∈Rm×r,
+A ∈Rr×n,
+(2)
+and only B, A are trained. Following the standard LoRA initialization [14], B is initialized to
+zero while A is randomly initialized, so that the initial update satisfies ∆W = 0 and preserves the
+pretrained model at the start of the fine-tuning procedure. We refer to r as the LoRA rank. ∥∆W∥F
+constrains the magnitude of the update, which we refer to as the update’s Frobenius budget.
+Candidate set and selection
+Let {W1, . . . , WN} denote the set of pretrained weight matrices
+eligible for LoRA adaptation, typically including attention projections and MLP linear layers across
+all transformer blocks. A selection is a subset S ⊆{1, . . . , N} with |S| = K, where K denotes
+the adaptation budget.
+To ensure meaningful comparison across matrices, we partition the candidate set into architectural
+groups G1, . . . , Gg. In transformer architectures, we use separate groups for attention projections (e.g.,
+query, key, value, and output matrices) and MLP projections (e.g., up-, down-, and gate-projection
+matrices). As illustrated in Figure 1, matrices with different architectural roles exhibit distinct
+condition number distributions and naturally form separate clusters. We therefore perform ranking
+and selection within each group rather than globally across all matrices.
+Reachable capacity
+Given a matrix W and a bounded low-rank update satisfying ∥∆W∥F ≤ϵ,
+we define ρ(W; ϵ) as the maximum relative change that can be induced in the action of W along any
+singular direction. Intuitively, ρ(W; ϵ) measures how sensitive the behavior of W is to a bounded
+low-rank perturbation.
+3.2
+Method
+Standard LoRA [14] applies low-rank adapters uniformly to a predefined set of weight matrices
+(e.g., all attention and MLP projections), implicitly assuming that all matrices benefit equally from
+4
+
+
+adaptation. We challenge this assumption by analyzing how much a bounded low-rank update can
+actually change the behavior of each matrix.
+Effect of bounded low-rank updates
+Consider a pretrained weight matrix W ∈Rm×n. Suppose
+we apply a bounded low-rank update ∆W such that rank(∆W) ≤k and ∥∆W∥F ≤ϵ. We analyze
+how much this update can change the action of W along a singular direction vi:
+∥(W + ∆W)vi −Wvi∥
+∥Wvi∥
+.
+The numerator satisfies
+∥(W + ∆W)vi −Wvi∥= ∥∆Wvi∥≤∥∆W∥2∥vi∥2 = ∥∆W∥2 ≤∥∆W∥F ≤ϵ,
+where we use the fact that vi is a unit singular vector. The denominator is equal to
+∥Wvi∥= ∥σiui∥= σi.
+Therefore, the relative change along direction vi is upper bounded by
+ϵ
+σi .
+Intuition
+This bound reveals a key asymmetry: directions corresponding to small singular values
+(σi) can be significantly altered even by small updates. In particular, the smallest singular value
+σmin(W) determines the maximum achievable relative change:
+ρ(W; ϵ) := max
+i
+ϵ
+σi
+=
+ϵ
+σmin(W).
+This quantity measures the maximum relative change that a bounded low-rank update can induce
+in the behavior of W: how much its functional behavior can be changed under a bounded low-rank
+update. Importantly, this upper bound is attainable by low-rank updates. In particular, a rank-1 update
+of the form ∆W = ϵ u v⊤
+i achieves the bound along direction vi. Since LoRA parameterizes updates
+as low-rank matrices, it can realize such updates in practice. Therefore, ρ(W; ϵ) is not merely a
+theoretical upper bound, but reflects the actual expressive capacity of LoRA updates.
+The maximum achievable relative change under a bounded low-rank update can therefore be written as
+ρ(W; ϵ) := max
+i
+ϵ
+σi
+=
+ϵ
+σmin(W) =
+ϵ · κ(W)
+σmax(W).
+(3)
+Connection to condition number
+Equation (3) shows that the maximum achievable relative change
+under a bounded low-rank update is inversely proportional to the smallest singular value, and can be
+expressed in terms of the condition number
+κ(W) = σmax(W)
+σmin(W) .
+Under the mild assumption that σmax(W) varies within a comparatively smaller range inside an
+architectural group, Equation (3) suggests that the sensitivity of a matrix to bounded low-rank
+updates is largely governed by its condition number. Empirically, as illustrated in Figure 1, matrices
+within the same architectural group exhibit more coherent condition number distributions compared
+to cross-group comparisons, making condition number a practical proxy for ranking adaptation
+sensitivity. This observation motivates our strategy of prioritizing matrices with larger condition
+numbers for LoRA adaptation.
+Beyond the connection in Eq. (3), the condition number has another useful property: it is invariant to
+uniform scaling of the matrix. Specifically, for any scalar c > 0,
+κ(cW) = κ(W).
+This property is desirable for matrix selection because the same network function can often be repre-
+sented using different parameter scalings. For example, two consecutive linear transformations W2W1
+can be equivalently rewritten as (cW2)(W1/c) without changing the overall mapping [8]. Under
+such rescaling, quantities based solely on σmin(W) vary with the scale factor, potentially altering
+the ranking of matrices despite preserving the network function. In contrast, the condition number
+remains unchanged, making it a more intrinsic criterion for ranking matrices for LoRA adaptation.
+5
+
+
+Selection rule
+The above analysis suggests a simple principle: matrices with larger condition
+numbers admit directions where bounded low-rank updates can induce larger relative changes. We
+therefore prioritize such matrices for LoRA adaptation.
+Under a fixed budget of K LoRA modules, our goal is to allocate adaptation updates to matrices
+that are most sensitive to bounded low-rank perturbations. To formalize this intuition, given a subset
+S of matrices, we define
+Φ(S) =
+X
+Wi∈S
+ρ(Wi; ϵ),
+which measures the total achievable relative change across the selected matrices.
+Selecting matrices that maximize Φ(S) under the constraint |S| = K naturally prioritizes matrices
+with larger values of ρ(Wi; ϵ). Under the mild assumption that σmax(W) varies within a compara-
+tively smaller range inside each architectural group, this ranking is approximately consistent with
+selecting matrices with larger condition numbers.
+3.3
+Algorithm
+Our procedure takes a pretrained model and a target selection ratio α ∈(0, 1], and outputs a
+fine-tuned model in which LoRA adapters are attached only to a selected subset of pretrained weight
+matrices. We first enumerate candidate weight matrices, such as attention projections and MLP
+projections. For each candidate matrix W, we compute its condition number κ(W) once before
+fine-tuning. Then, we rank the matrices within each architectural group and select the top α fraction
+with the largest condition numbers. LoRA adapters are added only to these selected matrices, while
+all other pretrained weights remain frozen.
+The selection step is data-free and training-free: it depends only on the spectral properties of the
+pretrained weights and does not require gradient statistics, calibration data, or additional forward
+passes. Since condition numbers are computed once offline, the additional SVD cost is negligible
+compared to the cost of fine-tuning large models. Algorithm 1 summarizes the full procedure.
+Group-wise selection
+In transformer architectures, different types of weight matrices can exhibit
+substantially different spectral norm and condition number distributions due to differences in their
+functional roles. For example, attention projections and MLP projections often operate at different
+scales, making direct global ranking potentially biased toward certain architectural components.
+To address this, we perform selection within each architectural group. Specifically, we partition
+matrices into architectural groups, such as attention projections (query, key, value, and output matrices)
+and MLP projections (up-, down-, and gate-projection matrices), compute condition numbers within
+each group, and select a fixed ratio αj per group.
+This design ensures that adaptation capacity is distributed across different functional components
+of the model, while still prioritizing matrices that are more sensitive to bounded low-rank updates
+within each group.
+Discussion
+Intuitively, ill-conditioned matrices contain highly anisotropic transformations, where
+certain directions are under-utilized (small σi) and thus easier to modify. In contrast, well-conditioned
+matrices already behave more uniformly and are less sensitive to low-rank updates. While the
+condition number alone does not fully determine the importance of a matrix, it provides a simple
+and effective proxy for identifying where adaptation can have the largest impact. We empirically
+validate that this selection leads to improved efficiency and faster convergence. This also explains why
+prioritizing well-conditioned matrices (with small condition numbers) is less effective: their trans-
+formations are already stable and isotropic, leaving limited room for impactful low-rank adaptation.
+4
+Experiments
+To demonstrate the broad effectiveness of the κ-LoRA Algorithm, we conducted extensive experi-
+ments across Natural Language Generation (NLG) tasks and Natural Language Understanding (NLU)
+tasks. All experiments were conducted on NVIDIA GH200 GPUs (96 GB HBM). All LoRA have the
+scale weight 1. Unless otherwise stated, κ-LoRA has selection ratio α = 0.5.
+6
+
+
+Algorithm 1 κ-LoRA Algorithm
+Input: Pretrained model with candidate matrices {W1, . . . , WN} partitioned into architectural
+groups {G1, . . . , Gg} (e.g., attention and MLP); per-group selection ratios {αj}g
+j=1 with αj ∈
+(0, 1]; fine-tuning dataset D
+Output: Fine-tuned model with LoRA adapters on the selected subset
+1: for i = 1 to N do
+2:
+Compute σmax(Wi) and σmin(Wi) via truncated SVD
+3:
+κi ←σmax(Wi) / σmin(Wi)
+4: end for
+5: S ←∅
+6: for j = 1 to g do
+7:
+Kj ←⌈αj |Gj|⌉
+8:
+Sj ←indices of the Kj matrices in Gj with the largest κi
+9:
+S ←S ∪Sj
+10: end for
+11: for i ∈S do
+12:
+Initialize Bi ∈Rmi×r as zero, Ai ∈Rr×ni via Kaiming uniform
+13:
+Replace forward pass of Wi with Wi + BiAi
+14: end for
+15: for i /∈S do
+16:
+Freeze Wi; no adapter attached
+17: end for
+18: Train {Bi, Ai}i∈S on D with the standard LoRA optimization recipe; keep all Wi frozen
+19: return Fine-tuned model
+Table 1: κ-LoRA on NLG tasks. The results are averaged over three runs, with standard deviations
+included. The GSM8K and MATH datasets share a math fine-tuned model, while HumanEval and
+MBPP use a code fine-tuned model. MT-Bench utilizes a conversation fine-tuned model. The "Avg.
+time" represents the average fine-tuning time for the three models.
+Model
+Method
+Avg. Time(↓)
+Math
+Code
+Conversation
+GSM8K(↑)
+MATH(↑)
+HumanEval(↑)
+MBPP(↑)
+MT-Bench(↑)
+LLaMA 2-7B
+full-LoRA
+7071s
+41.40±0.21
+5.06±0.17
+21.8±0.2
+33.4±0.3
+4.99±0.02
+κ-LoRA
+5948s(-15.9%)
+39.29±0.35
+5.30±0.24
+21.3±0.2
+37.6±0.4
+5.10±0.03
+Mistral-7B
+full-LoRA
+7251s
+70.51±0.25
+19.76±0.32
+48.2±0.1
+63.2±0.2
+6.29±0.05
+κ-LoRA
+6119s(-15.6%)
+70.60±0.18
+19.84±0.54
+45.1±0.2
+63.3±0.4
+6.44±0.04
+Gemma-7B
+full-LoRA
+7962s
+77.41±0.45
+29.46±0.48
+52.9±0.3
+53.0±0.3
+5.42±0.04
+κ-LoRA
+6603s(-17.0%)
+76.27±0.32
+29.50±0.36
+41.5±0.3
+63.0±0.2
+5.44±0.04
+4.1
+NLG benchmarks
+Experimental setup
+We adopt the Alpaca [27] implementation strategy and fine-tune with the
+AdamW optimizer [24] using a global batch size of 128, a learning rate of 2e-5, a cosine annealing
+schedule [23, 37], a warmup ratio of 0.03, and no weight decay, with a maximum sequence length of
+512. LoRA modules use rank r = 128.
+Tasks and evaluation
+We evaluate κ-LoRA algorithms across a diverse set of NLG tasks, see
+Table 1. Specifically, we fine-tune LLaMA 2-7B [29], Mistral-7B [15], and Gemma-7B [28] on the
+MetaMathQA dataset [36] to benchmark their mathematical reasoning capabilities on GSM8K [4] and
+MATH [12]. To assess coding proficiency, we further fine-tune these models on CodeFeedback [40]
+and evaluate on HumanEval [3] and MBPP [1]. For conversational ability, we train on WizardLM-
+Evol-Instruct [34] and evaluate on MT-Bench [39]. Following Meng et al. [25], all models are
+fine-tuned for a single epoch on a 100K-example subset of each dataset to bound training compute
+and ensure a fair comparison across methods. Due to the small size of HumanEval and MBPP, and to
+maintain consistency with prior work, we report all code tasks results with one decimal place.
+7
+
+
+Efficiency
+As shown in Table 1, κ-LoRA reduces fine-tuning time by 15.6–17.0% across all three
+backbones. This speedup follows directly from κ-LoRA’s parameter footprint: it introduces only
+half as many trainable parameters as full-LoRA, effectively halving the size of the adapted module.
+The reduction is stable across model families and grows mildly with model complexity (largest on
+Gemma-7B), indicating that the speedup stems from the method itself rather than backbone-specific
+interactions. While κ-LoRA consistently improves training efficiency, we further examine whether
+these savings come at the cost of downstream performance.
+Effectiveness
+κ-LoRA matches or surpasses full-LoRA on 11 of 15 (model, task) pairs despite
+adapting only half of the LoRA modules. It attains the best MATH score on every backbone (+0.24,
++0.08, +0.04) and the best MT-Bench score on every backbone (+0.11, +0.15, +0.02). This consistent
+improvement on MATH and MT-Bench suggests that adaptation sensitivity is concentrated in a
+relatively small subset of matrices, and that selectively adapting high-condition-number matrices can
+preserve and sometimes improve complex reasoning and instruction-following behaviors. The largest
+improvements appear on MBPP (+4.2 on LLaMA 2-7B and +10.0 on Gemma-7B), where broader and
+more diverse program synthesis targets may benefit from concentrating updates on the most sensitive
+matrices. Differences on GSM8K remain within 1.2 points of full-LoRA and overlap within standard
+deviations on Mistral-7B. In contrast, gains on HumanEval are less consistent, with performance
+drops of 0.5–11.4 points depending on the backbone. This suggests that exact functional code
+synthesis may be less tolerant to sparse adaptation than broader coding benchmarks such as MBPP.
+Despite task-specific variation, the overall efficiency-quality tradeoff remains consistent across three
+backbones with markedly different pre-training corpora and tokenizers. κ-LoRA achieves an average
+16.2% reduction in fine-tuning time without measurable degradation in aggregate downstream quality,
+suggesting that the observed behavior reflects a general property of LoRA adaptation rather than
+backbone-specific effects.
+4.2
+NLU benchmarks
+We evaluate κ-LoRA’s NLU capability on the GLUE benchmark [32] with DeBERTa-v3-base [11].
+The LoRA rank is r = 8, the standard choice for DeBERTa on GLUE. Since we do not normalize
+for training set size, we report the total fine-tuning time aggregated over all eight tasks. The number
+of training epochs is set per-task: 20 for RTE, 10 for CoLA, MRPC, and STS-B, 3 for SST-2 and
+QNLI, and 2 for MNLI and QQP.
+Efficiency
+As shown in Table 2, κ-LoRA reduces the cumulative wall-clock time across the eight
+GLUE tasks from 4979s to 3872s, corresponding to a 22.2% reduction under identical training
+settings. The magnitude exceeds the 15.6–17.0% range observed on the three 7B NLG backbones as
+shown in Table 1.
+Effectiveness
+As shown in Table 2, κ-LoRA matches full-LoRA on GLUE while training only
+half of the LoRA projections. Aggregating the per-task numbers into a single GLUE-style score,
+full-LoRA reaches 88.44% and κ-LoRA reaches 87.91%; the 0.53-point gap collapses to 0.04 points
+(88.44% vs. 88.40%) once the 277-example RTE split, which is well known to be high-variance, is
+set aside. This small gap suggests that adaptation sensitivity is highly concentrated in a relatively
+small subset of matrices even for language understanding tasks.
+On a per-metric basis, κ-LoRA is the top method on 7 of the 12 reported numbers, with the most
+pronounced gains on CoLA, STS-B, and QQP, and stays within typical run-to-run variance on the
+remainder. These gains suggest that selectively adapting high-condition-number matrices is sufficient
+to preserve fine-grained linguistic and semantic representations across a broad range of understanding
+tasks. Overall, these results suggest that sparse adaptation guided by condition number remains
+highly effective for language understanding tasks, indicating that a substantial fraction of LoRA
+modules can be removed without measurable degradation in aggregate benchmark quality while
+reducing wall-clock cost by 22.2%.
+4.3
+Ablation Study
+We sweep the selection ratio α on LLaMA2-7B in Figure 2. α = 50% lies near the Pareto knee,
+reducing wall-clock time by approximately 16% while matching or exceeding full-LoRA on four
+of five benchmarks.
+8
+
+
+Table 2: κ-LoRA on NLU tasks. Matthews correlation on CoLA, Pearson–Spearman mean on STS-B,
+accuracy–F1 mean on MRPC and QQP, and matched–mismatched mean on MNLI.
+Method
+Time(↓)
+CoLA
+SST-2
+MRPC
+STS-B
+RTE
+QNLI
+MNLI
+QQP
+(Matt↑)
+(acc↑)
+(acc↑/ F1↑)
+(P↑/ S↑)
+(acc↑)
+(acc↑)
+(m↑/ mm↑)
+(acc↑/ F1↑)
+full-LoRA
+4979s
+66.24
+95.64
+90.69 / 93.31
+91.60 / 91.49
+88.45
+94.09
+90.24 / 90.40
+90.74 / 87.74
+κ-LoRA
+3872s(-22.2%)
+66.56
+95.41
+89.95 / 92.77
+91.77 / 91.53
+84.48
+94.11
+90.27 / 90.11
+90.95 / 88.13
+Table 3: Trainable parameter counts. Projections
+is the number of LoRA projections; Trainable
+sums the LoRA A, B parameters across those
+modules.
+Model
+Method
+Proj.
+Trainable
+Total
+Train. %
+LLaMA 2-7B
+full-LoRA
+224
+319.8 M
+7.06 B
+4.75%
+κ-LoRA
+112
+159.9 M
+6.90 B
+2.37%
+Mistral-7B
+full-LoRA
+224
+335.5 M
+7.58 B
+4.63%
+κ-LoRA
+112
+180.4 M
+7.42 B
+2.49%
+Gemma-7B
+full-LoRA
+196
+400.0 M
+8.94 B
+4.69%
+κ-LoRA
+98
+200.0 M
+8.74 B
+2.34%
+DeBERTa-v3
+full-LoRA
+72
+1.33 M
+185.2 M
+0.72%
+κ-LoRA
+36
+0.66 M
+184.5 M
+0.36%
+100%
+70%
+50%
+30%
+10%
+Ratio. (high->low)
+0.6
+0.7
+0.8
+0.9
+1.0
+1.1
+Score (vs. full-LoRA)
+1.00
+1.04
+1.08
+1.06
+0.67
+1.00
+0.97
+0.95
+0.81
+0.63
+1.00
+0.92
+0.98
+0.84
+0.78
+1.00
+1.05
+1.09
+0.99
+0.91
+1.00
+0.95
+1.02
+1.01
+0.97
+1.00
+0.90
+0.84
+0.79
+0.74
+Time
+MATH
+GSM8K
+HumanEval
+MBPP
+MT-Bench
+Figure 2: κ-LoRA sweep, normalized to full-
+LoRA at LLaMA2-7B.
+When α becomes too small, performance degradation appears most noticeably on reasoning-intensive
+tasks such as MATH, suggesting that overly aggressive sparsification removes matrices that still
+contribute meaningfully to complex reasoning behaviors. In contrast, increasing α beyond 50% yields
+diminishing performance gains while steadily increasing fine-tuning cost, indicating that many lower-
+priority matrices contribute only marginally once the highest-condition-number matrices are retained.
+Overall, these results support the central hypothesis of κ-LoRA: adaptation sensitivity is highly
+uneven across matrices, and a relatively small subset of high-condition-number matrices captures
+most of the useful adaptation capacity.
+5
+Discussion
+A central design choice of κ-LoRA (Section 3) is to apply LoRA to the most ill-conditioned weight
+matrices, under the hypothesis that the low-rank updates help reduce their condition numbers. To
+validate this, we measure the change in condition number of all selected matrices in Gemma-7B
+before and after fine-tuning. As shown in Figure 3, 83%–87% of these matrices become better
+conditioned, confirming our expectation and suggesting that the gains of κ-LoRA stem from targeted
+spectral rebalancing rather than parameter selection alone. Building on this insight, κ-LoRA offers
+a simple recipe for efficient LoRA fine-tuning: rank weight matrices by condition number and
+adapt only the most ill-conditioned half. Across math, code, conversation, and NLU benchmarks,
+this design reduces fine-tuning time by 16.2% on average while matching the accuracy of standard
+LoRA. We view condition-number–guided selection as a complementary axis to existing efficiency
+techniques, such as quantization, and leave their combination to future work.
+Limitations Our study has several limitations that open directions for future work. First, our analysis
+assumes that the condition number of pretrained weights remains a stable proxy for adaptation
+leverage throughout fine-tuning; a dynamic criterion that re-evaluates spectral statistics during
+training could, in principle, adapt better to objectives that significantly reshape weight geometry,
+such as long-horizon reinforcement learning. Second, we apply a fixed selection ratio α across all
+transformer blocks; allowing α to vary by depth, or combining κ-LoRA’s matrix-level selection with
+rank-level allocation methods such as AdaLoRA, which are orthogonal to our criterion, may yield
+further gains. Finally, our theoretical analysis establishes that high-κ matrices admit provably greater
+leverage under bounded low-rank perturbations rather than full optimality of top-κ selection in the
+general case, and a formal characterization of when the criterion is provably optimal remains open.
+9
+
+
+102
+103
+104
+cond(Wbase)  (before training)
+102
+103
+104
+cond(Wbase + B A)  (after training)
+ decreased: 81 (83%)
+ increased: 17 (17%)
+= unchanged: 0
+gemma-7b/metamath
+selected modules (98)
+y = x  (no change)
+102
+103
+104
+cond(Wbase)  (before training)
+102
+103
+104
+cond(Wbase + B A)  (after training)
+ decreased: 82 (84%)
+ increased: 16 (16%)
+= unchanged: 0
+gemma-7b/code
+selected modules (98)
+y = x  (no change)
+102
+103
+104
+cond(Wbase)  (before training)
+102
+103
+104
+cond(Wbase + B A)  (after training)
+ decreased: 85 (87%)
+ increased: 13 (13%)
+= unchanged: 0
+gemma-7b/conversation
+selected modules (98)
+y = x  (no change)
+Figure 3: LoRA training systematically reduces the condition number of high-κ projections in
+Gemma-7B.
+10
+
+
+References
+[1] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David
+Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, and Charles Sutton. Program synthesis
+with large language models. arXiv preprint arXiv:2108.07732, 2021.
+[2] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[3] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto,
+Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul
+Puri, Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke
+Chan, Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad
+Bavarian, Clemens Winter, Philippe Tillet, Felipe Petroski Such, Dave Cummings, Matthias
+Plappert, Fotios Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex
+Nichol, Alex Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain,
+William Saunders, Christopher Hesse, Andrew N. Carr, Jan Leike, Josh Achiam, Vedant Misra,
+Evan Morikawa, Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer,
+Peter Welinder, Bob McGrew, Dario Amodei, Sam McCandlish, Ilya Sutskever, and Wojciech
+Zaremba. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374,
+2021.
+[4] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+Schulman. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168,
+2021.
+[5] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient
+finetuning of quantized llms. Advances in Neural Information Processing Systems, 36, 2024.
+[6] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of
+deep bidirectional transformers for language understanding. In NAACL, 2019.
+[7] Ning Ding, Xingtai Lv, Qiaosen Wang, Yulin Chen, Bowen Zhou, Zhiyuan Liu, and Maosong
+Sun. Sparse low-rank adaptation of pre-trained language models. In Proceedings of the 2023
+conference on empirical methods in natural language processing, pages 4133–4145, 2023.
+[8] Laurent Dinh, Razvan Pascanu, Samy Bengio, and Yoshua Bengio. Sharp minima can generalize
+for deep nets. In International Conference on Machine Learning, pages 1019–1028. PMLR,
+2017.
+[9] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai,
+Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al.
+An image is worth 16x16 words: Transformers for image recognition at scale. arXiv preprint
+arXiv:2010.11929, 2020.
+[10] Anchun Gui and Han Xiao. Hifi: High-information attention heads hold for parameter-efficient
+model adaptation. In Proceedings of the 61st Annual Meeting of the Association for Computa-
+tional Linguistics (Volume 1: Long Papers), pages 8521–8537, 2023.
+[11] Pengcheng He, Jianfeng Gao, and Weizhu Chen. Debertav3: Improving deberta using electra-
+style pre-training with gradient-disentangled embedding sharing, 2021.
+[12] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn
+Song, and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset.
+arXiv preprint arXiv:2103.03874, 2021.
+[13] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe,
+Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning
+for nlp. In International conference on machine learning, pages 2790–2799. PMLR, 2019.
+11
+
+
+[14] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+Lu Wang, and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv
+preprint arXiv:2106.09685, 2021.
+[15] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh
+Chaplot, Diego de Las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile
+Saulnier, Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut
+Lavril, Thomas Wang, Timothée Lacroix, and William El Sayed. Mistral 7b. arXiv preprint
+arXiv:2310.06825, 2023.
+[16] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child,
+Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language
+models. arXiv preprint arXiv:2001.08361, 2020.
+[17] Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient
+prompt tuning. arXiv preprint arXiv:2104.08691, 2021.
+[18] Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation.
+arXiv preprint arXiv:2101.00190, 2021.
+[19] Yixiao Li, Yifan Yu, Qingru Zhang, Chen Liang, Pengcheng He, Weizhu Chen, and Tuo Zhao.
+Losparse: Structured compression of large language models based on low-rank and sparse
+approximation. In International Conference on Machine Learning, pages 20336–20350. PMLR,
+2023.
+[20] Vijay Lingam, Atula Tejaswi, Aditya Vavre, Aneesh Shetty, Gautham K Gudur, Joydeep Ghosh,
+Alex Dimakis, Eunsol Choi, Aleksandar Bojchevski, and Sujay Sanghavi. Svft: Parameter-
+efficient fine-tuning with singular vectors. Advances in Neural Information Processing Systems,
+37:41425–41446, 2024.
+[21] Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang,
+Kwang-Ting Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation.
+arXiv preprint arXiv:2402.09353, 2024.
+[22] Zeyu Liu, Souvik Kundu, Anni Li, Junrui Wan, Lianghao Jiang, and Peter Beerel. Aflora:
+Adaptive freezing of low rank adaptation in parameter efficient fine-tuning of large models.
+In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics
+(Volume 2: Short Papers), pages 161–167, 2024.
+[23] Ilya Loshchilov and Frank Hutter. SGDR: Stochastic gradient descent with warm restarts. In
+International Conference on Learning Representations (ICLR), 2017.
+[24] Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International
+Conference on Learning Representations (ICLR), 2019.
+[25] Fanxu Meng, Zhaohui Wang, and Muhan Zhang. PiSSA: Principal singular values and singular
+vectors adaptation of large language models. arXiv preprint arXiv:2404.02948, 2024.
+[26] Rui Pan, Xiang Liu, Shizhe Diao, Renjie Pi, Jipeng Zhang, Chi Han, and Tong Zhang. Lisa: Lay-
+erwise importance sampling for memory-efficient large language model fine-tuning. Advances
+in Neural Information Processing Systems, 37:57018–57049, 2024.
+[27] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following LLaMA model.
+https://github.com/tatsu-lab/stanford_alpaca, 2023.
+[28] Gemma Team, Thomas Mesnard, Cassidy Hardin, Robert Dadashi, Surya Bhupatiraju, Shreya
+Pathak, Laurent Sifre, Morgane Rivière, Mihir Sanjay Kale, Juliette Love, Pouya Tafti, Léonard
+Hussenot, Pier Giuseppe Sessa, Aakanksha Chowdhery, Adam Roberts, Aditya Barua, Alex
+Botev, Alex Castro-Ros, Ambrose Slone, Amélie Héliou, Andrea Tacchetti, Anna Bulanova,
+Antonia Paterson, Beth Tsai, Bobak Shahriari, Charline Le Lan, Christopher A. Choquette-Choo,
+Clément Crepy, Daniel Cer, Daphne Ippolito, David Reid, Elena Buchatskaya, Eric Ni, Eric
+Noland, Geng Yan, George Tucker, George-Christian Muraru, Grigory Rozhdestvenskiy, Henryk
+12
+
+
+Michalewski, Ian Tenney, Ivan Grishchenko, Jacob Austin, James Keeling, Jane Labanowski,
+Jean-Baptiste Lespiau, Jeff Stanway, Jenny Brennan, Jeremy Chen, Johan Ferret, Justin Chiu,
+Justin Mao-Jones, Katherine Lee, Kathy Yu, Katie Millican, Lars Lowe Sjoesund, Lisa Lee,
+Lucas Dixon, Machel Reid, Maciej Mikuła, Mateo Wirth, Michael Sharman, Nikolai Chinaev,
+Nithum Thain, Olivier Bachem, Oscar Chang, Oscar Wahltinez, Paige Bailey, Paul Michel,
+Petko Yotov, Rahma Chaabouni, Ramona Comanescu, Reena Jana, Rohan Anil, Ross McIlroy,
+Ruibo Liu, Ryan Mullins, Samuel L Smith, Sebastian Borgeaud, Sertan Girgin, Sholto Douglas,
+Shree Pandya, Siamak Shakeri, Soham De, Ted Klimenko, Tom Hennigan, Vlad Feinberg,
+Wojciech Stokowiec, Yu hui Chen, Zafarali Ahmed, Zhitao Gong, Tris Warkentin, Ludovic
+Peran, Minh Giang, Clément Farabet, Oriol Vinyals, Jeff Dean, Koray Kavukcuoglu, Demis
+Hassabis, Zoubin Ghahramani, Douglas Eck, Joelle Barral, Fernando Pereira, Eli Collins,
+Armand Joulin, Noah Fiedel, Evan Senter, Alek Andreev, and Kathleen Kenealy. Gemma: Open
+models based on gemini research and technology. arXiv preprint arXiv:2403.08295, 2024.
+[29] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas
+Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes,
+Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony
+Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian
+Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov,
+Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta,
+Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiao-
+qing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng
+Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien
+Rodriguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation
+and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+[30] Lloyd N Trefethen and David Bau. Numerical linear algebra. SIAM, 2022.
+[31] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In NeurIPS, 2017.
+[32] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R Bowman.
+Glue: A multi-task benchmark and analysis platform for natural language understanding. In
+International Conference on Learning Representations, 2018.
+[33] Hanqing Wang, Yixia Li, Shuo Wang, Guanhua Chen, and Yun Chen. Milora: Harnessing
+minor singular components for parameter-efficient llm finetuning. In Proceedings of the 2025
+Conference of the Nations of the Americas Chapter of the Association for Computational
+Linguistics: Human Language Technologies (Volume 1: Long Papers), pages 4823–4836, 2025.
+[34] Can Xu, Qingfeng Sun, Kai Zheng, Xiubo Geng, Pu Zhao, Jiazhan Feng, Chongyang Tao, Qing-
+wei Lin, and Daxin Jiang. WizardLM: Empowering large pre-trained language models to follow
+complex instructions. In The Twelfth International Conference on Learning Representations,
+2023.
+[35] Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng Chang, Hengheng Zhang, Zhensu Chen,
+Xiaopeng Zhang, and Qi Tian. Qa-lora: Quantization-aware low-rank adaptation of large
+language models. arXiv preprint arXiv:2309.14717, 2023.
+[36] Longhui Yu, Weisen Jiang, Han Shi, Jincheng Yu, Zhengying Liu, Yu Zhang, James T Kwok,
+Zhenguo Li, Adrian Weller, and Weiyang Liu. MetaMath: Bootstrap your own mathematical
+questions for large language models. arXiv preprint arXiv:2309.12284, 2023.
+[37] Weichen Yu, Tianyu Pang, Qian Liu, Chao Du, Bingyi Kang, Yan Huang, Min Lin, and
+Shuicheng Yan. Bag of tricks for training data extraction from language models. In International
+Conference on Machine Learning, pages 40306–40320. PMLR, 2023.
+[38] Qingru Zhang, Minshuo Chen, Alexander Bukharin, Pengcheng He, Yu Cheng, Weizhu Chen,
+and Tuo Zhao. AdaLoRA: Adaptive budget allocation for parameter-efficient fine-tuning. arXiv
+preprint arXiv:2303.10512, 2023.
+13
+
+
+[39] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica.
+Judging LLM-as-a-judge with MT-Bench and chatbot arena. Advances in Neural Information
+Processing Systems, 36, 2024.
+[40] Tianyu Zheng, Ge Zhang, Tianhao Shen, Xueling Liu, Bill Yuchen Lin, Jie Fu, Wenhu Chen, and
+Xiang Yue. OpenCodeInterpreter: Integrating code generation with execution and refinement.
+arXiv preprint arXiv:2402.14658, 2024.
+[41] Hongyun Zhou, Xiangyu Lu, Wang Xu, Conghui Zhu, Tiejun Zhao, and Muyun Yang. Lora-
+drop: Efficient lora parameter pruning based on output evaluation. In Proceedings of the 31st
+International Conference on Computational Linguistics, pages 5530–5543, 2025.
+[42] Bojia Zi, Xianbiao Qi, Lingzhi Wang, Jianan Wang, Kam-Fai Wong, and Lei Zhang. Delta-
+lora: Fine-tuning high-rank parameters with the delta of low-rank matrices. arXiv preprint
+arXiv:2309.02411, 2023.
+14
+
+
+Appendix
+A
+Memory and compute requirements
+We report our experiment memory usage at Table 4. Base (MB) is the canonical Hugging Face
+checkpoint (*.safetensors only; TinyLlama is released in fp32 so its base is comparatively large
+for its parameter count). ∆= full-LoRA - κ-LoRA is the per-cell adapter saving in MB; ∆/full
+shows that the Mistral and TinyLlama ratios deviate slightly from 0.50 because grouped-query
+attention (Mistral) and the smaller hidden size of TinyLlama perturb the per-module parameter mass.
+The final column expresses the saving as a fraction of the base-model storage cost: switching from
+full-LoRA to κ-LoRA reclaims roughly 4–5% of base-model disk per cell, and the saving compounds
+across our method × backbone × task × rank sweep.
+Table 4: On-disk adapter checkpoint sizes at r=128 in fp32 (the PEFT default), alongside the
+published bf16/fp16 base-model size that has to be shipped to deploy each adapter.
+Backbone
+Base (MB)
+full-LoRA (MB)
+κ-LoRA (MB)
+∆(MB)
+∆/ full
+∆ratio
+TinyLlama-1.1B
+4 197
+386
+211
+175
+0.45
+4.2%
+Llama-2-7B
+12 854
+1 221
+611
+610
+0.50
+4.7%
+Mistral-7B
+13 814
+1 284
+692
+592
+0.46
+4.3%
+Gemma-7B
+16 288
+1 563
+800
+763
+0.49
+4.7%
+Llama-2-13B
+24 827
+1 911
+956
+955
+0.50
+3.8%
+All training and evaluation in this paper are run on a single NVIDIA GH200 480 GB Grace Hopper
+Superchip node; the relevant specifications are summarised in Table 5. The “480 GB” in the SKU
+designation refers to the Grace LPDDR5X host memory; the GPU side of the chip exposes 96 GB of
+HBM3, which is the figure that actually bounds our training workloads. We use bf16 mixed precision
+with Flash-Attention 2 and gradient checkpointing enabled throughout, which leaves substantial
+headroom on the 96 GB HBM3 (peak GPU usage we observe is ≈21 GB at 7B and ≈39 GB at 13B).
+Inference for the generation evaluations runs on the same node via vLLM.
+Table 5: Hardware platform. The 96 GB HBM3 capacity is the ceiling that actually bounds our
+training workloads; the much larger 480 GB Grace memory is reachable from the GPU via the
+900 GB/s NVLink-C2C link but is not on the critical path for the experiments reported here. The
+GPU die is the same Hopper SXM die used in NVIDIA H100, so per-GPU throughput is comparable
+to a single H100 SXM card.
+Component
+Specification
+GPU
+NVIDIA GH200 480 GB (Grace Hopper Superchip)
+GPU architecture
+Hopper, compute capability 9.0 (sm_90)
+GPU memory
+96 GB HBM3, ≈3.0 TB/s bandwidth
+Tensor Core BF16/FP16 (dense)
+989 TFLOPS
+Tensor Core FP8 (dense)
+1979 TFLOPS
+Tensor Core FP64 (dense)
+67 TFLOPS
+GPU TDP
+700 W (observed cap; configurable 450–1000 W)
+Host CPU
+NVIDIA Grace, 72 Arm Neoverse-V2 cores (aarch64)
+Host memory
+480 GB LPDDR5X
+CPU–GPU interconnect
+NVLink-C2C, 900 GB/s coherent
+Driver / CUDA toolkit
+NVIDIA 570.195, CUDA 12.8
+Operating system
+Ubuntu 22.04, Linux 6.8 (aarch64)
+Number of GPUs / nodes
+1 GPU, 1 node (no tensor or data parallelism)
+B
+Models and datasets
+All models and datasets used in this work are publicly available; we list their canonical sources and
+licenses below. We did not retrain any base model; we consume each one only as a frozen backbone
+15
+
+
+for LoRA. Training and evaluation data are likewise consumed as released, except that for the code
+task, we filter the upstream Code-Feedback corpus to the Python subset (this filtering is provided by
+the PiSSA repackaging that we follow). The same sub-sampling protocol of 100 k examples, one
+epoch, used by [25], is applied identically across our full-LoRA, κ-LoRA, and other runs.
+Base models
+Table 6 lists the six pretrained checkpoints we fine-tune. Access to the Llama-2
+and Gemma weights is gated on Hugging Face and requires the user to accept the corresponding
+license on the model card before download; the remaining four are open-access. We use bf16 weights
+throughout.
+Table 6: Pretrained backbones. “Gated” means a one-time license click-through on Hugging Face is
+required before huggingface-cli download succeeds.
+Model
+Hugging Face identifier
+License
+LLaMA-2-7B
+meta-llama/Llama-2-7b-hf
+Llama-2 Community License (gated)
+LLaMA-2-13B
+meta-llama/Llama-2-13b-hf
+Llama-2 Community License (gated)
+Mistral-7B-v0.1
+mistralai/Mistral-7B-v0.1
+Apache-2.0
+Gemma-7B
+google/gemma-7b
+Gemma Terms of Use (gated)
+TinyLlama-1.1B
+TinyLlama/TinyLlama-1.1B-inter
+mediate-step-1431k-3T
+Apache-2.0
+DeBERTa-v3-base
+microsoft/deberta-v3-base
+MIT
+Training data
+The three-generation tasks follow the PiSSA training-set repackaging [25], available
+as fxmeng/pissa-dataset on Hugging Face under Apache-2.0; that bundle in turn redistributes the
+upstream sources listed in Table 7 in a unified Alpaca-style schema. The natural-language understand-
+ing experiments use the GLUE benchmark loaded directly via datasets.load_dataset("glue",
+task) for each of the eight tasks (COLA, SST2, MRPC, STSB, RTE, QNLI, MNLI, QQP); we exclude
+WNLI per common practice.
+Table 7: Training corpora. The MetaMathQA / Code-Feedback / WizardLM rows are redistributed
+inside fxmeng/pissa-dataset (Apache-2.0 wrapper) in the form we actually load. We use the
+143 k WizardLM subset that is released directly under MIT; we do not merge into the larger ShareGPT
+augmentation that the original card describes, so the additional ShareGPT licensing terms do not
+apply to our experiments. GLUE itself carries the HF other tag and defers to each subtask’s upstream
+license; we use GLUE only for non-commercial research.
+Task
+Source corpus
+Hugging Face id
+License
+Math
+MetaMathQA (395 k)
+meta-math/MetaMathQA
+MIT
+Code
+Code-Feedback
+(Python-filtered, 105 k)
+m-a-p/CodeFeedback-Filte
+red-Instruction
+Apache-2.0
+Conversation
+WizardLM-Evol-
+Instruct-V2 (143 k)
+WizardLMTeam/WizardLM_ev
+ol_instruct_V2_196k
+MIT
+GLUE (8 tasks)
+GLUE benchmark
+nyu-mll/glue
+other (per-task;
+see
+source)
+Evaluation data
+Table 8 lists the held-out evaluation sets. HumanEval+ and MBPP+ are obtained
+through the evalplus 0.3.1 package, which augments the original HumanEval and MBPP test
+cases. MT-Bench prompts are released as part of LMSYS’ FastChat repository under Apache-2.0
+(specifically fastchat/llm_judge/data/mt_bench/question.jsonl); we judge generations
+with GPT-4o through the OpenAI API (no model weights are downloaded for the judge) and use the
+FastChat single-turn protocol, so reproducing this part of the evaluation requires an OpenAI API key
+in addition to the artifacts listed below.
+Compliance and intended use
+All artifacts are used in a manner consistent with their licenses. The
+Llama-2 and Gemma experiments fall within the research-and-internal-use clauses of, respectively,
+the Llama 2 Community License Agreement and the Gemma Terms of Use (both gated on Hugging
+Face and accepted before download). GLUE is used only for non-commercial research, deferring
+to each subtask’s upstream license. The remaining training and evaluation artifacts are released
+16
+
+
+Table 8: Evaluation benchmarks. All test sets are loaded as released; we do not redistribute them.
+Benchmark
+Hugging Face id / package
+License
+GSM8K
+openai/gsm8k
+MIT
+MATH
+hendrycks/competition_math
+MIT
+HumanEval (base)
+openai/openai_humaneval
+MIT
+HumanEval+, MBPP+
+evalplus v0.3.1 (PyPI)
+Apache-2.0
+MBPP (base)
+google-research-datasets/mbpp
+CC-BY-4.0
+MT-Bench
+FastChat llm_judge data
+Apache-2.0 (questions); GPT-4o judge
+subject to OpenAI ToS
+Table 9: Code-Feedback fine-tuning evaluated on HumanEval / HumanEval+ and MBPP / MBPP+
+(pass@1, evalplus 0.3.1).
+Model
+Method
+Time(↓)
+HumanEval
+MBPP
+base(↑)
+plus(↑)
+base(↑)
+plus(↑)
+TinyLlama-1.1B
+full-LoRA
+2369s
+13.40
+11.00
+27.20
+21.20
+κ-LoRA
+1773s(-25.2%)
+13.40
+12.20
+24.60
+19.00
+LLaMA 2-7B
+full-LoRA
+7221s
+21.80
+19.50
+33.40
+27.80
+κ-LoRA
+6258s(-13.3%)
+21.30
+18.90
+37.60
+29.60
+LLaMA 2-13B
+full-LoRA
+13048s
+31.10
+28.00
+46.30
+39.40
+κ-LoRA
+11001s(-15.7%)
+30.50
+27.40
+47.10
+39.70
+under permissive open-source licenses (Apache-2.0, MIT, or CC-BY-4.0), which we comply with by
+retaining each upstream’s attribution and license notice in the released code. We release no derived
+base-model weights; only the LoRA adapter checkpoints (which are increments to a frozen base) and
+our condition-number selection regexes accompany this paper, and each adapter inherits the license
+of the base it was trained on (for example, a LoRA adapter trained on Llama-2-7B remains subject to
+the Llama 2 Community License).
+C
+Additional experiments
+C.1
+κ-LoRA is a scalable learner
+As shown in Table 9. We further validate the effectiveness of κ-LoRA across models of varying
+scales. All cells were trained for 1 epoch on 100k examples of Code-Feedback at LoRA rank r=128.
+As shown, our method remains effective across different model sizes. Notably, for the smaller
+TinyLlama-1.1B, the frozen backbone incurs lower forward and backward computation cost, allowing
+our method to deliver even greater wall-clock savings. It also perform well on LLaMA-13B model
+and save 15.7% training time. At the same time, it achieves performance on par with full-LoRA, and
+in several cases even surpasses it.
+17

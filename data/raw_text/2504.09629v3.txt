@@ -1,0 +1,3689 @@
+Quantization Error Propagation:
+Revisiting Layer-Wise Post-Training Quantization
+Yamato Arai
+Fujitsu Limited
+Department of Basic Science
+The University of Tokyo
+Yuma Ichikawa
+Fujitsu Limited
+RIKEN center for AIP
+§ Code: https://github.com/FujitsuResearch/qep
+Abstract
+Layer-wise PTQ is a promising technique for compressing large language models
+(LLMs), due to its simplicity and effectiveness without requiring retraining. How-
+ever, recent progress in this area is saturating, underscoring the need to revisit its
+core limitations and explore further improvements. We address this challenge by
+identifying a key limitation of existing layer-wise PTQ methods: the growth of
+quantization errors across layers significantly degrades performance, particularly in
+low-bit regimes. To address this fundamental issue, we propose Quantization Error
+Propagation (QEP), a general, lightweight, and scalable framework that enhances
+layer-wise PTQ by explicitly propagating quantization errors and compensating
+for accumulated errors. QEP also offers a tunable propagation mechanism that
+prevents overfitting and controls computational overhead, enabling the framework
+to adapt to various architectures and resource budgets. Extensive experiments
+on several LLMs demonstrate that QEP-enhanced layer-wise PTQ achieves sub-
+stantially higher accuracy than existing methods. Notably, the gains are most
+pronounced in the extremely low-bit quantization regime.
+1
+Introduction
+Large Language Models (LLMs) have achieved impressive performance in various natural language
+processing tasks, including open-ended text generation, multi-step reasoning, and dialogue modeling.
+Notable examples include ChatGPT [Achiam et al., 2023] and the Llama family [Touvron et al.,
+2023, Grattafiori et al., 2024]. However, deploying LLMs cost-effectively remains difficult because
+of their substantial memory usage and computational demands [Chen et al., 2023]. This limitation is
+especially critical for edge computing and latency-sensitive applications. To address these challenges,
+a wide range of model compression techniques, such as quantization [Lang et al., 2024, Gong et al.,
+2024], pruning [Wang et al., 2024, Cheng et al., 2024], low-rank approximation [Yang et al., 2024a,
+Hu et al., 2022], and knowledge distillation [Xu et al., 2024a, Yang et al., 2024b], have been explored.
+Among these methods, layer-wise post-training quantization (PTQ) has emerged as a practical and
+widely used approach for large-scale LLMs [Frantar et al., 2022, Lin et al., 2024, Yao et al., 2022,
+Chee et al., 2023]. Unlike block-wise PTQ [Tseng et al., 2024, Shao et al., 2023], global fine-tuning
+[Egiazarian et al., 2024, Tseng et al., 2024], quantization-aware training (QAT) [Xu et al., 2024b,
+Wang et al., 2023, Liu et al., 2023], and all of which require heavy retraining and backpropagation,
+layer-wise PTQ quantizes model parameters layer-by-layer without retraining or backpropagation,
+resulting in significantly lower computational and memory demands. Despite its simplicity, layer-wise
+PTQ effectively preserves model quality even at lower bit widths [Frantar et al., 2022, Lin et al., 2024,
+Chee et al., 2023]. As a result, layer-wise PTQ is increasingly adopted in real-world applications due
+to its efficient quantization, reduced computational cost, and broader compatibility with large-scale
+LLMs, varying bit widths, and diverse quantization strategies.
+39th Conference on Neural Information Processing Systems (NeurIPS 2025).
+arXiv:2504.09629v3  [cs.LG]  13 Jan 2026
+
+
+7B
+13B
+70B
+Model Size
+3.5
+4.5
+5.5
+6.5
+Perplexity on WikiText-2
+INT4 Quantization
+RTN
+QEP-RTN
+GPTQ
+QEP-GPTQ
+AWQ
+QEP-AWQ
+QuIP
+QEP-QuIP
+7B
+13B
+70B
+Model Size
+5.0
+10.0
+15.0
+20.0
+INT3 Quantization
+7B
+13B
+70B
+Model Size
+10.0
+25.0
+40.0
+55.0
+INT2 Quantization
+Figure 1: WikiText-2 perplexity comparison across Llama-2 models (7B-70B) quantized to INT-4,
+INT-3, and INT-2, employing RTN, GPTQ, AWQ, and QuIP methods. Solid bars indicate PTQ with
+QEP; border bars represent PTQ without QEP. Truncated bars indicate perplexities exceeding axis
+limits. QEP consistently reduces perplexity, with greater improvements observed at lower bitwidths
+and smaller model sizes. See Section 6 for detailed settings and results.
+Despite significant progress in layer-wise PTQ, advancements in this area are saturating [Malinovskii
+et al., 2024]. This study aims to push the performance boundaries of layer-wise PTQ by revisiting its
+core design strategy. This study begins by identifying a fundamental limitation of existing layer-wise
+PTQ approaches. These approaches do not adequately account for the propagation of quantization
+errors across layers. Quantization errors accumulate significantly, leading to a degradation in overall
+model performance, especially in low-bit settings. This represents a key bottleneck for the practical
+deployment of layer-wise PTQ in large-scale LLMs.
+To address this issue, we propose Quantization Error Propagation (QEP), a general and computation-
+ally efficient framework that enhances the performance of layer-wise PTQ methods. QEP modifies
+the layer-wise optimization objective to propagate and compensate for accumulated quantization
+errors, while maintaining computational complexity comparable to existing layer-wise PTQ methods.
+Furthermore, we introduce a tunable propagation mechanism whose adjustable propagation strength
+prevents overfitting, a known issue previously observed in GPTQ [Lin et al., 2024]. This mechanism
+also enables adaptive control over computational overhead, especially in parameter-heavy components
+such as MLP blocks. Notably, the enhancement of QEP is orthogonal to existing PTQ methods and
+can be seamlessly integrated with any layer-wise PTQ pipeline.
+Extensive experiments on several LLMs across various bit-width settings show that QEP significantly
+enhances layer-wise PTQ methods, including GPTQ [Frantar et al., 2022], AWQ [Lin et al., 2024],
+QuIP [Chee et al., 2023], as shown in Figure 1. These improvements are particularly pronounced
+in extreme low-bit regimes, such as 2-bit quantization, where standard layer-wise PTQ methods
+typically degrade significantly.
+2
+Related Work
+Quantization techniques primarily include data-free PTQ [Dettmers and Zettlemoyer, 2023], layer-
+wise PTQ [Frantar et al., 2022, Lin et al., 2024, Chee et al., 2023], block-wise PTQ [Tseng et al.,
+2024, Shao et al., 2023], global fine-tuning PTQ [Egiazarian et al., 2024, Tseng et al., 2024], and
+QAT [Xu et al., 2024b, Wang et al., 2023, Liu et al., 2023]. Among these methods, weight-only
+layer-wise PTQ has become especially popular for large-scale models because of its computational
+efficiency and strong performance [Frantar et al., 2022, Lin et al., 2024, Chee et al., 2023]. Recent
+benchmarking further highlights that most PTQ advances specifically target layer-wise methods [Zhao
+et al., 2025]. Following the taxonomy in [Zhao et al., 2025], we outline three distinct approaches and
+recent developments.
+Compensation-based layer-wise PTQ
+This category, pioneered by GPTQ [Frantar et al., 2022],
+uses a sequential quantization strategy, in which model weights are quantized based on the Hessian
+computed from a calibration dataset, while compensating for subsequent unquantized weights.
+Several studies refined the compensation mechanism by improving update rules [Behdin et al., 2023],
+integrating nonlinear quantization schemes [Liu et al., 2024a], employing adaptive grid selection
+[Zhang and Shrivastava, 2024], and using block-wise optimization [Guan et al., 2024].
+2
+
+
+Rotation-based layer-wise PTQ
+A second promising direction, advanced by QuIP [Chee et al.,
+2023], involves preprocessing weights through structured rotation matrices to more uniformly re-
+distribute weight magnitudes. This approach was improved by randomized Hadamard transforms
+and block-wise and global fine-tuning optimization [Tseng et al., 2024]. Learning-based methods
+to determine rotation matrices have also been introduced [Liu et al., 2024b]. This rotation-based
+strategy has also been extended to activation quantization [Ashkboos et al., 2024].
+Salience-based layer-wise PTQ
+Other approaches focus on identifying and preserving salient
+weights, often using mixed-precision quantization frameworks [Dettmers et al., 2022, 2023, Shang
+et al., 2023]. Although mixed-precision methods usually add complexity due to various data types,
+AWQ [Lin et al., 2024] mitigates these implementation difficulties. AWQ strategically employs
+a global scaling mechanism to align salient weights with the quantization grid better, simplifying
+deployment while maintaining high accuracy.
+Recent advances in layer-wise PTQ have mainly focused on nonlinear quantization and block-wise
+and global fine-tuning extensions; however, the fundamental layer-wise optimization has remained
+largely unchanged since GPTQ [Frantar et al., 2022]. This study revisits this foundational strategy,
+identifies its key limitations, and proposes improvements, demonstrating performance gains on
+the fundamental benchmarks such as GPTQ [Frantar et al., 2022], QuIP [Chee et al., 2023], and
+AWQ [Lin et al., 2024]. Therefore, our contributions complement and are orthogonal to recent
+advancements, such as nonlinear quantization and structured extensions.
+3
+Background
+Post-training quantization
+Post-training quantization (PTQ) is a technique that converts the
+parameters of pre-trained models into discrete quantized representations. Formally, let Wl ∈Rnl×dl
+denote the pre-trained weight matrix associated with the l-th linear operation. Note that the index
+l specifically refers to individual linear transformations rather than entire transformer blocks. The
+objective of PTQ is to find a quantized approximation c
+Wl ∈Qnl×dl that closely approximates the
+behavior of the original model, preserving performance while reducing computational costs and
+memory usage. The set Q ⊂R denotes the discrete quantization domain, which is represented as
+a finite set of 2b distinct quantization levels, referred to as a b-bit quantization scheme. To achieve
+accurate quantization, many approaches leverage a small calibration dataset. Specifically, given
+a calibration dataset X ∈Rd1×m consisting of m samples, these methods aim to find optimal
+quantized parameters c
+Wl that minimizes the deviation from the performance of the original model.
+Layer-wise PTQ
+Layer-wise PTQ has emerged as a promising framework [Frantar et al., 2022,
+Frantar and Alistarh, 2022] for compressing large-scale LLMs. Recent advancements in this area
+have significantly reduced the computational overhead and memory requirements of deploying LLMs.
+Despite methodological differences, existing layer-wise PTQ approaches typically follow a shared
+sequential quantization scheme, processing each layer independently and sequentially from the input
+layer toward the output layer.
+Formally, these techniques quantize the model parameters {Wl}L
+l=1 by solving the following layer-
+wise independent optimization problem:
+min
+c
+Wl∈Qnl×dl
+WlXl −c
+WlXl
+
+2
+F ,
+(1)
+where Xl denotes the input activations to the l-th layer. This quantization proceeds sequentially
+from l = 1 toward the output layers. Due to the quadratic form of the reconstruction objective, the
+associated Hessian, Hl := XlX⊤
+l , can be efficiently precomputed and cached for reuse in subsequent
+optimization steps, improving computational efficiency in practice.
+Existing PTQ methods typically use one of two possible forms for activation inputs Xl: Either
+quantized activations Xl, obtained by forward propagating the calibration dataset through previously
+quantized weights {c
+W1, . . . , c
+Wl−1}, or full-precision activations Xl, resulting from forward propa-
+gation through the original, unquantized weights {W1, . . . , Wl−1}. There is no consensus among
+existing PTQ methods [Frantar et al., 2022, Lin et al., 2024, Chee et al., 2023] regarding whether
+quantized or full-precision activations produce better quantization outcomes.
+3
+
+
+0
+10
+20
+30
+m (Block)
+0.0
+5.0
+10.0
+15.0
+m
+2-bit Quantization
+BASE
+With QEP
+0
+10
+20
+30
+m (Block)
+0.0
+0.2
+0.4
+0.6
+3-bit Quantization
+0
+10
+20
+30
+m (Block)
+0.0
+0.1
+0.2
+0.3
+4-bit Quantization
+Figure 2: Accumulation and growth of quantization errors across layers in a partially quantized
+Llama2-7B model [Touvron et al., 2023]. The first 10 Transformer blocks are quantized using
+standard RTN (BASE) and QEP-enhanced RTN (With QEP), while the remaining Transformer blocks
+after the 10th remain at full precision. The plot shows the squared Frobenius norm ∆m, defined in
+Eq. (2), between the original and partially quantized outputs at each Transformer block m.
+Leading layer-wise PTQ methods use distinct optimization strategies to approximate the behavior of
+the original model while adhering to the foundational sequential layer-wise framework in Eq. (1).
+GPTQ [Frantar et al., 2022], for example, uses quantized activations, Xl = c
+Xl, and quantizes
+parameters row-wise by sequentially minimizing reconstruction error and correcting residuals in the
+remaining unquantized entries until each row is fully quantized. AWQ [Lin et al., 2024] uses original
+activations, Xl = Xl, and identifies a small subset of salient weights whose magnitudes significantly
+influence the layer outputs, subsequently rescaling these weights before quantization.
+4
+Bottleneck: Quantization Error Accumulation and Growth
+To motivate our proposed approach, this section first revisits the core layer-wise optimization formu-
+lation given by Eq. (1), emphasizing its key limitation: The accumulation and growth of quantization
+errors across layers significantly degrade the performance. We investigate this phenomenon using
+experiments conducted on the pre-trained Llama-2-7B model [Touvron et al., 2023]. Specifically, we
+quantize only the first 10 Transformer blocks [Vaswani et al., 2017], while keeping all subsequent
+blocks in full precision. To quantify the propagation and accumulation of the errors, we measure
+the discrepancy between fully precise and partially quantized outputs at each block using a calibra-
+tion dataset. Let TransBlockm(·) denote the original full-precision m-th Transformer block, and
+\
+TransBlockm(·) denote its quantized counterpart. We evaluate the following metric at the m-th
+block:
+∆m =
+fm(X) −bfm(X)
+
+2
+F ,
+(2)
+fm(X) := TransBlockm ◦· · · ◦TransBlockn+1 ◦TransBlockn ◦· · · ◦TransBlock1(X),
+bfm(X) := TransBlockm ◦· · · ◦TransBlockn+1 ◦
+\
+TransBlockn ◦· · · ◦
+\
+TransBlock1(X).
+This experiment sets n = 10. Figure 2 shows an approximately exponential accumulation or
+errors within the quantized layer, as well as an error growth that persists in the unquantized layers.
+This growth occurs due to the layer-wise independent quantization approach described in Eq. (1),
+which neither accounts for quantization error propagated from previous layers nor corrects previously
+accumulated errors, thus exacerbating error growth in subsequent unquantized layers. The exponential
+accumulation of quantization errors observed empirically can also be theoretically explained under
+mild conditions, as detailed in Appendix B.2. Therefore, instead of treating layer-wise quantization
+as a series of independent optimization problems, it is essential to reformulate the original layer-wise
+optimization presented in Eq. (1) to mitigate error accumulation and growth.
+5
+QEP: Quantization Error Propagation
+Existing layer-wise independent PTQ has inherent limitations, particularly the accumulation and
+growth of quantization errors discussed in Section 4. To address these limitations, we introduce
+Quantization Error Propagation (QEP), a general, lightweight, and scalable framework that improves
+4
+
+
+layer-wise PTQ by propagating quantization errors. In subsequent sections, we provide theoretical
+evidence showing that QEP effectively reduces quantization errors.
+5.1
+Problem Reformulation
+We reformulate the layer-wise independent optimization strategy presented in Eq. (1) to propagate
+quantization errors across layers effectively. Instead of minimizing output differences based on shared
+input activations Xl, our reformulation directly minimizes the discrepancy between full-precision and
+quantized outputs, each computed using their respective upstream inputs. Formally, for each layer l,
+we optimize the discrete quantized weight matrix c
+Wl as follows:
+min
+c
+Wl∈Qnl×dl
+WlXl −c
+Wl c
+Xl
+
+2
+F .
+(3)
+This objective ensures that the quantized weights c
+Wl are optimized not only to independently
+approximate the full-precision weights Wl but also to counteract and compensate for the cumulative
+quantization errors introduced by previous layers. In contrast to the existing objective in Eq. (1),
+where the trivial optimal solution is c
+Wl = Wl if Wl ∈Qnl×dl, the optimal solution under the
+formulation in Eq. (3) is generally c
+Wl̸ = Wl, explicitly enabling error correction and accounting for
+accumulated quantization errors.
+Although the modification from Eq. (1) seems straightforward, Eq. (3) inherently breaks the key
+structural simplification that facilitates efficient quantization in existing PTQ frameworks. Specifically,
+the optimization in Eq. (3) no longer solely depends on the Hessian matrix Hl, thereby preventing
+the direct use of existing Hessian-based acceleration methods for quantization. In the following
+section, we address this challenge by proposing a practical and efficient weight correction scheme
+that overcomes this limitation while retaining the advantages of our error-propagation approach.
+5.2
+Weight Correction
+To efficiently perform quantization by the objective in Eq. (3) as in existing layer-wise PTQ methods,
+we relax the discrete feasible set to a continuous domain, leading to the following proposition.
+Proposition 5.1. Assume that the matrix c
+Hl is invertible. Then, after relaxing the discrete feasible
+set Qnl×dl into the continuous domain Rnl×dl, the optimal solution W ∗
+l is given by the following
+closed-form expression:
+W ∗
+l := Wl + Wlδl c
+X⊤
+l c
+H−1
+l
+=
+argmin
+c
+Wl∈Rnl×dl
+WlXl −c
+Wl c
+Xl
+
+2
+F ,
+(4)
+where δl := Xl −c
+Xl represents the accumulated quantization error from proceeding layers,
+c
+Hl := c
+Xl c
+X⊤
+l denotes the empirical Hessian constructed from quantized activations.
+The proof of Proposition 5.1 is provided in Appendix B.1. Proposition 5.1 highlights an important
+distinction from the existing formulation given by Eq. (1). Specifically, when upstream quantization
+introduces non-negligible errors, i.e., δl−1̸ = 0, the optimal quantized weights differ from straightfor-
+ward approximations of the original weights Wl. Instead, the optimal solution explicitly includes a
+correction term that compensating for accumulated quantization errors.
+This corrected weight enables us to reformulate the equivalent optimization objective within the
+original discrete set c
+Wl ∈Qnl×dl as follows:
+min
+c
+Wl∈Qnl×dl
+W ∗
+l c
+Xl −c
+Wl c
+Xl
+
+2
+F .
+(5)
+This objective shares the same structure as Eq. (1), with Wl replaced by its corrected counterpart W ∗
+l .
+This reformulation restores the quadratic structure found in Eq. (1), facilitating efficient optimization
+through the Hessian matrix Hl = c
+Hl. The structure of Eq. (5) allows for seamless integration with
+various existing layer-wise PTQ methods, as discussed in Section2. Furthermore, the proposed
+layer-wise quantization formulation in Eq. (3) formally guarantees improved quantization accuracy
+compared to the existing layer-wise independent PTQ defined in Eq. (1). Specifically, we establish
+the following theoretical result:
+5
+
+
+Theorem 5.2 (Informal). Consider an L-layer neural network defined by:
+fθ(X) = σL(WLσL−1(WL−1 · · · σ2(W2σ1(W1X)) · · · )),
+where each activation function σl is Lipschitz continuous and θ denotes the set of all full-precision
+parameters {Wl}L
+l=1. The output quantization error of the proposed quantization method defined in
+Eq. (3) is bounded by that of the existing layer-wise PTQ defined in Eq. (1):
+fθ(X) −fbθQEP(X)
+
+F ≤
+fθ(X) −fbθBASE(X)
+
+F .
+where bθQEP and bθBASE denote the sets of parameters quantized by the objective in Eq. (3) and the
+base PTQ method by the objective in Eq. (1), respectively.
+Explicit conditions and detailed proof are provided in Appendix B.3. The additional computational
+overhead arises solely from computing the correction term δl c
+X⊤
+l , since computing the Hessian inverse
+c
+H−1
+l
+remains unchanged from existing layer-wise independent PTQ. As empirically demonstrated
+in Section 6.1, this additional computation requires significantly less runtime compared to the
+quantization processes of layer-wise PTQ methods, even for large-scale LLMs, due to the tunable
+mechanism described in the next section.
+5.3
+Controlling Propagation Strength
+Although solving Eq. (5) effectively reduces the accumulation of quantization error, it can lead
+to overfitting. This issue is particularly pronounced when the calibration dataset is small and
+insufficiently representative of the target task, or when the model includes blocks with a large number
+of parameters such as the MLP blocks commonly found in transformer architectures, causing the
+correction to overfit the calibration dataset.
+To address this issue, we introduce a tunable propagation mechanism that generalizes the correction
+term using a scaling parameter αl ∈[0, 1]:
+W ∗
+l (αl) = Wl + αlWlδl c
+X⊤
+l c
+H−1
+l
+.
+(6)
+Here, setting αl = 1 recovers original fully-corrected case presented in Eq. (4), whereas setting
+αl = 0 corresponds to the existing approach in Eq. (1) under the setting that Xl = c
+Xl. This tunable
+correction mechanism relates to the following regularization optimization:
+Proposition 5.3. The parameter αl corresponds to the regularization parameter λ in the following
+optimization problem:
+min
+c
+Wl∈Qnl×dl ∥WlXl −c
+Wl c
+Xl∥2
+F + λl∥Wl −c
+Wl∥2
+F , λl ∈R+.
+Specifically, as αl increases from 0 to 1, the corresponding parameter λl decreases from +∞to 0.
+The derivation is provided in Appendix B.4. Additionally, the following proposition is established.
+Proposition 5.4. Under the same assumptions in Theorem 5.2, the output quantization error of the
+method employing QEP with parameter {αl}L
+l=1 decreases monotonically as each αl approaches 1.
+Explicit conditions and comprehensive proofs of this proposition are provided in Appendix B.3.
+Consequently, the parameter αl effectively controls overfitting, analogous to regularization techniques,
+and importantly provides a systematic way to balance overfitting and underfitting in layer-wise PTQ
+methods. Indeed, this parameter is crucial for preventing overfitting, especially in MLP blocks, which
+contain more parameters than other blocks.
+Furthermore, in large-scale LLMs, the high-dimensional activations in MLP layers often result in
+computationally expensive correction terms. In these cases, selectively setting αl = 0 for specific
+layers eliminates the computational cost of the correction term and acts as implicit regularization,
+potentially improving generalization. Therefore, appropriately setting αl = 0 can reduce the
+correction time by approximately one-third and one-half. Developing adaptive strategies for layer-
+wise, data-aware, or resource-efficient tuning of αl is a promising direction for future research. In the
+following, we refer to the overall approach, including the tunable mechanism controlled by {αl}L
+l=1,
+as Quantization Error Propagation (QEP).
+6
+
+
+6
+Experiments
+We conduct experiments to validate the effectiveness of QEP in improving the performance of
+layer-wise PTQ relative to existing methods.
+Baselines
+We use representative layer-wise PTQ methods based on linear quantization such as
+round-to-nearest (RTN) [Frantar et al., 2022, Dettmers and Zettlemoyer, 2023], GPTQ [Frantar
+et al., 2022], AWQ [Lin et al., 2024], and QuIP [Chee et al., 2023]. Although previous studies have
+explored extensions, such as non-linear and block-wise quantization, as discussed in Section 2, these
+techniques are orthogonal to the core improvement introduced by QEP. Therefore, to isolate and
+emphasize the impact of QEP, we focus on these representative layer-wise PTQ methods.
+Quantization
+This study focuses on weight-only quantization schemes, specifically per-channel
+and group-wise quantization, which have recently shown superior trade-offs between efficiency
+and accuracy [Dettmers and Zettlemoyer, 2023, Frantar et al., 2022, Lin et al., 2024]. The main
+text evaluates per-channel quantization under INT4, INT3, and INT2 precision settings. Due to
+space constraints, detailed results for group-wise quantization are presented in Appendix D. For the
+propagation strength parameter αl, we adopt a representative default value of αl = 1/2 for all layers,
+except for the MLP layers in the Llama-2 70B model, for which we set αl = 0. Tuning αl can further
+improve performance but is beyond the scope of this study and is left for future work.
+Datasets
+Following previous studies, we evaluate the Hessian matrix using the same default
+calibration datasets used in their original implementations. Specifically, GPTQ and QuIP use the
+C4 dataset [Frantar et al., 2022] for calibration, while AWQ uses the Pile dataset [Gao et al., 2020].
+Following Frantar et al. [2022], we evaluate the correction term in Eq. (4) using 128 randomly
+sampled segments of 2048 tokens each from the C4 dataset[Raffel et al., 2020], which consists of
+web-crawled text excerpts.
+Models
+Following Lin et al. [2024], Frantar et al. [2022], we evaluate our method on recent
+popular LLMs, namely the Llama-2 and Llama-3 model families [Touvron et al., 2023], with size
+ranging from 7B to 70B parameters, as well as Mistral-7 B [Jiang, 2024]. These models demonstrate
+superior performance compared to other open-source LLMs [Zhang et al., 2022, Workshop et al.,
+2022] and have become widely adopted as foundational models for numerous derivative open-source
+models [Taori et al., 2023, Chiang et al., 2023].
+Evaluations
+Following established evaluation protocols from prior studies [Dettmers et al., 2022,
+Xiao et al., 2023, Frantar et al., 2022, Dettmers and Zettlemoyer, 2023, Yao et al., 2022], we evaluate
+the quantized LLMs using the perplexity (PPL) on WikiText2 [Merity et al., 2016], Penn Treebank
+(PTB) [Marcus et al., 1994], and C4 [Raffel et al., 2020], and zero-shot accuracy on benchmarks
+including ARC Easy (ArcE) [Boratko et al., 2018], PiQA [Bisk et al., 2020], and StoryCloze (SC)
+[Mostafazadeh et al., 2016]. Due to space limitations, detailed results for each dataset are provided in
+Appendix D. All experiments are conducted using a single NVIDIA V100 GPU.
+6.1
+Results
+Perplexity
+Table 1 summarizes PPL results of various quantized models evaluated on WikiText2,
+comparing several bit-widths and different layer-wise PTQ methods, both with and without QEP.
+Additional C4 and PTB dataset results are provided in Appendix D.1, demonstrating consistent trends
+in the following. Our results indicate that incorporating QEP significantly enhances the performance
+of layer-wise PTQ, substantially reducing perplexity across nearly all tested methods and quantization
+levels. In medium-bit scenarios such as INT4 and INT3, where AWQ already exhibits strong
+performance, applying QEP yields further improvements. At 2-bit quantization, existing layer-
+wise PTQ methods based on linear quantization typically suffer severe PPL degradation, rendering
+deployment infeasible. However, QEP effectively mitigates this issue, making INT2 quantization
+achievable with practical perplexity levels. Notably, QEP-enhanced QuIP achieves state-of-the-art
+perplexity results among all tested layer-wise PTQ methods. Similar significant improvements are
+observed for RTN, GPTQ, and AWQ at INT2g32, INT2g64, and INT2g128 quantization levels; see
+Appendix D.1 for details.
+7
+
+
+Table 1: Evaluation of perplexities (↓) for Llama models on WikiText-2 under various layer-wise
+PTQ methods and bitwidths.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+Llama-3-8B
+Mistral-7B
+FP16
+-
+-
+5.472
+4.883
+3.319
+6.137
+5.255
+INT4
+RTN
+✗
+6.116
+5.206
+3.672
+8.540
+5.997
+✓
+6.017
+5.165
+3.621
+8.021
+5.877
+GPTQ
+✗
+6.083
+5.167
+3.594
+147.912
+5.643
+✓
+5.933
+5.127
+3.576
+9.509
+5.528
+AWQ
+✗
+5.831
+5.064
+3.484
+7.108
+5.716
+✓
+5.756
+5.041
+3.479
+6.981
+5.636
+QuIP
+✗
+8.434
+5.137
+3.826
+6.998
+11.109
+✓
+5.753
+5.034
+3.485
+6.650
+5.479
+INT3
+RTN
+✗
+539.866
+10.688
+7.530
+2276.227
+29.390
+✓
+17.309
+7.458
+5.648
+86.430
+10.241
+GPTQ
+✗
+10.881
+6.632
+4.860
+64.457
+8.247
+✓
+7.898
+6.245
+4.102
+18.845
+7.347
+AWQ
+✗
+15.299
+6.448
+4.362
+11.802
+7.902
+✓
+11.131
+6.092
+4.103
+10.713
+7.169
+QuIP
+✗
+12.048
+5.503
+4.135
+8.288
+7.108
+✓
+6.154
+5.347
+3.813
+7.703
+5.842
+INT2
+RTN
+✗
+17783.918
+51152.832
+26077.172
+1437176.750
+78488.328
+✓
+97153.266
+61158.555
+26063.672
+554142.313
+50540.059
+GPTQ
+✗
+13051.469
+1301.395
+107.458
+236596.891
+3543.708
+✓
+7214.328
+2782.353
+52.472
+282245.188
+1665.287
+AWQ
+✗
+199448.797
+93036.517
+81834.344
+1044956.250
+31391.543
+✓
+229888.406
+74735.836
+88684.156
+639158.313
+32668.666
+QuIP
+✗
+65.593
+11.232
+6.536
+70.518
+26.632
+✓
+11.972
+8.417
+5.869
+27.326
+9.586
+Zero-shot tasks
+We evaluate the zero-shot accuracy of quantized models on several tasks. Table
+2 summarizes the average accuracy for the ArcE, PiQA, and SC datasets. Detailed results for
+each dataset are provided in Appendix D.2. Consistent with the perplexity results, QEP effectively
+improves existing layer-wise PTQ methods. Notably, the performance gains from QEP are especially
+pronounced with INT2 quantization. For Llama-2-70B, the QEP-enhanced QuIP at INT2 achieves
+performance comparable to RTN and GPTQ at INT3 quantization.
+Table 3: Runtime comparison of the
+quantization process.
+Runtime
+Llama-2
+7B
+13B
+70B
+GPTQ
+14.9m
+26.4m
+2.9h
+AWQ
+13.6m
+25.4m
+2.4h
+QEP + RTN
+10.9m
+19.6m
+1.7h
+Runtime
+We examine the impact of computation time
+required for the correction term. Table 3 shows the process-
+ing time of each layer-wise PTQ. Since the quantization
+processing time for RTN is only a few seconds and thus
+negligible, the measured time for QEP+RTN is primar-
+ily due to computing the preprocessing of the correction
+term. This result indicates that calculating the QEP correc-
+tion term requires significantly less computation time than
+other existing layer-wise PTQ quantization processes. Moreover, using the same calibration dataset
+for weight correction and quantization reduces preprocessing overhead by approximately one-half to
+one-third by reusing computational steps.
+Table 4: Perplexity relative to RTN on Wiki-
+Text2, comparing GPTQ and QEP+RTN cali-
+brated with C4, PTB, and WikiText2.
+PPL to RTN (↓)
+Calibration Dataset
+C4
+PTB
+WikiText2
+GPTQ
+-0.25
++0.07
+-0.46
+QEP + RTN
+-0.33
+-0.30
+-0.49
+Robustness
+As discussed in Section 5.3, our
+method adaptively controls propagation strength
+in Eq. (6) to mitigate overfitting to the calibration
+dataset. In this section, we empirically validate this
+approach. Table 4 compares the perplexity differ-
+ence among QEP-enhanced RTN, GPTQ, and RTN
+when quantizing Llama-2-7B, evaluated on Wiki-
+8
+
+
+Table 2: Zero-shot average accuracy (↑) on ARC-Easy, PIQA, and StoryCloze for Llama models
+across three quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+Llama-3-8B
+Mistral-7B
+FP16
+-
+-
+0.7601
+0.7840
+0.8014
+0.7920
+0.8056
+INT4
+RTN
+✗
+0.6802
+0.7160
+0.7325
+0.7643
+0.7831
+✓
+0.6844
+0.7131
+0.7343
+0.7686
+0.7921
+GPTQ
+✗
+0.6817
+0.7134
+0.7306
+0.4812
+0.7906
+✓
+0.6795
+0.7104
+0.7308
+0.7531
+0.7904
+AWQ
+✗
+0.6832
+0.7120
+0.7257
+0.7821
+0.7956
+✓
+0.6870
+0.7126
+0.7331
+0.7879
+0.7967
+QuIP
+✗
+0.6500
+0.7248
+0.7285
+0.7872
+0.7204
+✓
+0.6920
+0.7167
+0.7311
+0.7800
+0.8012
+INT3
+RTN
+✗
+0.4770
+0.6082
+0.6402
+0.4560
+0.6448
+✓
+0.5802
+0.6550
+0.6939
+0.5388
+0.6963
+GPTQ
+✗
+0.6367
+0.6747
+0.7043
+0.4891
+0.7305
+✓
+0.6549
+0.6853
+0.7078
+0.5901
+0.7422
+AWQ
+✗
+0.5840
+0.6886
+0.7209
+0.7074
+0.7534
+✓
+0.6264
+0.6916
+0.7283
+0.7216
+0.7675
+QuIP
+✗
+0.6232
+0.7034
+0.7246
+0.7433
+0.7422
+✓
+0.6804
+0.7128
+0.7273
+0.7549
+0.7933
+INT2
+RTN
+✗
+0.4139
+0.4283
+0.4147
+0.4183
+0.4130
+✓
+0.4199
+0.4191
+0.4145
+0.4108
+0.4084
+GPTQ
+✗
+0.4162
+0.4222
+0.4356
+0.4116
+0.4159
+✓
+0.4263
+0.4283
+0.4714
+0.4228
+0.4148
+AWQ
+✗
+0.4213
+0.4176
+0.4129
+0.4164
+0.4177
+✓
+0.4162
+0.4165
+0.4140
+0.4150
+0.4181
+QuIP
+✗
+0.4667
+0.5945
+0.6628
+0.4600
+0.5422
+✓
+0.5926
+0.6404
+0.6998
+0.5121
+0.6858
+Text2 across various calibration datasets. Consistent with prior findings [Lin et al., 2024], GPTQ
+exhibits significant sensitivity to the calibration dataset: it outperforms RTN on C4 and WikiText2 but
+experiences notable performance degradation on PTB. In contrast, QEP-enhanced RTN consistently
+improves performance across all calibration datasets, demonstrating robustness to distributional shifts.
+This highlights the effectiveness of propagation control in preventing overfitting to the calibration
+dataset.
+7
+Conclusion
+We revisit the core design of layer-wise PTQ and identify a critical limitation: the exponential
+accumulation and growth of quantization errors across network layers. To address this issue, we
+propose QEP, a general framework that explicitly propagates and compensates for accumulated
+quantization errors. Extensive experiments demonstrate that QEP substantially improves performance,
+especially in low-bit quantization scenarios. These findings underscore that meaningful progress in
+layer-wise PTQ can still be made by revisiting fundamental strategies, complementing recent trends
+primarily centered around non-linear and block-wise quantization techniques. Integrating QEP with
+these advanced quantization methods in the future presents a promising approach toward achieving
+extreme compression, potentially exceeding QAT performance.
+Limitations
+QEP relies on a small calibration set, as in other layer-wise PTQ approaches, which
+makes performance sensitive to data quality; however, it overfits less than comparable methods such
+as GPTQ and AWQ. The method also introduces a per-layer propagation-strength parameter αl;
+Although this parameter is tunable, a fixed value, e.g., αl = 1/2, works well in most cases, and
+automatic learning of αl is left for future work.
+9
+
+
+References
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Alemán,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. GPT-4 technical
+report. arXiv preprint arXiv:2303.08774, 2023.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. LLaMA: Open and
+efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad
+Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The LLaMA 3 herd
+of models. arXiv preprint arXiv:2407.21783, 2024.
+Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgpt: How to use large language models while
+reducing cost and improving performance. arXiv preprint arXiv:2305.05176, 2023.
+Jiedong Lang, Zhehao Guo, and Shuyu Huang. A comprehensive study on quantization techniques for
+large language models. In Proceedings of the 4th International Conference on Artificial Intelligence,
+Robotics, and Communication (ICAIRC), pages 224–231. IEEE, 2024.
+Ruihao Gong, Yifu Ding, Zining Wang, Chengtao Lv, Xingyu Zheng, Jinyang Du, Haotong Qin,
+Jinyang Guo, Michele Magno, and Xianglong Liu. A survey of low-bit large language models:
+Basics, systems, and algorithms. arXiv preprint arXiv:2409.16694, 2024.
+Wenxiao Wang, Wei Chen, Yicong Luo, Yongliu Long, Zhengkai Lin, Liye Zhang, Binbin Lin, Deng
+Cai, and Xiaofei He. Model compression and efficient inference for large language models: A
+survey. arXiv preprint arXiv:2402.09748, 2024.
+Hongrong Cheng, Miao Zhang, and Javen Qinfeng Shi. A survey on deep neural network pruning:
+Taxonomy, comparison, analysis, and recommendations. IEEE Transactions on Pattern Analysis
+and Machine Intelligence, 2024.
+Menglin Yang, Jialin Chen, Yifei Zhang, Jiahong Liu, Jiasheng Zhang, Qiyao Ma, Harshit Verma,
+Qianru Zhang, Min Zhou, Irwin King, et al. Low-rank adaptation for foundation models: A
+comprehensive review. arXiv preprint arXiv:2501.00365, 2024a.
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. LoRA: Low-rank adaptation of large language models. International Confer-
+ence on Learning Representations (ICLR), 2022.
+Xiaohan Xu, Ming Li, Chongyang Tao, Tao Shen, Reynold Cheng, Jinyang Li, Can Xu, Dacheng Tao,
+and Tianyi Zhou. A survey on knowledge distillation of large language models. arXiv preprint
+arXiv:2402.13116, 2024a.
+Chuanpeng Yang, Yao Zhu, Wang Lu, Yidong Wang, Qian Chen, Chenlong Gao, Bingjie Yan, and
+Yiqiang Chen. Survey on knowledge distillation for large language models: Methods, evaluation,
+and application. ACM Transactions on Intelligent Systems and Technology, 2024b.
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training
+quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: Activation-aware weight quantization for
+on-device LLM compression and acceleration. Proceedings of Machine Learning and Systems, 6:
+87–100, 2024.
+Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang, Xiaoxia Wu, Conglong Li, and Yuxiong
+He. Zeroquant: Efficient and affordable post-training quantization for large-scale transformers.
+Advances in Neural Information Processing Systems, 35:27168–27183, 2022.
+Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher M. De Sa. Quip: 2-bit quantization of
+large language models with guarantees. Advances in Neural Information Processing Systems, 36:
+4396–4429, 2023.
+10
+
+
+Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. Quip#:
+Even better LLM quantization with hadamard incoherence and lattice codebooks. arXiv preprint
+arXiv:2402.04396, 2024.
+Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang,
+Peng Gao, Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization for large
+language models. arXiv preprint arXiv:2308.13137, 2023.
+Vage Egiazarian, Andrei Panferov, Denis Kuznedelev, Elias Frantar, Artem Babenko, and Dan
+Alistarh. Extreme compression of large language models via additive quantization. arXiv preprint
+arXiv:2401.06118, 2024.
+Yuzhuang Xu, Xu Han, Zonghan Yang, Shuo Wang, Qingfu Zhu, Zhiyuan Liu, Weidong Liu, and
+Wanxiang Che. Onebit: Towards extremely low-bit large language models. arXiv preprint
+arXiv:2402.11295, 2024b.
+Hongyu Wang, Shuming Ma, Li Dong, Shaohan Huang, Huaijie Wang, Lingxiao Ma, Fan Yang,
+Ruiping Wang, Yi Wu, and Furu Wei. Bitnet: Scaling 1-bit transformers for large language models.
+arXiv preprint arXiv:2310.11453, 2023.
+Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad, Yangyang
+Shi, Raghuraman Krishnamoorthi, and Vikas Chandra. LLM-QAT: Data-free quantization aware
+training for large language models. arXiv preprint arXiv:2305.17888, 2023.
+Vladimir Malinovskii, Denis Mazur, Ivan Ilin, Denis Kuznedelev, Konstantin Burlachenko, Kai Yi,
+Dan Alistarh, and Peter Richtárik. PV-Tuning: Beyond straight-through estimation for extreme
+LLM compression. Advances in Neural Information Processing Systems, 37:5074–5121, 2024.
+Tim Dettmers and Luke Zettlemoyer. The case for 4-bit precision: k-bit inference scaling laws. In
+Proceedings of the International Conference on Machine Learning (ICML), pages 7750–7774,
+2023.
+Jiaqi Zhao, Ming Wang, Miao Zhang, Yuzhang Shang, Xuebo Liu, Yaowei Wang, Min Zhang,
+and Liqiang Nie. Benchmarking post-training quantization in LLMs: Comprehensive taxonomy,
+unified evaluation, and comparative analysis. arXiv preprint arXiv:2502.13178, 2025.
+Kayhan Behdin, Ayan Acharya, Sathiya Keerthi Aman Gupta, and Rahul Mazumder. Quantease:
+Optimization-based quantization for language models—an efficient and intuitive algorithm. stat,
+1050:5, 2023.
+Yifei Liu, Jicheng Wen, Yang Wang, Shengyu Ye, Li Lyna Zhang, Ting Cao, Cheng Li, and Mao
+Yang. VPTQ: Extreme low-bit vector post-training quantization for large language models. arXiv
+preprint arXiv:2409.17066, 2024a.
+Tianyi Zhang and Anshumali Shrivastava. Leanquant: Accurate and scalable large language model
+quantization with loss-error-aware grid. arXiv preprint arXiv:2407.10032, 2024.
+Ziyi Guan, Hantao Huang, Yupeng Su, Hong Huang, Ngai Wong, and Hao Yu. APTQ: Attention-
+aware post-training mixed-precision quantization for large language models. In Proceedings of the
+61st ACM/IEEE Design Automation Conference, pages 1–6, 2024.
+Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krish-
+namoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: LLM quantization
+with learned rotations. arXiv preprint arXiv:2405.16406, 2024b.
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian Croci, Bo Li, Pashmina Cameron, Martin
+Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman. Quarot: Outlier-free 4-bit inference in
+rotated LLMs. Advances in Neural Information Processing Systems, 37:100213–100240, 2024.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3.INT8(): 8-bit matrix
+multiplication for transformers at scale. Advances in Neural Information Processing Systems, 35:
+30318–30332, 2022.
+11
+
+
+Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, Denis Kuznedelev, Elias Frantar, Saleh Ashk-
+boos, Alexander Borzunov, Torsten Hoefler, and Dan Alistarh. Spqr: A sparse-quantized represen-
+tation for near-lossless LLM weight compression. arXiv preprint arXiv:2306.03078, 2023.
+Yuzhang Shang, Zhihang Yuan, Qiang Wu, and Zhen Dong. Pb-llm: Partially binarized large language
+models. arXiv preprint arXiv:2310.00034, 2023.
+Elias Frantar and Dan Alistarh. Optimal brain compression: A framework for accurate post-training
+quantization and pruning. Advances in Neural Information Processing Systems, 35:4475–4488,
+2022.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz
+Kaiser, and Illia Polosukhin. Attention is all you need. Advances in Neural Information Processing
+Systems, 30, 2017.
+Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang,
+Horace He, Anish Thite, Noa Nabeshima, et al. The pile: An 800 gb dataset of diverse text for
+language modeling. arXiv preprint arXiv:2101.00027, 2020.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text
+transformer. Journal of Machine Learning Research, 21(140):1–67, 2020.
+Fengqing Jiang. Identifying and mitigating vulnerabilities in llm-integrated applications. Master’s
+thesis, University of Washington, 2024.
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher
+Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. OPT: Open pre-trained transformer language
+models. https://arxiv.org/abs/2205.01068, 2022.
+BigScience Workshop, Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ili´c,
+Daniel Hesslow, Roman Castagné, Alexandra Sasha Luccioni, François Yvon, Matthias Gallé,
+Jonathan Tow, Alexander M. Rush, Stella Biderman, et al. BLOOM: A 176b-parameter open-access
+multilingual language model. arXiv preprint arXiv:2211.05100, 2022. v4.
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following LLaMA model.
+GitHub repository, 2023. URL https://github.com/tatsu-lab/stanford_alpaca.
+Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng, Zhanghao Wu, Hao Zhang, Lianmin Zheng, Siyuan
+Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, et al. Vicuna: An open-source chatbot impressing
+GPT-4 with 90%* chatgpt quality. https://lmsys.org/blog/2023-03-30-vicuna/, March
+2023.
+Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant:
+Accurate and efficient post-training quantization for large language models. In Proceedings of the
+International Conference on Machine Learning (ICML), pages 38087–38099, 2023.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+models. https://arxiv.org/abs/1609.07843, 2016.
+Mitchell Marcus, Grace Kim, Mary Ann Marcinkiewicz, Robert MacIntyre, Ann Bies, Mark Ferguson,
+Karen Katz, and Britta Schasberger. The Penn Treebank: Annotating predicate argument structure.
+In Human Language Technology Workshop (HLT), 1994.
+Michael Boratko, Harshit Padigela, Divyendra Mikkilineni, Pritish Yuvraj, Rajarshi Das, Andrew
+McCallum, Maria Chang, Achille Fokoue-Nkoutche, Pavan Kapanipathi, Nicholas Mattei, et al. A
+systematic classification of knowledge, reasoning, and context within the ARC dataset. https:
+//arxiv.org/abs/1806.00358, 2018.
+Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. PIQA: Reasoning about physical
+commonsense in natural language. In Proceedings of the AAAI Conference on Artificial Intelligence,
+volume 34, pages 7432–7439, 2020.
+12
+
+
+Nasrin Mostafazadeh, Nathanael Chambers, Xiaodong He, Devi Parikh, Dhruv Batra, Lucy Vander-
+wende, Pushmeet Kohli, and James Allen. A corpus and cloze evaluation for deeper understanding
+of commonsense stories. In Proceedings of NAACL-HLT, pages 839–849, 2016.
+Ji Lin, Chuang Gan, and Song Han. Defensive quantization: When efficiency meets robustness. arXiv
+preprint arXiv:1904.08444, 2019.
+Yuhang Li, Ruokai Yin, Donghyun Lee, Shiting Xiao, and Priyadarshini Panda. Gptaq: Efficient
+finetuning-free quantization for asymmetric calibration. In Forty-second International Conference
+on Machine Learning, 2025. URL https://openreview.net/forum?id=QdELyl0FST.
+Dongwon Jo, Taesu Kim, Yulhwa Kim, and Jae-Joon Kim. Mixture of scales: Memory-efficient token-
+adaptive binarization for large language models. In Advances in Neural Information Processing
+Systems (NeurIPS), 2024. URL https://arxiv.org/abs/2406.12311.
+Peijie Dong, Lujun Li, Yuedong Zhong, Dayou Du, Ruibo Fan, Yuhan Chen, Zhenheng Tang,
+Qiang Wang, Wei Xue, Yike Guo, and Xiaowen Chu. Stbllm: Breaking the 1-bit barrier with
+structured binary llms. In International Conference on Learning Representations (ICLR), 2025.
+URL https://openreview.net/forum?id=6XUSDvBFkV.
+Vladimír Boža and Vladimír Macko. Addition is almost all you need: Compressing neural networks
+with double binary factorization. CoRR, abs/2505.11076, 2025. doi: 10.48550/arXiv.2505.11076.
+URL https://arxiv.org/abs/2505.11076.
+Banseok Lee, Dongkyu Kim, Youngcheon You, and Youngmin Kim. Littlebit: Ultra low-bit quantiza-
+tion via latent factorization. In Advances in Neural Information Processing Systems (NeurIPS),
+2025. URL https://openreview.net/forum?id=zJzu9evD5K.
+Ziang Long, Penghang Yin, and Jack Xin. Learning quantized neural nets by coarse gradient method
+for nonlinear classification. Research in the Mathematical Sciences, 8(3):48, 2021.
+Yuma Ichikawa, Shuhei Kashiwamura, and Ayaka Sakata. High-dimensional learning dynamics of
+quantized models with straight-through estimator. arXiv preprint arXiv:2510.10693, 2025.
+Penghang Yin, Jiancheng Lyu, Shuai Zhang, Stanley Osher, Yingyong Qi, and Jack Xin. Under-
+standing straight-through estimator in training activation quantized neural nets. arXiv preprint
+arXiv:1903.05662, 2019.
+Yuma Ichikawa and Hiroaki Iwashita. Continuous parallel relaxation for finding diverse solutions in
+combinatorial optimization problems. Transactions on Machine Learning Research, 2025. ISSN
+2835-8856. URL https://openreview.net/forum?id=ix33zd5zCw.
+Yuma Ichikawa and Yamato Arai. Optimization by parallel quasi-quantum annealing with gradient-
+based sampling. In The Thirteenth International Conference on Learning Representations, 2025.
+URL https://openreview.net/forum?id=9EfBeXaXf0.
+Haoran Sun, Katayoon Goshvadi, Azade Nova, Dale Schuurmans, and Hanjun Dai. Revisiting
+sampling for combinatorial optimization. In International Conference on Machine Learning, pages
+32859–32874. PMLR, 2023.
+Yuma Ichikawa. Controlling continuous relaxation for combinatorial optimization. Advances in
+Neural Information Processing Systems, 37:47189–47216, 2024.
+13
+
+
+A
+Additional Related Work
+Quantization error mitigation
+Defensive Quantization (DQ) [Lin et al., 2019] mitigates error
+accumulation by introducing an orthogonality penalty to the weights, which reduces the correlation-
+driven amplification of quantization noise It also employs gradient-based quantization to optimize the
+positioning of quantization levels, further suppressing propagated error and enhancing robustness. In
+contrast, the QEP module serves as a plug-and-play component for general layer-wise quantization,
+explicitly modulating propagation strength under standard linear, gradient-free quantization methods,
+such as GPTQ, AWQ, and QuIP.
+Relation to GPTAQ
+GPTAQ [Li et al., 2025] optimizes the same local objective but is closely
+related to GPTQ, and therefore does not easily generalize to other layer-wise PTQ methods such
+as AWQ and QuIP. In contrast, QEP adds the correction term in Eq. (4) directly to the pre-trained
+weights, enabling plug-and-play use with diverse PTQ algorithms and ensuring strong performance
+in low-bit regimes. Moreover, whereas GPTAQ offers no guarantee that its local optimization reduces
+global quantization error, our analysis provides such a guaranty. QEP also introduces a per-layer
+propagation-strength parameter, αl, which mitigates the overfitting often observed with GPTQ and
+GPTAQ.
+Extreme low-bit layer-wise PTQ
+In the ultra-low precision regime, the layer-wise PTQ pipeline
+described in the main text, such as GPTQ and AWQ with standard linear quantizers, often becomes
+inadequate. As a result, many methods adopt alternative formalisms that introduce additional degrees
+of freedom beyond naive rounding to avoid catastrophic quality degradation. Representative examples
+include SVID-based 1-bit parameterizations [Xu et al., 2024b], token-adaptive mixtures of scaling
+factors [Jo et al., 2024], and structured sparsity designed for extreme quantization [Dong et al., 2025].
+In parallel, binary-factor formats decompose each weight matrix into bit-packed sign factors with
+lightweight diagonal scaling, allowing inference to be largely driven by efficient 1-bit kernels [Boža
+and Macko, 2025, Lee et al., 2025]. In these formats, optimization is more challenging: strictly binary
+variables and highly non-smooth objectives can make straight-through estimators brittle [Long et al.,
+2021, Ichikawa et al., 2025, Yin et al., 2019], motivating the use of discrete optimization or robust
+relaxation-based solvers. Recent advances in controlled continuous relaxations and annealing-style
+objectives have emphasized promising techniques such as QQA and iSCO [Ichikawa and Iwashita,
+2025, Ichikawa and Arai, 2025, Sun et al., 2023, Ichikawa, 2024]. A natural direction for future work
+is to examine how these extreme low-bit approaches interact with our error-propagation perspective.
+For instance, we should investigate whether combining QEP with binary-factor or sparsity-based
+methods can further suppress cross-layer error growth while maintaining the strong INT2 performance
+observed here, yielding larger gains as precision approaches 1 bit.
+B
+Additional Theoretical Results
+This section presents proofs of the propositions stated in the main text along with additional theoretical
+analyzes. To avoid ambiguity, we will fix the following notation throughout this section:
+Symbol
+Description
+X ∈Rd1×m
+Calibration dataset (input activations at layer 1)
+Wl ∈Rnl×dl
+Full-precision weight matrix at layer l
+c
+Wl ∈Qnl×dl
+Quantized weight matrix at layer l
+σl(·)
+Activation function at layer l
+Xl+1 := σl(WlXl)
+Full-precision activations at layer (l + 1)
+c
+Xl+1 := σl(c
+Wl c
+Xl)
+Quantized activations at layer (l + 1)
+δl := Xl −c
+Xl
+Quantization error matrix at layer l
+Hl := XlX⊤
+l
+Empirical Hessian of a full-precision model at layer l
+c
+Hl := c
+Xl c
+X⊤
+l
+Empirical Hessian of a quantized model at layer l
+14
+
+
+In the following section, we assume that Hl and c
+Wl are invertible. This assumption is standard
+in existing layer-wise PTQ methods, which also use these inverse matrices. To ensure numerical
+stability, a diagonal matrix ρI, ρ > 0 is commonly added to the Hessian when its inversion becomes
+numerically unstable. The subsequent analysis remains consistent and valid even when applying this
+stabilization procedure, which simply involves adding ρI to the Hessian in the following derivations.
+Throughout this section, we examine the first-order linear term in the weight perturbations {El}.
+Concretely, we define each quantity as A = A(0) + A(1) + R, where A(1) collects all terms linear
+in {El} and the remainder satisfies ∥R∥= O(maxk ∥Ek∥2
+2) as maxk ∥Ek∥2 →0. This matches
+practice: with INT8 rounding ∥El∥F /∥Wl∥F = 10−2 ∼10−1, so quadratic terms are one order
+of magnitude smaller than any first–order contribution. Furthermore, The baseline PTQ and the
+QEP pipeline use the same quantiser configuration, hence they induce errors of the same order. We
+therefore write the same symbol El for the error matrix in either scheme; any difference is at most a
+few percent and does not affect first–order bounds.
+B.1
+Derivation of Proposition 5.1
+This section presents detailed proofs of Proposition 5.1 stated in the main text.
+Proof. First, we rewrite the residual inside the Frobenius norm by using the following relationship:
+WlXl = Wl c
+Xl + Wlδl. Thus, the objective can be expressed as follows:
+WlXl −c
+Wl c
+Xl
+
+2
+F =
+(Wl −c
+Wl)c
+Xl + Wlδl
+
+2
+F .
+Since the objective is a strictly convex quadratic function of c
+Wl when c
+Hl is invertible, the stationary
+point is the unique minimizer. To find the minimizer c
+Wl, we set the gradient of the expression with
+respect to c
+Wl, equal to zero. Using standard matrix calculus, we find that the calculus for a stationary
+point is
+(Wl −c
+Wl)c
+Xl c
+X⊤
+l + Wlδl c
+X⊤
+l = 0.
+By defining c
+Hl := c
+Xl c
+X⊤
+l , the above condition can be rewritten as
+(Wl −c
+Wl)c
+Hl = −Wlδl c
+X⊤
+l .
+Assuming c
+Hl is invertible, we multiply both sides on the right by c
+H−1
+l
+, obtaining
+Wl −c
+Wl = −Wlδl c
+X⊤
+l c
+H−1
+l
+,
+and hence
+c
+Wl = Wl + Wlδl c
+X⊤
+l c
+H−1
+l
+.
+This closed-form expression is indeed the unique minimizer of the Frobenius norm objective, thus
+completing the proof.
+B.2
+Quantization Error Accumulation
+This section demonstrates that, under standard layer-wise PTQ, where each layer is quantized
+independently without considering downstream effects, the activation difference at the output layer,
+defined as δL := XL −c
+XL, grows exponentially with depth, to first order in the quantization noise,
+under mild conditions.
+Proposition B.1. For each layer l = 1, . . . , L + 1, the activation error can be expressed as follows:
+δl = −
+l−1
+X
+k=1
+ 
+l−1
+Y
+s=k+1
+JsWs
+!
+JkEkXk + O
+
+max
+k≤l−1 ∥Ek∥2
+F
+
+,
+where the empty product Ql−1
+s=l is defined to be the identity matrix, and Ek := c
+Wk −Wk represents
+the weight quantization error at layer k.
+15
+
+
+Proof. Consider explicitly the activations at layer l in both full-precision and quantized forms:
+Xl = σl−1(Wl−1Xl−1), c
+Xl = σl−1(c
+Wl−1 c
+Xl−1).
+By recursively applying this relation back to the first layer, we derive the activation difference δl as
+δl = Xl −c
+Xl
+= σl−1(Wl−1Xl−1) −σl−1(c
+Wl−1 c
+Xl−1)
+= Jl−1(Wl−1Xl−1 −c
+Wl−1 c
+Xl−1) + O
+ max{E2
+l−1, δ2
+l−1}
+
+= Jl−1 [−El−1Xl−1 + Wl−1δl−1] + O
+ max{E2
+l−1, δ2
+l−1}
+
+= −Jl−1El−1Xl−1 + Jl−1Wl−1δl−1 + O
+ max{E2
+l−1, δ2
+l−1}
+
+.
+By explicitly expanding δl−1, we obtain
+δl−1 = −Jl−2El−2Xl−2 + Jl−2Wl−2δl−2 + O
+ max{E2
+l−2, δ2
+l−2}
+
+.
+Substituting this expression into the previous equation yields
+δl = −Jl−1El−1Xl−1
++ Jl−1Wl−1 [−Jl−2El−2Xl−2 + Jl−2Wl−2δl−2] + O
+ max{E2
+l−1, E2
+l−2, δ2
+l−2}
+
+= −Jl−1El−1Xl−1 −Jl−1Wl−1Jl−2El−2Xl−2
++ Jl−1Wl−1Jl−2Wl−2δl−2 + O
+ max{E2
+l−1, E2
+l−2, δ2
+l−2}
+
+.
+By recursively repeating this explicit expansion down to the first layer, we obtain the fully expanded
+form as follows, noting δ1 = 0:
+δl = −
+l−1
+X
+k=1
+ 
+l−1
+Y
+s=k+1
+JsWs
+!
+JkEkXk + O
+
+max
+k≤l−1 ∥Ek∥2
+
+,
+where the empty product for s = l, . . . , l −1 is defined as the identity matrix.
+Proposition B.2. Assume each activation σl : Rnl×m →Rnl×m is γl-Lipschitz with respect to the
+Frobenius norm and satisfies σl(0) = 0:
+∥σl(U) −σl(V )∥F ≤γl∥U −V ∥F , γl > 0.
+Let X1 = c
+X1 = X; for l = 1, . . . , L −1 define
+Xl+1 = σl(WlXl), c
+Xl+1 = σl(c
+Wl c
+Xl), c
+Wl = Wl + El,
+and δl := Xl −c
+Xl. Assume ∥Wl∥2 > 0 for all l = 1, . . . , L −1 and set
+GL−1 :=
+L−1
+Y
+l=1
+γl∥Wl∥2, r :=
+max
+1≤k≤L−1
+∥Ek∥2
+∥Wk∥2
+.
+Then the final activation mismatch satisfies the explicit bound
+∥δL∥F ≤
+ (1 + r)L−1 −1
+
+GL−1∥X∥F .
+(7)
+Proof. Since σl(0) = 0 and σl are γl-Lipschitz,
+∥Xl+1∥F = ∥σl(WlXl) −σl(0)∥F ≤γl∥WlXl∥F ≤γl∥Wl∥2∥Xl∥F .
+By induction,
+∥Xl∥F ≤
+ l−1
+Y
+t=1
+γt∥Wt∥2
+!
+∥X∥F = Gl−1∥X∥F , l ≥1.
+(8)
+Using Lipschitz continuity again,
+∥δl+1∥F = ∥σl(WlXl) −σl(c
+Wl c
+Xl)∥F
+≤γl∥WlXl −c
+Wl c
+Xl∥F .
+16
+
+
+Since c
+Wl = Wl + El and δl = Xl −c
+Xl,
+WlXl −c
+Wl c
+Xl = WlXl −(Wl + El)c
+Xl = −ElXl + c
+Wlδl,
+hence, by the triangle inequality and ∥AB∥F ≤∥A∥2∥B∥F ,
+∥δl+1∥F ≤γl
+
+∥El∥2∥Xl∥F + ∥c
+Wl∥2∥δl∥F
+
+.
+(9)
+By definition of r, ∥El∥2 ≤r∥Wl∥2. Additionally, ∥c
+Wl∥2 ≤∥Wl∥2 + ∥El∥2 ≤(1 + r)∥Wl∥2.
+Combining these with Eq. (8) in Eq. (9) yields
+∥δl+1∥F ≤γl∥Wl∥2
+
+rGl−1∥X∥F + (1 + r)∥δl∥F
+
+.
+Define the normalized quantity
+al :=
+∥δl∥F
+Gl−1∥X∥F
+, l ≥1.
+Note a1 = 0 because δ1 = 0. Dividing the previous inequality by Gl∥X∥F (where Gl =
+Gl−1γl∥Wl∥2) yields
+al+1 ≤r + (1 + r)al.
+Let bl := al + 1. Then bl+1 ≤(1 + r)bl and b1 = 1; hence bl ≤(1 + r)l−1; therefore
+al ≤(1 + r)l−1 −1.
+Taking l = L gives Eq. (7).
+Proposition B.3. Assume each activation σl : Rnl×m →Rnl×m is γl-Lipschitz with respect to the
+Frobenius norm and satisfies σl(0) = 0:
+∥σl(U) −σl(V )∥F ≤γl∥U −V ∥F .
+Assume moreover that σl is Fréchet differentiable at the full-precision pre-activation Yl := WlXl
+for each l = 1, . . . , L −1. Let X1 = c
+X1 = X and for l = 1, . . . , L −1 define
+Xl+1 = σl(WlXl), c
+Xl+1 = σl(c
+Wl c
+Xl), c
+Wl = Wl + El.
+Assume ∥Wk∥2 > 0 for k = 1, . . . , L −1 and define
+GL−1 :=
+L−1
+Y
+l=1
+γl∥Wl∥2, r :=
+max
+1≤k≤L−1
+∥Ek∥2
+∥Wk∥2
+.
+Define the first-order component δ(1)
+L
+as follows. For t ∈R let c
+Wl(t) := Wl + tEl and define
+c
+X1(t) := X, c
+Xl+1(t) := σl(c
+Wl(t)c
+Xl(t)). Let δl(t) := Xl −c
+Xl(t). Then δ(1)
+L
+is defined by the
+derivative
+δ(1)
+L
+:= d
+dt
+
+t=0
+δL(t).
+Under these assumptions,
+∥δ(1)
+L ∥F ≤(L −1)rGL−1∥X∥F .
+(10)
+In particular, if γl∥Wl∥2 ≤1 + ε for all l, then
+∥δ(1)
+L ∥F ≤(L −1)r(1 + ε)L−1∥X∥F .
+(11)
+Proof. Since σl(0) = 0 and σl is γl-Lipschitz,
+∥Xl+1∥F = ∥σl(WlXl) −σl(0)∥F ≤γl∥WlXl∥F ≤γl∥Wl∥2∥Xl∥F .
+By induction,
+∥Xl∥F ≤
+ l−1
+Y
+t=1
+γt∥Wt∥2
+!
+∥X∥F , l ≥1.
+(12)
+17
+
+
+Fix l ∈{1, . . . , L −1}. By assumption, σl is Fréchet differentiable at Yl := WlXl. Let Jl :=
+Dσl(Yl) denote its Fréchet derivative. Because σl is γl-Lipschitz, the operator norm of Jl, induced
+by the Frobenius norm, satisfies
+∥Jl∥op ≤γl.
+(13)
+Indeed, for any H,
+∥Jl[H]∥F = lim
+t→0
+∥σl(Yl + tH) −σl(Yl)∥F
+|t|
+≤lim
+t→0
+γl∥tH∥F
+|t|
+= γl∥H∥F .
+Now consider c
+Xl+1(t) = σl(c
+Wl(t)c
+Xl(t)). Since matrix multiplication is smooth and σl is differen-
+tiable at Yl, the chain rule gives
+d
+dt
+
+t=0
+c
+Xl+1(t) = Jl
+
+ElXl + Wl
+d
+dt
+
+t=0
+c
+Xl(t)
+
+.
+Because δl(t) = Xl −c
+Xl(t), we have
+d
+dt
+
+t=0 c
+Xl(t) = −δ(1)
+l
+. Therefore,
+δ(1)
+l+1 = −Jl[ElXl −Wlδ(1)
+l
+] = −Jl(ElXl) + Jl(Wlδ(1)
+l
+), δ(1)
+1
+= 0.
+Taking Frobenius norms, using Eq. (13) and ∥AB∥F ≤∥A∥2∥B∥F ,
+∥δ(1)
+l+1∥F ≤γl∥El∥2∥Xl∥F + γl∥Wl∥2∥δ(1)
+l
+∥F .
+(14)
+Define al := ∥δ(1)
+l
+∥F . From Eq. (14) and a1 = 0, straightforward induction yields
+aL ≤
+L−1
+X
+k=1
+ L−1
+Y
+s=k+1
+γs∥Ws∥2
+!
+γk∥Ek∥2∥Xk∥F .
+Apply Eq. (12) to ∥Xk∥F and factor out GL−1:
+∥δ(1)
+L ∥F ≤GL−1
+ L−1
+X
+k=1
+∥Ek∥2
+∥Wk∥2
+!
+∥X∥F ≤(L −1)rGL−1∥X∥F ,
+which is Eq. (10). If additionally γl∥Wl∥2 ≤1 + ε for all l, then GL−1 ≤(1 + ε)L−1, proving
+Eq. (11).
+Proposition B.4. Consider the 1-dimensional network (dl = nl = 1) with σl(z) = z. Let Wl = 1+ε
+for all l = 1, . . . , L −1 with ε > 0, and let the input be X = C > 0. Choose quantized weights
+c
+Wl = Wl + El, El ≡cE > 0, l = 1, . . . , L −1.
+Then, for all L ≥2, the exact activation mismatch at layer L satisfies
+|δL| = |XL −b
+XL| ≥(L −1)cEC(1 + ε)L−2.
+(15)
+In particular,
+|δL| ≥cEC
+1 + ε(1 + ε)L−1.
+(16)
+Proof. Since σl is the identity map, we have
+XL = (1 + ε)L−1C,
+b
+XL = (1 + ε + cE)L−1C.
+Hence
+|δL| = C
+(1 + ε + cE)L−1 −(1 + ε)L−1 .
+Apply the mean value theorem to f(t) = tL−1 on the interval [1 + ε, 1 + ε + cE]: there exists
+ξ ∈(1 + ε, 1 + ε + cE) such that
+(1 + ε + cE)L−1 −(1 + ε)L−1 = f ′(ξ)cE = (L −1)ξL−2cE.
+Since ξ ≥1 + ε, we obtain
+|δL| ≥(L −1)cE(1 + ε)L−2C,
+which proves Eq. (15). Finally, Eq. (16) follows from (1 + ε)L−2 = 1/1+ε(1 + ε)L−1 and L −1 ≥1
+for L ≥2.
+18
+
+
+B.3
+Derivation of Theorem 5.2 and Corollary 5.4
+This section presents a rigorous statement and proof of Theorem 5.2 and Corollary 5.4. We first
+formally restate Theorem 5.2 below.
+Theorem B.5. Consider an L-layer network
+X1 = X, Xl+1 = σl(WlXl), l = 1, . . . , L.
+Assume each σl is γl-Lipschitz with respect to ∥· ∥F and satisfies σl(0) = 0. Let the quantized
+forward pass be
+c
+X1 = X, c
+Xl+1 = σl(c
+Wl c
+Xl).
+Define the activation mismatch as δl := Xl −c
+Xl.
+Fix any matrices El and set
+c
+W BASE
+l
+:= Wl + El.
+For QEP, define each l
+W ∗
+l (αl) := Wl + αlWlδl c
+X⊤
+l c
+H−1
+l
+, αl ∈[0, 1],
+and set
+c
+W QEP
+l
+:= W ∗
+l (αl) + El.
+Define the per-layer pre-activation residuals
+RM
+l
+:= WlXl −c
+W M
+l
+c
+XM
+l , M ∈{BASE, QEP},
+the global Lipschitz upper bound on the output mismatch
+UM :=
+L
+X
+k=1
+ 
+L
+Y
+s=k+1
+γs∥Ws∥2
+!
+γk∥RM
+k ∥F .
+Then for every choice of {αl}L
+l=1 ⊂[0, 1],
+UQEP ≤UBASE.
+Consequently,
+∥δQEP
+L+1 ∥F ≤UQEP ≤UBASE, ∥δBASE
+L+1 ∥F ≤UBASE.
+Proof. Fix a method M ∈{BASE, QEP}. By Lipschitz continuity,
+∥δM
+l+1∥F = ∥σl(WlXl) −σl(c
+W M
+l
+c
+XM
+l )∥F ≤γl∥WlXl −c
+W M
+l
+c
+XM
+l ∥F = γl∥RM
+l ∥F .
+Iterating this inequality through the remaining layers yields
+∥δM
+L+1∥F ≤
+L
+X
+k=1
+ 
+L
+Y
+s=k+1
+γs∥Ws∥2
+!
+γk∥RM
+k ∥F = UM.
+It remains to show UQEP ≤UBASE. We prove a stronger per-layer inequality:
+∥RQEP
+l
+∥F ≤∥RBASE
+l
+∥F , ∀l.
+(17)
+Fix l and write c
+Xl := c
+XQEP
+l
+and δl := Xl −c
+Xl. Define the orthogonal projection
+Pl := c
+X⊤
+l (c
+Xl c
+X⊤
+l )−1 c
+Xl,
+which satisfies P 2
+l = Pl and P ⊤
+l
+= Pl.
+By the construction of W ∗
+l (αl), we have the exact identity
+W ∗
+l (αl)c
+Xl = Wl c
+Xl + αlWlδlPl.
+19
+
+
+Therefore, using c
+W QEP
+l
+= W ∗
+l (αl) + El,
+RQEP
+l
+= WlXl −(W ∗
+l (αl) + El)c
+Xl
+= Wl(c
+Xl + δl) −W ∗
+l (αl)c
+Xl −El c
+Xl
+= Wlδl −αlWlδlPl −El c
+Xl
+= Wlδl(I −αlPl) −El c
+Xl.
+Consider the BASE residual at the same layer evaluated on the same c
+Xl:
+e
+RBASE
+l
+:= WlXl −(Wl + El)c
+Xl = Wlδl −El c
+Xl.
+Hence
+RQEP
+l
+= e
+RBASE
+l
+−αlWlδlPl.
+Since Pl is an orthogonal projection and 0 ≤αl ≤1, Lemma B.8 implies
+∥Wlδl(I −αlPl)∥F ≤∥Wlδl∥F .
+Therefore, by the triangle inequality,
+∥RQEP
+l
+∥F = ∥Wlδl(I −αlPl) −El c
+Xl∥F ≤∥e
+RBASE
+l
+∥F .
+Finally, since c
+XBASE
+l
+is the BASE activation produced by the BASE recursion, RBASE
+l
+is exactly
+e
+RBASE
+l
+evaluated at c
+XBASE
+l
+. Thus, taking c
+Xl = c
+XBASE
+l
+in the above inequality yields Eq. (17).
+Summing with nonnegative weights (QL
+s=k+1 γs∥Ws∥2)γk yields UQEP ≤UBASE, thus completing
+the proof.
+We further demonstrate that the final quantization error decreases monotonically as each propagation
+strength parameter αl approaches 1.
+Corollary B.6. Fix the layer index l ∈{1, . . . , L} and assume that c
+Hl := c
+Xl c
+X⊤
+l is invertible. Let
+the activation mismatch be δl := Xl −c
+Xl. Define the orthogonal projection
+Pl := c
+X⊤
+l (c
+Xl c
+X⊤
+l )−1 c
+Xl ∈Rm×m.
+For α ∈[0, 1], define the QEP corrected weight in the continuous domain as
+W ∗
+l (α) := Wl + αWlδl c
+X⊤
+l c
+H−1
+l
+.
+Let c
+Wl(α) := W ∗
+l (α) + El be defined by a fixed matrix El. Then, for any 0 ≤α′ ≤α ≤1,
+∥Wlδl(I −αPl)∥F ≤∥Wlδl(I −α′Pl)∥F .
+(18)
+Moreover, the pre-activation residual satisfies the exact identity
+WlXl −c
+Wl(α)c
+Xl = Wlδl(I −αPl) −El c
+Xl,
+(19)
+and hence the following upper bound is also monotone in α:
+∥WlXl −c
+Wl(α)c
+Xl∥F ≤∥Wlδl(I −αPl)∥F + ∥El∥2∥c
+Xl∥F .
+(20)
+Proof. First, Pl is an orthogonal projection. Indeed,
+P ⊤
+l
+= c
+X⊤
+l (c
+Xl c
+X⊤
+l )−1 c
+Xl = Pl,
+and
+P 2
+l = c
+X⊤
+l (c
+Xl c
+X⊤
+l )−1 c
+Xl c
+X⊤
+l
+| {z }
+=c
+Hl
+(c
+Xl c
+X⊤
+l )−1 c
+Xl = Pl.
+Thus, Lemma B.8 applies with Z := Wlδl and P := Pl, yielding
+∥Wlδl(I −αPl)∥F ≤∥Wlδl(I −α′Pl)∥F ,
+which proves Eq. (18).
+20
+
+
+Next, using the definitions of W ∗
+l (α) and c
+H−1
+l
+= (c
+Xl c
+X⊤
+l )−1,
+W ∗
+l (α)c
+Xl = Wl c
+Xl + αWlδl c
+X⊤
+l (c
+Xl c
+X⊤
+l )−1 c
+Xl = Wl c
+Xl + αWlδlPl.
+Therefore, since c
+Wl(α) = W ∗
+l (α) + El and Xl = c
+Xl + δl,
+WlXl −c
+Wl(α)c
+Xl = Wl(c
+Xl + δl) −(W ∗
+l (α) + El)c
+Xl
+= Wlδl −αWlδlPl −El c
+Xl
+= Wlδl(I −αPl) −El c
+Xl,
+which is Eq. (19).
+Finally, Eq. (20) follows from the triangle inequality and ∥El c
+Xl∥F
+≤
+∥El∥2∥c
+Xl∥F .
+B.4
+Relationship of QEP Correction and Ridge Regularization
+We formally establish a rigorous mathematical connection between the Quantization Error Propagation
+(QEP) correction parameter αl and the ridge regularization parameter λ. We show that tuning the
+QEP parameter αl is equivalent to adjusting the strength of ridge regularization with parameter λ.
+We prove the monotone inverse relationship between these two parameters.
+Proposition B.7. The QEP update with mixing factor αl ∈[0, 1] is
+c
+W ∗
+l (αl) = Wl(I + αδl c
+X⊤
+l c
+H−1
+l
+).
+The unique minimizer of the ridge objective
+min
+c
+Wl∈Rnl×dl f(c
+Wl), f(c
+Wl) = ∥WlXl −c
+Wl c
+Xl∥2
+F + λl∥Wl −c
+Wl∥2
+F , λl ≥0,
+equals
+c
+W ∗
+l (λl) = Wl
+
+I + δl c
+X⊤
+l (c
+Hl + λI)−1
+.
+(21)
+Let the positive definite matrices be
+G(αl) := α ˆ
+H−1
+l
+,
+R(λl) := (c
+Hl + λI)−1.
+Then
+α1 ≤α2 ⇒G(α1) ⪯G(α2), λ1 ≤λ2 ⇒R(λ1) ⪰R(λ2),
+and the scalar mapping as follows:
+α(λ) := 1
+dTrc
+HlR(λ) = 1
+dl
+dl
+X
+i=1
+γi
+γi + λl
+with γ1 ≥· · · ≥γd1 > 0 the eigenvalues of c
+Hl, is strictly decreasing, satisfies α(0) = 1 and
+limλ→∞α(λ) = 0, and obeys
+Trc
+HlG(α(λ)) = Trc
+HlR(λ).
+Thus, decreasing λ from +∞to 0 corresponds to increasing αl from 0 to 1.
+Proof. A standard differential identity ∂∥A∥2
+F = 2A gives
+∇c
+Wlf(c
+Wl) = 2
+
+c
+Wl c
+Hl −WlXl c
+X⊤
+l
+
++ 2λ(c
+Wl −Wl).
+Setting this gradient 0 yields
+c
+Wl(c
+Hl + λI) = Wl(Xl c
+X⊤
+l + λI),
+and right multiplication by inverse of c
+Hl +λI produces Eq. (21). Convexity of f ensures uniqueness.
+Diagonalise c
+Hl = UΓU ⊤with Γ = diag(γ1, . . . , γdl). Then G(αl) = UαlΓ−1U ⊤has eigenval-
+ues αl/γl, which increase strictly with αl, while R(λl) = U(Γ + λI)−1U ⊤has eigenvalues 1/γi+λ,
+which decrease with λl, which means Loewner relations follow directly.
+21
+
+
+Furthermore, the following equation holds:
+α(λ) = 1
+d1
+Tr(c
+HlR(λ)) = 1
+dl
+d1
+X
+i=1
+γi
+γi + λ
+Each summand has derivative
+∂
+∂λ
+γi
+γi + λ = −
+γi
+(γi + λ)2 < 0,
+which means α′(λ) < 0, ∀λ ≥0. Thus, α(·) is strictly decreasing on [0, ∞). One has
+lim
+λ→0
+γi
+γi + λ = 1,
+lim
+λ→∞
+γi
+γi + λ = 0.
+α(·) is strictly decreasing from 1 to 0 and smooth on [0, ∞). Because α is continous, strictly
+decreasing, it is a bijection from [0, +∞) onto (0, 1]. By construction
+Trc
+HlG(α(λ)) = Trc
+HlR(λ).
+Thus, decreasing λ from +∞to 0 corresponds to increasing αl from 0 to 1.
+B.5
+Technical Lemma
+Lemma B.8. Let Z ∈Rm×n be arbitrary, and let P ∈Rn×n be an orthogonal projection, i.e.,
+P 2 = P and P ⊤= P . For every pair 0 ≤α′ ≤α ≤1,
+∥Z(I −αP )∥F ≤∥Z(I −α′P )∥F ≤∥Z∥F .
+(22)
+Proof. Write f(α) := ∥Z(I −αP )∥2
+F . Because P ⊤= P and P 2 = P ,
+f(α) = Tr
+
+(I −αP )Z⊤Z(I −αP )
+
+= ∥Z∥2
+F −2α(1 −α) Tr(Z⊤ZP )
+|
+{z
+}
+t≥0
+.
+Thus, f ′(α) = −(2 −α)t ≤0 on [0, 1] indicates that f(α) is non-increasing. Taking square roots
+yields the first inequality in Eq. (22). Setting α′ = 0 yields the second inequality: ∥Z(I −αP )∥F ≤
+∥Z∥F .
+C
+Additional Implementation Details
+C.1
+Damping for Hessian
+A standard numerical issue in PTQ arises when the Hessian matrix c
+Hl is ill-conditioned or singular,
+rendering its inversion unstable or undefined. Following GPTQ [Frantar et al., 2022], we resolve
+this issue by employing a damping strategy that adds a small scalar value λ to the diagonal elements
+of c
+Hl to ensure positive definiteness. In our implementation, we set λ to the mean of the diagonal
+elements of c
+Hl, providing a straightforward yet effective method to stabilize the inversion process.
+D
+Additional Experiments
+D.1
+Additional Perplexity Results
+Due to space constraints, the main text reports perplexity results solely for the WikiText-2 dataset.
+Here, we provide additional results for PTB (Table 6) and C4 (Table 7), along with extended results
+for WikiText-2 (Table 5). These supplementary results further validate that QEP consistently enhances
+PTQ performance, particularly in low-bit quantization scenarios.
+22
+
+
+7B
+13B
+70B
+Model Size
+10
+20
+30
+Perplexity on WikiText-2
+INT4 Quantization
+QEP-QuIP
+QuIP
+7B
+13B
+70B
+Model Size
+10
+20
+30
+INT3 Quantization
+7B
+13B
+70B
+Model Size
+0
+20
+40
+60
+80
+INT2 Quantization
+7B
+13B
+70B
+Model Size
+0.60
+0.65
+0.70
+Average accuracy
+INT4 Quantization
+7B
+13B
+70B
+Model Size
+0.55
+0.60
+0.65
+0.70
+INT3 Quantization
+7B
+13B
+70B
+Model Size
+0.5
+0.6
+0.7
+INT2 Quantization
+Figure 3: Results averaged over 5 random seeds comparing QuIP with and without QEP across
+different quantization levels. Each subplot shows results for INT4, INT3, and INT2 quantization,
+respectively, with the horizontal axis indicating model size (7B, 13B, 70B). The top row reports
+perplexity on WikiText-2 (lower is better), while the bottom row shows the average of normalized
+accuracy scores on ARC (easy), PIQA, and StoryCloze benchmarks (higher is better), representing
+generalization capability. Error bars represent the standard error of the mean (SEM). Models using
+QEP-QuIP consistently outperform or match the performance of baseline QuIP, especially under
+more aggressive quantization (INT3 and INT2).
+D.2
+Detailed Accuracy Results for Individual Tasks
+Due to space limitations, the main text reports only the average accuracy across three tasks. Here, we
+provide task-specific accuracies for PIQA (Table 8), StoryCloze (Table 9), and ARC-Easy (Table 10),
+further confirming that QEP consistently improves layer-wise PTQ.
+D.3
+Stability of QuIP Results Across Random Seeds
+We assess the stability of QuIP-only experiments by averaging five independent runs per configuration.
+Model sizes, quantization levels, and benchmarks align with the main Experiments section. Figure
+3 plots QuIP with or without QEP at three quantization levels. Each marker is the mean of five
+seeds, and the error bars show the standard error of the mean. The top row gives perplexity on
+WikiText 2; the bottom row reports mean normalized accuracy on ARC easy, PIQA, and StoryCloze.
+Seed-to-seed variation is small and does not change the main conclusions. QEP-QuIP keeps its
+advantage, especially at INT3 and INT2. The main text lists the best seed per configuration for
+consistency with past work. This appendix confirms that the gains are not seed-specific but robust
+and reproducible, supporting using QEP.
+D.4
+Comparison with OmniQuant Baseline
+Table 11: WikiText-2 perplexity for LLaMA-
+2-7B at different bit-widths. NaN denotes di-
+vergence.
+Method
+INT4
+INT3
+INT2
+RTN+QEP
+6.017
+17.309
+97153.266
+GPTQ+QEP
+5.933
+7.898
+7214.328
+AWQ+QEP
+5.756
+11.131
+229888.406
+QuIP+QEP
+5.753
+6.154
+11.972
+OmniQuant
+5.880
+7.065
+NaN
+For completeness, we compare QEP-enhanced layer-
+wise PTQ with block-wise OmniQuant [Shao et al.,
+2023] on LLaMA-2-7B using WikiText-2 perplex-
+ity; lower values indicate better performance. As
+shown in Table 11, QuIP+QEP achieves the low-
+est perplexity at INT4/INT3 and remains stable at
+INT2, while OmniQuant diverges. These findings
+align with recent PTQ benchmarks indicating Om-
+niQuant’s underperformance relative to layer-wise
+PTQ [Zhao et al., 2025].
+23
+
+
+Table 5: Perplexities (↓) on WikiText-2 for Llama-2 (7B, 13B, 70B) under eight quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+5.726
+4.984
+3.463
+✓
+5.687
+4.966
+3.431
+GPTQ
+✗
+5.698
+4.987
+3.419
+✓
+5.609
+4.969
+3.416
+AWQ
+✗
+5.599
+4.987
+3.408
+✓
+5.580
+4.969
+3.404
+INT4
+RTN
+✗
+6.116
+5.206
+3.672
+✓
+6.017
+5.165
+3.621
+GPTQ
+✗
+6.083
+5.167
+3.594
+✓
+5.933
+5.127
+3.576
+AWQ
+✗
+5.831
+5.064
+3.484
+✓
+5.756
+5.041
+3.479
+INT3g128
+RTN
+✗
+6.662
+5.518
+3.978
+✓
+6.330
+5.412
+3.882
+GPTQ
+✗
+6.411
+5.459
+3.880
+✓
+6.160
+5.358
+3.838
+AWQ
+✗
+6.247
+5.315
+3.740
+✓
+6.108
+5.295
+3.724
+INT3
+RTN
+✗
+539.866
+10.688
+7.530
+✓
+17.309
+7.458
+5.648
+GPTQ
+✗
+10.881
+6.632
+4.860
+✓
+7.898
+6.245
+4.102
+AWQ
+✗
+15.299
+6.448
+4.362
+✓
+11.131
+6.092
+4.103
+INT2g32
+RTN
+✗
+90.692
+10.563
+6.802
+✓
+12.249
+7.920
+5.869
+GPTQ
+✗
+12.023
+8.394
+5.621
+✓
+9.245
+7.362
+5.445
+AWQ
+✗
+15887.204
+106933.227
+63663.707
+✓
+51.874
+80654.797
+37096.516
+INT2g64
+RTN
+✗
+431.595
+26.220
+10.312
+✓
+19.371
+9.917
+6.992
+GPTQ
+✗
+278.302
+11.584
+6.546
+✓
+14.737
+8.685
+6.030
+AWQ
+✗
+217111.860
+121737.148
+71703.781
+✓
+241136.594
+126944.578
+74227.539
+INT2g128
+RTN
+✗
+4270.828
+122.063
+27.268
+✓
+35.291
+12.779
+8.799
+GPTQ
+✗
+43.915
+16.653
+8.123
+✓
+17.886
+19.952
+6.825
+AWQ
+✗
+222344.250
+122795.898
+72446.680
+✓
+247751.203
+126813.172
+74192.570
+INT2
+RTN
+✗
+17783.918
+51152.832
+26077.172
+✓
+97153.266
+61158.555
+26063.672
+GPTQ
+✗
+13051.469
+1301.395
+107.458
+✓
+7214.328
+2782.353
+52.472
+AWQ
+✗
+199448.797
+93036.517
+81834.344
+✓
+229888.406
+74735.836
+88684.156
+24
+
+
+Table 6: Perplexities (↓) on PTB for Llama-2 (7B, 13B, 70B) under eight quantization settings. “N/A”
+denotes numerical overflow (NaN).
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+61.750
+53.835
+24.146
+✓
+47.798
+49.503
+24.604
+GPTQ
+✗
+N/A
+51.133
+24.101
+✓
+N/A
+50.072
+24.243
+AWQ
+✗
+43.894
+53.863
+24.525
+✓
+40.445
+55.345
+24.554
+INT4
+RTN
+✗
+82.641
+60.749
+23.545
+✓
+50.168
+53.117
+23.346
+GPTQ
+✗
+N/A
+53.561
+24.720
+✓
+124291.961
+53.537
+24.149
+AWQ
+✗
+60.261
+56.152
+25.542
+✓
+46.937
+57.445
+24.411
+INT3g128
+RTN
+✗
+55.467
+64.638
+23.586
+✓
+48.576
+54.866
+24.776
+GPTQ
+✗
+N/A
+57.079
+24.091
+✓
+N/A
+62.083
+24.092
+AWQ
+✗
+64.932
+57.273
+24.668
+✓
+52.356
+61.479
+26.309
+INT3
+RTN
+✗
+37167.801
+294.802
+64.002
+✓
+5514.820
+113.856
+34.212
+GPTQ
+✗
+44807.926
+106.715
+27.839
+✓
+N/A
+81.117
+27.469
+AWQ
+✗
+130.308
+121.698
+26.887
+✓
+81.606
+93.260
+25.592
+INT2g32
+RTN
+✗
+20280.412
+262.244
+63.428
+✓
+1685.683
+96.913
+36.677
+GPTQ
+✗
+18292.635
+152.169
+29.163
+✓
+N/A
+110.507
+30.465
+AWQ
+✗
+47850.137
+60977.195
+48520.398
+✓
+3741.642
+47591.414
+20185.246
+INT2g64
+RTN
+✗
+9252.538
+551.510
+153.528
+✓
+1096.720
+158.306
+42.991
+GPTQ
+✗
+N/A
+275.949
+37.024
+✓
+N/A
+187.477
+37.384
+AWQ
+✗
+202939.484
+113584.867
+79866.031
+✓
+220728.234
+117658.867
+82598.511
+INT2g128
+RTN
+✗
+9685.755
+1213.282
+767.896
+✓
+4462.478
+207.651
+63.806
+GPTQ
+✗
+10694.694
+395.689
+56.685
+✓
+N/A
+325.407
+45.569
+AWQ
+✗
+202164.484
+113784.242
+80543.727
+✓
+222388.375
+117059.742
+82493.251
+INT2
+RTN
+✗
+31824.279
+42619.883
+26063.672
+✓
+10824.680
+55286.305
+26077.172
+GPTQ
+✗
+N/A
+3868.426
+2438.034
+✓
+N/A
+3850.578
+4050.844
+AWQ
+✗
+183984.766
+87673.695
+90442.352
+✓
+198744.750
+62160.063
+91939.883
+25
+
+
+Table 7: Perplexities (↓) on C4 for Llama-2 (7B, 13B, 70B) under eight quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+7.584
+6.869
+5.826
+✓
+7.513
+6.839
+5.786
+GPTQ
+✗
+7.522
+6.860
+5.778
+✓
+7.421
+6.828
+5.770
+AWQ
+✗
+7.443
+6.840
+5.772
+✓
+7.416
+6.829
+5.767
+INT4
+RTN
+✗
+8.165
+7.146
+6.012
+✓
+7.945
+7.067
+5.947
+GPTQ
+✗
+7.866
+7.069
+5.905
+✓
+7.719
+6.998
+5.880
+AWQ
+✗
+7.721
+6.962
+5.842
+✓
+7.634
+6.932
+5.828
+INT3g128
+RTN
+✗
+8.977
+7.582
+6.266
+✓
+8.510
+7.402
+6.150
+GPTQ
+✗
+8.502
+7.463
+6.105
+✓
+8.185
+7.316
+6.072
+AWQ
+✗
+8.300
+7.310
+6.036
+✓
+8.105
+7.264
+6.019
+INT3
+RTN
+✗
+524.279
+13.883
+10.886
+✓
+21.436
+10.284
+8.202
+GPTQ
+✗
+11.780
+8.826
+7.067
+✓
+9.950
+8.429
+6.869
+AWQ
+✗
+17.418
+9.049
+6.631
+✓
+13.934
+8.257
+6.353
+INT2g32
+RTN
+✗
+225.440
+13.879
+9.720
+✓
+16.148
+10.561
+8.459
+GPTQ
+✗
+14.365
+10.719
+7.932
+✓
+11.839
+9.685
+7.717
+AWQ
+✗
+9028.133
+76591.883
+57596.215
+✓
+51.811
+49645.738
+33026.816
+INT2g64
+RTN
+✗
+553.766
+30.445
+15.155
+✓
+22.089
+12.762
+9.850
+GPTQ
+✗
+20.860
+13.394
+8.981
+✓
+14.084
+11.039
+8.508
+AWQ
+✗
+164477.422
+95241.625
+64913.477
+✓
+181582.719
+98917.820
+67203.359
+INT2g128
+RTN
+✗
+4811.772
+131.665
+47.878
+✓
+34.022
+15.398
+12.081
+GPTQ
+✗
+33.370
+18.008
+10.535
+✓
+18.184
+12.704
+9.433
+AWQ
+✗
+168465.266
+95617.305
+65646.594
+✓
+187329.625
+98457.031
+67248.492
+INT2
+RTN
+✗
+28258.385
+52642.387
+24912.074
+✓
+108424.680
+71050.250
+29042.623
+GPTQ
+✗
+3048.671
+299.684
+56.719
+✓
+276.638
+629.527
+30.874
+AWQ
+✗
+156266.797
+81233.602
+73251.945
+✓
+177576.750
+64098.504
+75607.211
+26
+
+
+Table 8: Accuracy (↑) on PIQA for Llama-2 (7B, 13B, 70B) under eight quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+0.773
+0.792
+0.804
+✓
+0.773
+0.790
+0.806
+GPTQ
+✗
+0.770
+0.789
+0.807
+✓
+0.771
+0.792
+0.806
+AWQ
+✗
+0.768
+0.790
+0.807
+✓
+0.764
+0.791
+0.810
+INT4
+RTN
+✗
+0.763
+0.789
+0.811
+✓
+0.767
+0.788
+0.812
+GPTQ
+✗
+0.755
+0.789
+0.804
+✓
+0.761
+0.787
+0.811
+AWQ
+✗
+0.760
+0.789
+0.807
+✓
+0.763
+0.784
+0.814
+INT3g128
+RTN
+✗
+0.757
+0.770
+0.793
+✓
+0.761
+0.779
+0.806
+GPTQ
+✗
+0.758
+0.778
+0.806
+✓
+0.764
+0.782
+0.807
+AWQ
+✗
+0.760
+0.780
+0.805
+✓
+0.765
+0.780
+0.805
+INT3
+RTN
+✗
+0.563
+0.705
+0.724
+✓
+0.677
+0.752
+0.764
+GPTQ
+✗
+0.720
+0.757
+0.783
+✓
+0.745
+0.770
+0.791
+AWQ
+✗
+0.647
+0.760
+0.787
+✓
+0.725
+0.770
+0.801
+INT2g32
+RTN
+✗
+0.588
+0.696
+0.760
+✓
+0.693
+0.735
+0.771
+GPTQ
+✗
+0.690
+0.732
+0.772
+✓
+0.714
+0.748
+0.776
+AWQ
+✗
+0.568
+0.505
+0.503
+✓
+0.702
+0.514
+0.501
+INT2g64
+RTN
+✗
+0.597
+0.614
+0.714
+✓
+0.676
+0.710
+0.748
+GPTQ
+✗
+0.647
+0.705
+0.745
+✓
+0.677
+0.713
+0.765
+AWQ
+✗
+0.502
+0.506
+0.502
+✓
+0.702
+0.506
+0.504
+INT2g128
+RTN
+✗
+0.511
+0.566
+0.635
+✓
+0.652
+0.678
+0.721
+GPTQ
+✗
+0.581
+0.639
+0.715
+✓
+0.659
+0.683
+0.747
+AWQ
+✗
+0.501
+0.505
+0.503
+✓
+0.501
+0.507
+0.503
+INT2
+RTN
+✗
+0.509
+0.493
+0.499
+✓
+0.510
+0.506
+0.510
+GPTQ
+✗
+0.500
+0.509
+0.511
+✓
+0.493
+0.507
+0.544
+AWQ
+✗
+0.507
+0.504
+0.502
+✓
+0.505
+0.504
+0.504
+27
+
+
+Table 9: Accuracy (↑) on StoryCloze for Llama-2 (7B, 13B, 70B) under eight quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+0.765
+0.785
+0.791
+✓
+0.770
+0.788
+0.794
+GPTQ
+✗
+0.768
+0.784
+0.793
+✓
+0.771
+0.789
+0.798
+AWQ
+✗
+0.777
+0.782
+0.792
+✓
+0.777
+0.785
+0.798
+INT4
+RTN
+✗
+0.756
+0.777
+0.796
+✓
+0.763
+0.777
+0.798
+GPTQ
+✗
+0.765
+0.776
+0.794
+✓
+0.766
+0.775
+0.792
+AWQ
+✗
+0.760
+0.774
+0.789
+✓
+0.766
+0.777
+0.794
+INT3g128
+RTN
+✗
+0.749
+0.766
+0.790
+✓
+0.756
+0.773
+0.789
+GPTQ
+✗
+0.763
+0.776
+0.793
+✓
+0.759
+0.770
+0.796
+AWQ
+✗
+0.761
+0.767
+0.795
+✓
+0.761
+0.782
+0.795
+INT3
+RTN
+✗
+0.546
+0.669
+0.738
+✓
+0.672
+0.728
+0.776
+GPTQ
+✗
+0.722
+0.752
+0.780
+✓
+0.745
+0.766
+0.782
+AWQ
+✗
+0.689
+0.767
+0.787
+✓
+0.702
+0.764
+0.782
+INT2g32
+RTN
+✗
+0.645
+0.668
+0.745
+✓
+0.704
+0.721
+0.776
+GPTQ
+✗
+0.758
+0.715
+0.724
+✓
+0.763
+0.748
+0.766
+AWQ
+✗
+0.660
+0.511
+0.516
+✓
+0.703
+0.570
+0.569
+INT2g64
+RTN
+✗
+0.607
+0.617
+0.718
+✓
+0.670
+0.696
+0.766
+GPTQ
+✗
+0.654
+0.686
+0.756
+✓
+0.712
+0.720
+0.758
+AWQ
+✗
+0.476
+0.479
+0.476
+✓
+0.474
+0.479
+0.475
+INT2g128
+RTN
+✗
+0.509
+0.577
+0.647
+✓
+0.651
+0.677
+0.741
+GPTQ
+✗
+0.588
+0.634
+0.724
+✓
+0.649
+0.690
+0.753
+AWQ
+✗
+0.475
+0.478
+0.476
+✓
+0.475
+0.478
+0.476
+INT2
+RTN
+✗
+0.468
+0.491
+0.482
+✓
+0.488
+0.487
+0.482
+GPTQ
+✗
+0.485
+0.501
+0.539
+✓
+0.514
+0.513
+0.589
+AWQ
+✗
+0.489
+0.478
+0.475
+✓
+0.482
+0.476
+0.477
+28
+
+
+Table 10: Accuracy (↑) on ARC-Easy for Llama-2 (7B, 13B, 70B) under eight quantization settings.
+Bits
+Method
+QEP
+Llama-2-7B
+Llama-2-13B
+Llama-2-70B
+INT4g128
+RTN
+✗
+0.554
+0.567
+0.596
+✓
+0.540
+0.572
+0.596
+GPTQ
+✗
+0.531
+0.573
+0.586
+✓
+0.521
+0.579
+0.592
+AWQ
+✗
+0.537
+0.577
+0.585
+✓
+0.526
+0.580
+0.592
+INT4
+RTN
+✗
+0.521
+0.582
+0.590
+✓
+0.524
+0.574
+0.593
+GPTQ
+✗
+0.525
+0.575
+0.594
+✓
+0.512
+0.570
+0.589
+AWQ
+✗
+0.529
+0.572
+0.580
+✓
+0.532
+0.577
+0.591
+INT3g128
+RTN
+✗
+0.528
+0.569
+0.575
+✓
+0.517
+0.556
+0.572
+GPTQ
+✗
+0.521
+0.568
+0.580
+✓
+0.515
+0.568
+0.569
+AWQ
+✗
+0.534
+0.561
+0.597
+✓
+0.527
+0.561
+0.592
+INT3
+RTN
+✗
+0.322
+0.450
+0.459
+✓
+0.391
+0.485
+0.541
+GPTQ
+✗
+0.468
+0.514
+0.550
+✓
+0.474
+0.520
+0.551
+AWQ
+✗
+0.416
+0.539
+0.588
+✓
+0.452
+0.540
+0.602
+INT2g32
+RTN
+✗
+0.339
+0.445
+0.533
+✓
+0.426
+0.474
+0.557
+GPTQ
+✗
+0.421
+0.481
+0.506
+✓
+0.441
+0.486
+0.547
+AWQ
+✗
+0.352
+0.272
+0.263
+✓
+0.449
+0.280
+0.263
+INT2g64
+RTN
+✗
+0.332
+0.371
+0.467
+✓
+0.390
+0.430
+0.557
+GPTQ
+✗
+0.377
+0.455
+0.485
+✓
+0.404
+0.458
+0.548
+AWQ
+✗
+0.266
+0.270
+0.262
+✓
+0.265
+0.270
+0.263
+INT2g128
+RTN
+✗
+0.269
+0.253
+0.395
+✓
+0.376
+0.407
+0.479
+GPTQ
+✗
+0.338
+0.383
+0.443
+✓
+0.367
+0.418
+0.508
+AWQ
+✗
+0.266
+0.269
+0.260
+✓
+0.265
+0.269
+0.261
+INT2
+RTN
+✗
+0.265
+0.253
+0.263
+✓
+0.262
+0.264
+0.261
+GPTQ
+✗
+0.263
+0.256
+0.257
+✓
+0.272
+0.265
+0.281
+AWQ
+✗
+0.267
+0.270
+0.262
+✓
+0.262
+0.270
+0.261
+29

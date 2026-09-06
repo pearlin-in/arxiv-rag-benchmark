@@ -1,0 +1,4321 @@
+The risk of KV cache compression
+Lukas Haverbeck∗
+RWTH Aachen University
+lukas.haverbeck@rwth-aachen.de
+Carmen Amo Alonso
+Stanford University
+camoalon@stanford.edu
+Andres Felipe Posada-Moreno
+RWTH Aachen University
+andres.posada@dsme.rwth-aachen.de
+Sebastian Trimpe
+RWTH Aachen University
+trimpe@dsme.rwth-aachen.de
+Marco Pavone
+Stanford University
+pavone@stanford.edu
+Abstract
+Transformer inference on long sequences is expensive because softmax attention
+repeatedly reads from a large KV cache. The prevalent approach to this bottleneck
+is KV cache compression, which replaces the full cache with a compact summary.
+Despite its practical importance, the design of such summaries is largely driven
+by empirical experimentation. On the theoretical side, existing results show that
+KV cache compression can be impossible in the worst case, but offer little sys-
+tematic guidance for designing algorithms in regimes where accurate compression
+is possible. We bridge this gap by characterizing the minimax risk of KV cache
+compression in terms of the intrinsic compressibility of a cache, revealing when and
+how accurate compression is possible. These results yield novel design principles
+for KV cache compression under causal masking that map efficiently to prefill
+and autoregressive decoding while achieving minimax-optimal risk. We instan-
+tiate these principles in a practical algorithm and report promising performance
+on LongBench in targeted experiments. Overall, our results provide a principled
+avenue for practical KV cache compression with theoretical guarantees.
+1
+Introduction
+Transformers have become the dominant architecture for processing and generating long sequences
+across various domains [4, 5, 14, 22] due to their excellent ability to model complex interactions
+between tokens. During inference, these interactions are mediated through the key–value (KV) cache
+storing all previous tokens, and each new token is computed from this cache via softmax attention
+[23]. The KV cache therefore serves as the model’s working memory of the past. While this persistent
+access to past data makes Transformers powerful, it is also costly. As the sequence grows, the cache
+grows with it, and each new step must read from an increasingly large history. For long-context
+applications, this creates a major bottleneck in both memory use and runtime.
+An attractive remedy is KV compression: replacing a long history of key–value pairs by a compact
+summary that approximately preserves the attention outputs of the original cache.2 Such a summary
+is useful only if future attention cannot reliably distinguish the compressed cache from the full history.
+This makes it challenging to decide which distinctions in the past can be safely forgotten, because the
+∗Work conducted at Stanford University.
+2The term also refers to numerical compression of the stored tensors. We focus on reducing the number of key–value pairs.
+Preprint.
+arXiv:2607.01520v1  [cs.LG]  1 Jul 2026
+
+
+importance of a token is not intrinsic to the token itself. A token that can be safely discarded in one
+context and for one set of future queries may be essential for another, while several distinct tokens
+may be interchangeable if attention uses them in the same way. Thus, compression is safe only to the
+extent that the summary preserves the context that future queries can actually use.
+Despite its practical importance, KV compression lacks a systematic design theory and remains
+largely guided by empirical exploration [1, 10, 19, 20, 24, 27], using heuristic proxies for future
+relevance such as recency, accumulated attention mass, and attention sinks. These methods show
+substantial compression is often possible, but they do not explain which properties of a cache make
+compression safe, how the achievable error should scale with the compression budget, or what an
+optimal summary should preserve. Conversely, theoretical results show that accurate KV compression
+can be impossible in the worst case [16], and identify structural assumptions under which compression
+is possible [11, 18, 26]. This leaves open the intermediate regime most relevant to practical algorithm
+design: caches that are not adversarial, but also not prescribed by a fixed model class.
+To bridge this gap, we provide a graded account of KV cache compressibility in terms of the intrinsic
+interaction between a cache and future queries through softmax attention. Specifically, we characterize
+the minimax risk of KV compression, asking: for a fixed compression budget, how much error is
+unavoidable for the way a given cache can be probed by future queries? Beyond quantitative rates,
+this characterization identifies what an optimal summary must preserve. It captures the continuum
+between easy regimes, where many past tokens are effectively redundant and a small summary can
+preserve attention accurately, and hard regimes, where the cache contains many separately retrievable
+pieces of information and any small summary must lose something, and yields concrete design criteria
+for algorithms to attain minimax-optimal risk.
+Concretely, we make the following contributions. (1) We recast KV compression as sparse approx-
+imation of a measure, strictly generalizing token eviction, and formalize its minimax risk. (2) We
+prove tight upper and lower bounds on this risk in terms of an intrinsic complexity measure capturing
+how future queries probe the cache, and show a sharp separation between algorithms with and without
+access to the future-query distribution. (3) We derive design principles for efficient KV compression
+during causally masked prefill and autoregressive decoding with minimax-optimal compression risk.
+(4) We instantiate these principles in a concrete KV compression algorithm and evaluate it through
+targeted experiments on LongBench, where it shows promising performance. Put together, our results
+advance KV compression towards practical methods with theoretical guarantees.
+2
+Related work
+A large body of recent work reduces KV cache size by selecting tokens according to empirical proxies
+for future relevance. These proxies include recency and attention sinks [24, 27], accumulated or
+persistent attention mass [1, 20, 27], and attention patterns observed during prefill or across layers
+[10, 19]. The strong empirical performance of these methods suggests that real Transformer caches
+often contain substantial redundancy. At the same time, these proxies do not by themselves explain
+which properties of a cache make compression safe, how the achievable error should scale with the
+compression budget, or what information an optimal summary must preserve. Our work addresses
+this gap by studying the minimax risk of KV compression algorithms broadly, aiming to inform
+practical compression beyond empirical exploration.
+Existing theory has mainly identified two endpoints: impossibility results for sharp token retrieval
+[3, 16], and positive approximation guarantees under additional structure [2, 11, 18, 26]. These results
+identify important limitations and tractable regimes, but they do not give a graded characterization
+from lossless compression to worst-case incompressibility. Our upper bounds require no a priori
+structural model of the data beyond bounded values, which is weaker than bounded keys and queries.
+Instead, we deliberately characterize the compression risk through the interaction between caches
+and softmax attention itself. Our lower-bound assumptions are close in spirit to the sharp-attention
+regimes considered in prior hardness results. However, we employ them to characterize when
+compression remains possible, even under sharp attention, not to establish impossibility alone.
+Finally, we formalize the minimax risk of KV compression as sparse approximation of a measure.
+Measure-based views of softmax attention and Transformers are not new, and have led to useful
+perspectives in several settings [9, 15]. To the best of our knowledge, our recasting is new for KV
+compression, and it strictly generalizes token eviction from subset selection to sparse reweighting.
+2
+
+
+3
+Problem setup
+We study KV compression: the problem of replacing the context seen by a single softmax attention
+head with a compact summary while preserving its outputs on future queries, in order to reduce
+memory use and computational cost. Since softmax attention depends on the context only through the
+induced weighting of its key–value pairs, we formalize KV compression as sparse approximation of a
+probability measure over tokens. Our goal is to characterize the achievable error for this approximation
+problem as a function of the context’s intrinsic compressibility under a query distribution, which we
+formalize as a minimax risk in terms of a data-dependent complexity measure.
+3.1
+KV compression as sparse approximation of a probability measure
+In their seminal work, Vaswani et al. [23] define softmax attention as
+Att
+ q | k1, . . . , kn, v1, . . . , vn
+
+=
+Pn
+i=1 exp
+ ⟨q, ki⟩/√dk
+
+vi
+Pn
+i=1 exp
+ ⟨q, ki⟩/√dk
+ ,
+(1)
+where q ∈Q is a query, ki ∈K are keys, and vi ∈V are values, in their respective spaces K, Q ⊆Rdk
+and V ⊆Rdv. We write X := K × V for the key–value space, and assume throughout that values are
+bounded in norm by a constant V > 0, which is usually not restrictive in practice.
+The collection (ki, vi)n
+i=1 of key–value pairs in (1) is called the KV cache. We study the problem of
+KV compression: finding a compact representation of this collection that approximately preserves the
+attention map in (1). Since (1) depends on the KV cache only through a weighted combination, we
+represent the KV cache as a finitely supported probability measure P and define
+Att
+ q | P
+ :=
+Z
+X
+ak(q | P) v dP(k, v),
+ak(q | P) :=
+κ(q, k)
+R
+X κ(q, k′) dP(k′, v′)
+(2)
+for a Gaussian kernel κ(q, k) := exp(−∥q −k∥2
+2/(2√dk)) on Rdk with scale parameter √dk. This
+definition coincides with (1) whenever P ∝Pn
+i=1 exp
+ ∥ki∥2/(2√dk)
+
+· δ(ki,vi). For the remainder
+of this paper, we work with attention as defined in (2) so that attention depends on the KV cache only
+through the context measure P.
+To formalize KV compression from this viewpoint, we introduce the notation P(S) for the probability
+measures on a subset S ⊆H of a Hilbert space H, and denote by Pfin(S) those with finite support
+and by PK(S) those supported on at most K points. KV compression then becomes the following
+problem.
+Problem statement I (KV compression)
+Given a budget K ≥1, a context measure P ∈Pfin(X), and a query distribution ν ∈P(Q),
+find a compressed context measure ˆP ∈PK(X) minimizing the mean squared error
+EP,ν
+  ˆP
+ := Eq∼ν
+Att
+ q | P
+
+−Att
+ q | ˆP
+2
+2.
+Problem Statement I strictly generalizes token eviction [10, 19, 20, 24, 27], which seeks a small,
+unweighted subset of K tokens that approximately preserve the attention map. In our setting, these
+tokens form the support of ˆP. However, we allow arbitrary sparse reweightings of the cache, which,
+to the best of our knowledge, provides a new view on KV compression.
+3.2
+Capturing the intrinsic compressibility of a context
+To understand when accurate compression is possible, we identify how changes to P affect softmax
+attention. Since P and ˆP are both probability measures, their difference ∆:= ˆP −P is a signed,
+zero-mass measure. Compression can therefore be viewed as a reweighting of the original context,
+and its error is determined by how this reweighting perturbs the softmax numerator and normalizer.
+Indeed, a direct computation shows that, for every query q ∈Q,
+Att(q | ˆP) −Att(q | P) =
+R
+X ak(q | P)
+ v −Att(q | P)
+
+d∆(k, v)
+1 +
+R
+X
+ ak(q | P) −1
+
+d∆(k, v)
+.
+(3)
+3
+
+
+Thus, every compression perturbation enters attention through two linear functionals of ∆: a centered
+numerator term and a centered renormalization term. This identifies the pair of query-indexed
+coefficients with which each (k, v) ∈X contributes to the compression-induced reweighting of
+tokens. We collect these coefficients with the following definition.
+Definition 3.1 (Response profile). Let P ∈Pfin(X) be a context measure and ν ∈P(Q) a query
+distribution. We call
+ΓP (k, v) : Q →Rdv ⊕R,
+q 7→
+
+ak(q | P)
+ v −Att(q | P)
+
+, V
+ ak(q | P) −1
+
+(4)
+the response profile of P. We view ΓP (k, v) as an element of the Hilbert space Hν := L2(ν, Rdv ⊕R)
+and define the covariance operator
+ΣP,ν :=
+R
+X ΓP (k, v) ⊗ΓP (k, v) dP(k, v).
+The first coordinate of ΓP (k, v) records the token’s contribution to the centered numerator perturba-
+tion in (3). The second coordinate records its contribution to the centered denominator perturbation,
+scaled by the value bound V so that both coordinates have the same units. The query distribution
+enters through the norm on Hν: Directions that matter on frequent queries are weighted heavily,
+while directions that matter only on rare queries are weighted lightly. Consequently, ΣP,ν measures
+the amount and geometry of query-visible variation in the context. While we do not claim that ΣP,ν
+is the only object to capture the intrinsic redundancy of a context, we argue that it is a meaningful
+choice. To substantiate this, we give three examples illustrating that the spectral decay of ΣP,ν tracks
+the intuitive difficulty of compression in several natural regimes.
+Example 3.2 (Needles in a haystack). Suppose a context P consists of m approximately equal “hay
+tokens” and n ≪m “needle tokens” that are well separated from all other tokens and dominate
+under ν. Then, ΣP,ν has few large eigenvalues.
+Example 3.3 (Waning clusters). Suppose a context P consists of m well-separated clusters of nearly
+interchangeable tokens, and the j-th cluster dominates under ν with frequency of order j−(1+α).
+Then, the eigenvalues of ΣP,ν decay as r−α.
+Example 3.4 (Random lookup). Suppose a context P consists of m pairwise well-separated tokens,
+and the query distribution ν is diffuse. Then, ΣP,ν has many large eigenvalues.
+3.3
+Characterizing the achievable error of KV compression algorithms
+Our goal in this paper is to characterize the fundamental limits of KV compression. Specifically, we
+seek minimax rates in terms of the intrinsic compressibility of a context by asking: What error does
+the best compression algorithm incur on its worst input (P, ν), as a function of ΣP,ν? To make this
+precise, we first specify what information a compression algorithm may use.
+Definition 3.5 (Compressor). A K-compressor is a map A : Pfin(X) × P(Q) × Ω→PK(X) over
+a probability space (Ω, F, P) of random seeds. We write Aaw
+K for the class of all such compressors.
+This definition allows compression algorithms to be randomized. It also allows the compressor to
+depend on the query distribution ν. We call this the query-aware setting. In many applications,
+however, the compressed summary must be formed before the future query distribution is known,
+which we call the query-agnostic setting, which we capture through the following restricted class.
+Definition 3.6 (Query-agnostic compressor). We call a K-compressor A ∈Aaw
+K query-agnostic if
+A(P, ν, ω) = A(P, ρ, ω) for all ν, ρ ∈P(Q), P ∈Pfin(X), and ω ∈Ω. We write Aag
+K for the class
+of all query-agnostic K-compressors.
+We measure the performance of a class of compressors by its worst-case expected mean squared error
+over a prescribed family of contexts and query distributions.
+Definition 3.7 (Minimax risk). Fix K ≥1. For a family of compressors C ⊆Aaw
+K , and a family of
+context and query measures F ⊆Pfin(X) × P(Q), define the minimax compression risk
+R(C, F) := inf
+A∈C
+sup
+(P,ν)∈F
+Eω∼P
+
+EP,ν
+ A(P, ν, ω)
+
+.
+Our objective is to characterize R(Aaw
+K , F) and R(Aag
+K , F) through the response covariances ΣP,ν
+realized by (P, ν) ∈F, and to use this characterization to identify what compressed summaries must
+preserve in order to attain minimax-optimal risk.
+4
+
+
+X
+(k, v)
+Hν
+ΓP (k, v)
+X
+Hν
+X
+Hν
+X
+Hν
+sup
+inf
+∥Att(q |
+) −Att(q |
+)∥L2(ν)
+≍
+∥
+∥Hν
+Figure 1: Illustration of our approach. Left: We view the token sequence as a measure P over key–
+value pairs (k, v) ∈X, which we map to their response profiles ΓP (k, v) ∈Hν. Right: Compressing
+P amounts to a sparse reweighting of tokens, which moves the barycenter of the response profiles.
+The size of this displacement depends on the retained tokens and their assigned weights, and controls
+the attention error incurred by compression. KV compression therefore reduces to a balancing
+problem in Hilbert space: find a K-atomic reweighting that keeps the barycenter in Hν nearly fixed.
+4
+Minimax rates for KV compression
+We now study the minimax risk of KV compression. Figure 1 illustrates our approach: compressing
+a KV cache amounts to replacing the context measure P by a sparse reweighting, so that many
+tokens receive weight 0 while the remaining tokens are reweighted to preserve the effect of the full
+context on the attention map. To track this effect, we represent each key–value pair (k, v) ∈X by its
+response profile ΓP (k, v) ∈Hν, which records the contribution of (k, v) to the attention numerator
+and denominator under reweightings of P. These individual contributions combine through their
+barycenter in Hν. As we show, reweightings causing small barycenter displacement also cause small
+attention error, recasting KV compression as a balancing problem in Hilbert space: given a context
+measure P, reweight P so that its support is limited to at most K tokens while the barycenter of the
+response profiles remains nearly fixed. Problem Statement II formulates this problem abstractly.
+Problem statement II (Sparse balancing in Hilbert space)
+Given K ≥1, a Hilbert space H, and µ ∈Pfin(H), find ˆµ ∈PK(supp(µ)) minimizing
+eEµ(ˆµ) :=
+R
+H g dˆµ(g)
+2
+H.
+The rest of the section turns this reformulation into tight minimax bounds. Section 4.1 proves the
+transfer back to KV compression: a K-atomic reweighting whose squared barycenter displacement
+is at most ε incurs attention error at most Cε, for a universal constant C > 0. Section 4.2 then
+proves two balancing bounds for Problem Statement II and transfers them to the query-aware and
+query-agnostic minimax compression risk. Finally, Section 4.3 proves that these bounds are tight for
+sufficiently rich classes of contexts and query distributions. For that, we work in the regime where
+softmax attention can sharply retrieve individual tokens, formalized by the following assumption.
+Assumption 4.1. Fix K ≥1 and let Bd(r) denote the radius-r ball in Rd. Assume that (i)
+K ∩Q ⊇Bdk
+ 8 d1/4
+k
+√log K
+
+; (ii) dk, dv ≥10 log K; and (iii) V = Bdv(V ).
+Condition (i) gives the minimal norm growth needed for sharp attention among K tokens: resolving
+one token against K competitors requires logit gaps of order log K, while radius-B keys and queries
+give gaps at most 2B2/√dk, forcing B ≳d1/4
+k
+√log K. Condition (ii) allows mild dimension growth
+with context length, and Condition (iii) ensures that the value norm bound V is at the right scale.
+Notation.
+For a Hilbert space H and a positive trace-class operator L on H, with eigenvalues
+λ1(L) ≥λ2(L) ≥· · · ≥0, multiplicities counted, set tailr(L) := P
+j>r λj(L). For x, y ≥0, write
+x ≲y if x ≤Cy and x ≳y if x ≥cy for universal C, c > 0, and write x ≍y if both hold.
+All proofs and constructions for this section are in Appendices A and B.
+5
+
+
+4.1
+KV compression reduces to sparse balancing in Hilbert space
+Recall from Section 3 that, for a fixed context measure P and query distribution ν, each token affects
+attention outputs under context reweightings through its response profile ΓP (k, v) ∈Hν. Having
+formalized the context as a measure, we can form the pushforward µP,ν := P ◦Γ−1
+P , which then
+describes the distribution of responses to the attention numerator and denominator under reweightings
+of P. Moreover, every K-atomic measure ˆµ approximating µP,ν while remaining supported on
+supp(µP,ν) can be pulled back to a K-atomic context measure ˆP. Consequently, any solution of
+Problem II for the measure µP,ν in Hν directly yields a compressed KV cache. The following
+proposition shows that error bounds survive this pullback, so that upper bounds for sparse balancing
+in Hilbert space immediately transfer to bounds on the KV compression error.
+Proposition 4.2. Let K ≥1, P ∈Pfin(X), and ν ∈P(Q). Define µP,ν := P ◦Γ−1
+P . Then, µP,ν is
+centered and has covariance operator ΣP,ν. Moreover, any fixed ˆµ ∈PK(supp(µP,ν)) can be pulled
+back to a measure ˆP ∈PK(X) independently of ν such that EP,ν
+  ˆP
+
+≲eEµP,ν(ˆµ). In particular,
+inf
+ˆ
+P ∈PK(X)
+EP,ν
+  ˆP
+
+≲
+inf
+ˆµ∈PK(supp(µP,ν))
+eEµP,ν
+ ˆµ
+
+.
+4.2
+Compression bounds from balancing bounds
+By Proposition 4.2, it suffices to bound the sparse balancing error in Hilbert space: prove a bound
+for balancing the barycenter of a probability measure in Hilbert space, and have the same bound
+apply pointwise to KV compression. Standard results on sparse convex optimization already provide
+basic balancing bounds. First, kernel herding and conditional-gradient methods give a bound of order
+B2/K when supp(µP,ν) lies in a radius-B ball [12, 17]. This can be loose, however, because the
+radius is sensitive to worst-case response profiles and does not measure data-dependent redundancy.
+Second, independent sampling from P gives a bound of the form tr(ΣP,ν)/K. This captures the
+total response variance but does not exploit potential anisotropy of ΣP,ν, which can be significant
+when ν concentrates on a few important directions.
+4.2.1
+Query-aware upper bound
+Since query-aware compressors can explicitly adapt to anisotropic structure in the query distribution,
+we seek a bound in terms of the spectral decay of ΣP,ν, which kernel herding and random sampling
+do not provide. Below, we provide such a bound, which is new to the best of our knowledge. The con-
+struction works by preserving the barycenter exactly on the leading eigenspace while simultaneously
+sparsifying the measure on the orthogonal complement. Proposition 4.2 allows us to immediately
+transfer this bound to the minimax risk of query-aware KV compression.
+Theorem 4.3. Fix K ≥7 and a real Hilbert space H. Let µ ∈Pfin(H) be centered, with covariance
+operator Σ : H →H. Then, ∥
+R
+H g dˆµ(g)∥2
+H ≲
+tailK/3(Σ)
+K
+for some ˆµ ∈PK(supp(µ)).
+Corollary 4.4. Let K ≥7 and F ⊆Pfin(X) × P(Q). Then, R(Aaw
+K , F) ≲supP,ν∈F
+tailK/3(ΣP,ν)
+K
+.
+Thus, when ν is known, the compression budget can be spent on preserving the leading eigenspace of
+the response covariance, and the error is controlled only by the response variance outside that space.
+4.2.2
+Query-agnostic upper bound
+The above approach relies on knowledge of the geometry of ΣP,ν. In contrast, a query-agnostic
+strategy has no access to this geometry, since it depends on ν. A simple balancing strategy that does
+not rely on knowledge of the Hilbert space geometry is to sample K atoms independently from P
+and take their empirical measure, which corresponds to averaging K independent centered draws
+from µP,ν and yields the following, standard tr(ΣP,ν)/K bound for the query-agnostic minimax risk
+via Proposition 4.2.
+Theorem 4.5. Let K ≥1 and F ⊆Pfin(X) × P(Q). Then, R(Aag
+K , F) ≲supP,ν∈F tr(ΣP,ν)/K.
+6
+
+
+4.3
+Compressors cannot beat the spectral barrier
+We now show that the upper bounds from Corollary 4.4 and Theorem 4.5 are tight when attention can
+be sharp. In this regime, it is known that accurate KV compression, and fast approximate attention
+more broadly, is impossible in the worst case [3, 16]. We generalize these results by showing
+that sharpness alone does not determine whether a cache is compressible. Instead, the minimax
+compression risk is governed by the spectrum of ΣP,ν throughout a nontrivial range, from essentially
+loss-free compression to worst possible error scale under bounded values.
+Concretely, we construct admissible contexts, together with query distributions, on which the error
+for any compression is calibrated to tailK/3(ΣP,ν) and tr(ΣP,ν), respectively. Importantly, since an
+arbitrary finitely supported measure on X need not be induced by actual KV caches, our lower-bound
+instances are chosen from the subclass P⋆
+K(X) ⊆PK(X) of context measures induced by KV caches
+(ki, vi)K
+i=1. Moreover, the constructed contexts have length 2K, so that our lower bounds already
+apply when the original context is only a constant factor larger than the compression budget and do
+not rely on compressing extremely long contexts into tiny summaries.
+4.3.1
+Query-aware lower bound
+When the compressor knows ν, we show that, at every scale R ∈[0, V 2K], there exist instances with
+covariance tailK/3(ΣP,ν) ≍R, on which every K-atomic compressor incurs error at scale R/K.
+Thus, the rate tailK/3(ΣP,ν)/K governs the query-aware minimax risk throughout the full natural
+range, from exact compressibility at zero error to the maximum possible scale V 2.
+Theorem 4.6. Let K ≥50 and R ∈[0, V 2K]. Suppose Assumption 4.1 holds. Then, there exists
+F ⊆P⋆
+2K(X) × P(Q) with tailK/3(ΣP,ν) ≍R for all (P, ν) ∈F and R(Aaw
+K , F) ≳R
+K .
+4.3.2
+Query-agnostic lower bound
+When the compressor does not have access to ν, it must choose a single summary to protect against
+many query distributions simultaneously. In this harder setting, we obtain a sharper lower bound.
+Specifically, at every scale T ∈[V 2, V 2K], there exist instances with covariance tr(ΣP,ν) ≍T, on
+which every K-atomic compressor incurs error at scale T/K on some query distribution. At the same
+time, for each individual query distribution, perfect compression of the same contexts is possible,
+witnessing a genuine separation of the two regimes. The price of hiding the query distribution is
+therefore the loss of access to anisotropic geometry in ΣP,ν. Query-aware compressors can preserve
+the dominant directions and pay only for the tail, whereas query-agnostic compressors must in general
+pay for the full trace, which can be significantly worse.
+Theorem 4.7. Let K ≥50 and T ∈[V 2, V 2K]. Suppose Assumption 4.1 holds. Then, there
+exists F ⊆P⋆
+2K(X) × P(Q) with tr(ΣP,ν) ≍T for all (P, ν) ∈F and R(Aag
+K , F) ≳T
+K , while
+R(Aaw
+K , F) = 0.
+5
+Efficient KV compression algorithms with minimax-optimal risk
+We now study how the abstract minimax rates from the previous section can be attained algorithmically
+during practical Transformer inference, focusing on the causally masked setting of autoregressive
+sequence models [8, 13, 23]. During prefill, the prompt is processed in parallel subject to causal
+attention. During autoregressive decoding, tokens arrive sequentially and attend to the full past. Our
+goal is to make efficient and minimax-optimal KV compression compatible with both regimes.
+Since the future query distribution is typically unavailable at compression time, we work in the
+query-agnostic setting. Here, naive random sampling already achieves the minimax-optimal risk.
+Our objective is therefore to achieve this risk as a baseline, while improving on it under additional
+structure. Recall from Section 4 that the query-aware and query-agnostic minimax risks differ because
+the geometry of the response profile space Hν depends on ν. A query-aware compressor can adapt to
+this geometry, whereas a query-agnostic compressor must choose its summary before ν is known and
+hence hedge against all admissible geometries. We therefore restrict admissible query distributions to
+those whose response geometry is uniformly comparable to a data-independent reference geometry.
+7
+
+
+Algorithm 1 Parallel prefix compression for causally masked prefill
+1: M ←n/K,
+L ←log2 M,
+S1
+L ←∅
+2: Q0
+0, ..., Q0
+M−1 ←C1, ..., CM
+▷partition prompt into chunks of size K
+3: for ℓ= 1, . . . , L do
+▷upsweep stage
+4:
+for all j = 1, . . . , M/2ℓin parallel do
+5:
+Qℓ
+j ←REDUCE(Qℓ−1
+2j−1 ⊕Qℓ−1
+2j )
+▷summary of tokens (j −1)2ℓK + 1 to j2ℓK
+6: for ℓ= L, L −1, . . . , 1 do
+▷downsweep stage
+7:
+for all j = 1, . . . , M/2ℓin parallel do
+8:
+Sℓ−1
+2j−1 ←Sℓ
+j
+▷summary of tokens 1 to (2j −2)2ℓ−1K
+9:
+Sℓ−1
+2j
+←REDUCE(Sℓ
+j ⊕Qℓ−1
+2j−1)
+▷summary of tokens 1 to (2j −1)2ℓ−1K
+10: return (Sc ←S0
+c)M
+c=1 and QL
+1
+▷exclusive prefix summaries and full-prompt summary
+Algorithm 2 Streaming prefix compression for autoregressive decoding
+1: B0, B1, . . . ←∅,
+BL ←QL
+1 ,
+ℓ←0
+▷QL
+1 is the summary produced by Algorithm 1
+2: for t = 0, K, 2K, . . . do
+3:
+Q ←P{n+t+1,...,n+t+K}
+4:
+while Bℓ̸ = ∅do
+▷update buckets
+5:
+Q ←REDUCE(Bℓ⊕Q),
+Bℓ←∅,
+ℓ←ℓ+ 1
+6:
+ℓ←0,
+Bℓ←Q,
+H ←∅
+7:
+for ℓin decreasing order do
+▷compress buckets to size K
+8:
+H ←REDUCE(H ⊕Bℓ)
+9:
+yield H
+Assumption 5.1. Fix K ≥1, a Hilbert space H, and a bounded feature map Φ : X →H. Let
+ν ∈P(Q) and P ∈Pfin(X). Assume that,
+R
+X Φ dσ
+2
+H ≲
+R
+X ΓP dσ
+2
+Hν ≲
+R
+X Φ dσ
+2
+H
+for all signed measures σ supported on supp(P) with σ(X) = 0.
+Desiderata.
+We seek algorithms that (i) reduce the cost of attention during prefill and autoregressive
+decoding; (ii) reduce cache memory during autoregressive decoding; (iii) respect causal masking;
+(iv) attain the minimax-optimal query-agnostic risk; and (v) attain the query-aware minimax-optimal
+rate under Assumption 5.1.
+Notation.
+We work with a stream (ki, vi)i≥1 of key–value pairs. The first n pairs form the prompt;
+subsequent pairs arrive sequentially during decoding. Fix a chunk size K, and assume n = MK
+with M a power of two. For any index set I ⊆N, let PI denote the context measure on the indexed
+tokens, and define its unnormalized mass w(I) := P
+i∈I exp(∥ki∥2/(2√dk)). If P, Q ∈Pfin(X)
+represent disjoint index sets I and J, we write
+P ⊕Q :=
+w(I)
+w(I)+w(J)P +
+w(J)
+w(I)+w(J)Q
+for their union, suppressing the dependence on I and J when clear from context.
+All proofs and constructions for this section are in Appendix C.
+5.1
+Efficient prefill and autoregressive decoding under causal masking
+In causally masked prefill, token t may attend only to the prefix Pt := P{1,...,t}, so compression
+must provide prefix summaries for each position t. Since storing a separate summary for every prefix
+would defeat the purpose of compression, we summarize only at chunk boundaries. Specifically, we
+fix a chunk size K, partition the stream into chunks I1, I2, . . . of size K, and maintain a K-atomic
+summary Sc of the prefix for each chunk c. At position t ∈Ic, attention is then computed against
+ˆPt := Sc−1 ⊕P{min Ic,...,t},
+(5)
+8
+
+
+which keeps the local causal prefix exact and compresses only the long-range past. Hence, every
+attention computation uses at most 2K atoms while respecting causal masking.
+The summaries Sc are computed by recursively applying a randomized local reducer REDUCE :
+P2K(X) →PK(X). Algorithm 1 implements this recursion as a parallel Blelloch scan over chunks,
+producing one K-atomic summary for each chunk prefix and one summary of the full prompt.
+Algorithm 2 uses the same merge-reduce primitive online: starting from the prompt summary, it
+updates the compressed history during autoregressive decoding and emits a new K-atomic summary
+at each chunk boundary. Thus, both prefill and autoregressive decoding reduce to a small number of
+calls to REDUCE on inputs of size 2K. Consequently, if REDUCE can be implemented efficiently,
+the full compression scheme meets our efficiency desiderata, as the following proposition shows.
+Proposition 5.2. Algorithm 1 makes O(n/K) calls to REDUCE, and uses parallel depth
+O(log(n/K)) and O(n) memory. Additionally, at time t, Algorithm 2 stores O(K log(t/K)) atoms,
+and makes O(log(t/K)/K) calls to REDUCE amortized per token.
+5.2
+From local reducers to global risk guarantees
+Algorithms 1 and 2 lift any local compressor REDUCE : P2K(X) →PK(X) to a global compression
+scheme for causally masked prefill and autoregressive decoding. It remains to identify conditions on
+REDUCE that yield global risk guarantees. We give such conditions below.
+Definition 5.3 (Design criteria). Fix K ≥1, a Hilbert space H, and Φ : X →H. For P ∈Pfin(X)
+and Q ∈P2K(X), define
+µΦ
+P :=
+R
+X Φ(k, v) dP(k, v)
+and
+ΣΦ
+P :=
+R
+X (Φ(k, v) −µΦ
+P ) ⊗(Φ(k, v) −µΦ
+P ) dP(k, v).
+We call REDUCE (Φ, r, τ)-admissible for r, τ ≥0 if, for all Q ∈P2K(X), ˆQ := REDUCE(Q) ∈
+PK(supp(Q)) almost surely and the following hold:
+(i) E[ ˆQ] = Q
+(ii) E
+
+∥
+R
+X Ψ d( ˆQ −Q)∥2
+G
+
+≲1
+K tr(ΣΨ
+Q) for all Hilbert spaces G and bounded Ψ : X →G
+(iii) E
+
+∥
+R
+X Φ d( ˆQ −Q)∥2
+H
+
+≲1
+K
+ tailr(ΣΦ
+Q) + τ
+
+Such reducers exist. We give concrete instantiations satisfying the conditions for any bounded Φ in
+Appendix C, together with a natural choice of Φ and illustrative examples in which Assumption 5.1
+holds for this Φ. When REDUCE satisfies these conditions, we recover the minimax-optimal query-
+agnostic trace bound without further assumptions, and obtain the spectral refinement of query-aware
+compression under Assumption 5.1.
+Theorem 5.4. Let K ≥1 and ν ∈P(Q), and suppose that REDUCE is (Φ, r, τ)-admissible. Let
+ˆPt ∈P2K(X) be as in (5). Then, E EPt,ν
+  ˆPt
+
+≲log(2+t/K)
+K
+tr(ΣPt,ν). If additionally Assump-
+tion 5.1 holds for ν, Pt, and Φ, then E EPt,ν
+  ˆPt
+
+≲log(2+t/K)
+K
+(tailr(ΣPt,ν) + τ).
+6
+Experiments
+We conduct a focused long-context evaluation of the compression scheme from Section 5 on the
+“long” subset of LongBench-v2 [6], a multiple-choice benchmark with contexts ranging from 128k to
+2M words. We evaluate Qwen3-32B [25]. As a baseline, we use attention over the entire available KV
+cache, following the official truncation protocol of Bai et al. [6] whenever the full context exceeds the
+model’s context window. We compare the baseline against our compression scheme from Section 5
+and against ScissorHands [20], SnapKV [19], and StreamingLLM [24] from the literature, each
+applied independently to each attention head.
+Since ScissorHands and SnapKV do not provide efficient parallel inference methods for compressed
+prefill, we let the literature baselines (including StreamingLLM) use the full KV cache during prefill
+and only compress during decoding. In contrast, our compression algorithm is used during both
+prefill and decoding, so that each head only ever attends to a small subset of the tokens seen by the
+full-attention baseline.
+9
+
+
+Table 1:
+Accuracy and standard error on the “long” subset of LongBench-v2 [6] using Qwen3-
+32B [25]. “Full KV” refers to standard softmax attention using the full, uncompressed KV cache.
+Literature baselines [19, 20, 24] use the full, uncompressed KV cache during prefill, then compress it
+once after prefill, and use the compressed cache during decoding. Our methods compress during both
+prefill and decoding, using the scheme from Section 5 for different choices of REDUCE.
+Method
+Prefill budget
+Decode budget
+Protected rank
+Accuracy (%)
+Full KV
+130,944
+130,944
+—
+37.04 (±4.65)
+Random (ours)
+6152
+6152
+—
+34.26 (±4.57)
+Balanced clustering (ours)
+6152
+6152
+64
+35.19 (±4.60)
+Balanced clustering (ours)
+6152
+6152
+128
+37.04 (±4.65)
+ScissorHands [20]
+130,944
+6152
+—
+35.19 (±4.60)
+SnapKV [19]
+130,944
+6152
+—
+34.26 (±4.57)
+StreamingLLM [24]
+130,944
+6152
+—
+32.41 (±4.50)
+We evaluate our compression scheme for two local reducers. The first is random sampling from the
+context measure Q, which attains the query-agnostic minimax-optimal rate. The second protects the
+leading r directions of ΣΦ
+Q and clusters tokens in the protected coordinates. This reducer attains the
+spectral guarantee of Theorem 5.4 under Assumption 5.1. We elaborate on the design of the clustering
+reducer and the choice of feature map Φ in Appendix C. Appendix D has additional implementation
+details.
+Table 1 reports accuracy with standard error for a compression rate of approximately 95% relative to
+full context window. Random sampling already provides a strong query-agnostic baseline, consistent
+with its minimax optimality. Admissible clustering improves accuracy at r = 64, and matches the
+uncompressed baseline at r = 128. Furthermore, all our local reducers are competitive with the
+literature baselines [19, 20, 24] despite using significantly fewer tokens during prefill. While we
+emphasize that standard errors overlap and further validation is warranted, these results suggest that
+the algorithmic design principles developed in Section 5 hold promise for practical long-context
+compression at substantial KV budget reductions, during both decoding and prefill.
+7
+Conclusion
+We posit KV compression as sparse balancing of a finite probability measure in Hilbert space,
+and characterize its minimax risk in terms of how a cache interacts with future queries through
+softmax attention. This yields tight rates under natural assumptions and identifies what compressed
+summaries must preserve. The same characterization reveals design principles for causal compression
+during prefill and autoregressive decoding, separating universal guarantees from structure-exploiting
+refinements. Together, our results provide a principled path toward practical KV cache compression
+with theoretical guarantees.
+Acknowledgments and Disclosure of Funding
+Funded by the European Union. This work has received funding from the European High Performance
+Computing Joint Undertaking (JU) and from the German Federal Ministry of Research, Technology
+and Space (BMFTR), the Ministry of Culture and Science of North Rhine-Westphalia (MKW
+NRW) and the Hessian Ministry of Science and Research, Arts and Culture (HMWK) under grant
+agreement No 101250682. LH was supported by the RWTH Research Ambassador Scholarship
+during his research stay at Stanford University. CAA is supported by a Schmidt Science Fellowship.
+Computations were performed with computing resources granted by RWTH Aachen University under
+project thes2228.
+10
+
+
+References
+[1] Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant J Nair, Ilya Soloveychik, and
+Purushotham Kamath. Keyformer: KV cache reduction through key tokens selection for efficient
+generative inference. Proceedings of Machine Learning and Systems, 6:114–127, 2024.
+[2] Maryam Aliakbarpour, Vladimir Braverman, Junze Yin, and Haochen Zhang. Support basis:
+Fast attention beyond bounded entries. In Proceedings of the 29th International Conference on
+Artificial Intelligence and Statistics, 2026.
+[3] Josh Alman and Zhao Song. Fast attention requires bounded entries. Advances in Neural
+Information Processing Systems, 36:63117–63135, 2023.
+[4] Žiga Avsec, Vikram Agarwal, Daniel Visentin, Joseph R Ledsam, Agnieszka Grabska-
+Barwinska, Kyle R Taylor, Yannis Assael, John Jumper, Pushmeet Kohli, and David R Kelley.
+Effective gene expression prediction from sequence by integrating long-range interactions.
+Nature Methods, 18(10):1196–1203, 2021.
+[5] Alexei Baevski, Henry Zhou, Abdelrahman Mohamed, and Michael Auli. wav2vec 2.0: A frame-
+work for self-supervised learning of speech representations. Advances in Neural Information
+Processing Systems, 33:12449–12460, 2020.
+[6] Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xiaozhi Wang, Xin Lv, Shulin Cao, Jiazheng
+Xu, Lei Hou, Yuxiao Dong, et al. LongBench v2: Towards deeper understanding and reason-
+ing on realistic long-context multitasks. In Proceedings of the 63rd Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers), pages 3639–3664, 2025.
+[7] Nikhil Bansal. On a generalization of iterated and randomized rounding. Theory of Computing,
+20(6):1–23, 2024.
+[8] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in Neural Information Processing Systems, 33:1877–1901, 2020.
+[9] Martin Burger, Samira Kabri, Yury Korolev, Tim Roith, and Lukas Weigand. Analysis of
+mean-field models arising from self-attention dynamics in transformer architectures with layer
+normalization. Philosophical Transactions of the Royal Society A: Mathematical, Physical and
+Engineering Sciences, 383(2298), 2025.
+[10] Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu, Yucheng Li, Tianyu Liu, Keming Lu, Wayne
+Xiong, Yue Dong, Junjie Hu, et al. PyramidKV: Dynamic KV cache compression based on
+pyramidal information funneling. arXiv preprint arXiv:2406.02069, 2024.
+[11] Annabelle Michael Carrell, Albert Gong, Abhishek Shetty, Raaz Dwivedi, and Lester
+Mackey. Low-rank thinning. In Aarti Singh, Maryam Fazel, Daniel Hsu, Simon Lacoste-
+Julien, Felix Berkenkamp, Tegan Maharaj, Kiri Wagstaff, and Jerry Zhu, editors, Proceed-
+ings of the 42nd International Conference on Machine Learning, volume 267 of Proceed-
+ings of Machine Learning Research, pages 6811–6848. PMLR, 13–19 Jul 2025.
+URL
+https://proceedings.mlr.press/v267/carrell25a.html.
+[12] Yutian Chen, Max Welling, and Alex Smola. Super-samples from kernel herding. In Proceedings
+of the Twenty-Sixth Conference on Uncertainty in Artificial Intelligence, pages 109–116, 2010.
+[13] Zihang Dai, Zhilin Yang, Yiming Yang, Jaime G Carbonell, Quoc Le, and Ruslan Salakhutdinov.
+Transformer-xl: Attentive language models beyond a fixed-length context. In Proceedings of the
+57th annual meeting of the association for computational linguistics, pages 2978–2988, 2019.
+[14] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training
+of deep bidirectional transformers for language understanding. In Proceedings of the 2019
+conference of the North American chapter of the association for computational linguistics:
+human language technologies, volume 1 (long and short papers), pages 4171–4186, 2019.
+11
+
+
+[15] Borjan Geshkovski, Cyril Letrouit, Yury Polyanskiy, and Philippe Rigollet. A mathematical
+perspective on transformers. Bulletin of the American Mathematical Society, 62(3):427–479,
+2025.
+[16] Themistoklis Haris and Krzysztof Onak. Compression barriers for autoregressive transformers.
+arXiv preprint arXiv:2502.15955, 2025.
+[17] Martin Jaggi. Revisiting frank-wolfe: Projection-free sparse convex optimization. In Interna-
+tional conference on machine learning, pages 427–435. PMLR, 2013.
+[18] Ekaterina Kochetkova, Kshiteej Sheth, Insu Han, Amir Zandieh, and Michael Kapralov. Stream-
+ing attention approximation via discrepancy theory. arXiv preprint arXiv:2502.07861, 2025.
+[19] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye,
+Tianle Cai, Patrick Lewis, and Deming Chen. SnapKV: LLM knows what you are looking
+for before generation. Advances in Neural Information Processing Systems, 37:22947–22970,
+2024.
+[20] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+Kyrillidis, and Anshumali Shrivastava. ScissorHands: Exploiting the persistence of importance
+hypothesis for LLM KV cache compression at test time. Advances in Neural Information
+Processing Systems, 36:52342–52364, 2023.
+[21] Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole. YaRN: Efficient context
+window extension of large language models. In B. Kim, Y. Yue, S. Chaudhuri, K. Fragkiadaki,
+M. Khan, and Y. Sun, editors, International Conference on Learning Representations, volume
+2024, pages 31932–31951, 2024. URL https://proceedings.iclr.cc/paper_files/
+paper/2024/file/874a4d89f2d04b4bcf9a2c19545cf040-Paper-Conference.pdf.
+[22] Alexander Rives, Joshua Meier, Tom Sercu, Siddharth Goyal, Zeming Lin, Jason Liu, Demi Guo,
+Myle Ott, C Lawrence Zitnick, Jerry Ma, et al. Biological structure and function emerge from
+scaling unsupervised learning to 250 million protein sequences. Proceedings of the National
+Academy of Sciences, 118(15):e2016239118, 2021.
+[23] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in Neural Information
+Processing Systems, 30, 2017.
+[24] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+language models with attention sinks. In B. Kim, Y. Yue, S. Chaudhuri, K. Fragkiadaki,
+M. Khan, and Y. Sun, editors, International Conference on Learning Representations, volume
+2024, pages 21875–21895, 2024. URL https://proceedings.iclr.cc/paper_files/
+paper/2024/file/5e5fd18f863cbe6d8ae392a93fd271c9-Paper-Conference.pdf.
+[25] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+[26] Amir Zandieh, Insu Han, Vahab Mirrokni, and Amin Karbasi. SubGen: Token generation in
+sublinear time and memory. arXiv preprint arXiv:2402.06082, 2024.
+[27] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao
+Song, Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2O: Heavy-hitter oracle for efficient
+generative inference of large language models. Advances in Neural Information Processing
+Systems, 36:34661–34710, 2023.
+12
+
+
+Appendix Contents
+A Sparse barycenter balancing in Hilbert space
+14
+A.1
+Finite-dimensional constrained rounding . . . . . . . . . . . . . . . . . . . . . . .
+14
+A.2
+Protected Hilbert rounding . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+A.3
+Proof of Theorem A.1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+B
+Minimax rates
+21
+B.1
+Upper bounds . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+21
+B.2
+Lower bounds . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+25
+C Algorithms
+36
+C.1
+Choice of feature map . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+36
+C.2
+Admissible reducers . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+37
+C.3
+Global risk guarantees
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+41
+C.4
+Computational cost of the global merge-reduce scheme . . . . . . . . . . . . . . .
+46
+D Experimental details
+48
+13
+
+
+A
+Sparse barycenter balancing in Hilbert space
+This appendix records an upper bound for the abstract balancing problem in Problem Statement II.
+Theorem A.1. Let H be a real Hilbert space, and let
+µ = Pn
+i=1 pi δxi ∈Pn(H)
+have mean zero and covariance operator
+Σ := Pn
+i=1 pi xi ⊗xi.
+Let U ⊆H be a finite-dimensional subspace. Let d := dim U, and let ΠU : H →H be the
+orthogonal projector onto U. Then, for every m ∈N, there exists ˆµ ∈Pm+2d+2(supp(µ)) with
+Z
+H
+x dˆµ ∈U ⊥
+and
+
+Z
+H
+x dˆµ
+
+2
+H
+≤20
+9m tr
+ (I −ΠU)Σ
+
+.
+Proof. Deferred to Section A.3.
+While Theorem A.1 only claims existence, we give a constructive proof with concrete algorithms.
+We later invoke this construction when we design KV compression algorithms in Appendix C.
+For our construction, we reduce sparsifying a finitely supported measure µ = Pn
+i=1 pi δxi ∈Pn(H)
+to a constrained rounding problem: Given a vector (p1, ..., pn) ∈[0, 1]n, find a (random) rounded
+vector (ˆp1, ..., ˆpn) ∈[0, 1]n with at most m + 2d + 2 fractional entries preserving the mass of p
+while satisfying linear constraints. As we show, mass preservation is sufficient to construct a sparse
+measure supported on at most m + 2d + 2 points from such a constrained rounding procedure, and
+linear constraints are used to encode exact preservation of the barycenter in the subspace U.
+In Section A.1, we first describe a general algorithm for constrained rounding with mass preservation.
+Section A.2 then specializes this algorithm to sparsification of measures with a protected subspace,
+and Section A.3 proves Theorem A.1 from this.
+A.1
+Finite-dimensional constrained rounding
+We first isolate a finite-dimensional constrained rounding procedure. Starting from a fractional weight
+vector, the goal is to round most coordinates while preserving mass and satisfying linear constraints.
+Such a procedure can be obtained as a straightforward application of the sub-isotropic rounding walk
+of Bansal [7]. Given a current point x ∈[0, 1]n, an alive set A ⊆[n], and linear constraints, we write
+x+ = SUBISOWALK
+ 
+x, A
+
+n
+X
+s=1
+zs = m,
+n
+X
+s=1
+zscs = 0
+!
+for the stopped phase of Bansal’s walk, restricted to the coordinates in A, that returns a random point
+x+ ∈[0, 1]n satisfying the constraints
+n
+X
+s=1
+x+
+s = m,
+n
+X
+s=1
+x+
+s cs = 0,
+and x+
+s = xs for all s̸ ∈A, such that at least one coordinate in A reaches 0 or 1. Algorithm 3 simply
+applies this procedure iteratively until only 2d + 2 fractional coordinates remain, which yields the
+following guarantees on the output.
+14
+
+
+Algorithm 3 CONSTRAINEDPARTIALROUND
+Require: z ∈[0, 1]N, vectors c1, . . . , cN ∈Rd
+Require: PN
+s=1 zs = m and PN
+s=1 zs cs = 0
+1: t ←0,
+z(0) ←z
+2: A ←{s ∈[N] | 0 < z(0)
+s
+< 1}
+▷“alive set”
+3: while |A| > 2d + 2 do
+4:
+t ←t + 1
+5:
+z(t) ←SUBISOWALK
+
+z(t−1), A | PN
+s=1 zs = m, PN
+s=1 zscs = 0
+
+▷provided by [7]
+6:
+A ←{s ∈[N] | 0 < z(t)
+s
+< 1}
+7: return z(t)
+Lemma A.2. Fix n, d, m ∈N. Let z ∈[0, 1]n and c1, ..., cn ∈Rd. Assume that Pn
+s=1 zs cs = 0
+and m := Pn
+s=1 zs ∈N. Let Z := CONSTRAINEDPARTIALROUND(z, c1, ..., cn) be the random
+output of Algorithm 3. Then, the following hold:
+(i) Pn
+s=1 Zs = m almost surely
+(ii) Pn
+s=1 Zs cs = 0 almost surely
+(iii) |{s ∈[n] | 0 < Zs < 1}| ≤2d + 2 almost surely
+(iv) E[Z] = z
+(v) for every a ∈Rn,
+E
+" n
+X
+s=1
+(Zs −zs) a
+2
+#
+≤20
+9
+n
+X
+s=1
+a2
+szs(1 −zs).
+Proof. For x ∈[0, 1]n, let
+A(x) := {s ∈[n] : xs ∈(0, 1)}
+be the alive set. The algorithm runs the sub-isotropic rounding walk of Bansal [7, Section 3.1] with
+the following deterministic schedule of active constraints. As long as |A(x)| > 2d + 2, we keep the
+constraints
+n
+X
+s=1
+xs = m
+and
+n
+X
+s=1
+xscs = 0
+active on the alive coordinates. Once |A(x)| ≤2d + 2, the algorithm stops.
+We first check that the active constraints satisfy the rank condition required by Bansal [7]. Restricted
+to the alive coordinates, the active system has at most d + 1 scalar constraints. Whenever the loop is
+entered, |A(x)| > 2d + 2, and therefore
+d + 1 ≤|A(x)|
+2
+.
+Thus the slack hypothesis in [7, Theorem 1.2] holds with parameter δ = 1/2.
+Let (z(k))k≥0 denote the elementary iterates of the resulting walk, and let (Fk)k≥0 be its natural
+filtration. Let T be the terminal time of the full walk and write
+X := z(T ) ∈{0, 1}n
+for the final integral vector. By the martingale property of Bansal’s walk, E[X] = z. Let
+τ := inf
+n
+k ≥0 :
+A(z(k))
+ ≤2d + 2
+o
+.
+Then, Z := z(τ).
+15
+
+
+Before time τ, every increment lies in the nullspace of the active constraints. Hence, the identities
+n
+X
+s=1
+z(k)
+s
+= m
+and
+n
+X
+s=1
+z(k)
+s cs = 0
+are preserved pathwise for all k ≤τ. Since they hold at initialization, they hold for Z, which proves
+n
+X
+s=1
+Zs = m,
+n
+X
+s=1
+Zscs = 0.
+The definition of τ gives
+{s ∈[n] | 0 < Zs < 1}
+ ≤2d + 2.
+It remains to prove unbiasedness and the scalar second-moment bound. For k ≥1, set
+∆(k) := z(k) −z(k−1),
+and put ∆(k) := 0 for k > T. In the notation of Bansal [7, Section 3.1], conditional on Fk−1, the
+increment on the alive coordinates is of the form γkU 1/2
+k
+rk, where rk is a random sign vector and Uk
+is positive semidefinite with range contained in the nullspace of the active constraints. Embedding
+the conditional covariance into Rn and padding zeros outside the alive coordinates gives a matrix eUk
+such that
+E[∆(k) | Fk−1] = 0,
+E
+h
+∆(k)(∆(k))⊤| Fk−1
+i
+= eUk.
+Moreover, the sub-isotropic covariance estimate in the same construction gives, for δ = 1/2,
+eUk ⪯20
+9 diag(eUk).
+Fix a ∈Rn. Since (⟨a, z(k)⟩)k≥0 is a martingale, its increments are orthogonal in L2. Hence,
+E
+h
+a, X −z
+2i
+=
+X
+k≥1
+E
+h
+a, ∆(k)2i
+.
+Using the conditional covariance estimate,
+E
+h
+a, ∆(k)2 | Fk−1
+i
+= a⊤eUka
+≤20
+9
+n
+X
+s=1
+a2
+s(eUk)ss
+= 20
+9
+n
+X
+s=1
+a2
+s E
+h
+(∆(k)
+s )2 | Fk−1
+i
+.
+Summing over k and taking expectations yields
+E
+h
+a, X −z
+2i
+≤20
+9
+n
+X
+s=1
+a2
+s
+X
+k≥1
+E
+h
+(∆(k)
+s )2i
+.
+For each coordinate s, the process (z(k)
+s )k≥0 is a bounded martingale with terminal value Xs ∈{0, 1}.
+Its increments are orthogonal in L2, and therefore
+X
+k≥1
+E
+h
+(∆(k)
+s )2i
+= E
+
+(Xs −zs)2
+= zs(1 −zs),
+where we used X2
+s = Xs and E[Xs] = zs. Consequently,
+E
+h
+a, X −z
+2i
+≤20
+9
+n
+X
+s=1
+a2
+szs(1 −zs).
+16
+
+
+Algorithm 4 PROTECTEDSPARSIFY
+Require: µ = PS
+j=1 pj δxj ∈Pfin(H)
+Require: finite-dimensional subspace U ⊆H with d = dim(U)
+Require: integer m ≥1
+1: ¯x ←
+R
+x dµ
+2: u1, ..., ud ←orthonormal basis of U
+3: s ←0
+▷split atoms to have small mass
+4: for j = 1, . . . , S do
+5:
+nj ←⌈mpj⌉
+6:
+for ℓ= 1, . . . , nj do
+7:
+s ←s + 1
+8:
+ys ←xj
+9:
+ιs ←j
+10:
+αs ←pj/nj
+11: N ←s
+12: for s = 1, . . . , N do
+▷compute protected coordinates
+13:
+ξs ←ys −¯x
+14:
+cs ←
+ ⟨ξs, u1⟩, . . . , ⟨ξs, ud⟩
+
+∈Rd
+15:
+zs ←mαs
+16: Z ←CONSTRAINEDPARTIALROUND(z, c1, . . . , cN)
+▷sparsify
+17: for j = 1, . . . , S do
+▷reassemble atoms
+18:
+ˆpj ←1
+m
+P
+s: ιs=j Zs
+19: ˆµ ←PS
+j=1 ˆpj δxj
+20: return ˆµ
+Finally, the stopped process (z(k∧T ))k≥0 is a bounded martingale and τ ≤T almost surely. Hence,
+optional stopping gives
+Zs = z(τ)
+s
+= E[Xs | Fτ]
+for every s ∈[n]. Taking expectations gives E[Z] = z. Moreover,
+
+a, Z −z
+
+= E
+
+a, X −z
+
+| Fτ
+
+,
+and conditional Jensen yields
+E
+h
+a, Z −z
+2i
+≤E
+h
+a, X −z
+2i
+≤20
+9
+n
+X
+s=1
+a2
+szs(1 −zs).
+That proves the claim.
+A.2
+Protected Hilbert rounding
+We now apply the constrained rounding procedure to finitely supported measures on a Hilbert space.
+The linear constraints are chosen to preserve the barycenter in a protected subspace, and mass
+preservation forces small support.
+Proposition A.3. Fix a Hilbert space H, a finite-dimensional subspace U ⊆H with d := dim(U),
+and some m ≥1. Let µ = PS
+j=1 pj δxj ∈Pfin(H) and let
+ˆµ := PROTECTEDSPARSIFY(µ, U, m) = PS
+j=1 ˆpj δxj
+be the random output of Algorithm 4. Write
+¯x :=
+R
+H x dµ,
+Σ :=
+R
+H(x −¯x) ⊗(x −¯x) dµ,
+η :=
+R
+H x d(ˆµ −µ).
+Then, the following hold:
+(i) ˆµ ∈Pm+2d+2(supp(µ)) almost surely
+17
+
+
+(ii)
+R
+H x d(ˆµ −µ) ∈U ⊥almost surely
+(iii) E[ˆµ] = µ
+(iv) E[η ⊗η] ⪯20
+9m(I −ΠU)Σ(I −ΠU)
+Additionally, for every Hilbert space G and every y1, . . . , yS ∈G, writing
+¯y := PS
+j=1 pjyj,
+Σy := PS
+j=1 pj(yj −¯y) ⊗(yj −¯y),
+one has
+E
+
+S
+X
+j=1
+(ˆpj −pj)yj
+
+2
+G ≤20
+9m tr(Σy).
+Proof. Use the notation of Algorithm 4. We verify the four guarantees in the order suggested by the
+construction: first that the finite-dimensional rounding lemma applies, then support preservation and
+unbiasedness, then exact cancellation on U, and finally the operator second-moment bound.
+The splitting step gives
+N
+X
+s=1
+αsδys = µ,
+0 < αs ≤1
+m.
+Hence zs = mαs ∈[0, 1] and P
+s zs = m. Since
+N
+X
+s=1
+αsξs =
+Z
+H
+(x −¯x) dµ = 0,
+the protected coordinates satisfy
+N
+X
+s=1
+zscs = 0.
+Thus, CONSTRAINEDPARTIALROUND applies. By Lemma A.2, it returns Z ∈[0, 1]N with
+N
+X
+s=1
+Zs = m,
+N
+X
+s=1
+Zscs = 0,
+E[Z] = z,
+at most 2d + 2 fractional coordinates, and, for every a ∈RN,
+E
+
+
+ N
+X
+s=1
+(Zs −zs)as
+!2
+≤20
+9
+N
+X
+s=1
+zs(1 −zs)a2
+s.
+The non-fractional positive coordinates of Z are equal to 1, and their count is at most P
+s Zs = m.
+Together with the at most 2d + 2 fractional coordinates, this shows that at most m + 2d + 2 split
+copies receive positive mass. After reassembling split copies, the same bound holds for the number
+of original atoms with ˆpj > 0. Hence,
+ˆµ ∈Pm+2d+2(supp(µ))
+almost surely.
+Moreover, for each j,
+E[ˆpj] = 1
+m
+X
+s: ιs=j
+E[Zs] = 1
+m
+X
+s: ιs=j
+zs =
+X
+s: ιs=j
+αs = pj.
+Therefore,
+E[ˆµ] =
+S
+X
+j=1
+E[ˆpj]δxj =
+S
+X
+j=1
+pjδxj = µ.
+18
+
+
+By the reassembly definition of ˆpj,
+η =
+S
+X
+j=1
+(ˆpj −pj)xj = 1
+m
+N
+X
+s=1
+(Zs −zs)ys.
+Since P
+s Zs = P
+s zs = m, the constant component ¯x cancels, and hence
+η = 1
+m
+N
+X
+s=1
+(Zs −zs)ξs.
+Moreover, P
+s(Zs −zs)cs = 0, and therefore
+⟨η, uℓ⟩= 1
+m
+N
+X
+s=1
+(Zs −zs)⟨ξs, uℓ⟩= 0
+(ℓ= 1, . . . , d).
+Thus η ∈U ⊥, and consequently
+η = 1
+m
+N
+X
+s=1
+(Zs −zs)(I −ΠU)ξs.
+Fix h ∈H, and apply the scalar second-moment bound with as = ⟨h, (I −ΠU)ξs⟩. Since zs = mαs,
+E⟨h, η⟩2 ≤
+20
+9m2
+N
+X
+s=1
+zs(1 −zs)⟨h, (I −ΠU)ξs⟩2
+≤20
+9m
+N
+X
+s=1
+αs⟨h, (I −ΠU)ξs⟩2
+= 20
+9m ⟨h, (I −ΠU)Σµ(I −ΠU)h⟩.
+Since h ∈H was arbitrary, the operator inequality follows.
+It remains to prove the auxiliary variance bound. Since P
+j(ˆpj −pj) = 0,
+S
+X
+j=1
+(ˆpj −pj)yj =
+S
+X
+j=1
+(ˆpj −pj)(yj −¯y).
+Using the split copies,
+S
+X
+j=1
+(ˆpj −pj)(yj −¯y) = 1
+m
+N
+X
+s=1
+(Zs −zs)(yιs −¯y).
+Fix g ∈G and apply the scalar second-moment bound with
+as = ⟨g, yιs −¯y⟩G.
+Then
+E
+
+
+*
+g,
+S
+X
+j=1
+(ˆpj −pj)yj
++2
+≤
+20
+9m2
+N
+X
+s=1
+zs(1 −zs)⟨g, yιs −¯y⟩2.
+Since zs = mαs ≤1,
+zs(1 −zs) ≤mαs.
+Therefore,
+E
+*
+g,
+S
+X
+j=1
+(ˆpj −pj)yj
++2
+≤20
+9m
+N
+X
+s=1
+αs⟨g, yιs −¯y⟩2.
+19
+
+
+Reassembling the split copies gives
+N
+X
+s=1
+αs(yιs −¯y) ⊗(yιs −¯y) = Σy.
+Thus
+E
+*
+g,
+S
+X
+j=1
+(ˆpj −pj)yj
++2
+≤20
+9m⟨g, Σyg⟩.
+Taking traces yields the claim.
+A.3
+Proof of Theorem A.1
+Theorem A.1 now follows by running PROTECTEDSPARSIFY on the measure µ and subspace U, and
+taking one random realization on which the desired bound holds.
+Proof. Apply Proposition A.3 to (µ, U, m), and let ˆµ denote the random output. Since µ is centered,
+η :=
+Z
+H
+x dˆµ =
+Z
+H
+x d(ˆµ −µ).
+Hence, Proposition A.3 gives a random ˆµ such that
+(i) ˆµ ∈Pm+2d+2(supp(µ)) almost surely;
+(ii)
+R
+H x dˆµ ∈U ⊥almost surely; and
+(iii) E[η ⊗η] ⪯20
+9m(I −ΠU)Σ(I −ΠU).
+Moreover, taking traces in (iii) gives
+E
+
+Z
+H
+x dˆµ
+
+2
+H
+= E ∥η∥2
+H ≤20
+9m tr
+ (I −ΠU)Σ(I −ΠU)
+
+= 20
+9m tr
+ (I −ΠU)Σ
+
+.
+Therefore some realization of ˆµ satisfies the same bound.
+20
+
+
+B
+Minimax rates
+This appendix proves our minimax rates for KV compression in the query-aware and query-agnostic
+settings. Section B.1 proves upper bounds and Section B.2 proves the matching lower bounds.
+Notation.
+We briefly recall the relevant notation from the main text. Given a context measure
+P ∈Pfin(X), we write softmax attention as
+Att
+ q | P
+
+=
+Z
+X
+aP (q, k) v dP(k, v),
+ak(q | P) =
+κ(q, k)
+R
+X κ(q, k′) dP(k′, v′)
+and study the mean squared error of compressed context measures ˆP ∈PK(X)
+EP,ν
+  ˆP
+
+= Eq∼ν
+Att
+ q | P
+
+−Att
+ q | ˆP
+
+2
+2
+under a fixed query distribution ν ∈P(Q). The response profile of a key–value pair (k, v) ∈X
+under P is
+ΓP (k, v) : Q →Rdv ⊕R,
+q 7→
+
+ak(q | P)
+ v −Att(q | P)
+
+, V
+ ak(q | P) −1
+
+,
+with the corresponding covariance operator
+ΣP,ν =
+Z
+X
+ΓP (k, v) ⊗ΓP (k, v) dP(k, v),
+where ΓP (k, v) ⊗ΓP (k, v) is understood as the rank-one operator
+h 7→⟨ΓP (k, v), h⟩Hν · ΓP (k, v)
+and Hν = L2(ν, Rdv ⊕R).
+B.1
+Upper bounds
+We derive upper bounds on the minimax compression risk in the query-aware and query-agnostic
+settings from a shared Hilbert space representation. For fixed (P, ν), the response profile map ΓP
+sends each token (k, v) to an element of the Hilbert space Hν, and thereby pushes the context measure
+P forward to a finitely supported probability measure on Hν. This measure is centered and has
+covariance ΣP,ν, and the attention error of a compressed context is controlled by the squared norm
+of the corresponding barycenter in Hν. The query-aware and query-agnostic regimes differ only in
+how this barycenter is approximated: in the aware regime, we may choose a sparse approximation
+after seeing ν, whereas in the agnostic regime we must rely on a query-independent approximation.
+Both regimes permit upper bounds on the sparse barycenter approximation problem, which we then
+translate back to bounds on the KV compression problem.
+B.1.1
+Reduction to barycenter sparsification
+Recall the surrogate error definition
+eEµ(ˆµ) =
+
+Z
+H
+g dˆµ(g)
+
+2
+H
+between measures µ and ˆµ on a Hilbert space Hν. Our goal is to derive upper bounds on the
+compression error EP,ν( ˆP) from upper bounds on eE(ˆµ) for the pushforward µP,ν = P ◦Γ−1
+P
+by pulling back a sparse approximation ˆµ ∈PK(supp(µP,ν)) of µP,ν to a sparse approximation
+ˆP ∈PK(X) of P. Lemma B.1 first shows that upper bounds on eE indeed survive this pullback, and
+Proposition 4.2 packages the full reduction principle.
+Lemma B.1. Let P ∈Pfin(X), ν ∈P(Q), and let ˆP ∈P(supp(P)). Then,
+EP,ν
+  ˆP
+
+≤16
+
+Z
+X
+ΓP (k, v) d ˆP(k, v)
+
+2
+Hν
+.
+21
+
+
+Proposition 4.2. Let K ≥1, P ∈Pfin(X), and ν ∈P(Q). Define µP,ν := P ◦Γ−1
+P . Then, µP,ν is
+centered and has covariance operator ΣP,ν. Moreover, any fixed ˆµ ∈PK(supp(µP,ν)) can be pulled
+back to a measure ˆP ∈PK(X) independently of ν such that EP,ν
+  ˆP
+
+≲eEµP,ν(ˆµ). In particular,
+inf
+ˆ
+P ∈PK(X)
+EP,ν
+  ˆP
+
+≲
+inf
+ˆµ∈PK(supp(µP,ν))
+eEµP,ν
+ ˆµ
+
+.
+Proof of Lemma B.1. Fix q ∈supp(ν), and abbreviate
+mP (q) :=
+Z
+X
+κ(q, k) dP(k, v),
+m ˆ
+P (q) :=
+Z
+X
+κ(q, k) d ˆP(k, v).
+Define
+U(q) :=
+Z
+X
+ak(q | P)
+ v −Att
+ q | P
+
+d ˆP(k, v),
+and
+t(q) :=
+Z
+X
+ ak(q | P) −1
+
+d ˆP(k, v).
+Since ˆP is a probability measure,
+1 + t(q) =
+Z
+X
+ak(q | P) d ˆP(k, v) = m ˆ
+P (q)
+mP (q) ≥0.
+Also,
+Att
+ q | ˆP
+
+=
+R
+X κ(q, k)v d ˆP(k, v)
+m ˆ
+P (q)
+=
+R
+X ak(q | P)v d ˆP(k, v)
+1 + t(q)
+= Att
+ q | P
+
++ U(q) + t(q) Att
+ q | P
+
+1 + t(q)
+= Att
+ q | P
+
++
+U(q)
+1 + t(q).
+Hence
+Att
+ q | ˆP
+
+−Att
+ q | P
+
+=
+U(q)
+1 + t(q).
+On the other hand,
+Z
+X
+ΓP (k, v)(q) d ˆP(k, v) =
+ U(q), V t(q)
+
+∈Rdv+1.
+Since both Att
+ q | P
+
+and Att
+ q | ˆP
+
+are convex combinations of values, we have
+Att
+ q | ˆP
+
+−Att
+ q | P
+
+2 ≤2V.
+If 1 + t(q) ≥1
+2, then
+Att
+ q | ˆP
+
+−Att
+ q | P
+
+2
+2 =
+
+U(q)
+1 + t(q)
+
+2
+2
+≤4∥U(q)∥2
+2.
+If 1 + t(q) < 1
+2, then t(q)2 ≥1
+4, and therefore
+Att
+ q | ˆP
+
+−Att
+ q | P
+
+2
+2 ≤4V 2 ≤16V 2t(q)2.
+Thus, in all cases,
+Att
+ q | ˆP
+
+−Att
+ q | P
+
+2
+2 ≤16
+ ∥U(q)∥2
+2 + V 2t(q)2
+= 16
+
+Z
+X
+ΓP (k, v)(q) d ˆP(k, v)
+
+2
+Rdv ⊕R
+.
+Averaging over q ∼ν then yields the claim.
+22
+
+
+Proof of Proposition 4.2. We first show that µP,ν is centered. For every q ∈Q,
+Z
+X
+ΓP (k, v)(q) dP(k, v)
+=
+Z
+X
+ak(q | P)
+ v −Att
+ q | P
+
+dP(k, v), V
+Z
+X
+ak(q | P) dP(k, v) −1
+
+= (0, 0),
+since
+Z
+X
+ak(q | P) dP(k, v) = 1
+and
+Z
+X
+ak(q | P) v dP(k, v) = Att
+ q | P
+
+.
+Thus,
+R
+Hν g dµP,ν(g) = 0.
+For the covariance identity, we have
+Z
+Hν
+g ⊗g dµP,ν(g) =
+Z
+X
+ΓP (k, v) ⊗ΓP (k, v) dP(k, v) = ΣP,ν
+by the definition of ΣP,ν.
+Now, let ˆµ ∈PK(supp(µP,ν)). Write
+ˆµ =
+m
+X
+ℓ=1
+βℓδgℓ,
+m ≤K,
+with gℓ∈supp(µP,ν), βℓ≥0, and Pm
+ℓ=1 βℓ= 1.
+For each ℓ∈[m], choose one atom (ˆkℓ, ˆvℓ) ∈supp(P) such that
+ΓP (ˆkℓ, ˆvℓ) = gℓ.
+This is possible because gℓ∈supp(P ◦Γ−1
+P ). Define
+ˆP :=
+m
+X
+ℓ=1
+βℓδ(ˆkℓ,ˆvℓ).
+Then, ˆP ∈PK(supp(P)) depends on ˆµ but not on ν, and
+Z
+X
+ΓP (k, v) d ˆP(k, v) =
+m
+X
+ℓ=1
+βℓΓP (ˆkℓ, ˆvℓ) =
+m
+X
+ℓ=1
+βℓgℓ=
+Z
+Hν
+g dˆµ(g).
+Therefore, by Lemma B.1,
+EP,ν
+  ˆP
+
+≤16
+
+Z
+X
+ΓP (k, v) d ˆP(k, v)
+
+2
+Hν
+= 16
+
+Z
+Hν
+g dˆµ(g)
+
+2
+Hν
+.
+Since ˆµ ∈PK(supp(µP,ν)) was arbitrary, that proves the claim.
+B.1.2
+Query-aware upper bound
+In the query-aware regime, the compressor may depend on ν, and therefore on the geometry of
+Hν. After the reduction above, the problem is exactly to approximate the zero barycenter of the
+pushed-forward measure µP,ν by a K-atomic measure on supp(µP,ν). This is exactly the setting
+of Theorem 4.3, which provides a barycenter bound in terms of the spectral tail of its covariance,
+which here is ΣP,ν. Pulling the resulting sparse measure back to supp(P) then gives the desired
+compression bound for KV compression.
+Theorem 4.3. Fix K ≥7 and a real Hilbert space H. Let µ ∈Pfin(H) be centered, with covariance
+operator Σ : H →H. Then, ∥
+R
+H g dˆµ(g)∥2
+H ≲
+tailK/3(Σ)
+K
+for some ˆµ ∈PK(supp(µ)).
+23
+
+
+Proof. Choose r := ⌊K/3⌋and M := K −2r −2. Further, choose U to be the span of the top
+r∗:= min{r, rank(Σ)} eigenvectors of Σ. Then, dim(U) = r∗≤r. Invoking Theorem A.1 with
+subspace U and support size parameter M yields ˆµ ∈P(supp(µ)) with supp(ˆµ) ≤M +2r+2 ≤K
+and
+
+Z
+H
+x dˆµ(x)
+
+2
+H
+≤20
+9M tr
+ (I −ΠU)Σ
+
+= 20
+9M tailr(Σ).
+Corollary 4.4. Let K ≥7 and F ⊆Pfin(X) × P(Q). Then, R(Aaw
+K , F) ≲supP,ν∈F
+tailK/3(ΣP,ν)
+K
+.
+Proof. This is immediate from Proposition 4.2 and Theorem 4.3.
+B.1.3
+Query-agnostic upper bound
+In the query-agnostic regime, the compressor cannot adapt to ν, so the sparse approximation argument
+from the aware case does not apply. A natural query-independent alternative is the empirical measure
+of K i.i.d. samples from P. Under the Hilbert embedding, this corresponds to averaging K
+independent copies of the centered random response profile G = ΓP (X). The mean remains zero,
+and the mean squared norm of the empirical average is of order tr(ΣP,ν)/K. Using Lemma B.1 from
+the reduction, this yields the trace upper bound.
+Lemma B.2. Let H be a real Hilbert space, and let µ ∈Pfin(H) be centered, with covariance
+operator Σ. Let G1, . . . , GK
+iid
+∼µ, and define
+ˆµK := 1
+K
+K
+X
+i=1
+δGi.
+Then,
+E
+h
+eEµ(ˆµK)
+i
+= tr(Σ)
+K
+.
+Proof. Since µ is centered, the Gi are independent and mean zero. Hence
+E
+h
+eEµ(ˆµK)
+i
+= E
+
+1
+K
+K
+X
+i=1
+Gi
+
+2
+H
+=
+1
+K2
+K
+X
+i=1
+E ∥Gi∥2
+H = tr(Σ)
+K
+.
+Theorem 4.5. Let K ≥1 and F ⊆Pfin(X) × P(Q). Then, R(Aag
+K , F) ≲supP,ν∈F tr(ΣP,ν)/K.
+Proof. Let P ∈Pfin(X) and ν ∈P(Q). Let X1, . . . , XK
+iid
+∼P, set
+Gi = ΓP (Xi),
+ˆµK = 1
+K
+K
+X
+i=1
+δGi.
+By Proposition 4.2, ˆµK can be pulled back to the empirical context measure
+ˆP = 1
+K
+K
+X
+i=1
+δXi
+with
+EP,ν
+  ˆP
+
+≲eEµP,ν(ˆµK).
+Taking expectations and applying Lemma B.2 with µ = µP,ν and Σ = ΣP,ν gives
+E[EP,ν
+  ˆP
+
+] ≲tr(ΣP,ν)
+K
+.
+The claim then follows because random sampling from P can be implemented by a randomized
+query-agnostic compressor.
+24
+
+
+B.2
+Lower bounds
+We now provide lower bounds on the query-aware and query-agnostic minimax compression risk
+matching the upper bounds from Section B.1. Both bounds are derived from a shared, explicit
+construction of an instance of a context P and a query distribution ν that are realizable from actual
+keys, queries, and values under Assumption 4.1. This instance is constructed so that any significant
+compression of the context incurs large error over the chosen query distribution. We then specialize
+this construction to the query-aware and query-agnostic regime by calibrating the error incurred
+under compression against the spectrum of ΣP,ν, obtaining lower bounds that faithfully match their
+corresponding upper bounds throughout the entire claimed range of redundancy levels captured by
+tr(ΣP,ν) and tailK/3(ΣP,ν), respectively.
+Throughout this section, fix universal constants
+ρ0 :=
+99
+100
+and
+γ0 :=
+9
+10.
+B.2.1
+Hard instance construction
+We begin by constructing a pair P, ν that is impossible to compress significantly without incurring
+large error. The main idea is to use keys that can be sharply distinguished from each other, and have
+them carry almost orthogonal values. We call such an instance a lookup instance because querying a
+key of the context sharply retrieves the associated value. Definition B.3 formalizes the properties
+of a lookup instance formally, and Lemma B.4 shows that such instances can indeed be constructed
+from actual keys, queries, and values under Assumption 4.1. In particular, Assumption 4.1 provides
+enough ambient dimension to choose well-separated keys and values from Hamming packings, and
+enough key/query norm budget to address the keys sharply through softmax attention.
+Definition B.3 (Lookup instance). Fix an even integer N ≥2 and let
+PN := 1
+N
+PN
+i=1 δ(ki,vi),
+νN := 1
+N
+PN
+i=1 δki.
+We call the pair (PN, νN) a lookup instance of size N if
+(membership) ki ∈K ∩Q, and vi ∈V for all i ∈[N];
+(centering)
+1
+N
+PN
+i=1 vi = 0;
+(boundary)
+∥vi∥2 = ρ0V for all i ∈[N];
+(separation)
+⟨vi, vj⟩≤γ0ρ2
+0V 2 for all i̸ = j;
+(sharpness)
+1
+N
+P
+j̸=i akj(ki | PN) ≤N −3/2 for all i ∈[N].
+Lemma B.4. Let K ≥50, set N := 2K, and suppose Assumption 4.1 holds. Then, there exists a
+lookup instance
+ PN, νN
+
+∈P⋆
+N(X) × P(Q) of size N such that
+(i) | supp(νN)| = | supp(PN)| = N;
+(ii) dim span{v1, . . . , vN} ≤K/6; and
+(iii) ∥k∥2 = 5d1/4
+k
+√log N for all k ∈supp(νN).
+Proof. For r ≥1, set
+Br :=
+⌊r/20⌋
+X
+ℓ=0
+r
+ℓ
+
+.
+We first construct a Hamming packing. Greedily select words from x ∈{±1}r. After selecting x,
+delete the Hamming balls of radius ⌊r/20⌋around x and around −x. Each step deletes at most 2Br
+words, so the set Cr ⊆{±1}r selected by the greedy procedure satisfies
+|Cr| ≥2r
+2Br
+.
+Denote by dH the Hamming distance. If x, x′ ∈Cr are distinct, then
+dH(x, x′) > ⌊r/20⌋
+and
+dH(x, −x′) > ⌊r/20⌋.
+25
+
+
+Since ⟨x, x′⟩= r −2dH(x, x′), this implies
+| ⟨x, x′⟩| ≤γ0r.
+Using the entropy bound for Hamming balls, for r ≥20,
+Br ≤exp
+
+r
+
+−1
+20 log 1
+20 −19
+20 log 19
+20
+
+≤exp(0.2r).
+Hence, for r ≥20,
+|Cr| ≥1
+2 exp((log 2 −0.2)r).
+(6)
+In particular, if r ≥10 log K, then
+|Cr| ≥1
+2K4.9 ≥2K,
+(7)
+where the last inequality uses K ≥50. Also, if r ≥8, then
+|Cr| ≥6r + 5.
+(8)
+Indeed, for 8 ≤r < 20, this follows from Br = 1 and 2r−1 ≥6r + 5. For r ≥20, Equation (6)
+gives
+|Cr| ≥1
+2 exp((log 2 −0.2)r) ≥6r + 5.
+Let N := 2K. Choose distinct ξ1, . . . , ξN ∈Cdk, and define
+Rk := 5d1/4
+k
+p
+log N,
+and
+ki := Rk
+ξi
+√dk
+for i ∈[N]. Since dk ≥10 log K, the code Cdk has at least 2K = N words. Moreover,
+∥ki∥2 = Rk = 5d1/4
+k
+p
+log N ≤8d1/4
+k
+p
+log K,
+so ki ∈K ∩Q by Assumption 4.1.
+Set
+rv := min{dv, ⌊K/6⌋}.
+Then rv ≥8, since dv ≥10 log K and K ≥50. The code Crv has at least K words. If rv = dv, this
+follows from Equation (7), because then rv ≥10 log K. If rv = ⌊K/6⌋, it follows from Equation (8),
+because then rv ≥8 and 6rv + 5 ≥K. Choose distinct ζ1, . . . , ζK ∈Crv, and let E : Rrv →Rdv
+be the canonical coordinate embedding. Define
+uℓ:= E ζℓ
+√rv
+,
+vℓ:= ρ0V uℓ,
+vK+ℓ:= −ρ0V uℓ
+for ℓ∈[K]. Then, vi ∈V = Bdv(V ),
+1
+N
+N
+X
+i=1
+vi = 0,
+and
+∥vi∥2 = ρ0V
+for all i ∈[N]. For i̸ = j,
+⟨vi, vj⟩≤γ0ρ2
+0V 2.
+Also,
+dim span{v1, . . . , vN} ≤dim im(E) ≤rv ≤K/6.
+Define
+PN := 1
+N
+N
+X
+i=1
+δ(ki,vi),
+and
+νN := 1
+N
+N
+X
+i=1
+δki.
+Since ki ∈K ∩Q and ∥vi∥2 ≤V for all i ∈[N], PN ∈P⋆
+N(X) and νN ∈P(Q).
+26
+
+
+The keys ki are distinct, so
+| supp(PN)| = | supp(νN)| = N.
+It remains to verify sharpness. For i̸ = j,
+⟨ki, kj⟩
+√dk
+≤25γ0 log N,
+while
+∥ki∥2
+2
+√dk
+= 25 log N.
+Hence, for j̸ = i,
+akj(ki | PN) =
+N exp(⟨ki, kj⟩/√dk)
+PN
+m=1 exp(⟨ki, km⟩/√dk)
+≤N exp(−25(1 −γ0) log N) = N −3/2.
+Therefore,
+1
+N
+X
+j̸=i
+akj(ki | PN) ≤N −3/2
+for all i ∈[N].
+Thus, (PN, νN) is a lookup instance of size N, and it satisfies (i)–(iii).
+B.2.2
+Approximating lookup instances requires almost the full context
+We now show that lookup instances are hard to compress. Indeed, querying a key of such an instance
+retrieves the associated value almost perfectly, and the retrievable values are separated by a constant
+fraction of the value norm. As a consequence, compressing lookup instances to even half their context
+size incurs compression error at the maximum possible scale V 2.
+Lemma B.5. Fix an even integer N ≥100, and let (PN, νN) be the lookup instance of size N from
+Lemma B.4. Then, Att(0 | PN) = 0, and, for every (k, v) ∈supp(PN),
+∥Att(k | PN) −v∥2 ≤2ρ0V N −3/2.
+Consequently,
+∥Att(k | PN)∥2 ≤249
+250V
+and
+∥Att(k | PN) −Att(k′ | PN)∥2 ≥V
+4
+for all k, k′ ∈supp(νN) with k̸ = k′.
+Lemma B.6. Fix an even integer N ≥100, and let (PN, νN) be the lookup instance of size N from
+Lemma B.4. Assume ∥v∥2 ≤V for all v ∈V. Then, for every ˆP ∈PN/2(X),
+EPN,νN
+  ˆP
+
+≳V 2.
+Proof of Lemma B.5. Write
+PN = 1
+N
+N
+X
+i=1
+δ(ki,vi),
+νN = 1
+N
+N
+X
+i=1
+δki,
+as in Definition B.3, and set
+wj(q) := 1
+N akj(q | PN).
+Then, wj(q) ≥0, PN
+j=1 wj(q) = 1, and
+Att(q | PN) =
+N
+X
+j=1
+wj(q)vj.
+27
+
+
+Since akj(0 | PN) = 1 for every j ∈[N], centering gives
+Att(0 | PN) = 1
+N
+N
+X
+j=1
+vj = 0.
+Fix i ∈[N]. By sharpness,
+X
+j̸=i
+wj(ki) = 1
+N
+X
+j̸=i
+akj(ki | PN) ≤N −3/2.
+Hence, using ∥vj∥2 = ρ0V for all j ∈[N],
+∥Att(ki | PN) −vi∥2 =
+
+(wi(ki) −1)vi +
+X
+j̸=i
+wj(ki)vj
+
+2
+≤(1 −wi(ki))∥vi∥2 +
+X
+j̸=i
+wj(ki)∥vj∥2
+= 2ρ0V
+X
+j̸=i
+wj(ki) ≤2ρ0V N −3/2.
+This proves the approximation bound.
+The norm bound follows immediately. For N ≥100,
+∥Att(ki | PN)∥2 ≤∥vi+(Att(ki | PN)−vi)∥2 ≤∥vi∥2+2ρ0V N −3/2 = ρ0V (1+2N −3/2) ≤249
+250V.
+Finally, if i̸ = j, then the separation condition gives
+∥vi −vj∥2
+2 = 2ρ2
+0V 2 −2 ⟨vi, vj⟩≥2(1 −γ0)ρ2
+0V 2.
+Therefore, again using N ≥100, ρ0 = 99/100, and γ0 = 9/10,
+∥Att(ki | PN) −Att(kj | PN)∥2 ≥∥vi −vj∥2 −∥Att(ki | PN) −vi∥2 −∥Att(kj | PN) −vj∥2
+≥ρ0V
+p
+2(1 −γ0) −4ρ0V N −3/2 ≥V
+4 .
+That proves the claim.
+Proof of Lemma B.6. Write
+PN = 1
+N
+N
+X
+i=1
+δ(ki,vi),
+νN = 1
+N
+N
+X
+i=1
+δki,
+and let
+yi := Att(ki | PN).
+By Lemma B.5,
+∥yi −vi∥2 ≤2ρ0V N −3/2
+for all i ∈[N].
+Fix ˆP ∈PN/2(X), and write
+ˆP =
+M
+X
+r=1
+βrδ(ˆkr,ˆvr)
+for M ≤N/2. By assumption, ∥ˆvr∥2 ≤V for all r ∈[M]. For each i ∈[N], set
+zi := Att(ki | ˆP).
+Since zi is a convex combination of the values ˆv1, . . . , ˆvM, we may write
+zi =
+M
+X
+r=1
+ωirˆvr,
+28
+
+
+with ωir ≥0 and ∥ωi∥1 = 1 for all i ∈[N].
+Let
+I :=
+
+i ∈[N] | ∥zi −yi∥2 ≤V
+200
+
+be the well-approximated indices. We claim that |I| ≤M. To that end, fix i ∈I. Then,
+⟨zi, vi⟩= ⟨yi, vi⟩+ ⟨zi −yi, vi⟩
+≥⟨yi, vi⟩−∥zi −yi∥2∥vi∥2
+= ⟨vi, vi⟩+ ⟨yi −vi, vi⟩−∥zi −yi∥2∥vi∥2
+≥∥vi∥2
+2 −∥yi −vi∥2∥vi∥2 −V
+200∥vi∥2
+≥
+
+ρ2
+0 −2ρ2
+0N −3/2 −ρ0
+200
+
+V 2 ≥97
+100V 2,
+where the last step uses N ≥100 and ρ0 = 99/100. Since zi = P
+r ωirˆvr, there exists r(i) ∈[M]
+such that
+
+ˆvr(i), vi, ≥
+ 97
+100V 2.
+The map i 7→r(i) is injective. Indeed, suppose that r(i) = r(j) = r for distinct i, j ∈I. Set
+u := ˆvr
+V ,
+si :=
+vi
+ρ0V ,
+and
+sj :=
+vj
+ρ0V .
+Then, ∥u∥2 ≤1, ∥si∥2 = ∥sj∥2 = 1, and by separation,
+⟨si, sj⟩≤γ0.
+On the other hand,
+⟨u, si + sj, ≥⟩2 · 97
+100ρ0
+= 194
+99 .
+This contradicts Cauchy–Schwarz, since
+⟨u, si + sj, ≤⟩∥si + sj∥2 ≤
+p
+2 + 2γ0 =
+r
+19
+5 < 194
+99 .
+Hence, |I| ≤M ≤N/2.
+Therefore, at least N/2 indices satisfy ∥zi −yi∥2 > V/200. Since νN is uniform on the hard queries,
+EPN,νN
+  ˆP
+
+= 1
+N
+N
+X
+i=1
+∥yi −zi∥2
+2
+≥1
+N · N
+2 ·
+ V
+200
+2
+=
+V 2
+80000.
+That proves the claim.
+B.2.3
+Query-aware lower bound
+With the lookup instance established as hard to compress, we turn to the query-aware minimax lower
+bound. By itself, the lookup instance only gives the lower bound at the lowest redundancy scale,
+where tailK/3(ΣP,ν) is of order V 2K and every K-atomic approximation incurs error of order V 2.
+To show that tailK/3(ΣP,ν) faithfully governs the minimax risk throughout all scales R ∈[0, V 2K],
+we need the same obstruction at every intermediate such scale. We achieve this by diluting the lookup
+query distribution with the easy query distribution δ0. The dummy query contributes only low-rank
+covariance, while the hard queries contribute both the (K/3)-tail and the approximation error. Thus,
+the mixture pνN + (1 −p)δ0 scales the relevant redundancy and the compression difficulty by the
+same factor p, allowing us to tune both to the desired level R.
+29
+
+
+Lemma B.7. Let K ≥50 and set N := 2K. Suppose Assumption 4.1 holds, and let (PN, νN) be
+the lookup instance from Lemma B.4. For p ∈[0, 1], define the diluted query distribution
+νN,p := p νN + (1 −p) δ0.
+Then,
+tailK/3(ΣPN,νN,p) ≍p V 2K.
+Lemma B.8. Let K ≥50 and set N := 2K. Suppose Assumption 4.1 holds and let (PN, νN) be the
+lookup instance from Lemma B.4. Then, for every k ∈supp(νN), there exists ˆPk ∈P2(X) such that
+Att(0 | ˆPk) = Att(0 | PN),
+and
+Att(k | ˆPk) = Att(k | PN).
+Consequently, for every p ∈[0, 1] and every k ∈supp(νN),
+EPN,p δk+(1−p) δ0
+  ˆPk
+
+= 0.
+Theorem 4.6. Let K ≥50 and R ∈[0, V 2K]. Suppose Assumption 4.1 holds. Then, there exists
+F ⊆P⋆
+2K(X) × P(Q) with tailK/3(ΣP,ν) ≍R for all (P, ν) ∈F and R(Aaw
+K , F) ≳R
+K .
+Proof of Lemma B.7. Write
+PN = 1
+N
+N
+X
+i=1
+δ(ki,vi),
+and
+νN = 1
+N
+N
+X
+i=1
+δki,
+and abbreviate
+aij := akj(ki | PN),
+and
+yi := Att(ki | PN).
+Let
+H0 :=
+
+u ∈L2(PN) |
+Z
+X
+u dPN = 0
+
+.
+This space has dimension N −1. Define
+Tρ : H0 →Hρ,
+u 7→
+Z
+X
+ΓPN (z)u(z) dPN(z)
+and let
+Gρ := T ∗
+ρ Tρ
+be the corresponding Gram operator on H0. Since
+Z
+X
+ΓPN dPN = 0,
+we have
+TρT ∗
+ρ = ΣPN,ρ.
+Hence, Gρ and ΣPN,ρ have the same nonzero eigenvalues.
+We first prove
+tailK/3(GνN ) ≍V 2K.
+For u ∈H0, write ui := u(ki, vi), so that
+1
+N
+N
+X
+i=1
+ui = 0,
+and
+∥u∥2
+L2(PN) = 1
+N
+N
+X
+i=1
+u2
+i .
+The scalar component of TνN u at query ki is
+(TνN u)sc(ki) := V
+N
+N
+X
+j=1
+(aij −1)uj.
+By sharpness,
+si :=
+X
+j̸=i
+aij ≤N −1/2,
+and
+aii = N −si.
+30
+
+
+Hence, for u ∈H0,
+(TνN u)sc(ki) = V
+N
+N
+X
+j=1
+(aij −1)uj
+= V ui + V
+N
+
+−siui +
+X
+j̸=i
+aijuj
+
+.
+If ∥u∥L2(PN) = 1, then |uj| ≤
+√
+N for all j, and therefore
+|(TνN u)sc(ki) −V ui| ≤2V
+N .
+Consequently,
+∥TνN u∥HνN ≥
+ 
+1
+N
+N
+X
+i=1
+|(TνN u)sc(ki)|2
+!1/2
+≥
+ 
+1
+N
+N
+X
+i=1
+V 2u2
+i
+!1/2
+−
+ 
+1
+N
+N
+X
+i=1
+4V 2
+N 2
+!1/2
+≥V −2V
+N ≥V
+2 .
+Thus,
+GνN ⪰V 2
+4 IH0.
+Since dim H0 = N −1 = 2K −1,
+tailK/3(GνN ) ≳V 2K.
+For the reverse bound, again use si ≤N −1/2. Then,
+N
+X
+j=1
+a2
+ij = (N −si)2 +
+X
+j̸=i
+a2
+ij ≤N 2 + 1.
+Since P
+j aij = N,
+N
+X
+j=1
+(aij −1)2 =
+N
+X
+j=1
+a2
+ij −N ≤N 2 + 1.
+By Lemma B.5, ∥yi∥2 ≤V , and by the boundary condition, ∥vj∥2 ≤V . Hence,
+∥vj −yi∥2 ≤2V.
+Therefore, using the trace formula for ΣPN,δki,
+tr(ΣPN,δki) = 1
+N
+N
+X
+j=1
+
+V 2(aij −1)2 + a2
+ij∥vj −yi∥2
+2
+
+≤1
+N
+
+V 2(N 2 + 1) + 4V 2(N 2 + 1)
+
+≲V 2N.
+Averaging over i gives
+tr(GνN ) = tr(ΣPN,νN ) ≲V 2N ≍V 2K,
+and hence
+tailK/3(GνN ) ≲V 2K.
+Combining the two bounds gives
+tailK/3(GνN ) ≍V 2K.
+31
+
+
+Set
+GN := GνN ,
+G0 := Gδ0,
+and
+Gp := GνN,p.
+For every u ∈H0,
+⟨u, Gpu⟩H0 = ∥TνN,pu∥2
+HνN,p
+= p∥TνN u∥2
+HνN + (1 −p)∥Tδ0u∥2
+Hδ0
+= ⟨u, (pGN + (1 −p)G0)u⟩H0 .
+Hence,
+Gp = pGN + (1 −p)G0
+as operators on H0.
+At query 0, the scalar response vanishes and the value response lies in span{v1, . . . , vN}. By
+Lemma B.4,
+rank(G0) ≤dim span{v1, . . . , vN} ≤K/6.
+The lower bound follows from Gp ⪰pGN. By eigenvalue monotonicity,
+tailK/3(Gp) ≥p tailK/3(GN) ≳pV 2K.
+For the upper bound, let U ⊂H0 be any subspace of dimension at most K/3 containing ran(G0).
+Then,
+tr
+ (I −ΠU)G0
+
+= 0.
+Hence, by Ky Fan’s variational formula,
+tailK/3(Gp) ≤tr
+ (I −ΠU)Gp
+
+= p tr
+ (I −ΠU)GN
+
++ (1 −p) tr
+ (I −ΠU)G0
+
+= p tr
+ (I −ΠU)GN
+
+≤p tr(GN) ≲pV 2K.
+Thus,
+tailK/3(Gp) ≍pV 2K.
+Since Gp and ΣPN,νN,p have the same nonzero eigenvalues,
+tailK/3(ΣPN,νN,p) ≍pV 2K.
+Proof of Lemma B.8. Fix k ∈supp(νN), and set
+y := Att(k | PN).
+By Lemma B.4,
+∥k∥2 = 5d1/4
+k
+p
+log N.
+Since N = 2K and K ≥50,
+∥k∥2 ≤8d1/4
+k
+p
+log K,
+so k, −k ∈K by Assumption 4.1. Moreover,
+∥k∥2
+2
+√dk
+= 25 log N.
+By Lemma B.5,
+Att(0 | PN) = 0,
+and
+∥y∥2 ≤249
+250V.
+Since N ≥100,
+tanh(25 log N) = N 50 −1
+N 50 + 1 ≥249
+250.
+Hence the vector
+w :=
+y
+tanh(25 log N)
+satisfies ∥w∥2 ≤V , and therefore w, −w ∈V.
+32
+
+
+Define
+ˆPk := 1
+2δ(k,w) + 1
+2δ(−k,−w).
+At query 0, the two logits are equal, so
+Att(0 | ˆPk) = 1
+2w + 1
+2(−w) = 0 = Att(0 | PN).
+At query k, the two logits are
+⟨k, k⟩
+√dk
+= 25 log N,
+and
+⟨k, −k⟩
+√dk
+= −25 log N.
+Thus
+Att(k | ˆPk) = tanh(25 log N) w = y = Att(k | PN).
+That proves the first claim.
+The final claim follows because the query distribution pδk + (1 −p)δ0 is supported on the two points
+where PN and ˆPk have identical attention outputs, so
+EPN,pδk+(1−p)δ0
+  ˆPk
+
+= p∥Att(k | PN) −Att(k | ˆPk)∥2
+2 + (1 −p)∥Att(0 | PN) −Att(0 | ˆPk)∥2
+2 = 0.
+Proof of Theorem 4.6. Let N := 2K, and let (PN, νN) be the lookup instance from Lemma B.4. Set
+p :=
+R
+V 2K ,
+and
+νR := p νN + (1 −p) δ0,
+and define
+F := {(PN, νR)}.
+Since R ∈[0, V 2K], we have p ∈[0, 1]. Also, by Lemma B.4, | supp(PN)| = N = 2K and
+F ⊆P⋆
+2K(X) × P(Q).
+By Lemma B.7,
+tailK/3(ΣPN,νR) ≍pV 2K = R.
+Now, fix any query-aware K-atomic compressor A, and let ˆP be its random output on (PN, νR). For
+every realization of ˆP,
+EPN,νR
+  ˆP
+
+= p EPN,νN
+  ˆP
+
++ (1 −p) EPN,δ0
+  ˆP
+
+≥p EPN,νN
+  ˆP
+
+.
+By Lemma B.6,
+EPN,νN
+  ˆP
+
+≳V 2
+almost surely. Hence,
+EPN,νR
+  ˆP
+
+≳pV 2 = R
+K
+almost surely. Taking expectation over the randomness of A, and then taking the infimum over all
+query-aware K-atomic compressors, gives
+R(Aaw
+K , F) ≳R
+K .
+B.2.4
+Query-agnostic lower bound
+We now prove the query-agnostic lower bound and simultaneously show a separation from the
+query-aware regime. We use the same hard lookup instance as before, but expose it through a family
+of query distributions of the form pδk + (1 −p)δ0, one for each key k ∈supp(νN). Each member of
+this family is easy for query-aware compression: once the query law is known, the compressor only
+has to match the output at 0 and at one key. At the same time, the family is hard for query-agnostic
+compression because a query-agnostic compressor must choose one K-atomic summary that protects
+against all active keys. Averaging over the active key then recovers the lookup query distribution νN,
+on which any compression to half the context size necessarily incurs large error.
+As in the query-aware regime, dilution by the 0 query controls the error and redundancy scale. Each
+hard query contributes trace of order V 2K, while the dummy query contributes trace of order V 2.
+Thus, the mixture pδk + (1 −p)δ0 tunes tr(ΣP,ν) to the target level T ∈[V 2, V 2K], while the
+averaged error retains the corresponding fraction of the lookup compression error.
+33
+
+
+Lemma B.9. Let K ≥50 and set N := 2K. Suppose Assumption 4.1 holds and let (PN, νN) be the
+lookup instance from Lemma B.4. Then,
+tr(ΣPN,δ0) ≍V 2,
+and, for every k ∈supp(νN),
+tr(ΣPN,δk) ≍V 2K.
+Consequently, for every p ∈[0, 1] and every k ∈supp(νN),
+tr(ΣPN,p δk+(1−p) δ0) ≍pV 2K + V 2.
+Theorem 4.7. Let K ≥50 and T ∈[V 2, V 2K]. Suppose Assumption 4.1 holds. Then, there
+exists F ⊆P⋆
+2K(X) × P(Q) with tr(ΣP,ν) ≍T for all (P, ν) ∈F and R(Aag
+K , F) ≳T
+K , while
+R(Aaw
+K , F) = 0.
+Proof of Lemma B.9. Write
+PN = 1
+N
+N
+X
+i=1
+δ(ki,vi),
+ai(q) := aki(q | PN),
+and
+y(q) := Att(q | PN).
+By the definition,
+tr(ΣPN,δq) = 1
+N
+N
+X
+i=1
+
+V 2(ai(q) −1)2 + ai(q)2∥vi −y(q)∥2
+2
+
+.
+At q = 0, we have ai(0) = 1 for all i, and Att(0 | PN) = 0 by Lemma B.5. Hence
+tr(ΣPN,δ0) = 1
+N
+N
+X
+i=1
+∥vi∥2
+2 = ρ2
+0V 2 ≍V 2.
+Now, fix k ∈supp(νN). By Lemma B.4, the keys are distinct, so k = ki for a unique i ∈[N]. Since
+PN
+ℓ=1 aℓ(ki) = N, the sharpness condition gives
+X
+ℓ̸=i
+aℓ(ki) ≤N −1/2,
+and hence
+ai(ki) ≥N −N −1/2.
+Therefore, the scalar part alone gives
+tr(ΣPN,δki) ≥V 2
+N (ai(ki) −1)2 ≳V 2N.
+Conversely,
+N
+X
+ℓ=1
+aℓ(ki)2 = ai(ki)2 +
+X
+ℓ̸=i
+aℓ(ki)2 ≤N 2 +
+
+X
+ℓ̸=i
+aℓ(ki)
+
+
+2
+≤N 2 + 1.
+Also, by Lemma B.5 and the boundary condition of Definition B.3,
+∥y(ki)∥2 ≤V
+and
+∥vℓ∥2 ≤V
+for all ℓ∈[N], and hence ∥vℓ−y(ki)∥2 ≤2V . Thus
+tr(ΣPN,δki) ≤V 2
+N
+N
+X
+ℓ=1
+(aℓ(ki) −1)2 + 4V 2
+N
+N
+X
+ℓ=1
+aℓ(ki)2
+≲V 2
+N
+ 
+N +
+N
+X
+ℓ=1
+aℓ(ki)2
+!
+≲V 2N.
+Since N = 2K, this proves
+tr(ΣPN,δk) ≍V 2K
+34
+
+
+for all k ∈supp(νN).
+Finally, the trace is affine in the query distribution, so
+tr(ΣPN,pδk+(1−p)δ0) = p tr(ΣPN,δk) + (1 −p) tr(ΣPN,δ0)
+≍pV 2K + (1 −p)V 2 ≍pV 2K + V 2,
+for all p ∈[0, 1]. That proves the claim.
+Proof of Theorem 4.7. Let N := 2K, and let (PN, νN) be the lookup instance from Lemma B.4. Set
+p :=
+T
+V 2K .
+Since T ∈[V 2, V 2K], we have p ∈[1/K, 1]. For every k ∈supp(νN), set
+νk := p δk + (1 −p) δ0,
+and define
+F := {(PN, νk) | k ∈supp(νN)}.
+By Lemma B.4, F ⊆P⋆
+2K(X) × P(Q). By Lemma B.9, for every k ∈supp(νN),
+tr(ΣPN,νk) ≍pV 2K + V 2 = T + V 2 ≍T,
+where the last comparison uses T ≥V 2. Hence, every (P, ν) ∈F satisfies
+tr(ΣP,ν) ≍T.
+We next prove the error lower bound. Fix any query-agnostic K-atomic compressor A, and let ˆP be
+its random output on the common context PN. For every realization of ˆP,
+1
+N
+X
+k∈supp(νN)
+EPN,νk
+  ˆP
+
+= 1
+N
+X
+k∈supp(νN)
+h
+p∥Att(k | PN) −Att(k | ˆP)∥2
+2 + (1 −p)∥Att(0 | PN) −Att(0 | ˆP)∥2
+2
+i
+≥p EPN,νN
+  ˆP
+
+≳pV 2 = T
+K ,
+where the last inequality uses Lemma B.6. Taking expectation over the randomness of A gives
+1
+N
+X
+k∈supp(νN)
+E
+h
+EPN,νk
+  ˆP
+i
+≳T
+K .
+Hence,
+sup
+(P,ν)∈F
+E
+
+EP,ν
+ A(P)
+
+≳T
+K .
+Taking the infimum over all query-agnostic K-atomic compressors gives the claim.
+Finally, we prove that the same family is exactly approximable by query-aware K-atomic compressors.
+By Lemma B.8, for every k ∈supp(νN), there exists ˆPk ∈P2(X) ⊆PK(X) such that
+EPN,νk
+  ˆPk
+
+= 0.
+Since the query-aware compressor may depend on νk, this gives
+R(Aaw
+K , F) = 0.
+35
+
+
+C
+Algorithms
+This appendix gives proofs and instantiations for the algorithmic framework of Section 5. Algorithm 1
+and Algorithm 2 are parameterized by a local compression subroutine REDUCE. Any choice for
+REDUCE compressing a context from 2K to K points yields an efficient and parallel KV compression
+algorithm for causally masked prefill via Algorithm 1 and autoregressive decoding via Algorithm 2.
+Recall that we use the following design criteria for REDUCE, under which we obtain guarantees on
+the compression quality.
+Definition 5.3 (Design criteria). Fix K ≥1, a Hilbert space H, and Φ : X →H. For P ∈Pfin(X)
+and Q ∈P2K(X), define
+µΦ
+P :=
+R
+X Φ(k, v) dP(k, v)
+and
+ΣΦ
+P :=
+R
+X (Φ(k, v) −µΦ
+P ) ⊗(Φ(k, v) −µΦ
+P ) dP(k, v).
+We call REDUCE (Φ, r, τ)-admissible for r, τ ≥0 if, for all Q ∈P2K(X), ˆQ := REDUCE(Q) ∈
+PK(supp(Q)) almost surely and the following hold:
+(i) E[ ˆQ] = Q
+(ii) E
+
+∥
+R
+X Ψ d( ˆQ −Q)∥2
+G
+
+≲1
+K tr(ΣΨ
+Q) for all Hilbert spaces G and bounded Ψ : X →G
+(iii) E
+
+∥
+R
+X Φ d( ˆQ −Q)∥2
+H
+
+≲1
+K
+ tailr(ΣΦ
+Q) + τ
+
+When REDUCE satisfies these criteria, the global merge-reduce scheme matches the minimax-optimal
+query-agnostic trace risk, up to logarithmic degradation in time. To obtain stronger guarantees in the
+query-agnostic regime, additional structure is necessary. Recall that we capture such structure with
+the following assumption.
+Assumption 5.1. Fix K ≥1, a Hilbert space H, and a bounded feature map Φ : X →H. Let
+ν ∈P(Q) and P ∈Pfin(X). Assume that,
+R
+X Φ dσ
+2
+H ≲
+R
+X ΓP dσ
+2
+Hν ≲
+R
+X Φ dσ
+2
+H
+for all signed measures σ supported on supp(P) with σ(X) = 0.
+Under this assumption, there is a reference geometry induced by the feature map Φ : X →H that is
+comparable, on balanced reweightings of the current context, to the query-visible response geometry
+in Hν. Query-agnostic compressors can then use the geometry of H as a ν-independent proxy for
+Hν.
+Roadmap.
+This section is organized as follows. In Section C.1, we discuss the choice of Φ
+and give a natural softmax-attention instantiation for which Assumption 5.1 holds in stylized but
+informative settings. In Section C.2, we show that Definition 5.3 can guide concrete algorithm design
+by constructing two local reducers satisfying the required criteria. Section C.3 proves Theorem 5.4,
+which lifts these local guarantees to the full prefill and decoding schemes, with a strengthened spectral
+bound under Assumption 5.1. Finally, Section C.4 proves Proposition 5.2 on the efficiency of the
+global merge-reduce scheme.
+Notation.
+We briefly recall the notation used throughout this section. We work with a stream
+(ki, vi)i≥1 of key–value pairs. For an index set I ⊆N, we write PI for the context measure
+associated with (ki, vi)i∈I, and abbreviate Pt := P{1,...,t}. We also use the unnormalized mass
+w(I) :=
+X
+i∈I
+exp(∥ki∥2/(2
+p
+dk)),
+which comes from the Gaussian-kernel form of softmax attention in Equation (2). Finally, we
+fix a bounded feature map Φ : X →H for this appendix and use the notation µΦ
+P and ΣΦ
+P from
+Definition 5.3 for context measures P ∈Pfin(X).
+C.1
+Choice of feature map Φ
+The choice of feature map Φ : X →H determines which structure a query-agnostic compressor can
+exploit beyond random sampling. While there is no single choice that results in a good proxy for all
+36
+
+
+query distributions, a natural query-agnostic choice is obtained from the two linear quantities that
+define attention before normalization: the unnormalized, value-weighted numerator and the scalar
+normalizer.
+Concretely, we choose
+Φ : X →H,
+(k, v) 7→
+ κ(·, k) ⊗v, V κ(·, k)
+
+,
+(9)
+where
+H := Hκ ⊗Rdv ⊕Hκ
+is constructed from the feature space Hκ of the Gaussian kernel κ from Section 3. As for the response
+profiles in Equation (4), the factor V puts the normalizer component on the same scale as the value
+component.
+Intuitively, Assumption 5.1 then requires that the query distribution sees the same context directions
+as the reference features. If a reweighting of the context substantially changes the numerator or
+normalizer of Equation (2), then this change should also be visible in the attention responses under
+queries q ∼ν, and, conversely, a reweighting that is small in these quantities should not produce a
+large response.
+Formally, the response profile ΓP measures the query-visible effect of a context reweighting after
+attention normalization and averaging over q ∼ν. For the reference features in Equation (9),
+Assumption 5.1 requires that, on balanced reweightings of supp(P),
+
+Z
+X
+Φ dσ
+
+2
+H
+≍
+
+Z
+X
+ΓP dσ
+
+2
+Hν
+.
+Thus, large perturbations to the pre-normalization numerator or normalizer are exactly the pertur-
+bations that produce large query-visible changes in the attention response. When this is the case, a
+query-agnostic compressor can exploit Φ as a hint at the ν-dependent geometry, and beat the lower
+bound barrier of Theorem 4.7.
+However, this assumption need not always hold. In particular, it fails on the hard instances of
+Appendix B used to prove lower bounds. The following examples illustrate when this comparison is
+a reasonable model of the attention head and when it should not be expected to hold.
+Example C.1. Suppose a context P consists of m well-separated clusters of nearly interchangeable
+tokens, and the query distribution ν assigns comparable mass to queries that attend to each cluster.
+Then, for the reference features in Equation (9), Assumption 5.1 holds up to the within-cluster
+approximation error.
+Example C.2. Suppose the keys in supp(P) lie on a low-dimensional semantic manifold, values
+vary smoothly along this manifold, and ν consists of queries whose attention weights vary on the
+same scale. Then, the reference geometry induced by Φ is comparable to the response geometry of
+ΓP .
+Example C.3. Suppose a context P contains two well-separated groups of tokens, but queries from
+ν attend only to the first group. Then, moving mass inside the second group can be large in the
+reference geometry induced by Φ while nearly invisible in response geometry, so Assumption 5.1
+fails.
+C.2
+Admissible reducers
+We instantiate the abstract design criteria of Definition 5.3 by giving two concrete local reducers.
+Both algorithms operate on a candidate context Q ∈P2K(X) through the reference feature map
+Φ : X →H.
+The first reducer is a constrained rounding procedure derived directly from the sparse barycenter
+approximation theorem in Appendix A. It provides the cleanest theoretical guarantee: for every target
+rank r ≤(K −3)/3, it is (Φ, r, 0)-admissible. Its drawback is that the constrained rounding step
+is inherently sequential in the protected dimension r, making it poorly suited to modern parallel
+hardware.
+To compensate for this, we also provide a more practical, clustering-based reducer. It maps efficiently
+to parallel hardware, but it is only (Φ, r, τ)-admissible with a non-zero τ term determined by the
+achieved clustering error.
+37
+
+
+Algorithm 5 ROUNDREDUCE
+Require: context measure Q = P2K
+i=1 qi δzi ∈P2K(X)
+Require: feature map Φ : X →H
+Require: integer r ≤(K −3)/3
+1: ¯Φ ←P2K
+i=1 qi Φ(zi)
+2: ΣΦ
+Q ←P2K
+i=1 qi (Φ(zi) −¯Φ) ⊗(Φ(zi) −¯Φ)
+3: U ←Topr(ΣΦ
+Q)
+▷top-r eigenspace of ΣΦ
+Q
+4: µ ←P2K
+i=1 qi δΦ(zi)
+▷pushforward
+5: ˆµ ←PROTECTEDSPARSIFY(µ, U, K −2r −2) = P2K
+i=1 ˆqi δΦ(zi)
+▷Algorithm 4
+6: return ˆQ ←P2K
+i=1 ˆqi δzi
+▷pullback
+Algorithm 6 CLUSTERREDUCE
+Require: context measure Q = P2K
+i=1 qi δzi ∈P2K(X)
+Require: feature map Φ : X →H
+Require: integer r ≥0
+1: H ←{i : qi > 1/K},
+L ←[2K] \ H
+▷filter out heavy-weight atoms
+2: if P
+i∈L qi = 0 then
+3:
+return Q
+4: m ←K −|H|,
+β ←P
+i∈L qi,
+ρ ←β/m
+5: ¯Φ ←P
+i qi Φ(zi)
+6: ΣΦ
+Q ←P
+i qi (Φ(zi) −¯Φ) ⊗(Φ(zi) −¯Φ)
+7: U ←Topr(ΣΦ
+Q)
+▷top-r eigenspace of ΣΦ
+Q
+8: for i ∈L do
+▷cluster atoms projected onto U
+9:
+ui ←ΠU(Φ(zi) −¯Φ)
+10:
+pi ←qi/ρ
+11: X ←CLUSTERSLOTS((pi, ui)i∈L, m) ∈[0, 1]m×|L|
+12: for a = 1, . . . , m do
+▷sample one atom per cluster
+13:
+sample Ia ∈L with P(Ia = i) = Xai
+14: return ˆQ ←P
+i∈H qiδzi + Pm
+a=1 ρ δzIa .
+Both reducers require an orthonormal basis of the top-r eigenspace of the centered covariance ΣΦ
+Q.
+For computational efficiency, practical implementations may replace this exact eigenspace by an
+approximate one, with the resulting loss absorbed into the tail condition of Definition 5.3. Finally,
+although both reducers are stated using the abstract feature map Φ : X →H, they can be implemented
+using only inner products ⟨Φ(z), Φ(z′)⟩H. The framework therefore also covers infinite-dimensional
+feature spaces.
+C.2.1
+Perfect admissibility via constrained rounding
+Algorithm 5 is a direct implementation of the Hilbert-space sparsification argument in Appendix A.
+Given a context measure Q ∈P2K(X), the reducer preserves the features Φ exactly in the leading
+eigenspace of ΣΦ
+Q, and sparsifies the measure only in the orthogonal complement. Because of that,
+the reducer is (Φ, r, 0)-admissible.
+Theorem C.4. Fix K ≥3 and r ≤(K −3)/3. Let H be a Hilbert space and Φ : X →H bounded.
+Then, ROUNDREDUCE(·, Φ, r) is (Φ, r, 0)-admissible.
+Proof. Fix
+Q =
+2K
+X
+i=1
+qi δzi ∈P2K(X),
+38
+
+
+set m := K −2r −2, and use the notation of Algorithm 5. Since r ≤(K −3)/3, we have m ≥K/3.
+ROUNDREDUCE(Q, Φ, r) applies PROTECTEDSPARSIFY to the pushforward
+µ =
+s
+X
+i=1
+qiδΦ(zi)
+with protected subspace
+U = Topr(ΣΦ
+Q)
+and sparsification budget m.
+By Proposition A.3,
+| supp( ˆQ)| ≤m + 2 dim(U) + 2 ≤K
+almost surely, and supp( ˆQ) ⊆supp(Q). Hence,
+ˆQ ∈PK(supp(Q)).
+Proposition A.3 also gives E[ˆµ] = µ and therefore E[ ˆQ] = Q. That proves unbiasedness.
+Let G be a Hilbert space and let Ψ : X →G be bounded. Applying the variance bound in
+Proposition A.3 with yi = Ψ(zi) gives
+E
+
+Z
+X
+Ψ d( ˆQ −Q)
+
+2
+G ≤20
+9m tr(ΣΨ
+Q) ≤20
+3K tr(ΣΨ
+Q).
+For the feature map Φ, let
+ηΦ :=
+Z
+X
+Φ d( ˆQ −Q).
+By the protected covariance bound in Proposition A.3,
+E[ηΦ ⊗ηΦ] ⪯20
+9m(I −ΠU)ΣΦ
+Q(I −ΠU).
+Taking traces and using U = Topr(ΣΦ
+Q), we obtain
+E
+
+Z
+X
+Φ d( ˆQ −Q)
+
+2
+H ≤20
+9m tailr(ΣΦ
+Q) ≤20
+3K tailr(ΣΦ
+Q).
+Thus, all design criteria hold for every Q ∈P2K(X), making ROUNDREDUCE(·, Φ, r) (Φ, r, 0)-
+admissible.
+C.2.2
+Practical admissibility via clustering
+Algorithm 6 provides an admissible reducer based on clustering. On a context measure Q, the
+algorithm protects the principal directions of ΣΦ
+Q by projecting the features onto the leading eigenspace
+of ΣΦ
+Q and clustering them in these protected coordinates.
+For the clustering step, any finite-dimensional clustering subroutine CLUSTERSLOTS can be used,
+provided it produces a balanced latent-slot assignment. Concretely, using the notation of Algorithm 6,
+the subroutine receives the weighted protected coordinates (pi, ui)i∈L, where pi = qi/ρ, and returns
+a matrix X ∈[0, 1]m×|L|. Row a of X is the sampling distribution used by latent slot a, while the
+column constraints ensure that each light atom receives the correct expected mass. Formally, X must
+satisfy
+X
+i∈L
+Xai = 1
+and
+m
+X
+a=1
+Xai = pi.
+For example, one might use weighted k-means to group nearby protected coordinates and then sample
+representatives from those groups in proportion to their total mass, with X recording the resulting
+sampling probabilities.
+39
+
+
+Naturally, the quality of the compressed summary depends on the quality of the clustering. Using the
+notation of Algorithm 6, define the clustering error of the call to CLUSTERSLOTS by
+C(Q) := 1
+K
+m
+X
+a=1
+X
+i∈L
+Xai∥ui −¯ua∥2
+H,
+¯ua :=
+X
+i∈L
+Xaiui.
+If the light mass is zero, we set CCLUSTERSLOTS(Q) = 0.
+When this clustering error is small, CLUSTERREDUCE is admissible, as the following theorem shows.
+Theorem C.5. Fix K ≥1 and r ≥0.
+Let H be a Hilbert space and Φ : X
+→H
+bounded. Assume that CLUSTERSLOTS satisfies C(Q) ≤τ for every input Q ∈P2K(X). Then,
+CLUSTERREDUCE(·, Φ, r) is (Φ, r, τ)-admissible.
+Proof. Let
+Q =
+2K
+X
+i=1
+qiδzi ∈P2K(X).
+Use the notation of Algorithm 6. If the light mass is zero, then Q must already belong to PK(X).
+The algorithm then returns Q exactly, so all claims are immediate.
+Assume therefore that β > 0. Since each i ∈H satisfies qi > 1/K,
+β = 1 −
+X
+i∈H
+qi < 1 −|H|
+K = K −|H|
+K
+= m
+K .
+Thus, ρ = β
+m ≤1
+K
+The output is supported on supp(Q) and uses at most |H| + m = K atoms, so ˆQ ∈PK(supp(Q))
+almost surely. Moreover, the heavy atoms are kept exactly, and for every i ∈L,
+E[mass assigned to zi] = ρ
+m
+X
+a=1
+Xai = ρpi = qi.
+Hence E[ ˆQ] = Q. That proves unbiasedness.
+Let G be a Hilbert space and let Ψ : X →G be bounded. Write
+yi := Ψ(zi),
+¯y :=
+Z
+X
+Ψ dQ.
+The heavy atoms contribute no error, while the light slots give
+Z
+X
+Ψ d( ˆQ −Q) = ρ
+m
+X
+a=1
+ 
+yIa −
+X
+i∈L
+Xaiyi
+!
+.
+The summands are independent and centered. Therefore
+E
+"
+Z
+X
+Ψ d( ˆQ −Q)
+
+2
+G
+#
+= ρ2
+m
+X
+a=1
+E
+yIa −
+X
+i∈L
+Xaiyi
+
+2
+G
+≤ρ2
+m
+X
+a=1
+X
+i∈L
+Xai∥yi −¯y∥2
+G
+= ρ2 X
+i∈L
+pi∥yi −¯y∥2
+G
+= ρ
+X
+i∈L
+qi∥yi −¯y∥2
+G
+≤1
+K
+2K
+X
+i=1
+qi∥yi −¯y∥2
+G
+= 1
+K tr(ΣΨ
+Q).
+40
+
+
+This proves the universal trace criterion.
+It remains to prove the distinguished Φ-criterion. Let
+xi := Φ(zi),
+¯x :=
+Z
+X
+Φ dQ,
+ξi := xi −¯x,
+and let
+U := Topr(ΣΦ
+Q).
+Then, ui = ΠUξi for all i ∈L. As above,
+ηΦ :=
+Z
+X
+Φ d( ˆQ −Q) = ρ
+m
+X
+a=1
+ 
+ξIa −
+X
+i∈L
+Xaiξi
+!
+.
+Decomposing orthogonally along U ⊕U ⊥, the protected part is
+E ∥ΠUηΦ∥2
+H = ρ2
+m
+X
+a=1
+X
+i∈L
+Xai∥ui −¯ua∥2
+H.
+By the definition of C(Q) and ρ ≤1/K,
+E ∥ΠUηΦ∥2
+H = ρ2K C(Q) ≤C(Q)
+K
+≤τ
+K .
+For the residual part, the same variance estimate used above gives
+E ∥(I −ΠU)ηΦ∥2
+H ≤ρ
+X
+i∈L
+qi∥(I −ΠU)ξi∥2
+H
+≤1
+K tr
+ (I −ΠU)ΣΦ
+Q
+
+.
+Since U = Topr(ΣΦ
+Q),
+tr
+ (I −ΠU)ΣΦ
+Q
+
+= tailr(ΣΦ
+Q).
+Combining the protected and residual parts yields
+E
+"
+Z
+X
+Φ d( ˆQ −Q)
+
+2
+H
+#
+≤1
+K
+ tailr(ΣΦ
+Q) + τ
+
+.
+Thus, all design criteria hold for every Q ∈P2K(X), making CLUSTERREDUCE(·, Φ, r) (Φ, r, τ)-
+admissible.
+C.3
+Global risk guarantees
+This section proves the risk guarantee of Theorem 5.4 for the chunked prefill and decoding algorithms.
+Both schedules build summaries in a merge-reduce tree: starting from token chunks of K tokens,
+disjoint summaries are merged, their weighted union is compressed back to K atoms, and the
+unfinished current chunk is appended exactly. We show that, for admissible local compressors
+REDUCE, the approximation error accumulates linearly with the depth of the merge-reduce tree,
+which then transfers to the claimed risk guarantees.
+C.3.1
+Geometry transfer
+REDUCE is designed in the fixed reference geometry induced by Φ : X →H. In contrast, the desired
+risk bound is expressed in the geometry induced by ΓP : X →Hν, which depends on both the exact
+context P and the query distribution ν. We record here the transfer guarantees from the covariance
+ΣΦ
+P in H to the covariance ΣP,ν in Hν. Concretely, Lemma C.6 shows that, under Assumption 5.1,
+the spectral decay of ΣΦ
+P is controlled by the spectral decay of ΣP,ν in the reference geometry of Φ.
+Lemma C.6. Suppose Assumption 5.1 holds for P, ν and the chosen feature map Φ. Then,
+tailr(ΣΦ
+P ) ≲tailr(ΣP,ν)
+for every r ≥0.
+41
+
+
+Proof. Let
+L2
+0(P) :=
+
+f ∈L2(P) |
+R
+X f dP = 0
+	
+and define
+TΦf :=
+R
+X f(Φ −µΦ
+P ) dP,
+TΓf :=
+R
+X fΓP dP.
+Since fP is a signed, zero-mass measure supported on supp(P), Assumption 5.1 gives
+∥TΦf∥2
+H ≲∥TΓf∥2
+Hν
+for all f ∈L2
+0(P). Equivalently,
+T ∗
+ΦTΦ ⪯C T ∗
+ΓTΓ.
+for a universal constant C > 0. Moreover,
+TΦT ∗
+Φ = ΣΦ
+P
+and
+TΓT ∗
+Γ = ΣP,ν,
+where the second identity uses
+R
+ΓP dP = 0. Since TT ∗and T ∗T have the same eigenvalues,
+tailr(ΣΦ
+P ) = tailr(T ∗
+ΦTΦ) ≲tailr(T ∗
+ΓTΓ) = tailr(ΣP,ν).
+C.3.2
+Risk propagation through merge-reduce trees
+We now turn the one-step guarantees of REDUCE into guarantees for full causal prefixes. To that end,
+we show that the design criteria in Definition 5.3 for REDUCE — unbiasedness of the summary and
+second-moment control of its feature defect — propagate through the merge-reduce recursion. To
+express this invariant, we introduce the notion of a valid summary, which is a random context measure
+of a token block that satisfies the same criteria, with a parameter counting the number of reducer
+layers on its dependency path. Each node of the merge-reduce tree preserves validity, increasing this
+parameter by at most one. The global risk bound in Theorem 5.4 then follows by recognizing the
+prefill and decoding summaries as outputs of such trees, whose depth is logarithmic in the number of
+completed chunks.
+Definition C.7 (Valid summary). Let d, r, τ ≥0 and A ⊆N. We say that a random context measure
+SA is (d, r, τ)-valid for A if the following hold:
+(i) E[SA] = PA
+(ii) E
+
+∥
+R
+X Ψ d(SA −PA)∥2
+G
+
+≲d
+K tr(ΣΨ
+PA) for all Hilbert spaces G and bounded Ψ : X →G
+(iii) E
+
+∥
+R
+X Φ d(SA −PA)∥2
+H
+
+≲d
+K
+ tailr(ΣΦ
+PA) + τ
+
+Note that this resembles directly the design criteria of a (Φ, r, τ)-admissible reducer, as defined in
+Definition 5.3. In particular, if REDUCE is (Φ, r, τ)-admissible and PA ∈P2K(X) is the context
+measure of the tokens in A ⊆N, then REDUCE(PA) is (1, r, τ)-valid for A.
+We briefly record the following fact that we use repeatedly later on.
+Lemma C.8. Let P ∈Pfin(X) and let Q be a random variable taking values in Pfin(X). If
+E[Q] = P, then E[ΣΨ
+Q] ⪯ΣΨ
+P for any Hilbert space G and bounded Ψ : X →G.
+Proof. Let G be a Hilbert space and Ψ : X →G be bounded. Then,
+E
+
+ΣΨ
+Q
+
+= E
+Z
+X
+Ψ ⊗Ψ dQ
+
+−E
+
+µΨ
+Q ⊗µΨ
+Q
+
+=
+Z
+X
+Ψ ⊗Ψ dP −E
+
+µΨ
+Q ⊗µΨ
+Q
+
+=
+Z
+X
+Ψ ⊗Ψ dP −E
+ µΨ
+Q −E
+
+µΨ
+Q
+
+⊗
+ µΨ
+Q −E
+
+µΨ
+Q
+
+−E
+
+µΨ
+Q
+
+⊗E
+
+µΨ
+Q
+
+=
+Z
+X
+Ψ ⊗Ψ dP −E
+ µΨ
+Q −µΨ
+P
+
+⊗
+ µΨ
+Q −µΨ
+P
+
+−µΨ
+P ⊗µΨ
+P
+= ΣΨ
+P −E
+ µΨ
+Q −µΨ
+P
+
+⊗
+ µΨ
+Q −µΨ
+P
+
+⪯ΣΨ
+P .
+42
+
+
+We now consider the operation at a single node in the merge-reduce tree. Given two summaries
+of two disjoint blocks of tokens, we form a compressed summary of their union by compressing
+their weighted combination using REDUCE. When the two input summaries are (d, r, τ)-valid, the
+resulting summary is (d + 1, r, τ)-valid, thereby propagating the guarantees up the merge-reduce tree.
+Lemma C.9. Let A, B ⊆N be finite, nonempty, and disjoint. Let SA be (dA, r, τ)-valid for A, and
+let SB be (dB, r, τ)-valid for B. Assume that REDUCE is (Φ, r, τ)-admissible and that SA and SB
+are independent. Define
+Q :=
+w(A)
+w(A) + w(B)SA +
+w(B)
+w(A) + w(B)SB.
+If Q ∈P2K(X), then REDUCE(Q) is (1 + max{dA, dB}, r, τ)-valid for A ∪B.
+Proof. Let SA∪B := REDUCE(Q), and write
+P := PA∪B = αPA + βPB
+for α := w(A)/(w(A) + w(B)) and β := w(B)/(w(A) + w(B)). Additionally, introduce the
+defects
+σA := SA −PA,
+σB := SB −PB,
+σA∪B := SA∪B −PA∪B,
+and
+η := SA∪B −Q
+which are all zero-mass, signed measures on X.
+For a Hilbert space G and bounded Ψ : X →G, introduce the notation
+Ψ[σ] :=
+Z
+X
+Ψ dσ
+for zero-mass, signed measures σ on X.
+We next prove orthogonality of the defects after taking expectation. Condition on the already
+constructed summaries SA, SB. Then Q, σA, and σB are fixed, and the only remaining randomness
+is the fresh call to REDUCE. Admissibility of REDUCE gives E[η | SA, SB] = 0. Hence,
+E
+
+⟨Ψ[η], Ψ[σA]⟩G
+
+= E
+
+⟨E[Ψ[η] | SA, SB], Ψ[σA]⟩G
+
+= 0,
+and similarly for E[⟨Ψ[η], Ψ[σB]⟩G]. Moreover, SA and SB are independent and validity of SA and
+SB imply
+E[Ψ[σA]] = E[Ψ[σB]] = 0.
+Therefore,
+E
+
+⟨Ψ[σA], Ψ[σB]⟩G
+
+=
+
+E
+
+Ψ[σA]
+
+, E
+
+Ψ[σB]
+
+G = 0
+and thus expanding the square norm gives
+E
+Ψ[σA∪B]
+2
+G = E
+Ψ[η]
+2
+G + α2 E
+Ψ[σA]
+2
+G + β2 E
+Ψ[σB]
+2
+G.
+(10)
+We now prove the three validity conditions for SA∪B.
+For unbiasedness,
+E[SA∪B] = E[E[REDUCE(Q) | SA, SB]] = E[Q] = αPA + βPB = P,
+which follows immediately from unbiasedness of SA and SB.
+For trace control, we bound the three terms in Equation (10). Fix a Hilbert space G and a bounded
+map Ψ : X →G. Since E[Q] = P, Lemma C.8 gives E[ΣΨ
+Q] ⪯ΣΨ
+P . Conditioning on SA, SB, the
+input Q is fixed and the remaining randomness is the fresh reducer randomness. Thus, admissibility
+of REDUCE gives
+E
+Ψ[η]
+2
+G
+ SA, SB
+
+≲1
+K tr
+ ΣΨ
+Q
+
+.
+Taking expectations,
+E
+Ψ[η]
+2
+G ≲1
+K E tr
+ ΣΨ
+Q
+
+≤1
+K tr
+ ΣΨ
+P
+
+.
+43
+
+
+By validity of SA and SB,
+α2 E
+Ψ[σA]
+2
+G + β2 E
+Ψ[σB]
+2
+G ≲max{dA, dB}
+K
+h
+α2 tr(ΣΨ
+PA) + β2 tr(ΣΨ
+PB)
+i
+≤max{dA, dB}
+K
+h
+tr
+ αΣΨ
+PA + βΣΨ
+PB
+i
+≤max{dA, dB}
+K
+h
+tr
+ ΣΨ
+P
+i
+,
+where we additionally use α2 ≤α, β2 ≤β, and αΣΨ
+PA + βΣΨ
+PB ⪯ΣΨ
+P by Lemma C.8. Combining
+this with Equation (10) and admissibility of REDUCE proves
+E
+Ψ[σA∪B]
+2
+G ≲
+1 + max{dA, dB}
+K
+
+tr
+ ΣΨ
+P
+
+.
+Since Ψ and G were arbitrary, that proves the trace condition.
+For tail control, condition on SA, SB. Then, Q is fixed and the remaining randomness is the fresh
+reducer randomness. Admissibility applied to this realized input Q gives
+E
+
+∥Φ[η]∥2
+H
+ SA, SB
+
+≲1
+K
+ tailr(ΣΦ
+Q) + τ
+
+.
+Taking expectations gives
+E ∥Φ[η]∥2
+H ≲1
+K
+ E[tailr(ΣΦ
+Q)] + τ
+
+.
+Since E[Q] = P, Lemma C.8 gives E[ΣΦ
+Q] ⪯ΣΦ
+P . By concavity and monotonicity of tailr,
+E[tailr(ΣΦ
+Q)] ≤tailr(E[ΣΦ
+Q]) ≤tailr(ΣΦ
+P ).
+Hence
+E ∥Φ[η]∥2
+H ≲1
+K
+ tailr(ΣΦ
+P ) + τ
+
+.
+By validity of SA and SB,
+α2 E
+Φ[σA]
+2
+H + β2 E
+Φ[σB]
+2
+H ≲max{dA, dB}
+K
+h
+α2(tailr(ΣΦ
+PA) + τ) + β2(tailr(ΣΦ
+PB) + τ)
+i
+≤max{dA, dB}
+K
+h
+α tailr(ΣΦ
+PA) + β tailr(ΣΦ
+PB) + τ
+i
+≤max{dA, dB}
+K
+h
+tailr
+ ΣΦ
+P
+
++ τ
+i
+,
+where we additionally use α2 ≤α, β2 ≤β, αΣΦ
+PA + βΣΦ
+PB ⪯ΣΦ
+P by Lemma C.8, and concavity of
+tailr. Plugging into Equation (10), we get
+E
+Φ[σA∪B]
+2
+H ≲1 + max{dA, dB}
+K
+ tailr(ΣΦ
+P ) + τ
+
+.
+That proves the tail condition. Hence, SA∪B is (1 + max{dA, dB}, r, τ)-valid for A ∪B.
+Validity of a summary gives us the desired risk control, but only in terms of the fixed geometry of H.
+Proposition C.10 transfers this control to the attention error, which is measured in the geometry of
+Hν.
+Proposition C.10. Fix ν ∈P(Q), and let ˆPt be a random context measure. If ˆPt is (dt, r, τ)-valid
+for {1, . . . , t}, then
+E
+
+EPt,ν
+  ˆPt
+
+≲dt
+K tr(ΣPt,ν).
+If additionally (Pt, ν) satisfies Assumption 5.1, then
+E
+
+EPt,ν
+  ˆPt
+
+≲dt
+K (tailr(ΣPt,ν) + τ) .
+44
+
+
+Proof. First, note that
+EPt,ν
+  ˆPt
+ (1)
+≲
+
+Z
+X
+ΓPt d ˆPt
+
+2
+Hν
+(2)
+=
+
+Z
+X
+ΓPt d( ˆPt −Pt)
+
+2
+Hν
+(11)
+where (1) uses Lemma B.1, and (2) uses
+R
+X ΓPt dPt = 0.
+Using validity of ˆPt applied to ΓPt, it follows that
+E EPt,ν
+  ˆPt
+
+≲dt
+K tr(Σ
+ΓPt
+Pt ) = dt
+K tr(ΣPt,ν).
+That proves the first claim.
+Suppose now that Assumption 5.1 holds. Then, using validity of ˆPt and Lemma C.6,
+E EPt,ν
+  ˆPt
+ (11)
+≲E
+
+Z
+X
+ΓPt d( ˆPt −Pt)
+
+2
+Hν
+≲dt
+K
+ tailr
+ ΣΦ
+Pt
+
++ τ
+
+≲dt
+K
+ tailr(ΣPt,ν) + τ
+
+,
+which proves the second claim.
+The final summary ˆPt used as the compressed context for the token at position t is a combination of a
+compressed summary produced by the merge-reduce tree and an exact context measure of the tokens
+inside the same chunk as token t. The next lemma shows that this is harmless for the validity of the
+resulting summary.
+Lemma C.11. Let A, R ⊆N be finite and disjoint and A̸ = ∅. If SA is (d, r, τ)-valid for A, then
+SA∪R :=
+w(A)
+w(A) + w(R)SA +
+w(R)
+w(A) + w(R)PR
+is (d, r, τ)-valid for A ∪R.
+Proof. Unbiasedness of SA∪R is immediate from unbiasedness of SA and PR.
+Set α :=
+w(A)/(w(A) + w(R)).
+Let G be a Hilbert space and Ψ : X →G bounded. Then, the defect of SA∪R is
+Z
+X
+Ψ d(SA∪R −PA∪R) = α
+Z
+X
+Ψ d(SA −PA)
+
+Since αΣΨ
+PA ⪯ΣΨ
+PA∪R, the validity estimates for SA imply the validity estimates for SA∪R.
+It remains only to count the validity depth of the summaries produced by Algorithms 1 and 2. The
+prefill scan and the decoding buckets both construct summaries by repeated binary merges of disjoint
+completed chunks. Along any dependency path there are only logarithmically many reducer calls,
+and the unfinished current chunk is appended exactly. Thus, if REDUCE is (Φ, r, τ)-admissible, each
+resulting prefix summary ˆPt is (d, r, τ)-valid, with d proportional to the depth of the tree, which is
+logarithmic in the number of tokens. The claimed risk guarantees then follow immediately from
+Proposition C.10.
+Theorem 5.4. Let K ≥1 and ν ∈P(Q), and suppose that REDUCE is (Φ, r, τ)-admissible. Let
+ˆPt ∈P2K(X) be as in (5). Then, E EPt,ν
+  ˆPt
+
+≲log(2+t/K)
+K
+tr(ΣPt,ν). If additionally Assump-
+tion 5.1 holds for ν, Pt, and Φ, then E EPt,ν
+  ˆPt
+
+≲log(2+t/K)
+K
+(tailr(ΣPt,ν) + τ).
+Proof. We first show that ˆPt as produced by Algorithms 1 and 2 is O(log(2 + t/K), r, τ)-valid for
+{1, . . . , t}. The risk bounds then follow immediately from Proposition C.10.
+Let I1, I2, . . . denote the consecutive chunks of size K, and let c(t) be the chunk containing t. Write
+At := I1 ∪· · · ∪Ic(t)−1,
+Rt := Ic(t) ∩{1, . . . , t}.
+Thus, Pt is the normalized mixture of PAt and the exact current-chunk suffix PRt, with the obvious
+convention when At = ∅.
+45
+
+
+We claim that every summary stored by the merge-reduce computation for a union of m completed
+chunks is (O(log(2 + m)), r, τ)-valid for its underlying index set, and that summaries stored on
+disjoint index sets are independent. This follows by induction on the binary merge tree. A single
+chunk is represented exactly, hence is deterministic and (0, r, τ)-valid. Whenever two disjoint
+summaries with validity d1 and d2 are merged, the induction hypothesis gives their independence;
+the reducer call uses fresh randomness independent of both summaries. Thus, Lemma C.9 shows
+that the resulting summary is ((1 + max{d1, d2}), r, τ)-valid. The resulting summary depends only
+on its two children and on the fresh randomness used in this reducer call, so it remains independent
+of all stored summaries supported on disjoint index sets. Along any path in the merge tree for m
+chunks there are at most O(log(2 + m)) merges. Hence the summary of any completed-chunk prefix
+produced by the prefill scan, and the completed-prefix summary maintained by the decoding buckets,
+is (O(log(2 + m)), r, τ)-valid.
+Apply this to the completed chunks preceding t. If At̸ = ∅, the algorithm has an (O(log(2 +
+|At|/K)), r, τ)-valid summary SAt for At. Since Rt is kept exact,
+ˆPt =
+w(At)
+w(At) + w(Rt)SAt +
+w(Rt)
+w(At) + w(Rt)PRt.
+By Lemma C.11, and using |At| ≤t, ˆPt is (O(log(2 + t/K)), r, τ)-valid for {1, . . . , t}.
+The claim then follows immediately from Proposition C.10.
+The global guarantee therefore reduces entirely to the design of REDUCE. Any concrete reducer
+satisfying the one-step trace and tail conditions of Definition 5.3 inherits the same causal prefill
+and decoding guarantees through the merge-reduce schedules of Algorithms 1 and 2, with only the
+logarithmic depth loss.
+C.4
+Computational cost of the global merge-reduce scheme
+We prove Proposition 5.2 from the main text.
+Proposition 5.2. Algorithm 1 makes O(n/K) calls to REDUCE, and uses parallel depth
+O(log(n/K)) and O(n) memory. Additionally, at time t, Algorithm 2 stores O(K log(t/K)) atoms,
+and makes O(log(t/K)/K) calls to REDUCE amortized per token.
+Proof. Let M = n/K and L = log2 M. We count calls to REDUCE and atom storage, treating each
+K-atomic summary as an object of size K.
+First, consider Algorithm 1. In the upsweep stage, level ℓcontains M/2ℓindependent merge-reduce
+operations. Hence, the number of calls to REDUCE in the upsweep is
+L
+X
+ℓ=1
+M
+2ℓ= M −1.
+The downsweep has the same count. The total number of calls is thus 2M −2 = O(n/K).
+The parallel depth is also immediate from the tree structure. All calls at a fixed level are indepen-
+dent, so each level contributes one parallel round of REDUCE. There are L upsweep levels and L
+downsweep levels, giving depth O(L) = O(log(n/K)).
+For memory, the algorithm stores O(M) summaries across all levels of the scan tree, and each
+summary is K-atomic. Thus the total number of stored atoms is O(MK) = O(n).
+Now consider Algorithm 2. After s completed chunks have been incorporated, including the prompt
+summary, the nonempty buckets satisfy the standard binary-counter invariant: bucket Bℓ, when
+nonempty, stores a K-atomic summary of a block of 2ℓchunks, and there is at most one nonempty
+bucket at each level. Therefore, the number of nonempty buckets is at most 1 + ⌊log2 s⌋. For a prefix
+of length t = sK, the number of stored atoms is consequently
+O(K log s) = O(K log(t/K)).
+It remains to count calls to REDUCE. Each new chunk first creates a level-zero bucket. The while
+loop then performs the carry operations of a binary counter. Whenever a bucket is already occupied,
+46
+
+
+the two K-atomic summaries are merged and reduced to form one summary at the next level. Over s
+chunk insertions, level ℓparticipates in at most O(s/2ℓ+1) such carries. Summing over ℓgives O(s)
+carry calls in total, hence O(1) amortized carry calls per chunk.
+After the carry step, the algorithm forms the current history summary by merging the nonempty
+buckets in decreasing order. Since there are O(log s) nonempty buckets, this uses O(log s) calls to
+REDUCE per completed chunk. Combining this with the O(1) amortized carry cost gives O(log s)
+calls per chunk. Since each chunk contains K tokens, the amortized number of calls per token is
+O(log s/K) = O(log(t/K)/K).
+That proves the claim.
+47
+
+
+D
+Experimental details
+This appendix describes the implementation of our experiments in Section 6. Detailed instructions
+for reproducing our experiments are provided with the code in the supplementary material.
+Dataset and model.
+We evaluate on the “long” subset of LongBench-v2 [6]. The dataset is
+available at https://longbench2.github.io/. We use the official LongBench-v2 evaluation
+protocol. We run all experiments on Qwen3-32B [25], using int4 quantization. We extend the
+context window to 131k tokens using YaRN RoPE scaling [21]. The model is available at https:
+//huggingface.co/Qwen/Qwen3-32B. We disable chain-of-thought generation and use greedy
+decoding throughout. LongBench-v2 and Qwen3-32B are released under the Apache-2.0 license.
+Computational resources.
+All experiments were conducted on a single NVIDIA H100 GPU with
+95,830 MiB VRAM. The full set of runs took approximately 100 GPU hours, including failed runs.
+Implementation details.
+For the full-attention baseline, we use the standard implementation of
+the Qwen3-32B model. For the compressed methods, we use the algorithms described in Section 5,
+with two additions. First, each token may attend to the first 8 tokens, following the attention-sink
+heuristic of Xiao et al. [24]. Second, each token may attend to the K tokens immediately preceding
+its chunk boundary. Thus, each token attends to at most 3K + 8 tokens. This is compatible with our
+theory and enjoys the same guarantees. We use K = 2048, corresponding to a compression rate of
+approximately 95% relative to the 131k-token context available to the full-attention baseline.
+Many LongBench-v2 contexts exceed even the extended context window of Qwen3-32B. For such
+examples, we follow the official truncation protocol of Bai et al. [6] by removing the middle section
+of the prompt.
+Local reducer instantiations.
+We report results for two instantiations of REDUCE: random
+sampling and protected clustering. All randomized methods are evaluated with a single run using a
+fixed random seed.
+For random sampling, we sample i.i.d. from the context measure, i.e., proportionally to
+exp
+ ∥k∥2
+2/(2√dk)
+
+,
+(12)
+as described in Section 3.
+Protected clustering corresponds to Algorithm 6, using the static feature map described in Section C.1
+with the value norm bound fixed to V 2 = 50. We evaluate protected ranks r = 64 and r = 128.
+To compute the leading eigenspace, we use a randomized Nyström approximation with four-fold
+oversampling.
+For CLUSTERSLOTS in Algorithm 6, we use a sliced equal-mass clustering rule. After the heavy
+atoms have been retained exactly as in Algorithm 6, the light atoms i ∈L have normalized masses
+pi = qi/ρ satisfying P
+i∈L pi = m. For each direction in a fixed bank of random directions in
+the protected coordinate space, we sort the light atoms by their one-dimensional projection and
+place intervals of length pi consecutively on [0, m]. The m latent slots are the unit intervals of this
+line, and the assignment matrix X is given by the overlap of each atom interval with each unit slot.
+This construction satisfies the row and column constraints required in Algorithm 6. We choose the
+direction with the smallest within-slot squared error in the protected coordinates and sample one
+representative from each slot by inverse-transform sampling.
+For this method, we treat the initial context measure as uniform over the tokens rather than propor-
+tional to Equation (12), as this significantly improved numerical stability in the computation of the
+leading eigenspace.
+Literature baselines.
+We compare performance against ScissorHands [20], SnapKV [19], and
+StreamingLLM [24]. All three methods use a sliding window of the most recent 4096 tokens. The
+allocation of the remaining 2056 token budget is dictated by the respective method. StreamingLLM
+retains the initial 8 sink tokens and uses the rest of this budget to extend the recent-token window.
+SnapKV retains the top-ranked non-recent prompt tokens by attention score from the final prompt
+window, using average pooling with kernel size 5, as in the original paper [19]. ScissorHands retains
+the top-ranked non-recent tokens by cumulative pivotal-token counts.
+48

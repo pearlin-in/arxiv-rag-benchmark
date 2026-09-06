@@ -1,0 +1,1850 @@
+Variational Bayesian Quantization
+Yibo Yang * 1 Robert Bamler * 1 Stephan Mandt 1
+Abstract
+We propose a novel algorithm for quantizing con-
+tinuous latent representations in trained models.
+Our approach applies to deep probabilistic mod-
+els, such as variational autoencoders (VAEs), and
+enables both data and model compression. Un-
+like current end-to-end neural compression meth-
+ods that cater the model to a ﬁxed quantization
+scheme, our algorithm separates model design
+and training from quantization. Consequently,
+our algorithm enables “plug-and-play” compres-
+sion with variable rate-distortion trade-off, using
+a single trained model. Our algorithm can be
+seen as a novel extension of arithmetic coding to
+the continuous domain, and uses adaptive quan-
+tization accuracy based on estimates of posterior
+uncertainty. Our experimental results demonstrate
+the importance of taking into account posterior
+uncertainties, and show that image compression
+with the proposed algorithm outperforms JPEG
+over a wide range of bit rates using only a single
+standard VAE. Further experiments on Bayesian
+neural word embeddings demonstrate the versatil-
+ity of the proposed method.
+1. Introduction
+Latent-variable models have become a mainstay of modern
+machine learning. Scalable approximate Bayesian infer-
+ence methods, in particular Black Box Variational Inference
+(Ranganath et al., 2014; Rezende et al., 2014), have spurred
+the development of increasingly large and expressive proba-
+bilistic models, including deep generative probabilistic mod-
+els such as variational autoencoders (Kingma & Welling,
+2014b) and Bayesian neural networks (MacKay, 1992; Blun-
+dell et al., 2015). One natural application of deep latent
+variable modeling is data compression, and recent work has
+focused on end-to-end procedures that optimize a model
+*Equal contribution
+1Department of Computer Science, Uni-
+versity of California, Irvine.
+Correspondence to: Yibo Yang
+<yibo.yang@uci.edu>, Robert Bamler <rbamler@uci.edu>.
+Proceedings of the 37 th International Conference on Machine
+Learning, Online, PMLR 119, 2020. Copyright 2020 by the au-
+thor(s).
+for a particular compression objective. Here, we study a
+related but different problem: given a trained model, what
+is the best way to encode the information contained in its
+continuous latent variables?
+As we show, our proposed solution provides a new “plug-
+and-play” approach to lossy compression of both data in-
+stances (represented by local latent variables, e.g., in a VAE)
+as well as model parameters (represented by global latent
+variables that serve as parameters of a Bayesian statisti-
+cal model). Our approach separates the compression task
+from model design and training, thus implementing variable-
+bitrate compression as an independent post-processing step
+in a wide class of existing latent variable models.
+At the heart of our proposed method lies a novel quanti-
+zation scheme that optimizes a rate-distortion trade-off by
+exploiting posterior uncertainty estimates. Quantization is
+central to lossy compression, as continuous-valued data like
+natural images, videos, and distributed representations ul-
+timately need to be discretized to a ﬁnite number of bits
+for digital storage or transmission. Lossy compression al-
+gorithms therefore typically ﬁnd a discrete approximation
+of some semantic representation of the data, which is then
+encoded with a lossless compression method.
+In classical lossy compression methods such as JPEG or
+MP3, the semantic representation is carefully designed to
+support compression at variable bitrates. By contrast, state-
+of-the-art deep learning based approaches to lossy data com-
+pression (Ball´e et al., 2017; 2018; Rippel & Bourdev, 2017;
+Mentzer et al., 2018; Lombardo et al., 2019) are trained to
+minimize a distortion metric at a ﬁxed bitrate. To support
+variable-bitrate compression in this approach, one has to
+train several models for different bitrates. While training
+several models may be viable in many cases, a bigger issue
+is the increase in decoder size as the decoder has to store
+the parameters of not one but several deep neural networks
+for each bitrate setting. In applications like video streaming
+under ﬂuctuating connectivity, the decoder further has to
+load a new deep learning model into memory every time a
+change in bandwidth requires adjusting the bitrate.
+By contrast, we propose a a quantization method for latent
+variable models that decouples training from compression,
+and that enables variable-bitrate compression with a single
+model. We generalize a classical entropy coding algorithm,
+arXiv:2002.08158v2  [eess.IV]  7 Sep 2020
+
+
+Variational Bayesian Quantization
+Arithmetic Coding (Witten et al., 1987; MacKay, 2003),
+from the discrete to continuous domain. Our proposed algo-
+rithm, Variational Bayesian Quantization, exploits posterior
+uncertainty estimates to automatically reduce the quanti-
+zation accuracy of latent variables for which the model is
+uncertain anyway. This strategy is analogous to the way hu-
+mans communicate quantitative information. For example,
+Wikipedia lists the population of Rome in 2017 with the
+speciﬁc number 2,879,728. By contrast, its population in
+the year 500 AD is estimated by the round number 100,000
+because the high uncertainty would make a more precise
+number meaningless. Our ablation studies show that this
+posterior-informed quantization scheme is crucial to obtain-
+ing competitive performance.
+In detail, our contributions are as follows:
+• A new discretization scheme. We present a novel ap-
+proach to discretizing latent variables in a variational
+inference framework. Our approach generalizes arith-
+metic coding from discrete to continuous distributions
+and takes posterior uncertainty into account.
+• Single-model compression at variable bitrates. The
+decoupling of modeling and compression allows us
+to adjust the trade-off between bitrate and distortion
+in post-processing. This is in contrast to existing ap-
+proaches to both data and model compression, which
+often require specially trained models for each bitrate.
+• Automatic self-pruning. Deep latent variable models
+often exhibit posterior collapse, i.e., the variational
+posterior collapses to the model prior. In our approach,
+latent dimensions with collapsed posteriors require
+close to zero bits, thus don’t require manual pruning.
+• Competitive experimental performance. We show that
+our method outperforms JPEG over a wide range of
+bitrates using only a single model. We also show that
+we can successfully compress word embeddings with
+minimal loss, as evaluated on semantic reasoning task.
+The paper is structured as follows: Section 2 reviews related
+work in neural compression; Section 3 proposes our Varia-
+tional Bayesian Quantization algorithm. We give empirical
+results in Section 4, and conclude in Section 5.
+Section 6
+provides additional theoretical insight about our method.
+2. Related Work
+Compressing continuous-valued data is a classical problem
+in the signal processing community. Typically, a distortion
+measure (often the squared error) and a source distribution
+are assumed, and the goal is to design a quantizer that opti-
+mizes the rate-distortion (R-D) performance (Lloyd, 1982;
+Berger, 1972; Chou et al., 1989). Optimal vector quan-
+tization, although theoretically well-motivated (Gallager,
+1968), is not tractable in high-dimensional spaces (Gersho
+& Gray, 2012) and not scalable in practice. Therefore most
+classical lossy compression algorithms map data to a suit-
+ably designed semantic representation, in such a way that
+coordinate-wise scalar quantization can be fruitfully applied.
+Recent machine-learning-based data compression methods
+learn such hand-designed representation from data, but sim-
+ilar to classical methods, most such ML methods directly
+take quantization into account in the generative model de-
+sign or training. Various approaches have been proposed
+to approximate the non-differentiable quantization opera-
+tion during training, such as stochastic binarization (Toderici
+et al., 2016; 2017), additive uniform noise (Ball´e et al., 2017;
+2018; Habibian et al., 2019), or other differentiable approxi-
+mation (Agustsson et al., 2017; Theis et al., 2017; Mentzer
+et al., 2018; Rippel & Bourdev, 2017); many such schemes
+result in quantization with a uniformly-spaced grid, with the
+exception of (Agustsson et al., 2017), which optimizes for
+quantization grid points. Yang et al. (2020) considers opti-
+mal quantization at compression time, but assumes a ﬁxed
+quantization scheme of (Ball´e et al., 2017) during training.
+We depart from such approaches by treating quantization
+as a post-processing step decoupled from model design and
+training. Crucial to our approach is a new quantization
+scheme that automatically adapts to different length scales
+in the representation space based on posterior uncertainty
+estimates. To our best knowledge, the only prior work that
+uses posterior uncertainty for compression is in the context
+of bits-back coding (Honkela & Valpola, 2004; Townsend
+et al., 2019), but these works focus on lossless compression,
+with the recent exception of (Yang et al., 2020).
+Most existing neural image compression methods require
+training a separate machine learning model for each desired
+bitrate setting (Ball´e et al., 2017; 2018; Mentzer et al., 2018;
+Theis et al., 2017; Lombardo et al., 2019). In fact, Alemi
+et al. (2018) showed that any particular ﬁtted VAE model
+only targets one speciﬁc point on the rate-distortion curve.
+Our approach has the same beneﬁt of variable-bitrate single-
+model compression as methods based on recurrent VAEs
+(Gregor et al., 2016; Toderici et al., 2016; 2017; Johnston
+et al., 2018); but unlike these methods, which use dedicated
+model architecture for progressive image reconstruction, we
+instead focus more broadly on quantizing latent representa-
+tions in a given generative model, designed and trained for
+speciﬁc application purposes (possibly other than compres-
+sion, e.g., modeling complex scientiﬁc observations).
+
+
+Variational Bayesian Quantization
+3. Posterior-Informed Variable-Bitrate
+Compression
+We now propose an algorithm for quantizing latent vari-
+ables in trained models. After describing the problem setup
+and assumptions (Subsection 3.1), we brieﬂy review Arith-
+metic Coding (Subection 3.2). Subsection 3.3 describes our
+proposed lossy compression algorithm, which generalizes
+Arithmetic Coding to the continuous domain.
+3.1. Problem Setup
+Generative Model and Variational Inference.
+We con-
+sider a wide class of generative probabilistic models with
+data x and unknown (or “latent”) variables z ∈RK from
+some continuous latent space with dimension K. The gen-
+erative model is deﬁned by a joint probability distribution,
+p(x, z) = p(z) p(x|z)
+(1)
+with a prior p(z) and a likelihood p(x|z). Although our pre-
+sentation focuses on unsupervised representation learning,
+our framework also captures the supervised setup.1
+Our proposed compression method uses z as a proxy to de-
+scribe the data x. This requires “solving” Eq. 1 for z given x,
+i.e., inferring the posterior p(z|x) = p(x, z)/
+R
+p(x, z) dz.
+Since exact Bayesian inference is often intractable, we resort
+to Variational Inference (VI) (Jordan et al., 1999; Blei et al.,
+2017; Zhang et al., 2019), which approximates the posterior
+by a so-called variational distribution qφ(z|x) by minimiz-
+ing the Kullback-Leibler divergence DKL(qφ(z|x) || p(z|x))
+over a set of variational parameters φ.
+Factorization Assumptions.
+We assume that both the
+prior p(z) and the variational distribution qφ(z|x) are fully
+factorized (mean-ﬁeld assumption). For concreteness, our
+examples use a Gaussian variational distribution. Thus,
+p(z) = QK
+i=1p(zi);
+and
+(2)
+qφ(z|x) = QK
+i=1N(zi; µi(x), σ2
+i (x)),
+(3)
+where p(zi) is a prior for the ith component of z, and the
+means µi and standard deviations σi together comprise the
+variational parameters φ over which VI optimizes.2
+Prominently, the model class deﬁned by Eqs. 1-3 in-
+cludes variational autoencoders (VAEs) (Kingma & Welling,
+2014a) for data compression, but we stress that the class is
+1For supervised learning with labels y, we would consider
+a conditional generative model p(y, z|x) = p(y|z, x) p(z) with
+conditional likelihood p(y|z, x), where z are the model parameters,
+treated as a Bayesian latent variable with associated prior p(z).
+2These parameters are often amortized by a neural network (in
+which case µi and σi depend on x), but don’t have to (in which
+case µi and σi do not depend on x and are directly optimized).
+much wider, capturing also Bayesian neural nets (MacKay,
+2003), probabilistic word embeddings (Barkan, 2017; Bam-
+ler & Mandt, 2017), matrix factorization (Mnih & Salakhut-
+dinov, 2008), and topic models (Blei et al., 2003).
+Protocol Overview.
+We consider two parties in commu-
+nication, a sender and a receiver. In the case of data com-
+pression, both parties have access to the model, but only
+the sender has access to the data point x, which it uses
+to ﬁt a variational distribution qφ(z|x). It then uses the
+algorithm proposed below to select a latent variable vec-
+tor ˆz that has high probability under qφ, and that can be
+encoded into a compressed bitstring, which gets transmitted
+to the receiver. The receiver losslessly decodes the com-
+pressed bitstring back into ˆz and uses the likelihood p(x|ˆz)
+to generate a reconstructed data point ˆx, typically setting
+ˆx = arg maxx p(x|ˆz). In the case of model compression,
+the sender infers a distribution qφ(z|x) over model parame-
+ters z given training data x, and uses our algorithm to select
+a suitable vector ˆz of quantized model parameters. The
+receiver receives ˆz and uses it to reconstruct the model.
+The rest of this section describes how the proposed algo-
+rithm selects ˆz and encodes it into a compressed bitstring.
+3.2. Background: Arithmetic Coding
+Our quantization algorithm, introduced in Section 3.3 below,
+is inspired by a lossless compression algorithm, arithmetic
+coding (AC) (Witten et al., 1987; MacKay, 2003), which
+we generalize from discrete data to the continuous space of
+latent variables z ∈RK. To get there, we ﬁrst review the
+main idea of AC that our proposed algorithm borrows.
+AC is an instance of so-called entropy coding. It uniquely
+maps messages m ∈M from a discrete set M to a com-
+pressed bitstring of some length Rm (the “bitrate”). Entropy
+coding exploits prior knowledge of the distribution p(m) of
+messages to map probable messages to short bitstrings while
+spending more bits on improbable messages. This way, en-
+tropy coding algorithms aim to minimize the expected rate
+Ep(m)[Rm]. For lossless compression, the expected rate has
+a fundamental lower bound, the entroy H = Ep(m)[h(m)],
+where h(m) = −log2 p(m) is the Shannon information
+content of m. AC provides near optimal lossless compres-
+sion as it maps each message m ∈M to a bitstring of length
+Rm = ⌈h(m)⌉, where ⌈·⌉denotes the ceiling function.
+AC is usually discussed in the context of streaming com-
+pression where m is a sequence of symbols from a ﬁnite
+alphabet, as AC improves on this task over the more widely
+known Huffman coding (Huffman, 1952). In our work, we
+focus on a different aspect of AC: its use of a cumulative
+probability distribution function to map a nonuniformly dis-
+tributed random variable m ∼p(m) to a number ξ that is
+nearly uniformly distributed over the interval [0, 1).
+
+
+Variational Bayesian Quantization
+0 1 2 3 4 5 6 7 8 9 10
+discrete message m
+0
+(0.001)2 = 1/8
+(0.01)2 = 1/4
+(0.011)2 = 3/8
+(0.1)2 = 1/2
+(0.101)2 = 5/8
+(0.11)2 = 3/4
+(0.111)2 = 7/8
+1
+F<(m)
+F≤(m)
+p(m)
+−2
+0
+2
+latent variable zi ∈R
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+±σi
+µi
+p(zi)
+F(zi)
+q(zi|x)
+g(ξi)
+Figure 1. Comparison of Arithmetic Coding (AC, left) and VBQ
+(right, proposed). Both methods use a prior CDF (orange) to map
+nonuniformly distributed data to a number ξ ∼U(0, 1), and both
+require an uncertainty region for truncation.
+Figure 1 (left) illustrates AC for a binomial-distributed mes-
+sage m ∈{0, . . . , 10} (the number of ‘heads’ in a sequence
+of ten coin ﬂips). The solid and dashed orange lines show
+the left and right sided cumulative distribution function,3
+F<(m) := P
+m′<m p(m′) and F≤(m) := P
+m′≤m p(m′),
+respectively. They deﬁne a partitioning of the interval [0, 1)
+(vertical axis in Figure 1 (left)) into pairwise disjoint subin-
+tervals Im :=
+
+F<(m), F≤(m)
+
+(orange squares). Since
+the intervals Im are disjoint for all m ∈M, any number
+ξ ∈Im uniquely identiﬁes a given message m. AC picks
+such a number ˆξ ∈Im and encodes it into a string of bits bκ,
+κ ∈{0, . . . , Rm} by writing it in binary representation,
+ˆξ = (0.b1b2 . . . bRm)2
+with bits bκ ∈{0, 1} ∀κ.
+(4)
+Since any ξ ∈Im may be used to identify the message m,
+we can interpret the interval Im as an uncertainty region
+in ξ-space. AC picks the number ˆξ ∈Im with the shortest
+binary representation. This requires at most ⌈h(m)⌉bits
+because the numbers ξ that can be represented by Eq. 4
+with Rm = ⌈h(m)⌉form a uniform grid with spacing
+2−Rm = 2−⌈h(m)⌉, which is at most as wide as the size of
+the interval, |Im| = p(m) = 2−h(m). The red arrows in
+Figure 1 (left) illustrate how AC would encode the message
+m = 7 in the toy example into the bitstring “111”. Decoding
+works in the opposite direction and maps ˆξ back to m.
+In the next section, we generalize AC to the continuous
+domain. As we will show, the concept of an “uncertainty
+region” in ξ-space becomes again crucial.
+3.3. Variational Bayesian Quantization
+We now present our proposed algorithm, Variational
+Bayesian Quantization (VBQ), a novel quantization method
+for lossy compression that is inspired by AC but that op-
+erates on continuous latent variables z ∈RK. Similar to
+3If m is a sequence of symbols, F< and F≤are deﬁned by lex-
+icographical order and can be constructed in a streaming manner.
+AC, VBQ exploits knowledge of a prior probability distribu-
+tion p(z) in combination with a (soft) uncertainty region to
+encode probable values of z into short bitstrings.
+From Intervals to Distributions.
+The main ideas that
+VBQ borrows from AC are as follows: (1) the use of a
+cumulative distribution function to map a non-uniformly
+distributed random variable to a uniformly distributed ran-
+dom variable ξ over the interval (0, 1), and (2) the use of an
+“uncertainty region” to select a number from this interval to
+encode the message with as few bits as possible. While AC
+uses an interval Im with hard boundaries, VBQ softens this
+uncertainty region by considering posterior uncertainty.
+We consider a single continuous latent variable zi ∈R with
+arbitrary prior p(zi). The cumulative (CDF) of the prior,
+F(zi) :=
+Z zi
+−∞
+p(z′
+i) dz′
+i ,
+(5)
+is shown in orange in Figure 1 (right). It maps zi ∼p(zi)
+to ξi ∼U(0, 1). In contrast to the discrete case discussed
+in Section 3.2, where the prior CDF maps each message m
+to an entire interval Im, note that the CDF of a continuous
+random variable maps real numbers to real numbers.
+Since ξi ∼U(0, 1) is almost surely an irrational number, its
+binary representation is inﬁnitely long, and thus has to be
+truncated. We ﬁnd an optimal truncation by generalizing the
+idea of the uncertainty region Im to the continuous space:
+we consider the posterior uncertainty in zi-space and map
+it to ξi-space. Approximating the posterior p(zi|x) by the
+variational distribution q(zi|x) := N(zi; µi(x), σ2
+i (x)), see
+Eq. 3, we thus consider the function
+g(ξi) := q(F −1(ξi) | x).
+(6)
+Here, F −1 is the inverse CDF (the quantile function), which
+maps ξi back to zi. Note that g is not a normalized proba-
+bility distribution, as Eq. 6 deliberately does not include the
+Jacobian ∇ξiF −1(ξi) because the ﬁnal objective will be to
+maximize qφ(z|x) at a single point (see Eq. 7 below).
+Intuition.
+The solid and dashed purple curves in ﬁgure
+Figure 1 (right) plot q(zi|x) and g(ξi) on the horizontal and
+vertical axis, respectively. The red arrows illustrate how a
+ﬁnite uncertainty region µi(x)±σi(x) in zi-space is mapped
+to a ﬁnite width of g in ξi-space. VBQ ﬁnds a quantile ˆξi
+that has high value under g while at the same time having
+a short binary representation. The two purple arrowheads
+on the vertical axis point to two viable candidates, ˆξi = 7
+8
+and ˆξi =
+3
+4, that both lie within the uncertainty region.
+The choice between these two points poses a rate-distortion
+trade-off: while 7
+8 ≡(0.111)2 has higher value under g (i.e.,
+it identiﬁes a point ˆzi = F −1( 7
+8) with higher approximate
+posterior probability q(ˆzi|x)), the alternative ˆξi =
+3
+4 ≡
+(0.11)2 can be encoded in fewer bits.
+
+
+Variational Bayesian Quantization
+Algorithm 1 Rate-Distortion Optimization for Dimension i
+Input:
+Prior CDF F(zi), rate penalty λ > 0,
+variational mode µi(x) and variance σ2
+i (x).
+Output: Optimal code point ˆξ∗
+i ≡(0.b1b2 . . . bR(ˆξ∗
+i ))2.
+Evaluate ξ†
+i ←F(µi(x)).
+Initialize r ←0,
+ˆξ∗
+i ←null,
+ℓ∗←∞.
+repeat
+Update r ←r + 1
+Set ˆξr,left
+i
+←2−r⌊2rξ†
+i ⌋,
+ˆξr,right
+i
+←2−r⌈2rξ†
+i ⌉.
+if ˆξr,left
+i̸
+= 0 and ℓλ(ˆξr,left
+i
+| x) < ℓ∗then
+Update ˆξ∗
+i ←ˆξr,left
+i
+,
+ℓ∗←ℓλ(ˆξr,left
+i
+| x).
+end if
+if ˆξr,right
+i̸
+= 1 and ℓλ(ˆξr,right
+i
+| x) < ℓ∗then
+Update ˆξ∗
+i ←ˆξr,right
+i
+,
+ℓ∗←ℓλ(ˆξr,right
+i
+| x).
+end if
+until log g(ξ†
+i ) −log g(ˆξ∗
+i ) < λ(r + 1 −R(ˆξ∗
+i )).
+Optimizing the Rate-Distortion Trade-Off.
+Rather than
+considering a hard uncertainty region, VBQ simply tries
+to ﬁnd a point ξ ≡(ξi)K
+i=1 that identiﬁes latent variables
+z ≡(zi)K
+i=1 with high probability under the variational
+distribution qφ(z|x) while being expressible in few bits.
+We thus express log qφ(z|x) in terms of the coordinates
+ξi = F(zi) using Eq. 3,
+log qφ(z|x) = −
+K
+X
+i=1
+ F −1(ξi) −µi(x)
+2
+2 σ2
+i (x)
++ cnst.
+(7)
+For each dimension i, we restrict the quantile ξi ∈(0, 1) to
+the set of code points ˆξi that can be represented in binary
+via Eq. 4 with a ﬁnite but arbitrary bitlength R(ˆξi). We
+deﬁne the total bitlength R(ˆξ) := PK
+i=1 R(ˆξi), i.e., the
+length of the concatenation of all codes ˆξi, i ∈{1, . . . , K}
+neglecting, for now, an overhead for delimiters (see below).
+Using a rate penalty parameter λ > 0 that is shared across
+all dimensions i, we minimize the rate-distortion objective
+Lλ(ˆξ|x) = −log qφ(ˆz|x) + λR(ˆξ)
+(8)
+=
+K
+X
+i=1
+" F −1(ˆξi) −µi(x)
+2
+2 σ2
+i (x)
++ λR(ˆξi)
+#
++ cnst.
+The optimization thus decouples across all latent dimen-
+sions i, and can be solved efﬁciently and in parallel by
+minimizing the K independent objective functions
+ℓλ(ˆξi|x) =
+ F −1(ˆξi) −µi(x)
+2 + 2λ σ2
+i (x) R(ˆξi). (9)
+Although the bitlength R(ˆξi) is discontinuous (it counts
+the number of binary digits, see Eq. 4), ℓλ(ˆξi|x) can be
+efﬁciently minimized over ˆξi using Algorithm 1. The al-
+gorithm iterates over all rates r ∈{1, 2, . . .} and searches
+Figure 2. Effect of an anisotropic posterior distribution on quanti-
+zation. Left: linear regression model with optimal ﬁt (green) and
+ﬁts of models with quantized parameters (orange, purple). Right:
+posterior distribution and quantized model parameters following
+two different quantization schemes. Although both quantized mod-
+els are equally far away from the optimal solution (green dot),
+VBQ (orange) ﬁts the data better because it takes the anisotropy of
+the posterior into account.
+for the code point ˆξ∗
+i that minimizes ℓ(ˆξi|x). For each r,
+the algorithm only needs to consider the two code points
+ˆξr,left
+i
+≤ξ†
+i and ˆξr,right
+i
+≥ξ†
+i with rate at most r that enclose
+the optimum ξ†
+i := F(µi(x)) and are closest to it; these two
+code points can be easily computed in constant time. The
+iteration terminates as soon as the maximally possible re-
+maining increase in log q(zi|x) = log g(ξi) is smaller than
+the minimum penalty for an increasing bitlength (in practice,
+the iteration rarely exceeds r ≈8).
+Encoding.
+After ﬁnding the optimal code points (ˆξ∗
+i )K
+i=1,
+they have to be encoded into a single bitstring. Simply
+concatenating the binary representations (Eq. 4) of all ˆξ∗
+i
+would be ambiguous due to their variable lengths R(ˆξ∗
+i )
+(see detailed discussion in the Supplementary Material). In-
+stead, we treat the code points as symbols from a discrete
+vocabulary and encode them via lossless entropy coding,
+e.g., Arithmetic Coding. The entropy coder requires a prob-
+abilistic model over all code points; here we simply use
+their empirical distribution. When using our method for
+model compression, this empirical distribution has to be
+transmitted to the receiver as additional header information
+that counts towards the total bitrate. For data compression,
+by contrast, we obtain the empirical distribution of code
+points on training data and include it in the decoder.
+Discussion.
+The proposed algorithm adjusts the accuracy
+for each latent variable zi based on two factors: (i) a global
+rate setting λ that is shared across all dimensions i; and
+(ii) a per-dimension posterior uncertainty estimate σi(x).
+Point (i) allows tuning the rate-distortion trade-off whereas
+(ii) takes the anisotropy of the latent space into account.
+Figure 2 illustrates the effect of anisotropy in latent space.
+The right panel plots the posterior of a toy Bayesian linear
+
+
+Variational Bayesian Quantization
+0
+2
+4
+bits per latent dimension
+0.0
+0.2
+0.4
+0.6
+Hits@10 (higher is better)
+uncompressed model
+VBQ (proposed)
+uniform quant. + AC
+uniform quant. + lzma
+uniform quant. + bzip2
+uniform quant. + gzip
+Figure 3. Performance of compressed word embeddings on a stan-
+dard semantic and syntactic reasoning task (Mikolov et al., 2013a).
+VBQ (orange, proposed) leads to much smaller ﬁle sizes at equal
+model performance over a wide range of performances.
+regression model y = ax + b (see left panel) with only two
+latent variables z ≡(a, b). Due to the elongated shape of
+the posterior, VBQ uses a higher accuracy for a than for b.
+As a result, the algorithm ﬁnds a quantization ˆz (orange dot
+in right panel) that is closer to the optimal (MAP) solution
+(green dot) along the a-axis than along the b-axis.
+The purple dot in Figure 2 (right) compares to a more com-
+mon quantization method, which simply rounds the MAP
+solution to the nearest point (which is then entropy coded)
+from a ﬁxed grid with spacing δ > 0. We tuned δ so that the
+resulting quantized model parameters (purple dot) have the
+same distance to the optimum as our proposed solution (or-
+ange dot). Despite the equal distance to the optimum, VBQ
+ﬁnds model parameters with higher posterior probability.
+The resulting model ﬁts the data better (left panel).
+This concludes the description of the proposed Variational
+Bayesian Quantization algorithm. In the next section, we an-
+alyze the algorithm’s behaviour experimentally and demon-
+strate its performance for variable-bitrate compression on
+both word embeddings and images.
+4. Experiments
+We tested our approach on two very different domains: word
+embeddings and images. For word embeddings, we mea-
+sured the performance drop on a semantic reasoning task
+due to lossy compression. Our proposed VBQ method sig-
+niﬁcantly improves model performance over uniform dis-
+cretization and compression with either Arithmetic Coding
+(AC), gzip, bzip2, or lzma at equal bitrate. For image com-
+pression, we show that a single standard VAE, compressed
+with VBQ, outperforms JPEG and other baselines at a wide
+range of bitrates, both quantitatively and visually.
+4.1. Compressing Word Embeddings
+We consider the Bayesian Skip-gram model for neural word
+embeddings (Barkan, 2017), a probabilistic generative for-
+mulation of word2vec (Mikolov et al., 2013b) which inter-
+prets word and context embedding vectors as latent variables
+and associates them with Gaussian approximate posterior
+distributions. Point estimating the latent variables would
+result in classical word2vec. Even though the model was
+not speciﬁcally designed or trained with model compres-
+sion taken into consideration, the proposed algorithm can
+successfully compress it in post-processing.
+Experiment Setup.
+We implemented the Black Box VI
+version of the Bayesian Skip-gram model proposed in (Bam-
+ler & Mandt, 2017),4 and trained the model on books pub-
+lished between 1980 and 2008 from the Google Books cor-
+pus (Michel et al., 2011), following the preprocessing de-
+scribed in (Bamler & Mandt, 2017) with a vocabulary of
+V = 100,000 words and embedding dimension d = 100.
+In the trained model, we observed that the distribution of
+posterior modes µw,j across all words w and all dimen-
+sions j of the embedding space was quite different from the
+prior. To improve the bitrate of our method, we used an “em-
+pirical prior” for encoding that is shared across all w and j;
+we chose a Gaussian N(0, σ2
+0) where σ2
+0 is the empirical
+variance of all variational means (µw,j)w=1,...,V ; j=1,...,d.
+We compare our method’s performance to a baseline that
+quantizes to a uniform grid and then uses the empirical
+distribution of quantized coordinates for lossless entropy
+coding. We also compare to uniform quantization baselines
+that replace the entropy coding step with the standard com-
+pression libraries gzip, bzip2, and lzma. These methods
+are not restricted by a factorized distribution of code points
+and could therefore detect and exploit correlations between
+quantized code points across words or dimensions.
+We evaluate performance on the semantic and syntactic rea-
+soning task proposed in (Mikolov et al., 2013a), a popular
+dataset of semantic relations like “Japan : yen = Russia : ru-
+ble” and syntactic relations like “amazing : amazingly =
+lucky : luckily”, where the goal is to predict the last word
+given the ﬁrst three words. We report Hits@10, i.e., the frac-
+tion of challenges for which the compressed model ranks
+the correct prediction among the top ten.
+Results.
+Figure 3 shows the model performance on the
+semantic and syntactic reasoning tasks as a function of com-
+pression rate. Our proposed VBQ signiﬁcantly outperforms
+all baselines and reaches the same Hits@10 at less than half
+the bitrate over a wide range.5
+4See Supplementary Material for hyperparameters. Our code
+is available at https://github.com/mandt-lab/vbq.
+5 The uncompressed model performance (dotted gray line in
+Figure 3) is not state of the art. This is not a shortcoming of
+the compression method but merely of the model, and can be
+attributed to the smaller vocabulary and training set used compared
+to (Mikolov et al., 2013b) due to hardware constraints.
+
+
+Variational Bayesian Quantization
+decreasing bitrate, increasing distortion
+MNIST
+Frey Faces
+Figure 4. Qualitative behavior of our proposed VBQ algorithm on
+two data sets of small-scale images (MNIST and Frey Faces). With
+decreasing bitrate, the method starts to confuse the encoded object
+with a generic one (encoded by the median of the prior p(z)).
+4.2. Image Compression
+While Section 4.1 demonstrated the proposed VBQ method
+for model compression, we now apply the same method to
+data compression using a variational autoencoder (VAE).
+We ﬁrst provide qualitative insight on small-scale images,
+and then quantitative results on full resolution color images.
+Model.
+For simplicity, we consider regular VAEs with a
+standard normal prior and Gaussian variational posterior.
+The generative network parameterizes a factorized categor-
+ical or Gaussian likelihood model in experiments in Sec.
+4.2.1 or 4.2.2, respectively. Network architectures are de-
+scribed below and in more detail in Supplementary Material.
+Baselines.
+We consider the following baselines:
+• Uniform quantization: for a given image x, we quan-
+tize each dimension of the posterior mean vector µ(x)
+to a uniform grid. We report the bitrate for encoding
+the resulting quantized latent representation via stan-
+dard entropy coding (e.g., arithmetic coding). Entropy
+coding requires prior knowledge of the probabilities of
+each grid point. Here, we use the empirical frequencies
+of grid points over a subset of the training set;
+• k-means quantization: similar to “uniform quantiza-
+tion”, but with the placement of grid points optimized
+via k-means clustering on a subset of the training data;
+• Quantization with generalized Lloyd algorithm: similar
+to above, but the grid points are optimized using gener-
+alized Lloyd algorithm (Chou et al., 1989), a widely-
+used state-of-the-art classical quantization method;
+• JPEG: we used the libjpeg implementation packaged
+with the Python Pillow library, using default conﬁg-
+urations (e.g., 4:2:0 subsampling), and we adjust the
+quality parameter to vary the rate-distortion trade-off;
+• Deep learning baseline: we compare to Ball´e et al.
+(2017), who directly optimized for the rate and distor-
+tion, training a separate model for each point on the R-
+D curve. In our large-scale experiment, we adopte their
+model architecture, so their performance essentially
+represents the end-to-end optimized performance up-
+per bound for our method (which uses a single model).
+4.2.1. QUALITATIVE ANALYSIS ON TOY DATASETS
+We trained a VAE on the MNIST dataset and the Frey Faces
+dataset, using 5 and 4-dimensional latent spaces, respec-
+tively. See Supplemental Material for experimental details.
+Figure 4 shows example image reconstructions from our
+VBQ algorithm with increasing λ, and thus decreasing bi-
+trate. The right-most column is the extreme case λ →∞,
+resulting in the shortest possible bistring encoding ˆξi =
+(0.1)2 = 1
+2 (i.e., ˆzi being the median of the prior p(zi)) for
+every dimension i. As the bitrate decreases (as R(ˆξ) →0),
+our method gradually “confuses” the original image with
+a generic image (roughly in the center of the embedding
+space), while preserving approximately the same level of
+sharpness. This is in contrast to JPEG which typically intro-
+duces blocky and/or pixel-level artifacts at lower bitrates.
+4.2.2. FULL-RESOLUTION COLOR IMAGES
+We apply our VBQ method to a VAE trained on color im-
+ages, and obtain practical image compression performance
+rivaling JPEG, while outperforming baselines that ignore
+posterior uncertainty and directly quantize latent variables.
+Model and Dataset.
+The inference and generative net-
+works of our VAE are identical to the analysis and syn-
+thesis networks of Ball´e et al. (2017), using 3 layers of
+256 ﬁlters each in a convolutional architecture. We used a
+diagonal Gaussian likelihood model, whose mean is com-
+puted by the generative net and the variance σ2 is ﬁxed
+as a hyper-parameter, similar to a β-VAE (Higgins et al.,
+2017) approach (σ2 was tuned to 0.001 to ensure the VAE
+achieved overall good R-D trade-off; see (Alemi et al.,
+2018)). We trained the model on the same subset of the
+ImageNet dataset as used in (Ball´e et al., 2017). We evalu-
+ated performance on the standard Kodak (Kodak) dataset,
+a separate set of 24 uncompressed color images. As in the
+word embedding experiment, we also observed that using an
+empirical prior for our method improved the bitrate; for this,
+we used the ﬂexible density model of Ball´e et al. (2018),
+ﬁtting a different distribution per latent channel, on samples
+of posterior means µ (treating spatial dimensions as i.i.d.).
+
+
+Variational Bayesian Quantization
+(a) Original
+(b) JPEG
+MS-SSIM=0.813
+(c) VBQ
+MS-SSIM=0.933
+(d) Uniform grid
+MS-SSIM=0.723
+(e) Ball´e et al.
+MS-SSIM=0.958
+Figure 5. Image reconstructions at matching bitrate (0.24 bits per pixel). VBQ (c; proposed) outperforms AC with uniform quantization (d)
+and JPEG (b) and is comparable to the approach by (Ball´e et al., 2017) (e) despite using a model that is not optimized for this speciﬁc
+bitrate. Uniform quantization here used a modiﬁed version of the VAE in Figure 6, using an additional conv layer with smaller dimensions
+to reduce the bitrate down to 0.24 (this was not possible in the original model even with the largest possible grid spacing).
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Average Bits per Pixel (BPP)
+10
+15
+20
+25
+30
+35
+Average PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Average Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+Average MS-SSIM (RGB)
+VBQ (proposed)
+Uniform Quantization
+k-means Quantization
+Generalized Lloyd Quant.
+JPEG
+Ball´e et al. (2017)
+Figure 6. Aggregate rate-distortion performance on the Kodak
+dataset (higher is better). VBQ (blue, proposed) outperforms JPEG
+for all tested bitrates with a single model. By contrast, (Ball´e et al.,
+2017) (black squares) relies on individually optimized models for
+each bitrate that all have to be included in the decoder.
+Results.
+As common in image compression work, we
+measure distortion between original and compressed im-
+ages under two quality metrics (the higher the better):
+Peak Signal-to-Noise ratio (PSNR) and MS-SSIM (Wang
+et al., 2003), over all RGB channels. Figure 6 shows rate-
+distortion performance. We averaged both the bits per pixel
+(BPP) and quality measure over all images in the Kodak
+dataset for each λ (we got similar results by averaging only
+over the quality metrics for ﬁxed bitrates via interpolation).
+We found that our method generally produced images with
+higher quality, both in terms of PSNR and perceptual quality,
+compared to JPEG and uniform quantization. Similar to
+(Ball´e et al., 2017), our method avoids unpleasant artifacts,
+and introduces blurriness at low bitrate. See Figure 5 for
+example image reconstructions. For more examples and R-
+D curves on individual images, see Supplementary Material.
+Although our results fall short of the end-to-end optimized
+rate-distortion performance of Ball´e et al. (2017), it is worth
+emphasizing that our method operates anywhere on the R-D
+curve with a single trained VAE model, unlike Ball´e et al.
+(2017) , which requires costly optimization and storage of
+individual models for each point on the R-D curve. On
+the other hand, as with any quantization method, the re-
+construction quality of VBQ is upper-bounded by that of
+the full-precision latents; e.g., evaluating on uncompressed
+latents gives a PSNR upper-bound of about 38.9 in Figure 6.
+10−4
+10−2
+100
+Channel 1:
+Ex[DKL(q(zi|x) || p(zi))]: 28.8
+Ex[num. bits] (proposed): 1.07
+Ex[num. bits] (baseline):
+0.54
+Channel 2:
+Ex[DKL(q(zi|x) || p(zi))]: 0.09
+Ex[num. bits] (proposed): 0.02
+Ex[num. bits] (baseline):
+0.18
+Channel 3:
+Ex[DKL(q(zi|x) || p(zi))]: 0.11
+Ex[num. bits] (proposed): 0.02
+Ex[num. bits] (baseline):
+0.10
+−5
+0
+5
+10−4
+10−2
+100
+Channel 4:
+Ex[DKL(q(zi|x) || p(zi))]: 82.4
+Ex[num. bits] (proposed): 1.98
+Ex[num. bits] (baseline):
+0.97
+−5
+0
+5
+Channel 5:
+Ex[DKL(q(zi|x) || p(zi))]: 0.06
+Ex[num. bits] (proposed): 0.02
+Ex[num. bits] (baseline):
+0.11
+−5
+0
+5
+Channel 6:
+Ex[DKL(q(zi|x) || p(zi))]: 300
+Ex[num. bits] (proposed): 4.42
+Ex[num. bits] (baseline):
+1.01
+prior p(zi)
+aggregate q(zi)
+density of µi
+Figure 7. Variational posteriors and the encoding cost for the ﬁrst 6
+latent channels of an image-compression VAE trained with high β
+setting. “Baseline” refers to uniform quantization. The proposed
+VBQ method wastes fewer bits on channels that exhibit posterior
+collapse (channels 2, 3, and 5) than the baseline method. It instead
+spends more bits on channels without posterior collapse.
+Indifference to Posterior Collapse.
+A known issue in
+deep generative models such as VAEs is posterior collapse,
+where the model ignores some subset of latent variables,
+whose variational posterior distributions collapse to closely
+match the prior. Such collapsed dimensions constitute an
+overhead in conventional neural compression approaches,
+which is often dealt with by a pruning step. One curious
+consequence of our approach is that it automatically spends
+close to zero bits encoding the collapsed latent dimensions.
+As an illustration, we trained a VAE as used in the color
+image compression experiment with a high β setting to
+purposefully induce posterior collapse, and examine the
+average number of bits spent on various latent channels.
+Figure 7 shows the prior p(zi), aggregated (approximate)
+posterior q(zi) := Ex[q(zi|x)], and histograms of posterior
+means µi(x) for the ﬁrst six channels of the VAE; all the
+quantities were averaged over an image batch and across
+latent spatial dimensions. We observe that channels 2, 3,
+and 5 appear to exhibit posterior collapse, as the aggregated
+posteriors closely match the prior while the posterior means
+
+
+Variational Bayesian Quantization
+tightly cluster at zero; this is also reﬂected by low average
+KL-divergence between the variational posterior q(zi|x)
+and prior p(zi), see text inside each panel. We observe that,
+for these collapsed channels, our method spends fewer bits
+on average than uniform quantization (baseline) at the same
+total bitrate, and more bits instead on channels 1, 4, and 6,
+which do not exhibit posterior collapse. The explanation is
+that a collapsed posterior has unusually high variance σ2
+i (x),
+causing our model to refrain from long code words due to
+the high penalty ∝σ2
+i (x) per bitrate R(ˆξi) in Eq. 9.
+5. Conclusions
+We proposed a novel algorithm for discretizing latent rep-
+resentations in trained latent variables, with applications to
+both data and model compression. Our proposed “Varia-
+tional Bayesian Quantization” (VBQ) algorithm automati-
+cally adapts encoding accuracy to posterior uncertainty esti-
+mates, and is applicable to arbitrary probabilistic generative
+models with factorized prior and mean-ﬁeld variational pos-
+terior distributions. As our approach separates quantization
+from model design and training, it enables “plug-&-play”
+compression at variable bitrate with pretrained models.
+We showed the empirical effectiveness of our proposed VBQ
+method for both model and data compression. For model
+compression, VBQ retained signiﬁcantly higher task per-
+formance of a trained word embedding model than other
+methods that compress in post-processing. For data com-
+pression, we showed that VBQ can outperform JPEG over a
+wide range of bitrates with a single trained standard VAE.
+Given its versatility, we believe that VBQ holds promise
+for compressing Bayesian neural networks, especially in
+applications that demand rate-distortion trade-offs. Lastly,
+as VBQ relies on accurate posterior approximation , its rate-
+distortion performance provides a new metric for quantita-
+tive evaluation of approximate Bayesian inference methods.
+6. Theoretical Considerations
+Here, we provide additional theoretical insights into the
+proposed VBQ method based on reviewer feedback.
+Dense Quantization Grid.
+Section 3.3 describes the pro-
+posed VBQ algorithm in terms of quantiles ξi. While quan-
+tiles simplify the discussion, it is also instructive to consider
+what effectively happens directly in representation space.
+In the space of representations z, VBQ optimizes over a
+dense quantization grid, shown in Figure 8 (left) for a single
+dimension zi. Each code point ˆξi ∈(0, 1), i.e., each quantile
+with a ﬁnite-length binary representation, deﬁnes a grid
+point ˆzi = F −1(ˆξi). The height of each orange bar in the
+ﬁgure shows the bitlength R(ˆzi). Interestingly, the grid
+places many points with small R(ˆzi) in regions of high
+Figure 8. Dense quantization grid of VBQ (left) and a subset of it
+(center) that resembles the more common uniform grid (right).
+prior probability density (purple curve), while regions of
+low prior probability contain only grid points with large
+R(ˆzi). This observation can be formalized as follows.
+Theorem 1. For a latent dimension zi with prior p(zi) and
+for any interval I ⊂R, there exists a grid point ˆzi ∈I
+whose bitlength is bounded by the information content of I,
+i.e., R(ˆzi) ≤−log2 P(I) with P(I) =
+R
+I p(zi) dzi.
+Proof. R(ˆzi) is the number of nontrivial bits in the quan-
+tile ˆξi := F(ˆzi). For example, the quantiles 1
+4 = (0.01)2,
+1
+2 = (0.1)2, and 3
+4 = (0.11)2 each have at most one non-
+trivial bit (since the initial “0.” and terminal “1” are con-
+sidered trivial), and they are equally spaced with spacing
+1
+4 = 2−2. Incrementing the number of bits by one divides
+the spacing in half. Thus, for any r ∈N, the quantiles
+with at most r nontrivial bits are equally spaced with spac-
+ing 2−r−1. The prior CDF F maps any interval I ⊂R to
+an interval F(I) ⊂(0, 1) of size |F(I)| = P(I). Since
+P(I) > 2−r−1 for r = ⌊−log2 P(I)⌋, the interval I con-
+tains at least one grid point ˆzi with R(ˆzi) ≤r.
+Delimination Overhead.
+The above theorem provides an
+upper bound on the bitrate for a single coordinate zi. En-
+coding a high dimensional latent representation z requires
+some overhead for delimiting the individual coordinates.
+We provide a theoretical upper bound on this overhead for a
+severely restricted variant of VBQ that does not have access
+to posterior uncertainty estimates and that operates only on
+a subset of the proposed grid. Speciﬁcally, we pick only one
+grid point for each interval In = [n−1
+2, n+ 1
+2) with n ∈Z.
+According to Theorem 1, there always exists a grid point
+ˆzi ∈In with R(ˆzi) ≤−log2 P(In). Thus, the resulting
+subset of the grid (Figure 8, center) resembles the more
+commonly used uniform grid (Figure 8 right), whose bitrate
+under standard entropy coding is the information content.
+If we restrict VBQ to this sparse subset of the dense grid,
+then the algorithm collapses to a method known as Shannon-
+Fano-Elias coding (Cover & Thomas, 2012), whose over-
+head over the information theoretically minimal bitrate is
+known to be at most one bit per dimension. The full VBQ al-
+gorithm has more freedom: it exploits posterior uncertainty
+estimates to reduce accuracy where it is not needed, thus
+saving bits and improving compression performance.
+
+
+Variational Bayesian Quantization
+Acknowledgements
+We thank Johannes Ball´e for helping us reproduce the re-
+sults in prior work (Ball´e et al., 2017). Yibo Yang acknowl-
+edges funding from the Hasso Plattner Foundation. This
+material is based upon work supported by the Defense Ad-
+vanced Research Projects Agency (DARPA) under Contract
+No. HR001120C0021. Any opinions, ﬁndings and con-
+clusions or recommendations expressed in this material are
+those of the author(s) and do not necessarily reﬂect the
+views of the Defense Advanced Research Projects Agency
+(DARPA). Furthermore, this work was supported by the
+National Science Foundation under Grants NSF-1928718,
+NSF-2003237, and by Qualcomm.
+References
+Agustsson, E., Mentzer, F., Tschannen, M., Cavigelli, L.,
+Timofte, R., Benini, L., and Gool, L. V. Soft-to-hard
+vector quantization for end-to-end learning compressible
+representations. In Advances in Neural Information Pro-
+cessing Systems, 2017.
+Alemi, A., Poole, B., Fischer, I., Dillon, J., Saurous, R. A.,
+and Murphy, K. Fixing a broken elbo. In International
+Conference on Machine Learning, 2018.
+Ball´e, J., Laparra, V., and Simoncelli, E. P. End-to-end
+optimized image compression. International Conference
+on Learning Representations, 2017.
+Ball´e, J., Minnen, D., Singh, S., Hwang, S. J., and Johnston,
+N. Variational image compression with a scale hyperprior.
+In ICLR, 2018.
+Bamler, R. and Mandt, S.
+Dynamic word embeddings.
+In Proceedings of the 34th International Conference on
+Machine Learning-Volume 70, pp. 380–389, 2017.
+Barkan, O. Bayesian neural word embedding. In Association
+for the Advancement of Artiﬁcial Intelligence, pp. 3135–
+3143, 2017.
+Berger, T.
+Optimum quantizers and permutation codes.
+IEEE Trans. Information Theory, 18:759–765, 1972.
+Blei, D. M., Ng, A. Y., and Jordan, M. I. Latent dirichlet
+allocation. Journal of machine Learning research, 3:
+993–1022, 2003.
+Blei, D. M., Kucukelbir, A., and McAuliffe, J. D. Varia-
+tional inference: A review for statisticians. Journal of
+the American statistical Association, 112(518):859–877,
+2017.
+Blundell, C., Cornebise, J., Kavukcuoglu, K., and Wierstra,
+D. Weight uncertainty in neural networks. arXiv preprint
+arXiv:1505.05424, 2015.
+Chou, P. A., Lookabaugh, T. D., and Gray, R. M. Entropy-
+constrained vector quantization. IEEE Trans. Acoustics,
+Speech, and Signal Processing, 37:31–42, 1989.
+Cover, T. and Thomas, J.
+Elements of Information
+Theory.
+Wiley, 2012.
+ISBN 9781118585771.
+URL
+https://books.google.com/books?id=
+VWq5GG6ycxMC.
+Gallager, R. G. Information theory and reliable communi-
+cation, volume 2. Springer, 1968.
+Gersho, A. and Gray, R. M. Vector quantization and signal
+compression, volume 159. Springer Science & Business
+Media, 2012.
+Gregor, K., Besse, F., Rezende, D. J., Danihelka, I., and
+Wierstra, D. Towards conceptual compression, 2016.
+Habibian, A., Rozendaal, T. v., Tomczak, J. M., and Co-
+hen, T. S. Video compression with rate-distortion au-
+toencoders. In Proceedings of the IEEE International
+Conference on Computer Vision, pp. 7033–7042, 2019.
+Higgins, I., Matthey, L., Pal, A., Burgess, C., Glorot, X.,
+Botvinick, M., Mohamed, S., and Lerchner, A. beta-vae:
+Learning basic visual concepts with a constrained varia-
+tional framework. International Conference on Learning
+Representations, 2017.
+Honkela, A. and Valpola, H. Variational learning and bits-
+back coding: an information-theoretic view to bayesian
+learning. IEEE transactions on Neural Networks, 15(4):
+800–810, 2004.
+Huffman, D. A. A method for the construction of minimum-
+redundancy codes. Proceedings of the IRE, 40(9):1098–
+1101, 1952.
+Johnston, N., Vincent, D., Minnen, D., Covell, M., Singh,
+S., Chinen, T., Jin Hwang, S., Shor, J., and Toderici, G.
+Improved lossy image compression with priming and
+spatially adaptive bit rates for recurrent networks. In
+Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition, pp. 4385–4393, 2018.
+Jordan, M. I., Ghahramani, Z., Jaakkola, T. S., and Saul,
+L. K. An introduction to variational methods for graphical
+models. Machine learning, 37(2):183–233, 1999.
+Kingma, D. P. and Welling, M. Auto-encoding variational
+Bayes. In International Conference on Learning Repre-
+sentations, 2014a.
+Kingma, D. P. and Welling, M. Auto-encoding variational
+Bayes. In International Conference on Learning Repre-
+sentations, pp. 1–9, 2014b.
+
+
+Variational Bayesian Quantization
+Kodak, E. The Kodak PhotoCD Dataset. https://www.
+cns.nyu.edu/˜lcv/iclr2017/. Accessed: 2020-
+01-09.
+Lloyd, S. Least squares quantization in pcm. IEEE transac-
+tions on information theory, 28(2):129–137, 1982.
+Lombardo, S., Han, J., Schroers, C., and Mandt, S. Deep
+generative video compression. In Advances in Neural
+Information Processing Systems, pp. 9283–9294, 2019.
+MacKay, D. J. A practical bayesian framework for backprop-
+agation networks. Neural computation, 4(3):448–472,
+1992.
+MacKay, D. J. Information theory, inference and learning
+algorithms. Cambridge University Press, 2003.
+Mentzer, F., Agustsson, E., Tschannen, M., Timofte, R.,
+and Van Gool, L. Conditional probability models for
+deep image compression. In Proceedings of the IEEE
+Conference on Computer Vision and Pattern Recognition,
+pp. 4394–4402, 2018.
+Michel, J.-B., Shen, Y. K., Aiden, A. P., Veres, A., Gray,
+M. K., Pickett, J. P., Hoiberg, D., Clancy, D., Norvig, P.,
+Orwant, J., et al. Quantitative analysis of culture using
+millions of digitized books. science, 331(6014):176–182,
+2011.
+Mikolov, T., Chen, K., Corrado, G., and Dean, J. Efﬁcient
+estimation of word representations in vector space. arXiv
+preprint arXiv:1301.3781, 2013a.
+Mikolov, T., Sutskever, I., Chen, K., Corrado, G. S., and
+Dean, J. Distributed representations of words and phrases
+and their compositionality. In Advances in Neural Infor-
+mation Processing Systems, pp. 3111–3119, 2013b.
+Mnih, A. and Salakhutdinov, R. R. Probabilistic matrix fac-
+torization. In Advances in neural information processing
+systems, pp. 1257–1264, 2008.
+Ranganath, R., Gerrish, S., and Blei, D. M. Black box
+variational inference. In International Conference on
+Artiﬁcial Intelligence and Statistics, pp. 814–822, 2014.
+Rezende, D. J., Mohamed, S., and Wierstra, D. Stochastic
+backpropagation and approximate inference in deep gen-
+erative models. In International Conference on Machine
+Learning, pp. 1278–1286, 2014.
+Rippel, O. and Bourdev, L. Real-time adaptive image com-
+pression, 2017.
+Theis, L., Shi, W., Cunningham, A., and Husz´ar, F. Lossy
+image compression with compressive autoencoders. Inter-
+national Conference on Learning Representations, 2017.
+Toderici, G., O’Malley, S. M., Hwang, S. J., Vincent, D.,
+Minnen, D., Baluja, S., Covell, M., and Sukthankar, R.
+Variable rate image compression with recurrent neural
+networks. International Conference on Learning Repre-
+sentations, 2016.
+Toderici, G., Vincent, D., Johnston, N., Hwang, S. J., Min-
+nen, D., Shor, J., and Covell, M. Full resolution image
+compression with recurrent neural networks. In 2017
+IEEE Conference on Computer Vision and Pattern Recog-
+nition (CVPR), pp. 5435–5443, 2017.
+Townsend, J., Bird, T., and Barber, D. Practical lossless
+compression with latent variables using bits back coding.
+arXiv preprint arXiv:1901.04866, 2019.
+Wang, Z., Simoncelli, E. P., and Bovik, A. C. Multiscale
+structural similarity for image quality assessment. In
+The Thrity-Seventh Asilomar Conference on Signals, Sys-
+tems & Computers, 2003, volume 2, pp. 1398–1402. Ieee,
+2003.
+Witten, I. H., Neal, R. M., and Cleary, J. G. Arithmetic
+coding for data compression. Communications of the
+ACM, 30(6):520–540, 1987.
+Yang, Y., Bamler, R., and Mandt, S.
+Improving infer-
+ence for neural image compression.
+arXiv preprint
+arXiv:2006.04240, 2020.
+Zhang, C., Butepage, J., Kjellstrom, H., and Mandt, S. Ad-
+vances in variational inference. IEEE transactions on
+pattern analysis and machine intelligence, 2019.
+
+
+Supplementary Material to
+“Variational Bayesian Quantization”
+Yibo Yang * 1 Robert Bamler * 1 Stephan Mandt 1
+This document provides details of the proposed compression
+method (Section S1), model and experiment details (Sec-
+tion S2), and additional examples of compressed images
+(Section S3).
+S1. Delimitation Overhead
+We elaborate on the “encoding” paragraph of Section 3.3
+of the main paper. After ﬁnding a quantized code point ˆξi
+for each dimension i ∈{1, . . . , K} of the latent space,
+these code points have to be losslessly encoded into a sin-
+gle bitstring for transmission or storage. We experimented
+with two encoding schemes, described in Subsections S1.1
+and S1.2 below. Subsection S1.3 provides further analysis.
+S1.1. Encoding via Concatenation
+We ﬁrst describe an encoding scheme that we did not end
+up using, but that makes it easier to understand the objective
+function of VBQ (Eq. 8 of the main text). This encoding
+scheme concatenates the binary representations of ˆξi (Eq. 4
+of the main text) for all i ∈{1, . . . , K} in to a single bit-
+string. As each dimension i contributes R(ˆξi) bits to the
+concatenated bitstring, this encoding scheme justiﬁes the
+rate penalty term “λR(ˆξi)” in Eq. 4 of the main text.
+One also has to transmit the rates R(ˆξi) (in compressed
+form using traditional entropy coding) so that the decoder
+can split the concatenated bitstring at the correct positions.
+While this incurs some overhead, the variable-bitlength rep-
+resentation of ˆξi also saves one bit per dimension i because
+the last bit in the binary representation of each ˆξi does not
+need to be transmitted as it is always equal to one (other-
+wise, the optimization algorithm in VBQ would favor an
+equivalent shorter binary representation of ˆξi).
+*Equal contribution 1Department of Computer Science, Uni-
+versity of California, Irvine.
+Correspondence to: Yibo Yang
+<yibo.yang@uci.edu>, Robert Bamler <rbamler@uci.edu>.
+S1.2. Encoding via Standard Entropy Coding
+The actual encoding scheme we ended up using does not
+deal with the binary representation of each ˆξi explicitly.
+Instead, we treat each ˆξi as a discrete symbol and directly
+encode the sequence (ˆξi)K
+i=1 of symbols via entropy coding
+(e.g., standard arithmetic coding). The entropy coder needs
+a model of the probability p(ˆξi) of each symbol. For model
+compression, we use the empirical frequencies, which we
+transmit as extra header information that counts towards
+the total bitrate. For data compression, we estimate the
+frequencies on training data and include them in the decoder.
+Transmitting the empirical frequencies lead to a negligible
+overhead in the word embeddings experiment. Only a few
+hundred code points (depending on λ) had nonzero frequen-
+cies, so that the compressed ﬁle size was dominated by the
+encoding of K = V d = 107 quantized latent variables.
+S1.3. Justiﬁcation of the Rate Penalty Term λR(ˆξi)
+All experimental results are reported with the encoding
+scheme of Section S1.2 as it lead to slightly lower bitrates
+in practice. A peculiarity of this encoding scheme is that
+it ignores the length R(ˆξi) of the binary representation of
+each ˆξi. For a sequence of symbols ˆξ ≡(ˆξi)K
+i=1 with an
+i.i.d. entropy model p(ˆξi), an optimal entropy coder (such as
+arithmetic coding) achieves the total bitrate R(ˆξ) = ⌈h(ˆξ)⌉
+with the information content
+h(ˆξ) =
+K
+X
+i=1
+h(ˆξi) = −
+K
+X
+i=1
+log2 p(ˆξi).
+(S1)
+In particular, Eq. S1 does not depend on R(ˆξi). This poses
+the question whether the rate penalty term “λR(ˆξi)” in the
+VBQ objective (Eq. 8 of the main text) is justiﬁed. Ide-
+ally, the algorithm would minimize λh(ˆξi) = −λ log2 p(ˆξi)
+instead, but this quantity is unknown until the quantiza-
+tions (ˆξi)K
+i=1 and therefore the empirical frequencies p(ˆξi)
+are obtained. Our experiments suggest that R(ˆξi) is a useful
+proxy for the eventual value of h(ˆξi).
+Figure S1 plots the rate estimate R(ˆξi), i.e., the integer num-
+ber of bits in the binary representation of ˆξi (x-axis) against
+arXiv:2002.08158v2  [eess.IV]  7 Sep 2020
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0
+2
+4
+6
+8
+10
+rate estimate R(ˆξi)
+0
+10
+20
+information content h(ˆξi)
+Figure S1. Relation between rate estimate R(ˆξi) and the actual
+contribution h(ˆξi) of code point ˆξi to the total bitrate under en-
+tropy coding. The approximate afﬁne linear relationship justiﬁes
+minimizing R(ˆξi) as a proxy for h(ˆξi) in VBQ.
+the actual contribution h(ˆξi) = −log2 p(ˆξi) to the total
+bitrate according to Eq. S1 (y-axis). The ﬁgure shows exper-
+imental data for compressed word embeddings at 1.32 bits
+per latent dimension. We make the following observations:
+• For most code points ˆξi, the dependency between h(ˆξi)
+and R(ˆξi) can be approximated by an afﬁne linear
+function, thus justifying the use of R(ˆξi) in the opti-
+mization of Bayesian AC.
+• The slope of the approximate linear dependency is
+larger than one. This may be understood by the penalty
+term λR(ˆξi) in the objective function (Eq. 8 of the
+main text), which causes the method to avoid code
+points ˆξi with large rate estimates R(ˆξi), thus reduc-
+ing their empirical frequencies p(ˆξi) and increasing
+their information content h(ˆξi) = −log2 p(ˆξi). This
+observation does not invalidate the use of R(ˆξi) as
+an estimate for h(ˆξi) since the different slope can be
+absorbed in a rescaling of the parameter λ
+• For rates R(ˆξi) ≥4, there are two code points for
+each rate with considerably lower information content.
+These code points correspond to the two extremes for
+each rate, i.e., ˆξi closest to zero or one, respectively.
+The observation that the two extremes have lower in-
+formation content (i.e., higher empirical frequencies)
+can be explained by the fact that the empirical prior dis-
+tribution whose CDF we use to map latent variables zi
+to quantiles ξi does not fully capture the true distribu-
+tion of variational means. Indeed, experiments with
+a more long tailed empirical prior distribution lead to
+marginally better performance, but the simplicity of a
+Gaussian empirical prior seemed more valuable to us.
+S2. More Experimental Details
+S2.1. Word Embeddings
+The word embeddings experiment involved only minimal
+hyperparameter tuning, and we only optimized for perfor-
+mance of the uncompressed model since the goal of the
+experiment was to test the proposed compression method
+on a model that was not tuned for compression. We trained
+for 105 iterations with minibatches of 104 randomly drawn
+words and contexts due to hardware constraints. We tried
+learning rates 0.1 and 1 and chose 0.1.
+S2.2. Experiments on Images
+As mentioned in the main text, we used regular VAEs in the
+image experiments with standard normal prior p(z) and fac-
+torized normal posterior q(z|x) with diagonal covariance.
+S2.3. MNIST
+The VAE’s inference network has two convolutional layers
+followed by a fully connected layer. The two conv layers
+use 32 and 64 ﬁlters respectively, with kernel size 3, stride
+size 2, and ReLU activation. The fully connected layer has
+output dimension 10 so that µ and σ2 of q(z|x) each has
+dimension 5.
+The generative network architecture mirrors the inference
+network but in reverse, starting with a dense layer mapping
+5 dimensional latent variables to 1568 dimensional, treated
+as 32-channel 7x7 activations, and followed by two decon-
+volutional layers of 64 and 32 ﬁlters (with identical padding
+and stride as the convolutional layers). The output is de-
+convolved with a single 3x3 ﬁlter with sigmoid activation
+function. For each pixel, the (scalar) output of the last layer
+parameterizes the likelihood of the pixel being white.
+We trained the network on binarized MNIST images for 100
+epochs, using the Adam optimizer with learning rate 10−4.
+S2.4. Frey Faces
+On the Frey Faces dataset, we observe poor reconstruction
+quality by training on binarized images with a factorized
+Bernoulli likelihood model; instead, we treat each pixel
+as an observation from a factorized categorical likelihood
+model with 256 possible outcomes.
+The VAE’s inference network has two layers. The ﬁrst
+layer ﬂattens the input image, converts each pixel value in
+{0, 1, ..., 255} into a one-hot vector ∈R256, and uses it to
+index a 128-dimensional dense vector. The second layer
+ﬂattens the result of the ﬁrst layer as its input (which has
+dimensionality equal to 128 × number of pixels), and fully
+connects its input to 8 hidden units. The ﬁnal output is split
+to obtain 4-dimensional µ and log σ2 of q(z|x).
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+The generative network has two fully connected layers. The
+ﬁrst layer uses 4 hidden units and ReLU activation; the sec-
+ond layer uses 256 × number of pixels hidden units, and
+takes a 256-way softmax to compute the categorical proba-
+bility of of each pixel value taking value in {0, 1, ..., 255}.
+We obtained the Frey Faces images from https://cs.
+nyu.edu/˜roweis/data.html. We trained on a ran-
+dom subset of 1800 images for 800 epochs, using the Adam
+optimizer with learning rate 10−4.
+On both MNIST and Frey Faces, we vary the rate-distortion
+trade-off parameter λ of Variational Bayesian Quantization
+between 10−5 and 104.
+S2.5. Color Image Compression
+As mentioned in the main text, the VAE here uses a fully
+convolutional architecture with 3 layers of 256 ﬁlters each,
+the same as in (Ball´e et al., 2017); see the latter for detailed
+descriptions. We tuned the variance σ2 of the likelihood
+model on a logarithmic grid from 10−4 to 0.1 and set it to
+0.001. The VAE was trained on the same dataset as in (Ball´e
+et al., 2017) for 2 million steps, using Adam with learning
+rate 10−4.
+In the image compression R-D curves, λ ranges from 2−6
+to 216. In Figure 5 of the main text, λ was set to 17.5
+for VBQ to match the bitrate of the other methods. The
+uniform quantization result was obtained with 4 quantization
+levels, on a separately tuned model that had an additional
+convolutional layer of 64 channels. The additional conv
+layer was to reduce the latent dimensionality, as uniform
+quantization could not achieve bitrates lower than 0.5 even
+with only 2 grid points in the original 3-layer model.
+S3. Additional Image Compression Examples
+Starting on the next page, we provide detailed compression
+results for individual images from the Kodak dataset. For
+each image, we show the rate-distortion performance by
+various methods, followed by reconstructions using our
+proposed method and JPEG at equal bitrate.1
+1The present version of this document contains a subset of
+example images due to a ﬁle size limit on arXiv submissions.
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S2. Proposed. bits-per-pixel: 0.27, PSNR: 23.595, MS-SSIM: 0.871
+Figure S3. JPEG. bits-per-pixel: 0.27, PSNR: 22.015, MS-SSIM: 0.816
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S4. Proposed. bits-per-pixel: 0.19, PSNR: 29.226, MS-SSIM: 0.882
+Figure S5. JPEG. bits-per-pixel: 0.19, PSNR: 26.658, MS-SSIM: 0.747
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S6. Proposed. bits-per-pixel: 0.19, PSNR: 30.664, MS-SSIM: 0.94
+Figure S7. JPEG. bits-per-pixel: 0.19, PSNR: 26.201, MS-SSIM: 0.842
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S8. Proposed. bits-per-pixel: 0.34, PSNR: 22.177, MS-SSIM: 0.903
+Figure S9. JPEG. bits-per-pixel: 0.34, PSNR: 21.331, MS-SSIM: 0.882
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+(a) Proposed. bits-per-pixel: 0.22, PSNR: 29.584, MS-SSIM: 0.935
+(b) JPEG. bits-per-pixel: 0.22, PSNR: 26.543, MS-SSIM: 0.846
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S11. Proposed. bits-per-pixel: 0.2, PSNR: 29.523, MS-SSIM: 0.928
+Figure S12. JPEG. bits-per-pixel: 0.2, PSNR: 26.6, MS-SSIM: 0.838
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S13. Proposed. bits-per-pixel: 0.21, PSNR: 28.77, MS-SSIM: 0.908
+Figure S14. JPEG. bits-per-pixel: 0.21, PSNR: 26.247, MS-SSIM: 0.818
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+(a) Proposed. bits-per-pixel: 0.2, PSNR: 29.006, MS-SSIM: 0.936
+(b) JPEG. bits-per-pixel: 0.2, PSNR: 25.389, MS-SSIM: 0.835
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+40
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.2
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S16. Proposed. bits-per-pixel: 0.2, PSNR: 31.425, MS-SSIM: 0.945
+Figure S17. JPEG. bits-per-pixel: 0.2, PSNR: 26.976, MS-SSIM: 0.833
+
+
+Supplementary Material to “Variational Bayesian Quantization”
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+10
+20
+30
+PSNR (RGB)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Bits per Pixel (BPP)
+0.4
+0.6
+0.8
+1.0
+MS-SSIM (RGB)
+Bayesian AC (proposed)
+Uniform Quantization
+k-means Quantization
+JPEG
+Ball´e et al. (2017)
+Figure S18. Proposed. bits-per-pixel: 0.24, PSNR: 24.254, MS-SSIM: 0.882
+Figure S19. JPEG. bits-per-pixel: 0.24, PSNR: 22.562, MS-SSIM: 0.818

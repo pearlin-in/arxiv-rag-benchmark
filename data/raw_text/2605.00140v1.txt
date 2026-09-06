@@ -1,0 +1,585 @@
+Technical Report: Activation Residual Hessian Quantization
+(ARHQ) for Low-Bit LLM Quantization
+YiFeng Wang∗, Zhun Sun†, Keisuke Sakaguchi
+Graduate School of Information Sciences
+Tohoku University
+Abstract
+We present Activation Residual Hessian Quantization (ARHQ), a post-training weight split-
+ting method designed to mitigate error propagation in low-bit activation-weight quantization.
+By constructing an input-side residual Hessian from activation quantization residuals (Gx),
+ARHQ analytically identifies and isolates error-sensitive weight directions into a high-precision
+low-rank branch. This is achieved via a closed-form truncated SVD on the scaled weight ma-
+trix WG1/2
+x
+. Experimental results on Qwen3-4B-Thinking-2507 demonstrate that ARHQ sig-
+nificantly improves layer-wise SNR and preserves downstream reasoning performance on Ze-
+braLogic even under aggressive quantization. The code is available at https://github.com/
+BeautMoonQ/ARHQ.
+1
+Introduction
+Low-bit quantization of Large Language Models (LLMs) frequently encounters a fundamental mis-
+match between compression efficiency and inference fidelity. Conventional low-rank splitting meth-
+ods typically approach this by addressing different sources of information loss: (1) minimizing the
+Frobenius energy to reconstruct the weight matrix W ( Wang et al., 2024 ) ; (2) preserving heavy-
+hitter features by weighting the objective with activation energy Hx = 1
+N X⊤X ( Yuan et al., 2023
+) ; or (3) absorbing magnitude outliers into a high-precision branch to reduce the dynamic range
+and clipping errors of the quantized main branch ( Li et al., 2024 ) . However, we observe that
+under aggressive activation quantization, the dominant source of output error is often not the loss
+of original signal energy nor the presence of magnitude outliers alone, but rather how the linear
+map amplifies quantization residuals originating from the input activations.
+This observation motivates Activation Residual Hessian Quantization (ARHQ). Unlike previous
+works that aim to protect the signal or absorb the outliers, ARHQ is designed specifically to sup-
+press the noise amplification. By decomposing the output error of a quantized linear layer, we
+isolate the specific term ExW ⊤responsible for propagating activation residuals Ex. ARHQ op-
+timizes a low-rank split for this term, re-casting the task as a weighted low-rank approximation
+problem under a metric induced by the residual covariance Gx =
+1
+N E⊤
+x Ex. Intuitively, ARHQ
+identifies weight directions that most strongly amplify quantization noise and assigns them to a
+high-precision low-rank branch, while the remaining ”residual-insensitive” components follow the
+∗wang.yifeng.q6@dc.tohoku.ac.jp
+†sun.zhun.a5@tohoku.ac.jp
+1
+arXiv:2605.00140v1  [cs.LG]  30 Apr 2026
+
+
+standard quantized path. The optimization objective of ARHQ represents a significant departure
+from existing paradigms:
+Weight-only Reconstruction
+( Wang et al., 2024 ) : Minimizes pure weight approximation
+error by
+min
+L ∥W −L∥2
+F ;
+(1)
+Outlier Absorption
+( Li et al., 2024 ) : Extracts magnitude outliers into L to minimize the
+quantization clipping error of the residual main branch by
+min
+L ∥(W −L) −Qw(W −L)∥2
+F ;
+(2)
+Activation-aware Reconstruction
+( Yuan et al., 2023 ) : Weights the reconstruction by the
+input activation covariance Hx by
+min
+L ∥X(W −L)⊤∥2
+F ≈min
+L ∥(W −L)H1/2
+x
+∥2
+F ;
+(3)
+Activation-Residual-aware Reconstruction
+: Weights the reconstruction by the quantization
+residual covariance Gx by
+min
+L ∥Ex(W −L)⊤∥2
+F = min
+L ∥(W −L)G1/2
+x ∥2
+F .
+(4)
+We justify the term Residual Hessian by demonstrating that Gx is precisely the shared input-
+side Hessian block of the residual propagation loss. This distinction is critical: since Gx is derived
+directly from the observed quantization error Ex, ARHQ is inherently quantizer-adaptive. It adapts
+to the specificities of the deployed hardware codebooks, scaling rules, and calibration distributions,
+rather than assuming isotropic or quantizer-agnostic noise.
+2
+Activation Residual Hessian Quantization
+2.1
+Quantization Error Decomposition
+Consider a linear layer defined by
+Y = XW ⊤,
+(5)
+where X ∈RN×Din is the input activation matrix and W ∈RDout×Din is the weight matrix.
+Let Qx(·) and Qw(·) denote the activation and weight quantizers, respectively. We maintain a
+consistent notation for quantization residuals throughout this report:
+Ex = Qx(X) −X,
+Ew = Qw(W) −W
+(6)
+The actual forward pass of the quantized layer is given by
+ˆY = Qx(X)Qw(W)⊤= (X + Ex)(W + Ew)⊤
+(7)
+2
+
+
+Expanding this expression reveals the full output error
+ˆY −Y = ExW ⊤+ XE⊤
+w + ExE⊤
+w.
+(8)
+Equation (8) separates the total error into three distinct components: activation-error propagation
+(ExW ⊤), weight-error propagation (XE⊤
+w), and their second-order interaction. ARHQ is specif-
+ically designed to tackle the first term, ExW ⊤, as it directly captures how the layer amplifies
+activation quantization noise, which is considered a dominant source of degradation in low-bit
+regimes, and conveniently admits a tractable closed-form solution.
+2.2
+Isolating the Residual Propagation via a Low-Rank Branch
+To mitigate this error amplification, ARHQ splits the weight matrix into two fundamental compo-
+nents:
+W = Wres + L,
+rank(L) ≤r
+(9)
+Here, Wres remains on the primary quantized branch, while L acts as a high-precision, low-rank side
+branch. In practical deployments, to satisfy the rank constraint and achieve actual computational
+and memory savings, this low-rank matrix is explicitly parameterized as the product of two factor
+matrices as L = BA⊤, where A ∈RDin×r acts as a down-projection and B ∈RDout×r acts as an
+up-projection (the exact analytical forms of B and A will be derived in Section 2.5).
+During actual inference, the forward pass of the layer is structurally approximated by these two
+parallel branches as
+ˆY = Qx(X)Qw(Wres)⊤+ XL⊤
+(10)
+To derive a closed-form split for L, we must isolate the activation-residual propagation. We do
+this by temporarily assuming the main branch Wres is kept in full precision, yielding a surrogate
+inference model denoted as
+ˆYapprox = Qx(X)W ⊤
+res + XL⊤
+(11)
+Substituting Wres = W −L into this surrogate model, we evaluate the gap between the exact
+floating-point output and the surrogate approximation
+Y −ˆYapprox = XW ⊤−Qx(X)(W −L)⊤−XL⊤= (X −Qx(X))(W −L)⊤.
+(12)
+Since the activation residual is defined as Ex = Qx(X) −X, the error magnitude becomes exactly
+Ex(W −L)⊤. Minimizing the Frobenius energy of this isolated error leads directly to the ARHQ
+primal objective as
+min
+rank(L)≤r∥Ex(W −L)⊤∥2
+F
+(13)
+2.3
+The Activation Residual Hessian
+To solve this objective analytically, we define the residual covariance matrix in the following form:
+3
+
+
+Gx = 1
+N E⊤
+x Ex.
+(14)
+Using the cyclic property of the trace, we can rewrite the primal objective as
+∥Ex(W −L)⊤∥2
+F = Tr
+
+(W −L)E⊤
+x Ex(W −L)⊤
+(15)
+= N Tr
+
+(W −L)Gx(W −L)⊤
+(16)
+= N ∥(W −L)G1/2
+x ∥2
+F .
+(17)
+Dropping the constant factor N, the optimization problem simplifies to a weighted low-rank ap-
+proximation that solves
+min
+rank(L)≤r∥(W −L)G1/2
+x ∥2
+F .
+(18)
+It is important to explicitly distinguish the residual covariance Gx from the standard activation
+covariance Hx = 1
+N X⊤X. In standard post-training quantization literature ( Frantar et al., 2022
+) , weight importance is typically governed by the activation Hessian Hx, which arises naturally
+as the second-order derivative of the standard signal reconstruction loss. Methods relying on Hx
+inherently assume that preserving the largest original input features is the optimal strategy. In
+contrast, ARHQ relies on Gx to directly capture the structure of the quantization noise itself. This
+ensures that the low-rank split prioritizes fixing the errors introduced by activation quantization,
+rather than generic signal reconstruction.
+Because our primary focus shifts from full signal reconstruction to mitigating the isolated residual
+propagation error, the optimization landscape is correspondingly governed by Gx. We therefore
+formally term Gx the activation residual Hessian. To see this mathematically, consider the residual
+propagation loss derived from our isolated objective: L(Wres) =
+1
+N ∥ExW ⊤
+res∥2
+F = Tr(WresGxW ⊤
+res).
+Its gradient and Hessian with respect to Wres can be exactly written as:
+∇WresL = 2WresGx,
+∇2
+WresL = 2IDout ⊗Gx.
+(19)
+Thus, Gx plays the exact same mathematical and functional role in our residual-aware framework
+as the standard Hessian Hx does in traditional methods like GPTQ ( Frantar et al., 2022 ) .
+2.4
+Closed-form solution
+Proposition 1 (ARHQ closed-form decomposition). Let W ∈RDout×Din and assume the activation
+residual covariance Gx ≻0. Define the scaled weight matrix M = WG1/2
+x . If Mr is the optimal
+rank-r approximation of M under the Frobenius norm, then the exact solution to the weighted
+objective
+min
+rank(L)≤r∥(W −L)G1/2
+x ∥2
+F
+(20)
+is strictly given by
+L⋆= MrG−1/2
+x
+(21)
+Proof. We introduce the change of variables eL = LG1/2
+x . Because Gx ≻0, the matrix G1/2
+x
+is
+invertible, which guarantees that right-multiplication preserves the matrix rank, i.e., rank(eL) =
+4
+
+
+rank(L). The weighted objective can thus be rewritten as a standard unweighted approximation
+problem:
+min
+rank(eL)≤r
+∥M −eL∥2
+F
+(22)
+By the Eckart-Young-Mirsky theorem, the optimal solution for eL is the truncated SVD of M,
+denoted as Mr. Mapping this solution back to the original parameter space yields L⋆= MrG−1/2
+x
+,
+concluding the proof.
+2.5
+Factorization for Deployment
+While L⋆represents the mathematical optimum, deploying it directly as a dense matrix offers no
+computational savings. We must factorize it into two smaller matrices to construct the low-rank
+side branch L = BA⊤.
+Let the truncated SVD of the scaled weight matrix be explicitly written as Mr = UrΣrV ⊤
+r . Sub-
+stituting this into our optimal solution gives
+L⋆= (UrΣrV ⊤
+r )G−1/2
+x
+(23)
+To match the parameter shape of a dual-layer linear bottleneck, we group the terms to define the
+down-projection matrix A ∈RDin×r and the up-projection matrix B ∈RDout×r as follows
+B = UrΣr,
+A = G−1/2
+x
+Vr
+(24)
+This yields the final operational form L⋆= BA⊤. During inference, the input X is sequentially
+multiplied by A and B⊤, perfectly mirroring the standard LoRA architecture but achieved entirely
+post-training without backpropagation.
+2.6
+Numerical regularization
+In practical deployments, Gx is frequently singular or heavily ill-conditioned. This typically occurs
+when the number of calibration samples is smaller than the input dimension Din, when quantization
+residuals are near zero for specific channels, or when prior smoothing operations artificially lower
+the effective rank.To handle this instability, we compute the eigendecomposition of the residual
+covariance, Gx = U diag(λ) U⊤, and apply a floor ε to the eigenvalues to create a regularized
+metric as
+Gx,ε = U diag(max(λi, ε)) U⊤.
+(25)
+The safely deployed objective therefore becomes
+min
+rank(L)≤r∥(W −L)G1/2
+x,ε ∥2
+F .
+(26)
+This regularization stabilizes the inversion G−1/2
+x,ε
+and prevents the unconstrained growth of L along
+directions with near-zero residual energy, ensuring the problem remains identifiable and numerically
+robust.
+5
+
+
+Algorithm 1 Activation Residual Hessian Quantization (ARHQ) with Smoothing
+Require: Original weight matrix W ∈RDout×Din, Calibration activations Xcalib ∈RNcalib×Din,
+Positive diagonal smoothing matrix S = diag(s), Activation quantizer Qx(·), Target rank r,
+Regularization floor ϵ
+Ensure: Main branch residual weight Wres,s, Down-projection matrix As, Up-projection matrix
+B
+Stage 1: Smoothing Preprocessing
+1: Xs ←XcalibS−1
+▷Smooth calibration activations
+2: Ws ←WS
+▷Smooth weight matrix
+Stage 2: Residual Covariance Computation
+3: Xq ←Qx(Xs)
+▷Fake-quantize in the smoothed space
+4: Es ←Xq −Xs
+▷Compute smoothed activation residuals
+5: Gs ←
+1
+Ncalib E⊤
+s Es
+▷Construct residual covariance (Hessian)
+Stage 3: Numerical Regularization
+6: Compute eigendecomposition Gs = Udiag(λ)U⊤
+7: Gs,ϵ ←Udiag(max(λi, ϵ))U⊤
+▷Apply eigenvalue floor
+8: Construct G1/2
+s,ϵ and G−1/2
+s,ϵ
+Stage 4: Scaled Truncated SVD
+9: Ms ←WsG1/2
+s,ϵ
+▷Scale weights by residual metric
+10: Ur, Σr, Vr ←TruncatedSVD(Ms, r)
+▷Extract top-r components
+Stage 5: Factorization for Deployment
+11: B ←UrΣr
+▷Construct up-projection factor
+12: As ←G−1/2
+s,ϵ
+Vr
+▷Construct down-projection factor
+13: Ls ←BA⊤
+s
+▷Form high-precision low-rank branch
+14: Wres,s ←Ws −Ls
+▷Compute residual weight for main branch
+15: return Wres,s, As, B
+3
+Practical Pipeline
+ARHQ reduces the propagation of activation residuals, but it does not directly shrink the residual
+magnitude. Therefore, it is highly complementary to activation smoothing. Smoothing reduces
+or redistributes the activation error, while ARHQ subsequently adapts the low-rank split to the
+residual structure that remains after the smoothing operation. We integrate these two mechanisms
+into a unified practical pipeline.
+Let S = diag(s) be a positive diagonal smoothing matrix. We first apply an equivalent transform
+to the calibration activations and the weights
+Xs = XS−1,
+Ws = WS.
+(27)
+This transformation preserves the full-precision output, given that
+XsW ⊤
+s = XS−1(WS)⊤= XW ⊤.
+(28)
+Operating entirely within this smoothed space, the unified ARHQ decomposition is computed offline
+using calibration data, as detailed in Algorithm 1.
+6
+
+
+At runtime, inference seamlessly integrates the smoothed parameters. Assuming the pre-quantized,
+smoothed activation XS−1 is available at the linear layer boundary before online activation quan-
+tization, the forward pass is structurally approximated by
+ˆY = Qx(XS−1)Qw(Wres,s)⊤+ (XS−1As)B⊤
+(29)
+In this configuration, the main branch computes the quantized matrix multiplication
+Qx(XS−1)Qw(Wres,s)⊤,
+(30)
+while the side branch computes the higher-precision projection (XS−1As)B⊤. For a single layer,
+this dual-branch architecture introduces an additional arithmetic cost of O(Nr(Din + Dout)). The
+additional parameter count is r(Din + Dout).
+For square layers where Din = Dout = D, this
+parameter overhead ratio simplifies to 2r/D.
+4
+Experimental Evidence
+4.1
+Setup summary
+We summarize the current experimental scope used to validate the method:
+• Model. Qwen3-4B-Thinking-2507.
+• Modules. Attention projections across 36 layers.
+• Rank. r = 128.
+• Quantization focus. Aggressive low-bit activation-weight quantization, including NVFP4-
+style settings in the reported SNR study.
+• Baselines. A standard SVD low-rank split with and without smoothing.
+Several implementation details remain to be fully documented in a final reproducibility package,
+including exact block sizes, scale computation rules, accumulation dtypes, and whether low-rank
+factors are stored in bf16 or fp16. We state these omissions explicitly because they matter for a
+complete arXiv release.
+4.2
+SNR definition
+For a floating-point reference output Y and a quantized approximation ˆY , we use
+SNR(Y, ˆY ) = 10 log10
+∥Y ∥2
+F
+∥Y −ˆY ∥2
+F
+.
+(31)
+Higher values are better.
+7
+
+
+Table 1: Layer-wise SNR (dB) on 36 attention layers, rank r = 128.
+Scope
+ARHQ Raw
+ARHQ Smooth
+SVD Raw
+SVD Smooth
+q/k/v/o average
+24.4229
+24.7269
+22.6314
+24.2742
+q proj
+28.3389
+28.6415
+25.7253
+28.1420
+k proj
+28.3682
+28.6888
+25.8594
+27.9529
+v proj
+21.4883
+21.7858
+19.6953
+21.4014
+o proj
+19.4964
+19.7917
+19.2456
+19.6006
+Table 2: Improvement over baseline SNR (dB).
+Scope
+ARHQ Raw
+ARHQ Smooth
+SVD Raw
+SVD Smooth
+q/k/v/o average
++4.0828
++3.7906
++2.5627
++3.3378
+q proj
++5.1668
++4.7555
++3.2661
++4.2560
+k proj
++6.5745
++6.1158
++4.2142
++5.3799
+v proj
++2.9964
++2.6233
++1.5308
++2.2389
+o proj
++1.5936
++1.6675
++1.2397
++1.4764
+4.3
+Layer-wise attention projection SNR
+Table 1 reports the current SNR measurements on Qwen3-4B-Thinking-2507 attention projections.
+ARHQ raw corresponds to residual-aware splitting without smoothing; ARHQ smoothing adds
+smoothing before decomposition.
+ARHQ outperforms the unweighted SVD split without smoothing by a clear margin.
+On the
+q/k/v/o average, ARHQ raw reaches 24.4229 dB versus 22.6314 dB for SVD raw, a gain of about
+1.79 dB. With smoothing, ARHQ remains best at 24.7269 dB, also improving over SVD smoothing
+at 24.2742 dB. This pattern is consistent with the claim that residual-aware weighting chooses more
+useful low-rank directions than weight-only reconstruction.
+4.4
+Improvement over quantized baseline
+Table 2 reports the improvement over the underlying quantized baseline.
+These numbers suggest two practical conclusions. First, residual-aware weighting matters even
+before smoothing. Second, smoothing and ARHQ appear complementary rather than redundant.
+4.5
+Small-scale ZebraLogic evaluation
+We also ran a preliminary generation-based evaluation on a 140-problem ZebraLogic subset using
+Qwen3-4B-Thinking-2507 with seed 0, temperature 0.6, top-p = 0.95, and top-k = 20.
+On this small subset, ARHQ achieves the highest observed accuracy among quantized variants
+and matches the bf16 run on puzzle accuracy. However, the sample size is too small for strong
+conclusions. For 130/140, the binomial standard error is about 2.18%, so a 95% interval is roughly
+±4.3%. The difference between 127/140 and 130/140 is therefore within plausible statistical noise.
+We view Table 3 as encouraging evidence rather than definitive proof.
+8
+
+
+Table 3: Preliminary ZebraLogic results on 140 puzzles.
+Method
+Puzzle Acc
+Cell Acc
+Cell Recall
+bf16
+130/140 = 92.86%
+2671/2732 = 97.77%
+2671/2837 = 94.15%
+nvfp4
+105/140 = 75.00%
+2279/2625 = 86.82%
+2279/2783 = 81.89%
+awq4bit
+125/140 = 89.29%
+2589/2771 = 93.43%
+2589/2873 = 90.11%
+svdquant r128
+127/140 = 90.71%
+2643/2766 = 95.55%
+2643/2873 = 91.99%
+arhq r128 all
+130/140 = 92.86%
+2660/2779 = 95.72%
+2660/2873 = 92.59%
+5
+Discussion
+5.1
+Why residual Hessian instead of activation Hessian?
+Using Hx = X⊤X/N would prioritize directions with large activation energy, but low-bit quan-
+tization error is not generally isotropic and need not align with those directions. ARHQ instead
+uses Gx = E⊤
+x Ex/N, which is directly measured from the deployed quantizer and calibration data.
+This makes the method sensitive to block-wise quantization, non-uniform floating-point codebooks,
+scale selection rules, and any layer-specific distortion pattern.
+5.2
+Quantizer adaptivity
+ARHQ is adaptive not only to the quantizer family but to the triple of quantizer, calibration
+distribution, and layer input distribution. More precisely,
+Gx = Ex∼Dcalib
+
+(Qx(x) −x)(Qx(x) −x)⊤
+.
+(32)
+This is a strength when calibration matches deployment, but also a limitation: a mismatched
+calibration set can misestimate the true residual structure and reduce the benefit of the split.
+5.3
+Interaction with weight quantization
+The exact ARHQ objective solves the activation-residual subproblem, not the full joint objective
+in Equation (8). After the split, Wres is still quantized, which introduces additional terms involving
+Ew. In some cases, the inverse square-root mapping can enlarge the dynamic range of the low-rank
+factors or the residual weight, potentially making Wres harder to quantize. We partially address
+this with eigenvalue clamping and consider quantization-aware post-split refinement an important
+direction for future work.
+6
+Limitations and Future Work
+The current formulation is deliberately narrow so that it admits a closed-form solution. Several
+important directions remain open.
+9
+
+
+Weight-quantization-aware ARHQ. A more complete objective would combine activation resid-
+ual propagation with residual-weight quantization loss, for example
+min
+L ∥Ex(W −L)⊤∥2
+F + λ ∥X((W −L) −Qw(W −L))⊤∥2
+F ,
+(33)
+but this no longer has a simple closed form because the quantizer depends on L.
+Joint smoothing and splitting.
+In this report, smoothing is a preprocessing step.
+Jointly
+optimizing the smoothing transform and the ARHQ split may yield better trade-offs.
+Rank allocation. All current results use a fixed rank r = 128. A natural extension is to allocate
+a global rank budget according to the singular value gains of WG1/2
+x
+at each layer.
+Lower-cost variants. Full covariance ARHQ requires eigendecomposition of a Din × Din matrix.
+Diagonal or block-diagonal approximations may offer a better quality-cost trade-off.
+Stronger evaluation. A complete arXiv version should add rank ablations, comparisons against
+Hx-weighted and identity-weighted objectives, calibration-size studies, layer-wise spectra, perplex-
+ity, broader reasoning benchmarks, and end-to-end latency and memory measurements.
+References
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+Muyang Li, Yujun Lin, Zhekai Zhang, Tianle Cai, Xiuyu Li, Junxian Guo, Enze Xie, Chenlin Meng,
+Jun-Yan Zhu, and Song Han. Svdquant: Absorbing outliers by low-rank components for 4-bit
+diffusion models. arXiv preprint arXiv:2411.05007, 2024.
+Xin Wang, Yu Zheng, Zhongwei Wan, and Mi Zhang. Svd-llm: Truncation-aware singular value
+decomposition for large language model compression. arXiv preprint arXiv:2403.07378, 2024.
+Zhihang Yuan, Yuzhang Shang, Yue Song, Dawei Yang, Qiang Wu, Yan Yan, and Guangyu Sun.
+Asvd: Activation-aware singular value decomposition for compressing large language models.
+arXiv preprint arXiv:2312.05821, 2023.
+10

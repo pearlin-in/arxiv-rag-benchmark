@@ -1,0 +1,1338 @@
+Loss Aware Post-training Quantization
+Yury Nahshan⋆1, Brian Chmiel⋆1,2, Chaim Baskin⋆2, Evgenii
+Zheltonozhskii⋆2[0000−0002−5400−9321], Ron Banner1, Alex M. Bronstein2, and
+Avi Mendelson2
+1 Intel Artiﬁcial Intelligence Products Group (AIPG)
+2 Technion Israel Institute of Technology
+yury.nahshan@intel.com; brian.chmiel@intel.com;
+chaimbaskin@cs.technion.ac.il; evgeniizh@cs.technion.ac.il;
+ron.banner@intel.com; bron@cs.technion.ac.il;
+avi.mendelson@cs.technion.ac.il
+Abstract. Neural network quantization enables the deployment of large
+models on resource-constrained devices. Current post-training quanti-
+zation methods fall short in terms of accuracy for INT4 (or lower) but
+provide reasonable accuracy for INT8 (or above). In this work, we study
+the eﬀect of quantization on the structure of the loss landscape. Addition-
+ally, we show that the structure is ﬂat and separable for mild quantization,
+enabling straightforward post-training quantization methods to achieve
+good results. We show that with more aggressive quantization, the loss
+landscape becomes highly non-separable with steep curvature, making the
+selection of quantization parameters more challenging. Armed with this
+understanding, we design a method that quantizes the layer parameters
+jointly, enabling signiﬁcant accuracy improvement over current post-
+training quantization methods. Reference implementation is available at
+the paper repository.
+Keywords: Deep Neural Networks, Quantization, Post-training Quanti-
+zation, Compression
+1
+Introduction
+Deep neural networks (DNNs) are a powerful tool that have shown unmatched
+performance in various tasks in computer vision, natural language processing
+and optimal control, to mention only a few. The high computational resource
+requirements, however, constitute one of the main drawbacks of DNNs, hindering
+their massive adoption on edge devices. With the growing number of tasks
+performed on edge devices, e.g., smartphones or embedded systems, and the
+availability of dedicated custom hardware for DNN inference, the subject of DNN
+compression has gained popularity.
+One way to improve DNN computational eﬃciency is to use lower-precision
+representation of the network, also known as quantization. Most of the literature
+⋆Equal contribution.
+arXiv:1911.07190v2  [cs.LG]  16 Mar 2020
+
+
+2
+Y. Nahshan et al.
+(a)
+(b)
+Fig. 1: A visualization of the loss surface: For every pair of quantization step
+sizes in the ﬁrst two layers (x and y-axis), we estimate the cross-entropy loss
+(z-axis) using one batch of 512 images (ResNet18 on ImageNet). The colored dots
+mark the quantization step sizes found by optimizing diﬀerent p-norm metrics –
+each layer is quantized in a way that minimizes the p-norm distance between the
+quantized tensor to its original full precision counterpart (e.g., MSE distortion).
+(a) Note the complex inseparable shape of the loss landscape. (b) A zoom-in of
+sub-ﬁgure (a) to the point where the location of the optimal cross-entropy loss
+(red cross) can be distinguished from the optimized p-norm solutions.
+on neural network quantization involves training either from scratch [3, 12]
+or performing ﬁne-tuning on a pre-trained full-precision model [11, 24]. While
+training is a powerful method to compensate for accuracy loss due to quantization,
+it is often desirable to be able to quantize the model without training since this
+is both resource consuming and requires access to the data the model was
+trained on, which is not always available. These methods are commonly referred
+to as post-training quantization and usually require only a small calibration
+dataset. Unfortunately, current post-training methods are not very eﬃcient, and
+most existing works only manage to quantize parameters to the 8-bit integer
+representation (INT8).
+In the absence of a training set, these methods typically aim at minimizing
+the local error introduced during the quantization process (e.g., round-oﬀerrors).
+Recently, a popular approach to minimizing this error has been to clip the tensor
+outliers. This means that peak values will incur a larger error, but, in total,
+this will reduce the distortion introduced by the limited resolution [1, 16, 26].
+Unfortunately, these schemes suﬀer from two fundamental drawbacks.
+Firstly, it is hard or even impossible to choose an optimal metric for the
+network performance based on the tensor level quantization error. In particular,
+even for the same task, similar architectures may favor diﬀerent objectives. Sec-
+
+
+Loss Aware Post-Training Quantization
+3
+ondly, the noise in earlier layers might be ampliﬁed by successive layers, creating
+a dependency between quantizaton errors of diﬀerent layers. This cross-layer
+dependency makes it necessary to jointly optimize the quantization parameters
+across all network layers; however, current methods optimize them separately
+for each layer. Figure 1 plots the challenging loss surface of this optimization
+process.
+Below, we outline the main contributions of the present work along with the
+organization of the remaining sections.
+• First we consider current layer-by-layer quantization methods where the quan-
+tization step size within each layer is optimized to accommodate the dynamic
+range of the tensor while keeping it small enough to minimize quantization
+noise. Although these methods optimize the quantization step size of each
+layer independently of the other layers, we observe strong interactions be-
+tween the layers, explaining their suboptimal performance at the network
+level.
+• Accordingly, we consider network quantization as a multivariate optimization
+problem where the layer quantization step sizes are jointly optimized to
+minimize the neural network cross-entropy loss. We observe that layer-by-
+layer quantization identiﬁes solutions in a small region around the optimum,
+where degradation is quadratic in the distance from it. We provide analytical
+justiﬁcation as well as empirical evidence showing this eﬀect.
+• Finally, we propose to combine layer-by-layer quantization with multivariate
+quadratic optimization. Our method is shown to signiﬁcantly outperform
+state-of-the-art methods on two diﬀerent challenging tasks and six DNN
+architectures.
+The rest of the paper is organized as follows: Section 2 reviews the related work,
+Section 3 studies the properties of the loss function of the quantized network,
+Section 4 describes a proposed method, Section 5 provides the experimental
+results, and Section 6 concludes the paper.
+2
+Related work
+The approaches to neural network quantization can be divided roughly into
+two major categories [15]: quantization-aware training, which introduces the
+quantization at some point during the training, and post-training quantization,
+where the network weights are not optimized during the quantization. The recent
+progress in quantization-aware training has allowed the realization of results
+comparable to a baseline for as low as 2–4 bits per parameter [2, 9, 12, 24, 25] and
+show decent performance even for single bit (binary) parameters [13, 17, 22]. The
+major drawback of quantization-aware methods is the necessity for a vast amount
+of labeled data and high computational power. Consequently, post-training
+quantization is widely used in existing embedded hardware solutions. Most work
+that proposes hardware-friendly post-training schemes has only managed to get
+
+
+4
+Y. Nahshan et al.
+to 8-bit quantization without signiﬁcant degradation in performance or requiring
+substantial modiﬁcations in exisiting hardware.
+One of the ﬁrst post-training schemes, proposed by Gong et al. [8], used
+min-max (ℓ∞norm) as a threshold for 8-bit quantization. It produces a small per-
+formance degradation and can be deployed eﬃciently on the hardware. Afterward,
+better schemes involving the choosing of the clipping value, such as minimizing
+the Kullback-Leibler divergence [19], assuming the known distribution of weights
+[1], or minimizing quantization MSE iteratively [14], were proposed.
+Another eﬃcient approach quantization is to change the distribution of the
+tensors, making it more suitable for quantization, such as equalizing the weight
+ranges [20] or splitting outlier channels [26].
+Recent works noted that the quantization process introduces a bias into
+distributions of the parameters and focused on correction of this bias. Finkelstein
+et al. [6] addressed a problem of MobileNet quantization. They claimed that
+the source of degradation was shifting in the mean activation value caused by
+inherent bias in the quantization process and proposed a scheme for ﬁxing this
+bias. Multiple alternative schemes for the correction of quantization bias were
+proposed, and those techniques are widely applied in state-of-the-art quantization
+approaches [1, 4, 6, 20]. In our work, we utilize the bias correction method by
+developed Banner et al. [1].
+While the simplest form of quantization applies a single quantizer to the whole
+tensor (weights or activations), ﬁner quantization allows reduction of performance
+degradation. Even though this approach usually boosts performance signiﬁcantly
+[1, 5, 14, 16, 18], it requires more parameters and special hardware support,
+which makes it unfavorable for real-life deployment.
+One more source of performance improvement is using more sophisticated
+ways to map values to a particular bin. This includes clustering of the tensor entry
+values [21] and non-uniform quantization [4]. By allowing a more general quantizer,
+these approaches provide better performance than uniform quantization, but also
+require hardware support for eﬃcient inference, and thus, similarly to ﬁne-grained
+quantization, are less suitable for deployment on consumer-grade hardware.
+To the best of our knowledge, previous works did not take into account the
+fact that the loss might be not separable during optimization, usually performed
+per layer or even per channel. Notable exceptions are Gong et al. [8] and Zhao
+et al. [26], who did not show any kind of optimization. Nagel et al. [20] partially
+addressed the lack of separability by treating pairs of consecutive layers together.
+3
+Loss landscape of quantized DNNs
+In this section, we introduce the notion of separability of the loss function.
+We study the separability and the curvature of the loss function and show
+how quantization of DNNs aﬀect these properties. Finally, we show that during
+aggressive quantization, the loss function becomes highly non-separable with steep
+curvature, which is unfavorable for existing post-training quantization methods.
+
+
+Loss Aware Post-Training Quantization
+5
+Our method addresses these properties and makes post-training quantization
+possible at low bit quantization.
+We focus on symmetric uniform quantization with a ﬁxed number of bits M
+for all layers and quantization step size ∆that maps a continuous value x ∈R
+into a discrete representation,
+Q∆,M(x) =
+
+
+
+
+
+
+
+−2M−1∆
+x < −2M−1∆
+j x
+∆
+m
+∆
+|x| ⩽2M+1∆
++2M−1∆
+x > +2M−1∆.
+(1)
+By constraining the range of x to [−c, c], the connection between c and ∆is
+given by:
+∆=
+2c
+2M−1
+(2)
+In the case of activations, we limit ourselves to the ReLU function, which
+allows us to choose a quantization range of [0, c]. In such cases, the quantization
+step ∆is given by:
+∆=
+c
+2M−1
+(3)
+(a) 2 bit
+(b) 3 bit
+(c) 4 bit
+Fig. 2: A visualization of the loss surface showing complex interactions between
+quantization step sizes of the ﬁrst two layers in ResNet18. At higher bitwidth,
+the quantization step sizes ∆1 and ∆2 are smaller, thus introducing a smaller
+level of noise. Eq. (7) suggests a weak interaction between the ﬁrst and second
+layers in that case, which becomes evident at 4-bit precision (the eﬀect on the
+loss due to the quantization of the ﬁrst layer with ∆1 is almost independent of
+the eﬀect that is achieved with ∆2). On the other hand, at lower bitwidths (i.e.,
+higher quantization noise), we start seeing interactions between the quantization
+processes of the two layers.
+
+
+6
+Y. Nahshan et al.
+3.1
+Separable optimization
+Suppose the loss function of the network L depends on a certain set of variables
+(weights, activations, etc.), which we denote by a vector v. We would like to
+measure the eﬀect of adding quantization noise to this set of vectors. In the
+following we show that for suﬃciently small quantization noise, we can treat it as
+an additive noise vector ε, allowing coordinate-wise optimization. However, when
+quantization noise is increased, the degradation in one layer is associated with
+other layers, calling for more laborious non-separable optimization techniques.
+From the Taylor expansion:
+∆L = L(v + ε) −L(v) = ∂L
+∂v
+⊤
+ε + ε⊤∂2L
+∂v2 ε + O
+
+∥ε∥3
+(4)
+When the quantization error ε is suﬃciently small, higher-order terms can be
+neglected so that degradation ∆L can be approximated as a sum of the quadratic
+functions,
+∆L = ∂L
+∂v
+⊤
+ε + ε⊤∂2L
+∂v2 ε =
+n
+X
+i
+∂L
+∂vi
+· εi +
+n
+X
+i
+n
+X
+j
+∂2L
+∂vi∂vj
+εi · εj.
+(5)
+One can see from Eq. (5) that when quantization error ∥ε∥2 is suﬃciently small,
+the overall degradation ∆L can be approximated as a sum of N independent
+separable degradation processes as follows:
+∆L ≈
+n
+X
+i
+∂L
+∂vi
+· εi
+(6)
+On the other hand, when ∥ε∥2 is larger, one needs to take into account the
+interactions between diﬀerent layers, corresponding to the second term in Eq. (5)
+as follows:
+QIT =
+n
+X
+i
+n
+X
+j
+∂2L
+∂vi∂vj
+εi · εj,
+(7)
+where QIT refers to the quantization interaction term.
+In Fig. 2 we provide a visualization of these interactions at 2, 3 and 4 bitwidth
+representations.
+3.2
+Curvature
+We now analyze how the steepness of the curvature of the loss function with
+respect to the quantization step changes as the quantization error increases. We
+will show that at aggressive quantization, the curvature of the loss becomes steep,
+which is unfavorable for the methods that aim to minimize quantization error on
+the tensor level.
+
+
+Loss Aware Post-Training Quantization
+7
+p1
+p2
+p3
+p4
+p5
+0
+10
+20
+30
+40
+50
+60
+70
+Accuracy
+4 bit
+2 bit
+Fig. 3: Accuracy of ResNet-50 quantized to 2 and 4 bits, respectively. Quantization
+steps are chosen such that they minimize the Lp norm of the quantization error
+for diﬀerent values of p.
+We start by deﬁning a measure to quantify curvature of the loss function
+with respect to quantization step size ∆. Given a quantized neural network, we
+denote L(∆1, ∆2, . . . , ∆n) the loss with respect to quantization step size ∆i of
+each individual layer. Since L is twice diﬀerentiable with respect to ∆i we can
+calculate the Hessian matrix:
+H[L]ij =
+∂2L
+∂∆i∂∆j
+.
+(8)
+To quantify the curvature, we use Gaussian curvature [7], which is given by:
+K[L](∆) =
+det (H[L](∆))
+
+∥∇L(∆)∥2
+2 + 1
+2 ,
+(9)
+where ∆= (∆1, ∆2, . . . , ∆n). We calculated the Gaussian curvature at the point
+that minimizes the L2 norm of the quantization error and acquired the following
+values:
+K[L4 bit] (∆) = 6.7 · 10−25
+(10)
+K[L2 bit] (∆) = 0.58,
+(11)
+This means that the ﬂat surface for 4 bits, shown in Fig. 2, is a generic property
+of the ﬁne-grained quantization loss and not of the speciﬁc layer choice. Similarly,
+we conclude that coarser quantization generally has steeper curvature than more
+ﬁne-grained quantization.
+Moreover, the Hessian matrix provides additional information regarding the
+coupling between diﬀerent layers. As could be expected, adjacent oﬀ-diagonal
+terms have higher values than distant elements, corresponding to higher depen-
+dencies between clipping parameters of adjacent layers (the Hessian matrix is
+presented in Fig. A.1 in the Appendix).
+
+
+8
+Y. Nahshan et al.
+0
+1
+2
+3
+Quantization range
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Lp norm of error
+p=0.5
+p=1
+p=2
+p=3
+Fig. 4: The Lp norm of the quantization error generated by optimizing for diﬀerent
+values of p according to Eq. (12). For diﬀerent Lp metrics, the optimal quantization
+step is diﬀerent.
+When the curvature is steep, even small changes in quantization step size
+may change the results drastically. To justify this hypothesis experimentally, in
+Fig. 3, we evaluate the accuracy of ResNet-50 for ﬁve diﬀerent quantization steps.
+We choose quantization steps which minimize the Lp norm of the quantization
+error for diﬀerent values of p.
+While at 4-bit quantization, the accuracy is almost not aﬀected by small
+changes in the quantization step size, at 2-bit quantization, the same changes shift
+the accuracy by more than 20%. Moreover, the best accuracy is obtained with a
+quantization step that minimizes L3.5 and not the MSE, which corresponds to
+L2 norm minimization.
+4
+Loss Aware Post-training Quantization (LAPQ)
+In the previous section, we showed that the loss function L(∆), with respect to
+the quantization step size ∆, has a complex, non-separable landscape that is
+hard to optimize. In this section, we suggest a method to overcome this intrinsic
+diﬃculty. Our optimization process involves three consecutive steps.
+In the ﬁrst phase, we ﬁnd the quantization step ∆p that minimizes the Lp
+norm of the quantization error of the individual layers for several diﬀerent values
+of p. Then, we perform quadratic interpolation to approximate an optimum of
+the loss with respect to p. Finally, we jointly optimize the parameters of all layers
+acquired on the previous step by applying a gradient-free optimization method
+[23]. The pseudo-code of the whole algorithm is presented in Algorithm 1. Fig. 6
+provides the algorithm visualization.
+
+
+Loss Aware Post-Training Quantization
+9
+1.0
+0.5
+0.0
+0.5
+1.0
+distance from 
+*
+2.1
+2.2
+2.3
+2.4
+2.5
+2.6
+loss
+2.0
+2.5
+3.0
+3.5
+4.0
+4.5
+p
+2.25
+2.50
+2.75
+3.00
+3.25
+3.50
+3.75
+loss
+Fig. 5: Loss of ResNet-18 quantized with diﬀerent quantization steps. The orange
+dotted line shows quadratic interpolation: (a) on the left with respect to the
+distance from optimal quantization step ∆∗and (b) on the trajectory deﬁned by
+Lp norm minimization.
+4.1
+Layer-wise optimization
+Our method starts by minimizing the Lp norm of the quantization error of weights
+and activations in each layer with respect to clipping values:
+ep(∆) =
+
+∥Q∆(X) −X∥p
+1/p
+.
+(12)
+Given a real number p > 0, the set of optimal quantization steps ∆p =
+{∆1p, ∆2p, . . . , ∆np}, according to Eq. (12), minimizes the quantization error
+within each layer. In addition, optimizing the quantization error allows us to get
+∆p in the vicinity of the optimum ∆∗. Diﬀerent values of p result in diﬀerent
+quantization step sizes ∆p, which are still optimal under some metric Lp due to
+the trade-oﬀbetween clipping and quantization error (Fig. 4).
+4.2
+Quadratic approximation
+Assuming a quantization step size ∆in the vicinity of the optimal quantization
+step ∆∗, the loss function can be approximated with a Taylor series as follows:
+L(∆) −L(∆∗) =
+(13)
+=(∆∗−∆)⊤∇L(∆∗) + 1
+2(∆∗−∆)⊤H(∆∗)(∆∗−∆) + O
+
+∥∆∗−∆∥3
+, (14)
+where H(∆∗) is the Hessian matrix with respect to ∆. Since ∆∗is a minimum,
+the ﬁrst derivative vanishes and we acquire a quadratic approximation of L,
+∆L = L(∆) −L(∆∗) ≈1
+2(∆∗−∆)⊤H(∆∗)(∆∗−∆)
+(15)
+
+
+10
+Y. Nahshan et al.
+𝒅𝟏
+𝒅𝟐
+𝒅𝟑
+*
+𝚫𝒑
+1
+𝚫𝒑
+k
+𝚫𝒑
+𝚫∗
+Fig. 6: Illustration of the LAPQ algorithm. Yellow dots correspond to the quanti-
+zation step size {∆p}, which minimizes the Lp norm of the quantization error.
+{∆p} build a trajectory in the vicinity of the minimum ∆∗. The optimal quan-
+tization step size on that trajectory ∆p∗is used as a starting point for a joint
+optimization algorithm (Powell’s). Vectors {d1, d2, d3} demonstrate the ﬁrst iter-
+ation of Powell’s method that brings us closer to the global minimum ∆∗. Better
+viewed in color.
+Our method exploits this quadratic property for optimization. Fig. 5(a)
+demonstrates empirical evidence of such a quadratic relationship for ResNet-18
+around the optimal quantization step ∆∗obtained by our method. First, we
+sample a few data points {∆p} to build a trajectory on the graph of L(∆) (orange
+points in Fig. 6). Then, we use the prior quadratic assumption to approximate
+the minimum of the L on that trajectory by ﬁtting a quadratic function f(p)
+to the sampled ∆p. Finally, we minimize f(p) and use the optimal quantization
+step size ∆p∗as a starting point for a gradient-free joint optimization algorithm,
+such as Powell’s method [23], to minimize the loss and ﬁnd ∆∗.
+4.3
+Joint optimization
+By minimizing both the quantization error and the loss using quadratic interpo-
+lation, we get a decent approximation of the global minimum ∆∗. Due to steep
+curvature of the minimum, however, for a low bitwidth quantization, even a
+small error in the value of ∆leads to performance degradation. Thus, we use
+a gradient-free joint optimization, speciﬁcally an iterative algorithm (Powell’s
+method [23]), to further optimize ∆p∗.
+At every iteration, we optimize the set of parameters, initialized by ∆p∗.
+Given a set of linear search directions D = {d1, d2, . . . , dN}, the new position
+∆t+1 is expressed by the linear combination of the search directions as following
+
+
+Loss Aware Post-Training Quantization
+11
+Algorithm 1 LAPQ
+1: Layer-wise optimization:
+2: for p = {p1, p2, . . . pk} do
+3:
+Cp ←arg min
+C (∥Q∆,c(x) −x∥p)
+1/p for every layer
+4: end for
+5: Quadratic approximation:
+6: ∆p∗←arg min
+∆p L(∆p) using quadratic interpolation of ∆p
+7: Joint optimization (Powell’s):
+8: Starting point t0 ←∆p∗.
+9: Initial direction vector D = {d1, d2, . . . , dN}.
+10: while not converged do
+11:
+for k = 1 . . . N do
+12:
+λk ←arg min
+λ L(tk−1 + λkdk)
+13:
+tk ←tk−1 + λkdk
+14:
+end for
+15:
+for j = 1 . . . N −1 do
+16:
+dj ←dj+1
+17:
+end for
+18:
+dN ←tN −t0
+19:
+λN ←arg min
+λ L(tN + λNdN)
+20:
+t0 ←t0 + λNdN
+21: end while
+22: ∆∗←t0
+23: return ∆∗
+∆t + P
+i λidi. The new displacement vector P
+i λidi becomes part of the search
+directions set, and the search vector, which contributed most to the new direction,
+is deleted from the search directions set. For further details, see Algorithm 1.
+5
+Experimental Results
+In this section we conduct extensive evaluations and oﬀer a comparison to prior
+art of the proposed method on two challenging benchmarks, image classiﬁcation
+on ImageNet and a recommendation system on NCF-1B. In addition, we examine
+the impact of each part of the proposed method on the ﬁnal accuracy. In all
+experiments we ﬁrst calibrate the optimal clipping values on a small held-back
+calibration set using our method and then evaluate the validation set.
+5.1
+ImageNet
+We evaluate our method on several CNN architectures on ImageNet. We select
+a calibration set of 512 random images for the optimization step. The size of
+the calibration set deﬁnes the trade-oﬀbetween generalization and running time
+(the analysis is given in Appendix B). Following the convention [2, 24], we do
+not quantize the ﬁrst and last layers.
+
+
+12
+Y. Nahshan et al.
+Table 1: Comparison with other methods. MMSE refers to minimization of mean
+square error.
+Model
+W/A Method
+Accuracy(%)
+32 / 32 FP32
+69.7
+LAPQ (Ours)
+68.8
+DUAL [14]
+68.38
+ACIQ [1]
+65.528
+8 / 4
+MMSE
+68
+LAPQ (Ours)
+66.3
+ACIQ [1]
+52.476
+8 / 3
+MMSE
+63.3
+LAPQ (Ours)
+60.3
+ACIQ [1]
+4.1
+KLD [19]
+31.937
+ResNet-18
+4 / 4
+MMSE
+43.6
+32 / 32 FP32
+76.1
+LAPQ (Ours)
+74.8
+DUAL [14]
+73.25
+ACIQ [1]
+68.92
+8 / 4
+MMSE
+74
+LAPQ (Ours)
+70.8
+ACIQ [1]
+51.858
+8 / 3
+MMSE
+66.3
+LAPQ (Ours)
+70
+ACIQ [1]
+3.3
+KLD [19]
+46.19
+ResNet-50
+4 / 4
+MMSE
+36.4
+Model
+W/A Method
+Accuracy(%)
+32 / 32 FP32
+77.3
+LAPQ (Ours)
+73.6
+DUAL [14]
+74.26
+ACIQ [1]
+66.966
+8 / 4
+MMSE
+72
+LAPQ (Ours)
+65.7
+ACIQ [1]
+41.46
+8 / 3
+MMSE
+56.7
+LAPQ (Ours)
+59.2
+ACIQ [1]
+1.5
+KLD [19]
+49.948
+ResNet-101
+4 / 4
+MMSE
+9.8
+32 / 32 FP32
+77.2
+LAPQ (Ours)
+75.1
+DUAL [14]
+73.06
+ACIQ [1]
+66.42
+8 / 4
+MMSE
+74.3
+LAPQ (Ours)
+64.4
+ACIQ [1]
+31.01
+8 / 3
+MMSE
+54.1
+LAPQ (Ours)
+38.6
+ACIQ [1]
+0.5
+KLD [19]
+1.84
+Inception-V3
+4 / 4
+MMSE
+2.2
+Many successful methods of post-training quantization perform ﬁner pa-
+rameter assignment, such as group-wise [18], channel-wise [1], pixel-wise [5] or
+ﬁlter-wise [14] quantization, which require special hardware support and addi-
+tional computational resources. Finer parameter assignment appears to provide
+unconditional improvement, independently of the underlying methods used. In
+contrast with those approaches, our method performs layer-wise quantization,
+which is simple to implement on any existing hardware that supports low precision
+integer operations. Thus, we do not include the above-mentioned methods in
+our comparison study. We apply bias correction, as proposed by Banner et al.
+[1], on top of the proposed method. In Table 1 (more results are available in
+Table C.1 in the Appendix) we compare our method with several other layer-wise
+quantization methods, as well as the minimal MSE baseline. In most cases, our
+method signiﬁcantly outperforms all the competing methods, showing acceptable
+performance even for 4-bit quantization.
+5.2
+NCF-1B
+In addition to the vision models, we evaluated our method on a recommendation
+system task, speciﬁcally on a Neural Collaborative Filtering (NCF) [10] model.
+We use mlperf3 implementation to train the model on the MovieLens-1B dataset.
+3 https://github.com/mlperf/training/tree/master/recommendation/pytorch
+
+
+Loss Aware Post-Training Quantization
+13
+Similarly to the ImageNet, the calibration set of 50k random user/item pairs is
+signiﬁcantly smaller than both the training and validation sets.
+Table 2: Hit rate of NCF-1B applying our method, LAPQ, and MMSE.
+Model
+W/A
+Method
+Hit rate(%)
+NCF 1B
+32/32
+FP32
+51.5
+32/8 LAPQ (Ours)
+51.2
+MMSE
+51.1
+8/32 LAPQ (Ours)
+51.4
+MMSE
+33.4
+8/8
+LAPQ (Ours)
+51.0
+MMSE
+33.5
+In Table 2 we present results for the NCF-1B model compared to the MMSE
+method. Even at 8-bit quantization, NCF-1B suﬀers from signiﬁcant degradation
+when using the naive MMSE method. In contrast, LAPQ achieves near baseline
+accuracy with 0.5% degradation from FP32 results.
+5.3
+Ablation study
+Initialization The proposed method comprises of two steps: layer-wise optimiza-
+tion and quadratic approximation as the initialization for the joint optimization.
+In Table 3, we show the results for ResNet-18 under diﬀerent initializations
+and their results after adding the joint optimization. LAPQ suggest a better
+initialization for the joint optimization.
+Table 3: Accuracy of ResNet-18 with three diﬀerent initializations. LW refers to
+only applying layer-wise optimization for p = 2. LW + QA refers to the proposed
+initialization that includes layer-wise optimization and quadratic approximation.
+On top of each initialization, we apply the joint optimization.
+W / A Method
+Accuracy (%)
+Initial
+Joint
+4 / 4
+Random
+0.1
+7.8
+LW
+43.6
+57.8
+LW + QA
+54.1
+60.3
+32 / 2
+Random
+0.1
+0.1
+LW
+33
+50.3
+LW + QA
+48.1
+50.7
+
+
+14
+Y. Nahshan et al.
+Bias correction Prior research [1, 6] has shown that CNNs are sensitive to
+quantization bias. To address this issue, we perform bias correction of the weights
+as proposed by Banner et al. [1], which can easily be combined with LAPQ, in
+all our CNN experiments. In Table 4 we show the eﬀect of adding bias correction
+to the proposed method and compare it with MMSE. We see that bias correction
+is especially important in compact models, such as MobileNet.
+Table 4: Eﬀect of applying bias correction on top of LAPQ for ResNet-18, ResNet-
+50 and MobileNet-V2. LAPQ signiﬁcantly outperforms naive minimization of the
+mean square error. Notice the importance of bias correction on MobileNet-V2.
+W A ResNet-18 ResNet-50 MobileNet-V2
+LAPQ
+32 4
+68.8%
+74.8%
+65.1%
+32 2
+51.6%
+54.2%
+1.5%
+4 32
+62.6%
+69.9%
+29.4%
+4
+4
+58.5%
+66.6%
+21.3%
+LAPQ + bias correction
+4 32
+63.3%
+71.8%
+60.2%
+4
+4
+59.8%
+70.%
+49.7%
+FP32
+69.7%
+76.1%
+71.8%
+6
+Conclusion
+We have analyzed the loss function of quantized neural networks. At low precision,
+the function is non-separable, with steep curvature, which is unfavorable for
+existing post-training quantization methods. Accordingly, we have introduced
+Loss Aware Post-training Quantization (LAPQ), which jointly optimizes all
+quantization parameters by minimizing the loss function directly. We have shown
+that our method outperforms current post-training quantization methods. Also,
+our method does not require special hardware support such as channel-wise
+or ﬁlter-wise quantization. In some models, LAPQ is the ﬁrst to show com-
+patible performance in 4-bit post-training quantization regime with layer-wise
+quantization, almost achieving a the full-precision baseline accuracy.
+Acknowledgments The research was funded by National Cyber Security Au-
+thority and the Hiroshi Fujiwara Technion Cyber Security Research Center.
+
+
+Bibliography
+1. Banner, R., Nahshan, Y., Hoﬀer, E., Soudry, D.: Post-training 4-bit quan-
+tization of convolution networks for rapid-deployment. arXiv preprint
+arXiv:1810.05723 (2018), URL http://arxiv.org/abs/1810.05723 (cited
+on pp. 2, 4, 12, 14, and 20)
+2. Baskin, C., Liss, N., Chai, Y., Zheltonozhskii, E., Schwartz, E., Girayes,
+R., Mendelson, A., Bronstein, A.M.: Nice: Noise injection and clamping
+estimation for neural network quantization. arXiv preprint arXiv:1810.00162
+(2018), URL http://arxiv.org/abs/1810.00162 (cited on pp. 3 and 11)
+3. Bethge, J., Yang, H., Bornstein, M., Meinel, C.: Back to simplicity: How to
+train accurate bnns from scratch? arXiv preprint arXiv:1906.08637 (2019),
+URL http://arxiv.org/abs/1906.08637 (cited on p. 2)
+4. Fang, J., Shaﬁee, A., Abdel-Aziz, H., Thorsley, D., Georgiadis, G., Hassoun,
+J.: Near-lossless post-training quantization of deep neural networks via a
+piecewise linear approximation. arXiv preprint arXiv:2002.00104 (2020), URL
+https://arxiv.org/abs/2002.00104 (cited on p. 4)
+5. Faraone, J., Fraser, N., Blott, M., Leong, P.H.: Syq: Learning symmet-
+ric quantization for eﬃcient deep neural networks. In: The IEEE Con-
+ference on Computer Vision and Pattern Recognition (CVPR) (June
+2018), URL http://openaccess.thecvf.com/content_cvpr_2018/html/
+Faraone_SYQ_Learning_Symmetric_CVPR_2018_paper.html (cited on pp.
+4 and 12)
+6. Finkelstein, A., Almog, U., Grobman, M.: Fighting quantization bias with
+bias. arXiv preprint arXiv:1906.03193 (2019), URL http://arxiv.org/abs/
+1906.03193 (cited on pp. 4 and 14)
+7. Goldman, R.: Curvature formulas for implicit curves and surfaces. Com-
+puter Aided Geometric Design 22(7), 632 – 658 (2005), ISSN 0167-8396,
+https://doi.org/https://doi.org/10.1016/j.cagd.2005.06.005, URL http://
+www.sciencedirect.com/science/article/pii/S0167839605000737, ge-
+ometric Modelling and Diﬀerential Geometry (cited on p. 7)
+8. Gong, J., Shen, H., Zhang, G., Liu, X., Li, S., Jin, G., Maheshwari, N.,
+Fomenko, E., Segal, E.: Highly eﬃcient 8-bit low precision inference of
+convolutional neural networks with intelcaﬀe. In: Proceedings of the 1st
+on Reproducible Quality-Eﬃcient Systems Tournament on Co-designing
+Pareto-eﬃcient Deep Learning, ReQuEST ’18, ACM, New York, NY, USA
+(2018), ISBN 978-1-4503-5923-8, https://doi.org/10.1145/3229762.3229763,
+URL http://doi.acm.org/10.1145/3229762.3229763 (cited on p. 4)
+9. Gong, R., Liu, X., Jiang, S., Li, T., Hu, P., Lin, J., Yu, F., Yan, J.: Diﬀeren-
+tiable soft quantization: Bridging full-precision and low-bit neural networks.
+In: The IEEE International Conference on Computer Vision (ICCV) (October
+2019), URL http://openaccess.thecvf.com/content_ICCV_2019/html/
+Gong_Differentiable_Soft_Quantization_Bridging_Full-Precision_
+and_Low-Bit_Neural_Networks_ICCV_2019_paper.html (cited on p. 3)
+
+
+16
+Y. Nahshan et al.
+10. He, X., Liao, L., Zhang, H., Nie, L., Hu, X., Chua, T.S.: Neural collaborative
+ﬁltering. In: Proceedings of the 26th International Conference on World Wide
+Web, pp. 173–182, WWW ’17, International World Wide Web Conferences
+Steering Committee, Republic and Canton of Geneva, Switzerland (2017),
+ISBN 978-1-4503-4913-0, https://doi.org/10.1145/3038912.3052569, URL
+https://doi.org/10.1145/3038912.3052569 (cited on p. 12)
+11. Hubara, I., Courbariaux, M., Soudry, D., El-Yaniv, R., Bengio, Y.: Quan-
+tized neural networks: Training neural networks with low precision weights
+and activations. J. Mach. Learn. Res. 18(1), 6869–6898 (Jan 2017), ISSN
+1532-4435, URL http://dl.acm.org/citation.cfm?id=3122009.3242044
+(cited on p. 2)
+12. Jin, Q., Yang, L., Liao, Z.: Towards eﬃcient training for neural network
+quantization. arXiv preprint arXiv:1912.10207 (2019), URL https://arxiv.
+org/abs/1912.10207 (cited on pp. 2 and 3)
+13. Kim, H., Kim, K., Kim, J., Kim, J.J.: Binaryduo: Reducing gradient mismatch
+in binary activation network by coupling binary activations. arXiv preprint
+arXiv:2002.06517 (2020), URL https://arxiv.org/abs/2002.06517 (cited
+on p. 3)
+14. Kravchik, E., Yang, F., Kisilev, P., Choukroun, Y.: Low-bit quantiza-
+tion of neural networks for eﬃcient inference. In: The IEEE Interna-
+tional Conference on Computer Vision (ICCV) Workshops (Oct 2019),
+URL
+http://openaccess.thecvf.com/content_ICCVW_2019/html/
+CEFRL/Kravchik_Low-bit_Quantization_of_Neural_Networks_for_
+Efficient_Inference_ICCVW_2019_paper.html (cited on pp. 4 and 12)
+15. Krishnamoorthi, R.: Quantizing deep convolutional networks for eﬃcient
+inference: A whitepaper. arXiv preprint arXiv:1806.08342 (2018), URL http:
+//arxiv.org/abs/1806.08342 (cited on p. 3)
+16. Lee, J.H., Ha, S., Choi, S., Lee, W.J., Lee, S.: Quantization for rapid deploy-
+ment of deep neural networks. arXiv preprint arXiv:1810.05488 (2018), URL
+http://arxiv.org/abs/1810.05488 (cited on pp. 2 and 4)
+17. Liu, C., Ding, W., Xia, X., Hu, Y., Zhang, B., Liu, J., Zhuang, B.,
+Guo, G.: Rectiﬁed binary convolutional networks for enhancing the perfor-
+mance of 1-bit DCNNs. In: Proceedings of the Twenty-Eighth International
+Joint Conference on Artiﬁcial Intelligence, IJCAI-19, pp. 854–860, Inter-
+national Joint Conferences on Artiﬁcial Intelligence Organization (7 2019),
+https://doi.org/10.24963/ijcai.2019/120, URL https://doi.org/10.24963/
+ijcai.2019/120 (cited on p. 3)
+18. Mellempudi, N., Kundu, A., Mudigere, D., Das, D., Kaul, B., Dubey, P.:
+Ternary neural networks with ﬁne-grained quantization. arXiv preprint
+arXiv:1705.01462 (2017), URL http://arxiv.org/abs/1705.01462 (cited
+on pp. 4 and 12)
+19. Migacz,
+S.:
+8-bit
+inference
+with
+tensorrt
+(2017),
+URL
+http://on-demand.gputechconf.com/gtc/2017/presentation/
+s7310-8-bit-inference-with-tensorrt.pdf (cited on pp. 4 and 12)
+20. Nagel, M., Baalen, M.v., Blankevoort, T., Welling, M.: Data-free quantization
+through weight equalization and bias correction. In: Proceedings of the
+
+
+Loss Aware Post-Training Quantization
+17
+IEEE International Conference on Computer Vision, pp. 1325–1334 (2019),
+URL http://openaccess.thecvf.com/content_ICCV_2019/html/Nagel_
+Data-Free_Quantization_Through_Weight_Equalization_and_Bias_
+Correction_ICCV_2019_paper.html (cited on p. 4)
+21. Nayak, P., Zhang, D., Chai, S.: Bit eﬃcient quantization for deep neural
+networks. arXiv preprint arXiv:1910.04877 (2019), URL http://arxiv.org/
+abs/1910.04877 (cited on p. 4)
+22. Peng, H., Chen, S.: Bdnn: Binary convolution neural networks for fast
+object detection. Pattern Recognition Letters (2019), ISSN 0167-8655,
+https://doi.org/https://doi.org/10.1016/j.patrec.2019.03.026, URL http:
+//www.sciencedirect.com/science/article/pii/S0167865519301096
+(cited on p. 3)
+23. Powell, M.J.: An eﬃcient method for ﬁnding the minimum of a function of
+several variables without calculating derivatives. The Computer Journal 7(2),
+155 (1964), https://doi.org/10.1093/comjnl/7.2.155, URL http://dx.doi.
+org/10.1093/comjnl/7.2.155 (cited on pp. 8 and 10)
+24. Yang, J., Shen, X., Xing, J., Tian, X., Li, H., Deng, B., Huang,
+J.,
+Hua,
+X.s.:
+Quantization
+networks.
+In:
+The
+IEEE
+Conference
+on Computer Vision and Pattern Recognition (CVPR) (June 2019),
+URL
+http://openaccess.thecvf.com/content_CVPR_2019/html/Yang_
+Quantization_Networks_CVPR_2019_paper.html
+(cited on pp. 2, 3,
+and 11)
+25. Zhang, D., Yang, J., Ye, D., Hua, G.: Lq-nets: Learned quantization
+for highly accurate and compact deep neural networks. In: The Euro-
+pean Conference on Computer Vision (ECCV) (September 2018), URL
+http://openaccess.thecvf.com/content_ECCV_2018/html/Dongqing_
+Zhang_Optimized_Quantization_for_ECCV_2018_paper.html
+(cited on
+p. 3)
+26. Zhao, R., Hu, Y., Dotzel, J., De Sa, C., Zhang, Z.: Improving neural network
+quantization using outlier channel splitting. arXiv preprint arXiv:1901.09504
+(2019), URL https://arxiv.org/abs/1901.09504
+(cited on pp. 2, 4,
+and 20)
+
+
+18
+Y. Nahshan et al.
+A
+Hessian of the loss function
+To estimate dependencies between clipping parameters of diﬀerent layers, we
+analyze the structure of the Hessian matrix of the loss function. The Hessian
+matrix contains the second-order partial derivatives of the loss L(∆), where ∆is
+a vector of quantization steps:
+H[L]ij =
+∂2L
+∂∆i∂∆j
+.
+(A.16)
+In the case of separable functions, the Hessian is a diagonal matrix. This
+means that the magnitude of the oﬀ-diagonal elements can be used as a measure
+of separability. In Fig. A.1 we show the Hessian matrix of the loss function
+under quantization of 4 and 2 bits. As expected, higher dependencies between
+quantization steps emerge under more aggressive quantization.
+0.025 0.001 0.003 0.003 0.000 0.001 0.000 0.001 0.001 0.000 0.002 0.000 0.001 0.000 0.000
+0.001 0.030 0.005 0.006 0.005 0.004 0.000 0.002 0.001 0.000 0.001 0.002 0.002 0.001 0.001
+0.003 0.005 0.018 0.000 0.004 0.002 0.001 0.000 0.002 0.001 0.001 0.001 0.002 0.000 0.002
+0.003 0.006 0.000 0.020 0.005 0.001 0.002 0.004 0.001 0.001 0.000 0.001 0.001 0.001 0.003
+0.000 0.005 0.004 0.005 0.030 0.005 0.005 0.004 0.002 0.002 0.001 0.002 0.000 0.000 0.003
+0.001 0.004 0.002 0.001 0.005 0.023 0.001 0.003 0.003 0.002 0.002 0.002 0.001 0.000 0.008
+0.000 0.000 0.001 0.002 0.005 0.001 0.014 0.005 0.003 0.002 0.000 0.002 0.001 0.001 0.003
+0.001 0.002 0.000 0.004 0.004 0.003 0.005 0.016 0.005 0.002 0.000 0.001 0.001 0.000 0.002
+0.001 0.001 0.002 0.001 0.002 0.003 0.003 0.005 0.027 0.003 0.000 0.001 0.002 0.001 0.001
+0.000 0.000 0.001 0.001 0.002 0.002 0.002 0.002 0.003 0.019 0.000 0.002 0.002 0.000 0.002
+0.002 0.001 0.001 0.000 0.001 0.002 0.000 0.000 0.000 0.000 0.029 0.006 0.005 0.000 0.001
+0.000 0.002 0.001 0.001 0.002 0.002 0.002 0.001 0.001 0.002 0.006 0.029 0.005 0.000 0.002
+0.001 0.002 0.002 0.001 0.000 0.001 0.001 0.001 0.002 0.002 0.005 0.005 0.049 0.001 0.002
+0.000 0.001 0.000 0.001 0.000 0.000 0.001 0.000 0.001 0.000 0.000 0.000 0.001 0.024 0.012
+0.000 0.001 0.002 0.003 0.003 0.008 0.003 0.002 0.001 0.002 0.001 0.002 0.002 0.012 0.099
+(a) Quantization of 4 bit
+1.22
+0.29
+0.18
+0.54
+0.02
+0.24
+0.13
+0.35
+0.28
+0.24
+0.12
+0.20
+0.15
+0.09
+0.23
+0.29
+0.76
+0.13
+0.37
+0.18
+0.02
+0.01
+0.09
+0.14
+0.06
+0.03
+0.11
+0.12
+0.00
+0.03
+0.18
+0.13
+0.56
+0.32
+0.15
+0.05
+0.06
+0.12
+0.08
+0.17
+0.06
+0.08
+0.09
+0.02
+0.01
+0.54
+0.37
+0.32
+1.26
+0.38
+0.13
+0.00
+0.37
+0.36
+0.28
+0.09
+0.02
+0.13
+0.07
+0.06
+0.02
+0.18
+0.15
+0.38
+1.68
+0.74
+0.49
+0.61
+0.25
+0.32
+0.40
+0.43
+0.21
+0.29
+0.58
+0.24
+0.02
+0.05
+0.13
+0.74
+1.92
+0.21
+0.49
+0.33
+0.43
+0.29
+0.04
+0.05
+0.18
+0.52
+0.13
+0.01
+0.06
+0.00
+0.49
+0.21
+0.88
+0.65
+0.24
+0.08
+0.42
+0.44
+0.22
+0.21
+0.46
+0.35
+0.09
+0.12
+0.37
+0.61
+0.49
+0.65
+1.70
+0.72
+0.48
+0.63
+0.81
+0.38
+0.26
+0.63
+0.28
+0.14
+0.08
+0.36
+0.25
+0.33
+0.24
+0.72
+1.39
+0.36
+0.30
+0.60
+0.22
+0.20
+0.44
+0.24
+0.06
+0.17
+0.28
+0.32
+0.43
+0.08
+0.48
+0.36
+3.33
+0.43
+0.91
+0.17
+0.39
+0.94
+0.12
+0.03
+0.06
+0.09
+0.40
+0.29
+0.42
+0.63
+0.30
+0.43
+1.78
+0.69
+0.36
+0.38
+0.78
+0.20
+0.11
+0.08
+0.02
+0.43
+0.04
+0.44
+0.81
+0.60
+0.91
+0.69
+3.58
+0.00
+0.68
+1.13
+0.15
+0.12
+0.09
+0.13
+0.21
+0.05
+0.22
+0.38
+0.22
+0.17
+0.36
+0.00
+3.48
+0.31
+0.13
+0.09
+0.00
+0.02
+0.07
+0.29
+0.18
+0.21
+0.26
+0.20
+0.39
+0.38
+0.68
+0.31
+1.09
+1.12
+0.23
+0.03
+0.01
+0.06
+0.58
+0.52
+0.46
+0.63
+0.44
+0.94
+0.78
+1.13
+0.13
+1.12
+4.99
+(b) Quantization of 2 bit
+Fig. A.1: Absolute value of the Hessian matrix of the loss function with respect
+to quantization steps calculated over 15 layers of ResNet-18. Higher values at a
+diagonal of the Hessian at 2-bit quantization suggest that the minimum is sharper
+than at 4 bits. Non-diagonal elements provide an indication of the coupling
+between parameters of diﬀerent layers: closer layers generally exhibit stronger
+interactions.
+B
+Calibration set size
+Calibration set size reﬂects the balance between the running time and the
+generalization. To determine the required size, we ran the proposed method on
+
+
+Loss Aware Post-Training Quantization
+19
+ResNet-18 for various calibration set sizes and diﬀerent bitwidths. As shown in
+Fig. B.2, a calibration set size of 512 is a good choice to balance this trade-oﬀ.
+32
+64
+128
+256
+512
+1024
+Calibration set size (log scale)
+50
+55
+60
+65
+Accuracy (%)
+4W4A
+32W4A
+4W32A
+Fig. B.2: Accuracy of ResNet-18 for diﬀerent sized calibration sets at various
+quantization levels.
+C
+ImageNet additional results
+In Table C.1 we show additional results for the proposed method for the image
+classiﬁcation task on ImageNet dataset.
+
+
+20
+Y. Nahshan et al.
+Table C.1: Comparison with other methods.
+Model
+W/A Method
+Accuracy(%)
+32 / 32 FP32
+69.7
+ResNet-18
+8 / 2
+LAPQ (Ours)
+51.6
+ACIQ [1]
+7.07
+32 / 32 FP32
+76.1
+LAPQ (Ours)
+54.2
+8 / 2
+ACIQ [1]
+2.92
+LAPQ (Ours)
+71.8
+ResNet-50
+4 / 32 OCS [26]
+69.3
+32 / 32 FP32
+77.3
+LAPQ (Ours)
+29.8
+8 / 2
+ACIQ [1]
+3.826
+LAPQ (Ours)
+66.5
+ResNet-101
+4 / 32 MMSE
+18

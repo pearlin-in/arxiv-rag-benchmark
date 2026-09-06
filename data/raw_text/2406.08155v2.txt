@@ -1,0 +1,1738 @@
+QuantMoE-Bench: Examining Post-Training Quantization for
+Mixture-of-Experts
+Pingzhi Li†
+UNC-Chapel Hill
+Chapel Hill, NC, US
+pingzhi@cs.unc.edu
+Xiaolong Jin†
+Purdue University
+West Lafayette, IN, US
+jinxiaolong1129@gmail.com
+Zhen Tan
+Arizona State University
+Tempe, AZ, US
+ztan36@asu.edu
+Yu Cheng
+The Chinese University of Hong Kong
+Hong Kong
+chengyu@cse.cuhk.edu.hk
+Tianlong Chen
+UNC-Chapel Hill
+Chapel Hill, NC, US
+tianlong@cs.unc.edu
+Abstract
+Mixture-of-Experts (MoE) is a promising way to scale up the learn-
+ing capacity of large language models. It increases the number of
+parameters while keeping FLOPs nearly constant during inference
+through sparse activation. Yet, it still suffers from significant mem-
+ory overheads due to the vast parameter size, necessitating model
+compression techniques. Post-training quantization offers a pow-
+erful approach for model compression. Existing methods adopt a
+fixed quantization precision for the entire MoE model. This rigid
+setup can lead to suboptimal performance, without considering
+the inherent sparse structure. For example, MoE’s sparse routing
+mechanism leads to different activation patterns, where shared ex-
+perts are accessed by all tokens while token-conditioned experts
+are selectively activated. This activation disparity suggests differ-
+ent quantization requirements, with consistently activated shared
+experts potentially needing higher precision to maintain model
+quality. In this paper, we study a fine-grained precision setup for
+MoE quantization. We explore MoE structure-aware quantization
+heuristics, ranging from coarse (e.g., MoE layers) to fine granular-
+ity (e.g., linear layers). Our investigations reveal critical principles,
+where different MoE structures require varying numbers of bits
+for effective quantization. Conclusions are supported by extensive
+benchmarking across two representative MoE models and six tasks
+including commonsense reasoning and natural language under-
+standing. We further show that an MoE quantized in a fined-grained
+mixed precision achieved state-of-the-art 65.35% performance on
+average compared to the baseline 64.30% (i.e., GPTQ). Moreover,
+based on the findings, we introduce novel data-driven techniques
+for optimizing bit allocation in MoE quantization, including the
+outlier-aware linear layer scorer and MoE block importance pre-
+dictor. Our code for reproducing all our experiments is provided at
+https://github.com/UNITES-Lab/moe-quantization.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+Conference acronym ’XX, Woodstock, NY
+© 2018 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-XXXX-X/2018/06
+https://doi.org/XXXXXXX.XXXXXXX
+Expert 0
+Router
+Expert 1
+Expert 8
+…
+Q
+K
+V
+O
+Attention
+MoE FFN
+LM Head
+Embedding
+…
+…
+16 bits
+4 bits
+2 bits
+(a) Pre-Trained MoE
+(b) Mixed-Precision Quantized MoE
+Expert 0
+Router
+Expert 1
+Expert 8
+…
+Q
+K
+V
+O
+Attention
+MoE FFN
+LM Head
+Embedding
+…
+…
+𝚆𝟷
+𝚆𝟸
+𝚆𝟹
+Mixed-4-2 bits
+Figure 1: After our post-training quantization, the pre-
+trained MoE (a) is quantized into (b) with a mixed-precision
+based on structures, demonstrated with Mixtral-8x7B.
+CCS Concepts
+• Computing methodologies →Neural networks.
+Keywords
+Quantization, Mixture-of-Experts, Large Language Models
+ACM Reference Format:
+Pingzhi Li†, Xiaolong Jin†, Zhen Tan, Yu Cheng, and Tianlong Chen. 2018.
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-
+Experts. In Proceedings of Make sure to enter the correct conference title from
+your rights confirmation email (Conference acronym ’XX). ACM, New York,
+NY, USA, 13 pages. https://doi.org/XXXXXXX.XXXXXXX
+1
+Introduction
+Large Language Models (LLMs) have achieved remarkable success
+in various natural language processing tasks, such as language un-
+derstanding, reasoning, and generation, demonstrating superior
+performance and adaptability [4, 13, 15, 25, 31]. However, the rapid
+growth in model size, with state-of-the-art LLMs containing bil-
+lions of parameters, poses significant challenges to computational
+resources and memory consumption [2, 18, 30]. The Mixture of Ex-
+perts (MoE) [29] architecture has emerged as a promising solution
+to address the computation overhead. MoE allows for the scaling
+up of LLMs while maintaining roughly constant FLOPs. By incorpo-
+rating multiple experts and employing a sparse gating mechanism,
+MoE achieves efficient computation, enabling the development of
+larger models within the constraints of limited computation [6].
+Despite its advantages, MoE still suffers from extensive memory
+costs due to its vast parameter size, which hinders its practical
+arXiv:2406.08155v2  [cs.LG]  25 Feb 2025
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+deployment and widespread adoption. For example, pretrained in 8-
+bit precision, the DeepSeek-V3 [19] MoE model takes around 1.3 TB
+memory while only 74 GB parameters are activated for each input
+token. Model compression techniques tailored to MoE architectures
+are essential to address this issue. Existing MoE compression meth-
+ods can be categorized into two main approaches: merging and
+pruning. Expert merging, such as MC-MoE[17], aims to reduce the
+memory footprint by combining similar experts based on routing
+policy and compressing the resulting model using low-rank decom-
+position. On the other hand, expert pruning, such as task-specific
+pruning [5], focuses on identifying and removing the least impor-
+tant experts or connections based on their contribution to a specific
+task. However, these approaches not only necessitate prohibitively
+expensive model retraining but also operate under task-specific
+settings, limiting their practicality across real-world applications.
+Post-training quantization is a family of model compression
+techniques that converts pre-trained model weights from high-
+precision formats (e.g., FP32) to lower-precision representations
+without model retraining or task-specific tuning. Recent works,
+such as GPTQ [8], which adapts quantization intervals based on
+the Hessian information, and SmoothQuant [18], which jointly
+quantizes the model weight and activation by offline migrating the
+activation outliers, have demonstrated the effectiveness of post-
+training quantization for dense LLMs toward 4 bits compression.
+This advantage is particularly desired for MoE-based LLMs given
+their high training cost due to vast parameter sizes and prevailing
+deployment for various tasks [14, 19].
+However, our experiments show that directly deploy those tech-
+niques for MoE models leads to subpar performance. Existing meth-
+ods employ a uniform bit-width across all components of the MoE
+model. This one-size-fits-all approach fails to account for the in-
+herent sparse structure of the MoE architecture. For example, the
+sparse expert activations in MoE models exhibit distinct statistical
+properties from dense activations, suggesting adaptive bit alloca-
+tion among experts’ quantization. This yields the primary research
+question to be explored:
+(RQ) Do different MoE structures require varying numbers of bits
+for effective quantization?
+Our investigations reveal that different components in MoE re-
+quire varying bit allocations, as shown in Figure 1. For example,
+shared experts and the first few MoE layers demand higher preci-
+sion for effective quantization. Moreover, these findings naturally
+motivate two key questions: (1) How to identify the layers that
+are more sensitive to quantization; (2) How to systematically de-
+termine the importance of each MoE layer for bit allocation. To
+address these questions, we introduce novel data-driven techniques
+for optimizing bit allocation in MoE quantization, including the
+outlier-aware linear layer scorer that captures weight magnitude
+variations, and the MoE block importance predictor that leverages
+block-level activations patterns. Our key contributions are listed:
+(1) We establish the first benchmark for Mixture-of-Experts post-
+training quantization, i.e., QuantMoE-Bench. This benchmark en-
+compasses investigations into four critical MoE-related heuris-
+tics by evaluating different quantization methods including
+GPTQ and SmoothQuant, and analyzes multiple bit allocation
+strategies on attention layers, FFNN layers, experts, and MoE
+blocks. Our evaluation covers two representative MoE LLMs
+and six benchmark tasks.
+(2) Our benchmark study uncovers critical MoE quantization prin-
+ciples: attention layers require higher precision than FFNNs,
+shared experts need more bits than token-conditioned experts
+(4-bit v.s. 2-bit), and earlier MoE layers demand higher precision
+compared to later ones. These insights enable optimal bit allo-
+cation under constrained memory budgets while maintaining
+model performance.
+(3) Through extensive experiments, we demonstrate that our fine-
+grained mixed precision quantization approach achieves state-
+of-the-art performance, improving average task performance
+by 1.05% compared to existing methods (i.e., GPTQ).
+(4) Leveraging the insights from our benchmark study, we intro-
+duce novel data-driven techniques to optimize bit allocation in
+MoE quantization. These include the development of outlier-
+aware linear layer scorer and MoE block importance predic-
+tor, which significantly improve the effectiveness of mixed-
+precision quantization by 0.97%.
+2
+Related Works
+Mixture-of-Experts. The Mixture-of-Experts (MoE) approach [29]
+enhances neural network scalability by using router networks to
+activate model segments according to input tokens selectively. As
+the dominant architecture in NLP, numerous efforts have adapted
+feed-forward neural networks (FFNNs) within Transformers to in-
+corporate MoE layers, constructing MoE language models[6, 7, 14].
+Additionally, several variants of the standard MoE architecture
+exist. For example, DeepSeek-MoE [6] employs numerous finely
+segmented experts and designates a select few as shared experts to
+capture common knowledge. MoE’s application in LLMs is widely
+acknowledged for its superior generative abilities and remarkable
+computing efficiency [3, 6, 7, 14, 16, 27]. The recent work Mix-
+tral [14] illustrates that MoE can match the performance of equiva-
+lent full-parameter LLMs while utilizing far fewer active parameters.
+However, MoE suffers from significant memory overhead issues,
+posing challenges to its efficient deployment [16, 17, 19, 21, 33].
+MoE Compression. MoE models benefit from reduced FLOPs but
+are constrained by their significant memory overhead. Current
+works to reduce the memory overhead of MoE models mainly fo-
+cus on reducing the number of experts. An earlier approach [5]
+involves pruning non-essential experts for a specific downstream
+task during fine-tuning, utilizing statistics based on cumulative
+usage frequency. Another method, MC-SMoE [17], introduces a
+pipeline that identifies and groups similar experts, subsequently
+merging them and further decomposing the merged expert into low-
+rank components within each group. However, these approaches
+are developed under task-specific fine-tuning settings and do not
+explore the development of the MoE compression towards a general
+large langauge model.
+Post-Training Quantization. Post-training quantization reduces
+computational and storage demands by converting pre-trained mod-
+els from high-precision to lower-precision formats without exten-
+sive retraining [8, 9]. It has been widely applied to LLMs, optimizing
+them for deployment on resource-constrained devices. Techniques
+like layer-wise quantization and mixed-precision schemes are de-
+signed for minimal performance degradation while reducing model
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Figure 2: Visualization of expert usage of the two MoE models used in this work. It is profiled on our quantization calibration
+data, i.e., 512 random 4096 token sequences from the WikiText dataset [23].
+size and computational requirements efficiently [20, 26, 28]. Recent
+methods such as SmoothQuant [32], GPTQ [8], AWQ [18], and
+address specific challenges for LLMs. SmoothQuant [32] ensures
+smooth precision transitions across layers, reducing quantization
+errors and maintaining performance. GPTQ [8] employs layer-wise
+and mixed-precision quantization to balance efficiency and accu-
+racy. AWQ [18] adapts to weight sensitivity, preserving critical
+weights’ precision while aggressively quantizing less sensitive ones.
+These advancements in PTQ enable significant reductions in com-
+puting and storage while preserving LLM performance. However,
+their effectiveness on sparse MoE models is under-explored.
+3
+Preliminary
+3.1
+Quantization Method
+The primary objective of this work is to benchmark several MoE-
+related heuristics combined with established LLM quantization
+techniques. Given that the substantial memory overhead of MoE
+models predominantly originates from their weights, we adopt
+GPTQ [8], a popular weight quantization method. GPTQ executes
+layer-by-layer weight quantization by addressing a specific recon-
+struction problem for each layer. Specifically, let W be the weights
+of a linear layer and X be the input to that layer derived from a small
+subset of calibration data, the reconstruction problem is defined as:
+argmin b
+W, ||WX −b
+WX||2
+2.
+(1)
+This objective, being the sum of squared errors, forms a quadratic
+equation, allowing the greedy-optimal update of weights to be
+calculated element-by-element using the Hessian information, H =
+2XX⊤. GPTQ further enhances this process by incorporating a lazy-
+batch update and a Cholesky reformulation, to improve scalability
+and numerical stability for LLM quantization.
+3.2
+Mixture-of-Experts
+There are several variants of MoE in the context of LLMs, such as
+attention MoE and FFNN MoE. In this work, we explore the quan-
+tization of MoE models that utilize router networks to selectively
+activate FFNNs for different input tokens. Specifically, for the 𝑖-th
+expert’s feed-forward function at the 𝑙-th transformer layer, de-
+noted as FFNN𝑖𝑙(·), the output of the MoE layer for the input hidden
+states X is given by:
+FFNN𝑙
+MoE(X) =
+𝑙∑︁
+𝑖=1
+G(W𝑙X) · FFNN𝑙
+𝑖(X),
+(2)
+where W𝑙represents a linear routing matrix and G(·) is a routing
+function that typically employs a top-𝑘selection mechanism, re-
+sulting in a sparse output. Due to the duplication of FFNN layers,
+the principal memory overhead in the MoE model is attributed to
+the FFNN component.
+3.3
+Expert Usage as A Heuristic
+As the routing of experts in MoE models is not ideally balanced,
+expert usage frequency and its variants have emerged as prevalent
+heuristics for measuring the importance of different experts within
+an MoE block [5, 17]. For instance, task-specific expert pruning
+proposed by [5] uses a criterion based on cumulatively calculated
+expert routing probabilities for pruning during fine-tuning on a
+specific task. In this paper, focusing on post-training quantization,
+we utilize the routing distribution from the calibration data as
+the heuristic for expert usage. Specifically, for the 𝑙-th MoE block,
+equipped with a routing matrix W𝑙∈R𝑒×𝑑and input hidden states
+X ∈R𝑏×𝑑from the calibration data, the expert usage heuristic is:
+usage = normalize
+ ∑︁
+𝑖
+G(W𝑙X𝑖)
+!
+,
+(3)
+where G(·) is the routing function employing a top-𝑘selection
+mechanism that yields a sparse binary output. We visualize the
+calculated expert usage of Mixtral-8x7B and DeepSeek-MoE-16B-
+base MoE models on the quantization calibration data, as shown
+in Figure 2. Note that Mixtral-8x7B demonstrates a more balanced
+routing distribution than DeepSeek-MoE-16B-base.
+4
+Benchmark Post-Quantizations for MoE
+In this section, we present several heuristics for MoE quantization
+and the empirical performance of them. Our benchmarking covers
+two MoE models and six popular tasks.
+4.1
+Benchmark Setups
+MoE Models. We select two representative MoE models for our
+benchmark evaluation, i.e., Mixtral-8x7B [14] and DeepSeek-MoE-
+16B-base [6]. Mixtral-8x7B substitutes every FFNN with a MoE
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+block and has 8 experts per MoE block with top-2 routing, while
+DeepSeek-MoE-16B-base uses a fine-grained MoE architecture by
+including 64 experts with top-6 routing and 2 shared experts per
+MoE block. Notably, the DeepSeek-MoE-16B-base model applies a
+dense FFNN in its first transformer layer while employing an MoE
+architecture in subsequent blocks for better training stability.
+Quantization. We mainly focus on weight-only grouped mixed-
+precision quantization, though we also extend our experiments
+and conclusions to its combination with activation quantization
+in Section 5. We use GPTQ [8] for quantization, without loss of
+generality. Throughout this work, we use a group size of 128. Our
+experiments emphasize an extreme quantization scenario, where
+most weights are quantized to either 2 or 4 bits.
+Calibration and Evaluation Details. We use the calibration data
+consisting of 512 random 4096 token sequences from the WikiText
+dataset [23], following GPTQ [8]. Unlike previous literature that
+focuses on language modeling benchmarks [8, 18, 32], we evaluate
+all the methods on six popular LLM tasks for a practical bench-
+marking: WinoGrande [1], COPA [10], OpenBookQA (OBQA) [24],
+HellaSwag [34], and MMLU [11]. We report the performance on
+MMLU with 5-shot and all others with zero-shot. All experiments
+are conducted with PyTorch on 8 NVIDIA H100s, and we utilize
+lm-evaluation-harness 1 for the evaluation of all tasks.
+4.2
+Problem Formulation: Pareto-Optimal Bit
+Allocation
+In this section, we formalize the intrinsic tradeoff between model
+performance and bit allocation in MoE quantization through the
+lens of Pareto optimization.
+Given an MoE model with𝑛weight components (attention layers,
+MoE FFNN experts, etc.), we aim to find the optimal bit allocation
+strategy that balances model performance and memory efficiency.
+Let b = (𝑏1,𝑏2, . . . ,𝑏𝑛) represent a bit allocation vector, where
+𝑏𝑖∈{2, 4} is the quantization precision for the 𝑖-th component. We
+formulate this as a bi-objective optimization problem:
+max
+b
+P(b)
+min
+b
+B(b) = 1
+𝑛
+𝑛
+∑︁
+𝑖=1
+𝑏𝑖
+subject to
+𝑏𝑖∈{2, 4},
+∀𝑖∈{1, 2, . . . ,𝑛},
+(4)
+where P(b) is the model performance and B(b) is the average
+bit-width across all components. In practice, we can reformulate
+this as a constrained optimization problem:
+max
+b
+P(b)
+subject to
+M(b) ≤𝑀budget
+𝑏𝑖∈B,
+∀𝑖∈{1, 2, . . . , 𝑁},
+(5)
+where 𝑀budget is the maximum allowed memory budget. This for-
+mulation allows us to find the bit allocation that maximizes perfor-
+mance while satisfying memory constraints.
+Given the combinatorial nature of this problem and the difficulty
+in obtaining a closed-form expression for P(b), we approach it
+using the structure-aware heuristics described in the following
+1https://github.com/EleutherAI/lm-evaluation-harness
+Performance (%)
+45
+55
+65
+75
+Average Bits
+2.0
+3.0
+4.0
+Mixed-Precision
+8-Bits
+3-Bits
+Pareto-Optimal
+Figure 3: Comparison of allocating more bits (i.e. 4 bits) for
+attention and frequent experts with uniform-bits quantiza-
+tion (i.e. 3 and 8 bits). The Pareto-optimal solution is 3.29 bits.
+sections, leveraging our observations about the varying importance
+of different MoE components. As shown in Figure 3, our mixed-
+precision approach effectively navigates the Pareto frontier, offering
+superior performance compared to uniform bit allocation.
+4.3
+Benchmark Results
+We first evaluate the four bit-allocation heuristic MoE quantization
+approaches using GPTQ on Mixtral-8x7B and DeepSeek-MoE-16B.
+Table 1 presents the overall comparison performance of our
+mixed-precision MoE quantization strategies v.s. baseline (i.e. GPTQ)
+across multiple benchmarks Mixtral-8x7B and DeepSeek-MoE-16B-
+base. The results highlight that uniform quantization leads to sub-
+stantial performance degradation, reinforcing the need for structure-
+aware, fine-grained quantization strategies. By incorporating meth-
+ods such as attention-aware adjustments (+Attn), expert frequency-
+based bit allocation (+Freq), and prioritization of early MoE lay-
+ers (+FirstL), importance-based quantization (+LinearOSP and
++LayerISP), we observe improvements in model performance, par-
+ticularly in lower-bit settings. A key takeaway from the results is
+that a mixed-precision approach tailored to the MoE structure out-
+performs fixed-bit quantization. In particular, expert usage frequency-
+based quantization (+Freq) improves performance by dynamically
+allocating more bits to frequently used experts, though its impact
+varies depending on the routing balance of different models. Addi-
+tionally, prioritizing the first few MoE blocks (+FirstL) yields better
+results. Lastly, importance-based strategies(+LinearOSP, +LayerISP)
+further refine bit allocation, demonstrating the effectiveness of
+adaptive quantization at different levels of granularity.
+To gain deeper insights, we further systematically analyze four
+key research questions: (1) the effectiveness of expert usage fre-
+quency as a quantization heuristic, (2) whether attention or FFNN
+layers deserve more bit precision, (3) the importance of the first
+versus last MoE blocks in quantization, and (4) the necessity of allo-
+cating more bits to shared experts. The following sections provide
+a detailed discussion of each aspect.
+Q1: Is expert usage frequency a good quantization heuristic? A:
+Fairly good. Expert usage frequency is a popular heuristic in the
+compression of MoE models, predicated on the insight that less
+frequently used experts are likely less crucial. Our experiments,
+detailed in Table 2, corroborate its effectiveness as a quantization
+heuristic for MoE models. In particular, for the DeepSeek-MoE-16B-
+base model, this heuristic outperforms the strategy of randomly
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Table 1: Comparison of quantization bit allocation strategies including attention (Attn) and shared expert (Shared) prioritization,
+frequency-based expert selection (Freq), first-layer prioritization (FirstL), linear outlier score predictor (LinearOSP) and layer
+importance score predictor (LayerISP). We evaluate performance on Mixtral-8x7B and DeepSeek-MoE-16B-base across multiple
+benchmarks. Unlike uniform-precision quantization (i.e. GPTQ), our approach tailors bit allocation to the MoE structure,
+demonstrating the effectiveness of structure-aware precision allocation, especially in low-bit settings.
+Methodology
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+Mixtral-8x7B
+GPTQ
+3
+73.56
+93.00
+44.80
+75.31
+79.11
+58.37
+70.69
+GPTQ
+2
+49.33
+63.00
+25.40
+28.18
+52.99
+24.29
+40.53
++Attn
+2.06
+54.14
+65.00
+26.80
+44.87
+57.78
+27.38
+46.00 ↑5.47
++Attn+Freq
+3.27
+73.09
+92.00
+44.80
+77.03
+78.29
+63.05
+71.38 ↑30.85
++Attn+Freq+FirstL
+3.51
+73.32
+95.00
+44.00
+80.06
+79.71
+64.89
+72.83 ↑32.30
++Attn+LinearOSP
+3.12
+72.85
+92.00
+43.40
+78.14
+78.40
+62.92
+71.29 ↑30.76
++Attn+LayerISP
+3.35
+71.19
+93.00
+44.00
+77.03
+78.29
+63.15
+71.11 ↑30.58
+DeepSeek-MoE-16B-base
+GPTQ
+3
+67.87
+87.00
+40.40
+72.92
+78.50
+39.12
+64.30
+GPTQ
+2
+53.27
+76.00
+30.20
+45.32
+66.53
+25.28
+49.43
++Attn
+2.06
+61.72
+83.00
+34.00
+61.93
+73.45
+26.53
+56.77 ↑7.34
++Attn+Shared
+2.12
+65.67
+85.00
+39.20
+67.84
+76.28
+35.28
+61.55 ↑12.12
++Attn+Shared+Freq
+3.00
+68.82
+88.00
+42.00
+73.32
+77.31
+41.51
+65.16 ↑15.90
++Attn+Shared+Freq+FirstL
+3.06
+68.35
+88.00
+42.60
+73.85
+77.69
+41.58
+65.35 ↑15.92
++Attn+Shared+LinearOSP
+3.06
+67.32
+88.00
+41.60
+72.45
+77.48
+41.64
+64.84 ↑15.41
++Attn+Shared+LayerISP
+3.06
+69.30
+87.00
+42.00
+73.56
+77.86
+41.86
+65.27 ↑15.67
+Attention v.s. FFNN
+Performance
+40
+45
+50
+Average Bits
+1.9
+2
+2.1
+2.2
+Attention
+FFNN
+Shared v.s. Others
+56
+60
+64
+Average Bits
+1.9
+2.1
+2.3
+Shared
+Others
+Figure 4: Comparison of quantizing more bits for attention vs.
+FFNN and shared experts v.s. others, evaluated on the Mixtral-
+8x7B model. FFNN and others’ results show the mean and
+standard deviation (error bars) from 3 independent trials.
+allocating more bits to experts, likely due to the model’s unbalanced
+routing distribution. However, with the Mixtral-8x7B model, where
+the routing distribution is more balanced, the advantage of using
+expert usage frequency over random allocation is less significant.
+Q2: Attention vs. FFNN: Which Deserves More Bits in MoE? A:
+Attention layers are more bit-efficient. Because of the unique char-
+acteristics of the feedforward neural network (FFNN) within the
+mixture of experts (MoE) framework. we explore the attention layer
+and the feedforward neural network layer, which deserves more
+bits. We compare the performance evaluated by quantizing the
+attention layers with more bits v.s. randomly selecting experts in
+the FFNN layers with more bits, maintaining the same average bits
+of the entire MoE model for a fair comparison. Specifically, we
+quantize the attention weight or randomly selected FFNN weight
+to {2, 4, 8} bits, while All other weights are quantized to 2 bits
+by default. As illustrated in Figure 4 (left), quantizing attention
+weights to higher bit levels (i.e., 4 or 8 bits) consistently results in
+significant performance gains (over 5%) under each average bit allo-
+cation for the MoE model. This greater efficiency likely stems from
+the fact that attention weights are activated for every token, while
+FFNN weights only engage with a subset of the input tokens. Con-
+sequently, increasing the quantization bits for FFNN weights does
+not benefit all inputs. Based on these findings, attention weights
+are quantized to 4 bits by default in all following experiments.
+Q3: Do the model’s first or last MoE blocks deserve more bits in
+quantization? A: The first MoE blocks. As more and more Mixture-of-
+Experts (MoE) architectures emerge, we investigate which layer of
+the MoE block is more critical and thus deserves more bits during
+the quantization process. As shown in Table 3, we evaluate the
+performance of allocating more bits to the first 𝑘blocks versus the
+last 𝑘blocks in quantization. The results consistently indicate that
+higher bit quantization of the first few blocks yields better perfor-
+mance, suggesting that we can allocate more bits to the quantization
+of the first blocks of the model. This observation aligns with prior
+studies that have empirically confirmed the greater importance of
+the first few Transformer blocks [6, 22].
+Q4: Does the shared expert always deserve more bits? A: Yes. The
+DeepSeek-MoE-16B-base model includes two shared experts within
+each MoE block to obtain common knowledge across varying do-
+mains and alleviate the parameter redundancy. To evaluate their
+role in quantization, we compare quantizing these two shared ex-
+perts with more bits v.s. randomly selecting two non-shared experts
+for more bit allocation, maintaining the same average bits for a fair
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+Table 2: Comparison of the expert usage frequency heuristic v.s. random allocation. For the Mixtral-8x7B model, we compare
+the allocation of 4 bits to the top-{2, 4} most frequently used experts per MoE block against randomly selecting {2, 4} experts
+for the same bit allocation. For the DeepSeek-MoE-16B-base model, we keep shared expert {8} bits and compare between top-{10,
+15, 20, 25} most frequently used experts against randomly selecting {10, 15, 20, 25} experts per MoE block. The remaining experts
+are quantized to 2 bits, while all attention layers are uniformly quantized to 4 bits. All random experimental results in the
+format of 𝑎± 𝑏provide the mean value 𝑎and its standard deviation 𝑏over 3 independent trials.
+Methodology
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+Mixtral-8x7B
+Random 2
+2.54
+58.59 ± 2.57
+68.00 ± 11.27
+33.00 ± 1.78
+46.60 ± 18.21
+60.14 ± 9.32
+28.26 ± 4.64
+49.10 ± 7.73
+Frequent 2
+2.54
+58.33
+76.00
+32.00
+56.62
+66.21
+36.01
+54.20
+Random 4
+3.03
+67.77 ± 0.36
+86.33 ± 3.51
+38.47 ± 0.31
+67.48 ± 0.52
+73.99 ± 0.52
+48.13 ± 2.57
+63.70 ± 0.49
+Frequent 4
+3.03
+68.82
+86.00
+38.80
+67.68
+72.20
+49.42
+63.82
+DeepSeek-MoE-16B-base
+Random 10
+2.53
+67.28 ± 0.04
+88.50 ± 1.50
+38.40 ± 0.80
+70.99 ± 0.50
+76.74 ± 0.84
+35.23 ± 0.09
+62.86 ± 0.60
+Frequent 10
+2.53
+66.46
+87.00
+39.60
+70.31
+76.71
+37.84
+62.99
+Random 15
+2.68
+67.25 ± 0.47
+84.50 ± 2.50
+40.00 ± 0.60
+71.79 ± 0.43
+76.85 ± 0.08
+35.71 ± 0.82
+62.68 ± 0.71
+Frequent 15
+2.68
+67.17
+88.00
+39.00
+71.09
+76.93
+40.59
+63.80
+Random 20
+2.83
+67.25 ± 0.47
+84.50 ± 2.50
+40.00 ± 0.60
+71.79 ± 0.43
+76.85 ± 0.08
+35.71 ± 0.82
+62.68 ± 0.71
+Frequent 20
+2.83
+67.25
+86.00
+40.40
+72.06
+77.58
+40.78
+64.01
+Random 25
+2.97
+67.72 ± 0.24
+89.00 ± 1.00
+40.70 ± 0.10
+71.98 ± 0.19
+77.04 ± 0.05
+36.54 ± 1.55
+63.83 ± 0.04
+Frequent 25
+2.97
+67.72
+90.00
+39.20
+72.83
+77.15
+41.06
+64.66
+Table 3: Comparison between quantizing first 𝑘v.s. last 𝑘MoE blocks with higher (i.e. 4) bits. All weights in attention layers are
+quantized to 4 bits, and the other weights are quantized to 2 bits. In DeepSeek-MoE-16B-base model, we keep the first block that
+is dense block as 4 bits by default. We evaluate 𝑘of 4 and 8. The higher performance of each comparison pair is marked as bold.
+Methodology
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+Mixtral-8x7B
+First 4
+2.30
+57.85
+72.00
+32.80
+52.80
+61.59
+29.65
+51.12
+Last 4
+2.30
+53.75
+60.00
+27.80
+46.25
+58.87
+26.56
+45.54
+First 8
+2.54
+62.11
+85.00
+35.80
+62.72
+67.74
+35.61
+58.16
+Last 8
+2.54
+52.09
+69.00
+29.60
+47.87
+59.58
+26.03
+47.36
+DeepSeek-MoE-16B-base
+First 4
+2.29
+65.27
+85.00
+38.40
+64.42
+72.74
+28.88
+59.12
+Last 4
+2.29
+62.90
+83.00
+36.00
+64.41
+74.65
+27.38
+58.06
+First 8
+2.63
+64.09
+86.00
+38.75
+67.84
+75.35
+30.12
+60.36
+Last 8
+2.63
+62.83
+83.00
+37.80
+65.94
+75.73
+31.00
+59.38
+comparison. The shared or random non-shared experts are quan-
+tized to 2, 4, 8 bits, while attention weights are set to 4 bits and all
+other weights to 2 bits. As depicted in Figure 4 (right), allocating
+higher bit levels (i.e., 4 or 8 bits) to shared experts consistently yields
+superior performance. This enhanced efficiency and effectiveness
+are attributed to the shared experts being activated for every input
+token, unlike non-shared experts, which only engage with specific
+subsets of the tokens. Allocating more quantization bits to shared
+experts thus proves to be both more efficient and effective.
+5
+Extended Study to Improve MoE Quantization
+In this section, we introduce two novel data-driven techniques
+aimed at enhancing the effectiveness of identifying crucial compo-
+nents within MoE models for improved quantization performance.
+5.1
+Outlier-Aware Linear Layer Scorer
+Insight. From the quantization perspective, the larger the range
+of a weight magnitude group, the more difficult it will be for quan-
+tization. We found that, in MoE, each FFNN linear weight matrix
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+(a) Outlier-Aware Linear Layer Scorer
+(b) MoE Block Importance Score Predictor
+Figure 5: (a) Visualization of the outlier-aware linear layer scorer metric applied to each FFNN linear weight matrix within
+the Mixtral-8x7B model. For clearer visualization, we present separate components, including the gate projection (left), up
+projection (middle), and down projection (right) in FFNN experts. (b) Visualization of the MoE block importance score predictor
+metric applied on the DeepSeek-MoE-16B-base model.
+consists predominantly of values within a narrow range, inter-
+spersed with a few significant outliers. Consequently, we propose
+a weight-magnitude-based metric to identify those linear layers
+that are challenging to quantize effectively, thereby necessitating a
+higher allocation of quantization bits.
+Methodology. We define the metrics to estimate the outliers of
+weights by the maximum ratio of the largest to the average absolute
+magnitude within each column. Specifically, for a weight matrix
+W ∈R𝑚×𝑛, we compute the metric outlier-score(W) as follows:
+outlier-score(W) = max𝑗
+ max(|W:, 𝑗|)
+mean(|W:, 𝑗|)
+
+,
+(6)
+where |W:, 𝑗| is the absolute value of W’s 𝑗-th column. With this
+metric, we can identify those linear layers that require more quanti-
+zation bits and allocate more to them, providing an effective trade-
+off between performance and efficiency. The overall procedure is
+detailed in Algorithm 1.
+Algorithm 1 The Procedure of MoE Mixed-Precision Quantization
+with outlier-score.
+1: Initialize: A MoE model with𝑙linear layers across all the FFNN
+experts, the number of linear layers for 4 bit quantization 𝑘.
+2: Let M and S represent the set of each linear layer matrix in
+FFNN and its score, respectively.
+3: for linear layer 𝑖= 1, . . . ,𝑙do
+4:
+W ←M[𝑖]
+5:
+S[𝑖] ←max𝑗
+ max(|W:,𝑗|)
+mean(|W:,𝑗|)
+
+6: end for
+7: 𝛼←sorted(S)[𝑘]
+8: 4bits-quantize ({M[𝑖] | S[𝑖] >= 𝛼})
+9: 2bits-quantize ({M[𝑖] | S[𝑖] < 𝛼})
+10: Return: A quantized mixed-precision MoE model.
+Experiments. We evaluate this metric by comparing its application
+for the top-𝑝% of linear layers against randomly selecting linear
+layers, using percentages of 25% and 50%. In DeepSeek-MoE-16B-
+base model, we also involve shared experts using this metric. As
+illustrated in Table 4, our proposed scorer consistently outperforms
+the random baseline on both models and almost all tasks (except
+HellaSwag and MMLU). This is particularly evident in the DeepSeek-
+MoE-16B-base model, where it achieves an average performance
+improvement of about 3%, aligning with our expectations.
+Visualization. As shown in Figure 5 (a), we visualize the proposed
+outlier-score for each FFNN linear weight within the Mixtral-
+8x7B model. Given that each FFNN expert includes three linear
+layers, namely the gate projection, up projection, and down projec-
+tion, we visualize these components separately to ensure clarity.
+Notably, many of the down projection linear layers, particularly
+those positioned later in the MoE model, exhibit significantly higher
+outlier-scores compared to others.
+5.2
+MoE Block Importance Score Predictor
+Algorithm 2 The Training Procedure of Block Score Predictor.
+1: Initialize: A MoE block 𝑀, token input and output embedding
+set at block 𝑀{(x𝑖, y𝑖)}𝑖∈[𝑁].
+2: Let BSP denotes the block score predictor.
+3: X ←{x𝑖| 𝑖∈[𝑁]}
+4: S ←{cosine(x𝑖, y𝑖) | 𝑖∈[𝑁]}
+5: BSP ←train(X, S)
+6: Return: The importance scorer BSP for MoE Block 𝑀.
+Inspired by Q3 in Section 4.3, which demonstrates that allocat-
+ing more bits to different MoE blocks yields variable performance
+improvements, we propose a novel method to identify and quantize
+those critical blocks with additional bits. Specifically, this section
+outlines our approach to calculating importance scores for bit allo-
+cation using a data-driven method with a lightweight predictor.
+Insight. We find an increasing cosine similarity between the tensors
+generated before and after the FFN blocks for some of the MoE
+blocks, indicating less important computation results produced by
+these blocks. This observation also aligns with observations on
+dense models in previous literature [12]. Therefore, the basic idea
+is that less accurate output of these blocks producing tokens with
+high cosine similarity will not affect the overall model performance
+much, thus lower weight bits might not hurt performance much.
+Methodology. To capture the generalized hidden states’ dynamic
+information of each MoE block, we train a two-layer FFNN with
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+Table 4: Comparison between using our linear weight scorer vs. random selection of linear layers for bit allocation in quantization.
+We evaluate by quantizing 25% of the linear layers across all MoE blocks (i.e., FFNN) to 4 bits. All attention weights are quantized
+to 4 bits, and all other weights are quantized to 2 bits. In each comparison pair, the higher performance is highlighted in bold.
+All random experimental results in the format of 𝑎± 𝑏provide the mean value 𝑎and its standard deviation 𝑏over 3 trials.
+Methodology
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+Mixtral-8x7B
+Random 25%
+2.54
+60.74 ± 0.63
+78.67 ± 4.62
+34.07 ± 1.63
+57.36 ± 0.53
+68.19 ± 0.74
+32.49 ± 1.60
+55.25 ± 0.95
+Ours top-25%
+2.54
+62.19
+83.00
+35.80
+57.04
+68.23
+30.95
+56.20
+DeepSeek-MoE-16B-base
+Random 25%
+2.54
+64.04 ± 0.78
+84.67 ± 4.73
+37.53 ± 0.46
+67.39 ± 0.71
+74.61 ± 0.60
+29.43 ± 1.31
+59.61 ± 0.76
+Ours top-25%
+2.54
+66.14
+85.00
+38.80
+71.65
+76.82
+36.19
+62.43
+Table 5: Comparison between using our MoE block importance predictor v.s. two baselines: ①random selecting and ②first 𝑘MoE
+blocks. The predicted or selected MoE blocks are quantized to 4 bits, all attention weights are quantized to 4 bits, and all other
+weights are quantized to 2 bits. In each comparison, the highest performance is highlighted in bold. All random experimental
+results in the format of 𝑎± 𝑏provide the mean value 𝑎and its standard deviation 𝑏over 3 independent trials.
+Methodology
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+DeepSeek-MoE-16B-base
+Random 4
+2.29
+61.09 ± 0.78
+83.00 ± 0.00
+37.20 ± 0.85
+64.88 ± 0.30
+74.21 ± 0.08
+27.82 ± 0.46
+58.03 ± 0.13
+First 4
+2.29
+65.27
+85.00
+38.40
+64.42
+72.74
+28.88
+59.12
+Predicted 4
+2.29
+65.27
+83.00
+36.60
+64.88
+74.54
+37.75
+60.34
+Random 8
+2.63
+64.48 ± 0.83
+85.33 ± 3.21
+38.73 ± 0.95
+67.57 ± 0.40
+75.43 ± 0.14
+31.41 ± 2.17
+60.49 ± 0.56
+First 8
+2.63
+64.09
+86.00
+38.75
+67.84
+75.35
+30.12
+60.36
+Predicted 8
+2.63
+65.35
+86.00
+38.00
+68.77
+75.35
+30.01
+60.58
+Random 12
+2.92
+64.64 ± 0.89
+83.50 ± 0.71
+39.60 ± 2.83
+69.51 ± 0.56
+75.98 ± 0.42
+32.57 ± 0.30
+60.97 ± 0.62
+First 12
+2.92
+67.48
+88.00
+38.60
+70.59
+75.95
+39.25
+63.31
+Predicted 12
+2.92
+68.11
+88.00
+39.20
+71.82
+76.66
+38.45
+63.71
+a tangent activation function. This network predicts the cosine
+similarity between the input and output hidden states. We utilize
+a dataset of 400 random sequences, each containing 1024 tokens
+from the WikiText dataset [23], for training. The detailed training
+procedure is in Algorithm 2. During quantization, we applied this
+predictor to the calibration data, computing an average predicted
+score for each MoE layer across all tokens. A higher predicted score
+indicates less importance and fewer bits for quantization.
+Experiments. In Table 5, we compare the performance of using our
+block importance predictor to select 𝑘MoE blocks for 4 bits and
+others for 2 bits quantization with two other baselines: ①random
+selecting 𝑘MoE blocks, and ②first 𝑘MoE blocks (as it is the best
+in Q3 in Section 4.3). Evaluation results on the DeepSeek-MoE-16B-
+base model are presented in Table 5, showing the superiority of our
+method against the other two baselines.
+Visualization. We visualize the predicted scores of each MoE
+block using our trained predictors in the DeepSeek-MoE-16B-base
+model, as shown in Figure 5 (b). Notably, MoE blocks situated in the
+middle of the model, which exhibit higher scores, are regarded as
+less critical. Consequently, these blocks will be quantized with fewer
+bits (specifically, 2 bits), reflecting their lower importance. Besides,
+Figure 5 (b) also demonstrates that the first few MoE blocks are
+more important aligned with Q3. Interestingly, the last two blocks
+of the DeepSeek-MoE-16B-base model are also crucial, thereby
+allocating more bits and yielding better performance.
+6
+Conclusion
+This work introduces mixed-precision MoE quantization through
+a systematic investigation of various heuristic-based approaches
+in the post-training setting. While conventional quantization tech-
+niques (e.g., GPTQ) show limited effectiveness when directly applied
+to MoE models, the question of optimal bit allocation across dif-
+ferent MoE model components requires deeper exploration. We
+present QuantMoE-Bench, the first comprehensive benchmark to
+comprehensively study post-training quantization of MoE models,
+which reveals critical insights, including significant importance vari-
+ations among MoE blocks. Drawing on these insights, we further
+develop innovative techniques, i.e., a block importance predictor
+and a linear layer outlier range scorer, to more precisely identify
+which components benefit most from higher-precision quantization.
+Our methods substantially improve the effectiveness of MoE model
+quantization. We hope our study provides novel insights into the
+memory compression of MoE-based models.
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+References
+[1] 2019. WinoGrande: An Adversarial Winograd Schema Challenge at Scale.
+[2] Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad
+Awan, Cheng Li, Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase,
+and Yuxiong He. 2022. DeepSpeed Inference: Enabling Efficient Inference of
+Transformer Models at Unprecedented Scale. arXiv:2207.00032 [cs.LG]
+[3] Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam
+Shleifer, Xi Victoria Lin, Jingfei Du, Srinivasan Iyer, Ramakanth Pasunuru, Giri
+Anantharaman, Xian Li, Shuohui Chen, Halil Akin, Mandeep Baines, Louis Martin,
+Xing Zhou, Punit Singh Koura, Brian O’Horo, Jeff Wang, Luke Zettlemoyer, Mona
+Diab, Zornitsa Kozareva, and Ves Stoyanov. 2022. Efficient Large Scale Language
+Modeling with Mixtures of Experts. arXiv:2112.10684 [cs.CL]
+[4] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan,
+Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan,
+Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter,
+Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin
+Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya
+Sutskever, and Dario Amodei. 2020. Language Models are Few-Shot Learners.
+arXiv:2005.14165 [cs.CL]
+[5] Tianyu Chen, Shaohan Huang, Yuan Xie, Binxing Jiao, Daxin Jiang, Haoyi Zhou,
+Jianxin Li, and Furu Wei. 2022. Task-Specific Expert Pruning for Sparse Mixture-
+of-Experts. arXiv:2206.00277 [cs.LG]
+[6] Damai Dai, Chengqi Deng, Chenggang Zhao, R. X. Xu, Huazuo Gao, Deli Chen,
+Jiashi Li, Wangding Zeng, Xingkai Yu, Y. Wu, Zhenda Xie, Y. K. Li, Panpan Huang,
+Fuli Luo, Chong Ruan, Zhifang Sui, and Wenfeng Liang. 2024. DeepSeekMoE:
+Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models.
+arXiv:2401.06066 [cs.CL]
+[7] William Fedus, Barret Zoph, and Noam Shazeer. 2022.
+Switch Transform-
+ers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+arXiv:2101.03961 [cs.LG]
+[8] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2023. GPTQ:
+Accurate Post-Training Quantization for Generative Pre-trained Transformers.
+arXiv:2210.17323 [cs.LG]
+[9] Elias Frantar, Sidak Pal Singh, and Dan Alistarh. 2023. Optimal Brain Com-
+pression: A Framework for Accurate Post-Training Quantization and Pruning.
+arXiv:2208.11580 [cs.LG]
+[10] Andrew Gordon, Zornitsa Kozareva, and Melissa Roemmele. 2012. SemEval-
+2012 Task 7: Choice of Plausible Alternatives: An Evaluation of Commonsense
+Causal Reasoning. In *SEM 2012: The First Joint Conference on Lexical and
+Computational Semantics – Volume 1: Proceedings of the main conference and
+the shared task, and Volume 2: Proceedings of the Sixth International Workshop
+on Semantic Evaluation (SemEval 2012), Eneko Agirre, Johan Bos, Mona Diab,
+Suresh Manandhar, Yuval Marton, and Deniz Yuret (Eds.). Association for Com-
+putational Linguistics, Montr´eal, Canada, 394–398. https://aclanthology.org/S12-
+1052
+[11] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn
+Song, and Jacob Steinhardt. 2021. Measuring Massive Multitask Language Un-
+derstanding. arXiv:2009.03300 [cs.CY]
+[12] Ajay Jaiswal, Bodun Hu, Lu Yin, Yeonju Ro, Shiwei Liu, Tianlong Chen, and
+Aditya Akella. 2024. FFN-SkipLLM: A Hidden Gem for Autoregressive Decoding
+with Adaptive Feed Forward Skipping. arXiv:2404.03865 [cs.CL]
+[13] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, De-
+vendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel,
+Guillaume Lample, Lucile Saulnier, L´elio Renard Lavaud, Marie-Anne Lachaux,
+Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas Wang, Timoth´ee Lacroix,
+and William El Sayed. 2023. Mistral 7B. arXiv:2310.06825 [cs.CL]
+[14] Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche
+Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou
+Hanna, Florian Bressand, Gianna Lengyel, Guillaume Bour, Guillaume Lample,
+L´elio Renard Lavaud, Lucile Saulnier, Marie-Anne Lachaux, Pierre Stock, Sandeep
+Subramanian, Sophia Yang, Szymon Antoniak, Teven Le Scao, Th´eophile Gervet,
+Thibaut Lavril, Thomas Wang, Timoth´ee Lacroix, and William El Sayed. 2024.
+Mixtral of Experts. arXiv:2401.04088 [cs.LG]
+[15] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess,
+Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. 2020.
+Scaling Laws for Neural Language Models. arXiv:2001.08361 [cs.LG]
+[16] Jakub Krajewski, Jan Ludziejewski, Kamil Adamczewski, Maciej Pi´oro, Michał
+Krutul, Szymon Antoniak, Kamil Ciebiera, Krystian Kr´ol, Tomasz Odrzyg´o´zd´z,
+Piotr Sankowski, Marek Cygan, and Sebastian Jaszczur. 2024. Scaling Laws for
+Fine-Grained Mixture of Experts. arXiv:2402.07871 [cs.LG]
+[17] Pingzhi Li, Zhenyu Zhang, Prateek Yadav, Yi-Lin Sung, Yu Cheng, Mohit Bansal,
+and Tianlong Chen. 2024. Merge, Then Compress: Demystify Efficient SMoE
+with Hints from Its Routing Policy. arXiv:2310.01334 [cs.LG]
+[18] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen
+Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. 2024. AWQ:
+Activation-aware Weight Quantization for LLM Compression and Acceleration.
+arXiv:2306.00978 [cs.CL]
+[19] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Cheng-
+gang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. 2024. Deepseek-v3
+technical report. arXiv preprint arXiv:2412.19437 (2024).
+[20] Shih-yang Liu, Zechun Liu, Xijie Huang, Pingcheng Dong, and Kwang-Ting
+Cheng. 2023. Llm-fp4: 4-bit floating-point quantized transformers. arXiv preprint
+arXiv:2310.16836 (2023).
+[21] Shuqing Luo, Jie Peng, Pingzhi Li, and Tianlong Chen. 2024. HEXA-MoE: Ef-
+ficient and Heterogeneous-aware MoE Acceleration with ZERO Computation
+Redundancy. arXiv:2411.01288 [cs.DC] https://arxiv.org/abs/2411.01288
+[22] Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023. LLM-Pruner: On the Struc-
+tural Pruning of Large Language Models. arXiv:2305.11627 [cs.CL]
+[23] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. 2016.
+Pointer Sentinel Mixture Models. arXiv:1609.07843 [cs.CL]
+[24] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. 2018. Can
+a Suit of Armor Conduct Electricity? A New Dataset for Open Book Question
+Answering. arXiv:1809.02789 [cs.CL]
+[25] OpenAI, Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge
+Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam
+Altman, Shyamal Anadkat, Red Avila, Igor Babuschkin, Suchir Balaji, Valerie Bal-
+com, Paul Baltescu, Haiming Bao, Mohammad Bavarian, Jeff Belgum, Irwan Bello,
+Jake Berdine, Gabriel Bernadett-Shapiro, Christopher Berner, Lenny Bogdonoff,
+Oleg Boiko, Madelaine Boyd, Anna-Luisa Brakman, Greg Brockman, Tim Brooks,
+Miles Brundage, Kevin Button, Trevor Cai, Rosie Campbell, Andrew Cann, Brit-
+tany Carey, Chelsea Carlson, Rory Carmichael, Brooke Chan, Che Chang, Fotis
+Chantzis, Derek Chen, Sully Chen, Ruby Chen, Jason Chen, Mark Chen, Ben
+Chess, Chester Cho, Casey Chu, Hyung Won Chung, Dave Cummings, Jeremiah
+Currier, Yunxing Dai, Cory Decareaux, Thomas Degry, Noah Deutsch, Damien
+Deville, Arka Dhar, David Dohan, Steve Dowling, Sheila Dunning, Adrien Ecoffet,
+Atty Eleti, Tyna Eloundou, David Farhi, Liam Fedus, Niko Felix, Sim´on Posada
+Fishman, Juston Forte, Isabella Fulford, Leo Gao, Elie Georges, Christian Gibson,
+Vik Goel, Tarun Gogineni, Gabriel Goh, Rapha Gontijo-Lopes, Jonathan Gor-
+don, Morgan Grafstein, Scott Gray, Ryan Greene, Joshua Gross, Shixiang Shane
+Gu, Yufei Guo, Chris Hallacy, Jesse Han, Jeff Harris, Yuchen He, Mike Heaton,
+Johannes Heidecke, Chris Hesse, Alan Hickey, Wade Hickey, Peter Hoeschele,
+Brandon Houghton, Kenny Hsu, Shengli Hu, Xin Hu, Joost Huizinga, Shantanu
+Jain, Shawn Jain, Joanne Jang, Angela Jiang, Roger Jiang, Haozhun Jin, Denny Jin,
+Shino Jomoto, Billie Jonn, Heewoo Jun, Tomer Kaftan, Łukasz Kaiser, Ali Kamali,
+Ingmar Kanitscheider, Nitish Shirish Keskar, Tabarak Khan, Logan Kilpatrick,
+Jong Wook Kim, Christina Kim, Yongjik Kim, Jan Hendrik Kirchner, Jamie Kiros,
+Matt Knight, Daniel Kokotajlo, Łukasz Kondraciuk, Andrew Kondrich, Aris Kon-
+stantinidis, Kyle Kosic, Gretchen Krueger, Vishal Kuo, Michael Lampe, Ikai Lan,
+Teddy Lee, Jan Leike, Jade Leung, Daniel Levy, Chak Ming Li, Rachel Lim, Molly
+Lin, Stephanie Lin, Mateusz Litwin, Theresa Lopez, Ryan Lowe, Patricia Lue,
+Anna Makanju, Kim Malfacini, Sam Manning, Todor Markov, Yaniv Markovski,
+Bianca Martin, Katie Mayer, Andrew Mayne, Bob McGrew, Scott Mayer McKinney,
+Christine McLeavey, Paul McMillan, Jake McNeil, David Medina, Aalok Mehta,
+Jacob Menick, Luke Metz, Andrey Mishchenko, Pamela Mishkin, Vinnie Monaco,
+Evan Morikawa, Daniel Mossing, Tong Mu, Mira Murati, Oleg Murk, David M´ely,
+Ashvin Nair, Reiichiro Nakano, Rajeev Nayak, Arvind Neelakantan, Richard Ngo,
+Hyeonwoo Noh, Long Ouyang, Cullen O’Keefe, Jakub Pachocki, Alex Paino,
+Joe Palermo, Ashley Pantuliano, Giambattista Parascandolo, Joel Parish, Emy
+Parparita, Alex Passos, Mikhail Pavlov, Andrew Peng, Adam Perelman, Filipe de
+Avila Belbute Peres, Michael Petrov, Henrique Ponde de Oliveira Pinto, Michael,
+Pokorny, Michelle Pokrass, Vitchyr H. Pong, Tolly Powell, Alethea Power, Boris
+Power, Elizabeth Proehl, Raul Puri, Alec Radford, Jack Rae, Aditya Ramesh,
+Cameron Raymond, Francis Real, Kendra Rimbach, Carl Ross, Bob Rotsted, Henri
+Roussez, Nick Ryder, Mario Saltarelli, Ted Sanders, Shibani Santurkar, Girish
+Sastry, Heather Schmidt, David Schnurr, John Schulman, Daniel Selsam, Kyla
+Sheppard, Toki Sherbakov, Jessica Shieh, Sarah Shoker, Pranav Shyam, Szymon
+Sidor, Eric Sigler, Maddie Simens, Jordan Sitkin, Katarina Slama, Ian Sohl, Ben-
+jamin Sokolowsky, Yang Song, Natalie Staudacher, Felipe Petroski Such, Natalie
+Summers, Ilya Sutskever, Jie Tang, Nikolas Tezak, Madeleine B. Thompson, Phil
+Tillet, Amin Tootoonchian, Elizabeth Tseng, Preston Tuggle, Nick Turley, Jerry
+Tworek, Juan Felipe Cer´on Uribe, Andrea Vallone, Arun Vijayvergiya, Chelsea
+Voss, Carroll Wainwright, Justin Jay Wang, Alvin Wang, Ben Wang, Jonathan
+Ward, Jason Wei, CJ Weinmann, Akila Welihinda, Peter Welinder, Jiayi Weng,
+Lilian Weng, Matt Wiethoff, Dave Willner, Clemens Winter, Samuel Wolrich, Han-
+nah Wong, Lauren Workman, Sherwin Wu, Jeff Wu, Michael Wu, Kai Xiao, Tao
+Xu, Sarah Yoo, Kevin Yu, Qiming Yuan, Wojciech Zaremba, Rowan Zellers, Chong
+Zhang, Marvin Zhang, Shengjia Zhao, Tianhao Zheng, Juntang Zhuang, William
+Zhuk, and Barret Zoph. 2024. GPT-4 Technical Report. arXiv:2303.08774 [cs.CL]
+[26] Jiayi Pan, Chengcan Wang, Kaifu Zheng, Yangguang Li, Zhenyu Wang, and
+Bin Feng. 2023.
+SmoothQuant+: Accurate and Efficient 4-bit Post-Training
+WeightQuantization for LLM. arXiv preprint arXiv:2312.03788 (2023).
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+[27] Samyam Rajbhandari, Conglong Li, Zhewei Yao, Minjia Zhang, Reza Yazdani
+Aminabadi, Ammar Ahmad Awan, Jeff Rasley, and Yuxiong He. 2022. DeepSpeed-
+MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-
+Generation AI Scale. arXiv:2201.05596 [cs.LG]
+[28] Sayeh Sharify, Zifei Xu, Xin Wang, et al. 2024.
+Combining multiple post-
+training techniques to achieve most efficient quantized LLMs. arXiv preprint
+arXiv:2405.07135 (2024).
+[29] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le,
+Geoffrey Hinton, and Jeff Dean. 2017. Outrageously Large Neural Networks: The
+Sparsely-Gated Mixture-of-Experts Layer. arXiv:1701.06538 [cs.LG]
+[30] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper,
+and Bryan Catanzaro. 2020. Megatron-LM: Training Multi-Billion Parameter
+Language Models Using Model Parallelism. arXiv:1909.08053 [cs.CL]
+[31] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yas-
+mine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhos-
+ale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucu-
+rull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia
+Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini,
+Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel
+Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet,
+Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton,
+Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva,
+Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh Tang, Ross
+Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov,
+Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Ro-
+driguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. 2023. Llama 2:
+Open Foundation and Fine-Tuned Chat Models. arXiv:2307.09288 [cs.CL]
+[32] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song
+Han. 2024. SmoothQuant: Accurate and Efficient Post-Training Quantization for
+Large Language Models. arXiv:2211.10438 [cs.CL]
+[33] Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, and Mahesh Marina. 2024. MoE-Infinity:
+Offloading-Efficient MoE Model Serving. arXiv:2401.14361 [cs.LG] https://arxiv.
+org/abs/2401.14361
+[34] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. 2019.
+HellaSwag: Can a Machine Really Finish Your Sentence? arXiv:1905.07830 [cs.CL]
+A
+Appendix
+A.1
+Evaluation Datasets
+In this section, we introduce details of the datasets in our evalua-
+tion. For a more comprehensive study, we have selected six popular
+benchmark tasks: WinoGrande, COPA, OpenBookQA (OBQA), Hel-
+laSwag, and MMLU.
+WinoGrande [1] is a large-scale dataset designed for common-
+sense reasoning, consisting of pronoun resolution problems. Each
+instance in the dataset presents a sentence with an ambiguous pro-
+noun that needs to be resolved based on context. This task tests the
+model’s ability to understand and reason about everyday situations.
+The Choice of Plausible Alternatives (COPA) dataset [10]
+focuses on causal reasoning. Each question in COPA consists of a
+premise and two choices, where the model must select the more
+plausible alternative. This task evaluates the model’s understanding
+of cause-and-effect relationships in natural language.
+OpenBookQA [24] is a multiple-choice question-answering
+dataset that requires the model to use both scientific facts and com-
+monsense knowledge. The dataset challenges the model’s ability
+to combine factual knowledge with reasoning to answer questions
+correctly.
+HellaSwag [34] is a benchmark for commonsense NLI (Natural
+Language Inference) that tests the model’s ability to predict the
+most plausible continuation of a given sentence. The dataset con-
+tains scenarios from various domains, such as cooking and sports,
+requiring the model to understand context and plausibility.
+The Massive Multitask Language Understanding (MMLU)
+benchmark [11] evaluates models across a wide range of subjects,
+from elementary mathematics to law. For this study, we report
+performance on MMLU with a 5-shot setting, where the model is
+given five examples per task before evaluation, allowing us to gauge
+the model’s few-shot learning capabilities.
+We perform a zero-shot evaluation on WinoGrande, COPA, Open-
+BookQA, and HellaSwag, where the model is not provided with any
+task-specific training examples. For MMLU, a 5-shot evaluation pro-
+tocol is adopted, providing five examples per task. This setup helps
+us assess the generalization ability of the models across different
+types of reasoning and knowledge-based tasks.
+A.2
+Random Seed
+For all the random selection experiments, we use random seeds
+{42, 43, 44} to conduct three independent trials and then report
+the standard deviation and mean.
+A.3
+Further Discussion
+In this section, we present further discussion of the DeepSeek-MoE-
+16B-base performance across different bits.
+Expert usage frequency.As shown by Q1 in Section 4.3, expert
+usage frequency is a critical metric in the compression of MoE
+models, predicated on the insight that less frequently used experts
+are likely less crucial. We present further discussion of ablation on
+the bits allocation in the expert-frequency-based methods.
+In Table 6, we compare the allocation of {4, 8} bits of the selected
+top-𝑘experts, while all other experts are quantized to 2 bits. We
+quantize the shared experts and attention weights to 8 bits. Table 6
+indicates that increasing the bit width of frequently activated ex-
+perts improves performance. However, the gain from increasing
+the top-𝑘expert bits from 4 to 8 is minimal.
+Combination of the weight outlier and expert usage frequency.
+We conducted additional experiments on the DeepSeek-MoE-16B-
+base model by integrating bit-width allocation based on layers with
+significant weight outliers with allocation based on expert usage
+frequency to explore the trade-off between them. Specifically, we
+aimed for a total average bit budget of 2.97. We select portions
+of the model to be quantized to 4 bits using a combination of the
+two heuristics, while quantizing all attention weights to 4 bits
+and all other weights to 2 bits. For selecting the 4-bit weights,
+we introduce a hyper-parameter, 𝛼(0 ¡ 𝛼¡ 1), representing the
+proportion of weights chosen based on expert usage frequency,
+with the remainder selected based on weight outliers. We varies
+𝛼to illustrate the trade-off between these methods, as detailed
+above. As shown in Table ??, the optimal combination of these two
+methods occurs when alpha is set to 0.1. This means that 20% of the
+4-bit MoE weights are selected based on expert usage frequency,
+while the remaining 80% are chosen according to weight outliers.
+Baseline results of low-precision quantization. We provide the
+16-bit (FP16), 4-bit, and 2-bit baselines of both Mixtral-8x7B and
+DeepSeek-MoE-16B-base models in Table 9.
+Received 17 February 2025
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Table 6: Ablation on the allocated bits for the selected top-𝑘experts based on frequency. We compare the allocation of {4, 8}
+bits of the top-𝑘experts based on frequency, and all other experts are quantized to 2 bits.
+Top
+Top-𝑘bits
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+1
+4
+2.29
+66.30
+83.00
+39.00
+69.28
+75.03
+35.02
+61.27
+8
+2.35
+66.14
+87.00
+39.80
+69.44
+75.30
+34.04
+61.95
+2
+4
+2.32
+66.38
+88.00
+38.60
+69.44
+76.06
+36.49
+62.49
+8
+2.44
+65.98
+90.00
+38.60
+69.77
+76.33
+35.82
+62.75
+5
+4
+2.41
+66.54
+87.00
+38.40
+70.13
+76.12
+38.02
+62.70
+8
+2.70
+64.96
+89.00
+39.40
+70.56
+75.90
+38.56
+63.06
+10
+4
+2.55
+67.17
+86.00
+39.20
+70.55
+76.55
+39.11
+63.10
+8
+3.14
+66.06
+88.00
+39.00
+70.81
+76.71
+39.30
+63.31
+15
+4
+2.70
+67.17
+83.00
+39.00
+71.72
+76.93
+40.41
+63.04
+8
+3.58
+65.75
+85.00
+41.00
+71.34
+76.39
+40.48
+63.33
+20
+4
+2.85
+67.88
+84.00
+40.20
+72.35
+77.69
+41.25
+63.90
+8
+4.02
+66.61
+89.00
+38.00
+72.58
+77.64
+41.25
+64.18
+25
+4
+2.99
+67.17
+87.00
+40.00
+73.26
+78.07
+42.38
+64.65
+8
+4.46
+68.67
+86.00
+41.00
+73.00
+78.67
+41.79
+64.86
+30
+4
+3.14
+69.69
+89.00
+40.60
+73.92
+77.53
+42.82
+65.59
+8
+4.90
+67.56
+88.00
+40.80
+73.88
+78.56
+41.94
+65.12
+
+
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Li et al.
+Table 9: Baseline results of the 16-bit (FP16), 4-bit, and 2-bit quantization.
+Bits
+WinoGrande (%)
+COPA (%)
+OBQA (%)
+HellaSwag (%)
+PIQA (%)
+MMLU (%)
+Average (%)
+Mixtral-8x7B
+16
+76.48
+93.00
+47.00
+83.98
+82.37
+70.35
+75.33
+4
+74.98
+92.00
+46.20
+81.65
+80.85
+67.65
+73.89
+2
+49.33
+63.00
+25.40
+28.18
+52.99
+24.29
+40.53
+DeepSeek-MoE-16B-base
+16
+70.40
+91.00
+44.20
+77.35
+78.72
+44.77
+67.74
+4
+71.35
+87.00
+43.20
+76.39
+78.51
+44.22
+66.78
+2
+53.28
+76.00
+30.20
+45.33
+66.54
+25.28
+49.44
+
+
+QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY

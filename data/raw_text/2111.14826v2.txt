@@ -1,0 +1,1858 @@
+Nonuniform-to-Uniform Quantization: Towards Accurate Quantization via
+Generalized Straight-Through Estimation
+Zechun Liu1,2,4
+Kwang-Ting Cheng1
+Dong Huang2
+Eric Xing2,3
+Zhiqiang Shen2,3
+1Hong Kong University of Science and Technology
+2Carnegie Mellon University
+3Mohamed bin Zayed University of Artiﬁcial Intelligence
+4Reality Labs, Meta Inc.
+{zliubq, timcheng}@ust.hk
+epxing@cs.cmu.edu
+{dghuang,zhiqians}@andrew.cmu.edu
+Abstract
+The nonuniform quantization strategy for compressing
+neural networks usually achieves better performance than
+its counterpart, i.e., uniform strategy, due to its supe-
+rior representational capacity.
+However, many nonuni-
+form quantization methods overlook the complicated pro-
+jection process in implementing the nonuniformly quantized
+weights/activations, which incurs non-negligible time and
+space overhead in hardware deployment. In this study, we
+propose Nonuniform-to-Uniform Quantization (N2UQ), a
+method that can maintain the strong representation abil-
+ity of nonuniform methods while being hardware-friendly
+and efﬁcient as the uniform quantization for model infer-
+ence.
+We achieve this through learning the ﬂexible in-
+equidistant input thresholds to better ﬁt the underlying
+distribution while quantizing these real-valued inputs into
+equidistant output levels. To train the quantized network
+with learnable input thresholds, we introduce a gener-
+alized straight-through estimator (G-STE) for intractable
+backward derivative calculation w.r.t.
+threshold param-
+eters.
+Additionally, we consider entropy preserving reg-
+ularization to further reduce information loss in weight
+quantization.
+Even under this adverse constraint of im-
+posing uniformly quantized weights and activations, our
+N2UQ outperforms state-of-the-art nonuniform quantiza-
+tion methods by 0.5 ∼1.7% on ImageNet, demonstrating
+the contribution of N2UQ design. Code and models are
+available at: https://github.com/liuzechun/
+Nonuniform-to-Uniform-Quantization.
+1. Introduction
+Deep Neural Networks (DNNs) have demonstrated great
+success in various real-world applications [18, 43].
+De-
+spite their remarkable results, the large model size and high
+computational cost hinder pervasive deployment of DNNs,
+especially on resource-constrained devices. A number of
+0.7 0.9 5.3 1.4 0.7
+1.4 1.4 0.7 0.9 1.4
+1.4 0.9 5.3 5.3 0.7
+1.4 0.7 0.7 0.9 0.7
+1.4 1.4 0.9 1.4 0.9
+00
+01
+10
+11
+0.7 0.9 1.4 5.3
+-1.2 -0.8 0.2 3.7
+00
+01
+10
+11
+encode
+encode
+0000 0001
+…
+1111
+decode
+5.1 7.1 1.0 21.7 9.1
+4.8 7.9 25.011.7 -1.0
+4.9 5.9 1.0 18.020.1
+4.9 8.6 5.7 1.5 -1.2
+-0.4 2.8 4.2 1.9 3.5
+-1.2 0.2 0.2
+3.7 -0.8 0.2
+-0.8 3.7 0.2
+(a) Nonuniform quantization
+5.3
+×
+-1.2
+5.3
+×
+-0.8
+…
+5.3
+×
+3.7
+∗
+-3
+1
+1
+3
+-1
+1
+-1
+3
+1
+00
+01
+10
+11
+9
+6
+1
+12 11
+8
+12 20
+0
+-8
+9
+2
+-1 12
+7
+9
+9
+7
+-1 -5
+2
+-1
+8
+3
+2
+00
+01
+10
+11
+(b) The proposed Nonuniform-to-Uniform Quantization (N2UQ)
+∗
+Input !"
+Real-valued input
+Nonuniform
+Output !!
+Nonuniform
+0
+1
+3
+2
+0
+2
+2
+0
+1
+2
+2
+1
+3
+3
+0
+2
+0
+0
+1
+0
+2
+2
+1
+2
+1
+Non-uniformly quantized output
+Mapping process is costly
+Uniformly quantized output
+Efficient linear mapping
+0000 0001
+…
+1111
+G-STE Backward
+Forward
+Input !"
+Real-valued input
+Uniform
+Output !!
+Nonuniform
+Figure 1. (a) Previous nonuniform quantization function outputs
+weights and activations in in-equidistant levels, which requires the
+post-processing of mapping ﬂoating-point levels to binary digits in
+order to obtain the speed-up effect of quantization [1, 13, 52]. (b)
+The proposed N2UQ learns input thresholds to allow more ﬂexibil-
+ity, while outputs uniformly quantized values, enabling hardware-
+friendly linear mappings and efﬁcient bitwise operations. The in-
+tractable gradient computation w.r.t. input thresholds is tackled
+with the proposed generalized straight-through estimator (G-STE).
+approaches have been proposed to compress and acceler-
+ate DNNs, including channel pruning [29, 31], quantiza-
+tion [33,49,52], neural architecture search [6,45], etc.
+Among these methods, quantization-based methods have
+shown promising results in compressing the model size by
+representing weights with fewer bits, and faster inference
+by replacing computationally-heavy convolution operations
+with efﬁcient bitwise operations [38,49]. Despite these ad-
+vantages, quantized DNNs still have a non-negligible per-
+formance gap from their full-precision counterparts, espe-
+cially with extremely low-bit quantization. For example,
+arXiv:2111.14826v2  [cs.CV]  7 Apr 2022
+
+
+the 2-bit classic uniformly quantized ResNet-50 achieves
+67.1% top-1 accuracy [52] on ImageNet dataset, a drop of
+9.9% compared to a real-valued ResNet-50. This perfor-
+mance gap mainly results from the quantization error in rep-
+resenting real-valued weights and activations with a limited
+number of quantized levels and the inﬂexibility for uniform
+quantizers to adapt to different distributions of input values.
+To better ﬁt underlying distributions and mitigate quan-
+tization errors, several previous studies proposed nonuni-
+form quantization by adjusting the quantization resolution
+according to the density of real-valued distribution [48,49].
+However, the accuracy improvement of nonuniform quanti-
+zation usually comes at the expense of hardware implemen-
+tation efﬁciency [13, 52]. Since the output of the nonuni-
+form quantization are ﬂoating-point weights and activa-
+tions, their multiplication can no longer be directly acceler-
+ated by the bitwise operation between binaries [24]. A com-
+mon solution to address this issue has been building look-up
+tables (LUTs) to map ﬂoating-point values to binary dig-
+its [16, 48], as shown in Fig. 1(a). This post-processing
+incurred by nonuniform quantization costs more hardware
+area and consumes additional energy compared to uniform
+quantization [1,13].
+The goal of this study is to develop a new quantization
+method maintaining the hardware projection simplicity as
+uniform quantization and meanwhile offering the ﬂexibility
+to achieve the merit on performance of nonuniform quanti-
+zation. Despite that it is desirable to enforce a quantizer’s
+outputs (i.e., quantized weights/activations) to have uniform
+quantization levels in order not to incur additional post-
+processing tasks, each of the output levels does not nec-
+essarily need to represent an equal range of the real-valued
+input. As shown in Fig. 1 (b), we enforce the output quan-
+tization levels to be equidistant while learning the thresh-
+olds on the input values to incorporate more ﬂexibility in
+ﬁtting the underlying real-valued distributions for quanti-
+zation. We name this quantizer design as Nonuniform-to-
+Uniform Quantizer (N2UQ).
+However, it is challenging to optimize such a non-
+uniform-to-uniform quantizer, which can automatically
+learn to adapt the input thresholds through network train-
+ing for higher precision. Because the gradient computation
+w.r.t. the threshold parameters is intractable, and cannot
+be resolved by the existing gradient estimation method for
+quantization, i.e., the straight-through estimator (STE) [2].
+STE simply estimates the incoming gradient to a threshold
+operation to be equal to the outgoing gradient, which by
+deﬁnition is unable to incorporate the threshold difference
+in training neither to update the threshold with gradients.
+To circumvent this challenge, we revisit the earliest
+derivation of STE from the stochastic binarization [2] and
+derive a novel and more ﬂexible backward approxima-
+tion method for quantization. We name it as Generalized
+Straight-Through Estimator (G-STE). It degenerates to STE
+when all the input intervals are equal-sized, while for the
+scenarios that require nonuniform input thresholds, it auto-
+matically adapts the thresholds with gradient learning and
+provides a ﬁner-grained approximation to the quantization
+function. Speciﬁcally, G-STE encodes the expectation of
+stochastic quantization into the backward approximation to
+the forward deterministic quantization functions, which nat-
+urally converts the intractable gradient computation w.r.t.
+the input threshold parameters to that w.r.t. the slopes, and
+encodes the inﬂuence from input threshold difference to the
+remaining network in the backward gradient computation.
+Moreover, we propose the weight regularization that
+considers the overall entropy in a weight ﬁlter to further re-
+duce the information loss arising from weight quantization.
+We extensively evaluate the effectiveness of the proposed
+N2UQ with the collective contributions of the threshold-
+learning quantizer via G-STE and the weight regularization
+on ImageNet with different architectures and different bit-
+width constraints. Under all deployment scenarios, N2UQ
+consistently improves the accuracy by a signiﬁcant margin
+compared to the state-of-the-art methods, including both
+uniform and nonuniform quantization.
+The contribution of this paper includes four aspects:
+• We propose Nonuniform-to-Uniform Quantizer (N2UQ)
+for improving the quantization precision via learning input
+thresholds, while maintaining hardware-friendliness in im-
+plementation similar to uniform quantization.
+• We propose Generalized Straight-Through Estimator (G-
+STE) to tackle intractable gradient computation w.r.t. in-
+put threshold parameters in N2UQ. G-STE calculates the
+expectation of the stochastic quantization as the backward
+approximation to the forward deterministic quantization.
+• Based on entropy analysis, we propose a novel weight reg-
+ularization considering the overall weight distribution for
+further preserving information in weight quantization.
+• We demonstrate that even under the strict constraint of ﬁx-
+ing the quantized weights and activations to be uniform and
+only learning input thresholds, N2UQ exceeds state-of-the-
+art nonuniform quantization method with 0.5∼1.7% higher
+accuracy on ImageNet. Speciﬁcally, the 2-bit ResNet-50
+model achieves 76.4% top-1 accuracy on ImageNet, re-
+ducing the gap to its real-valued counterpart to only 0.6%,
+demonstrating the effectiveness of N2UQ design.
+2. Related Work
+Model compression is a useful technology for deploy-
+ing neural network models to mobile devices with limited
+storage and computational power [5, 6], and has attracted
+increasing attention. Model compression methods can be
+categorized into several major categories, including quanti-
+zation [33, 49, 52, 55], pruning [11, 29, 31], knowledge dis-
+tillation [19, 42], compact network design [20, 34, 41, 50],
+
+
+etc. This work is mainly focused on quantization.
+Quantization can be further classiﬁed to uniform quan-
+tization [7, 8, 15, 21, 22, 52] and nonuniform quantiza-
+tion [28, 36, 48, 49].
+Compared to uniform approaches,
+nonuniform quantization may achieve higher accuracy be-
+cause it can better capture the underlying distributions by
+learning to allocate more quantization levels to important
+value regions [13]. For example, PoT [36] uses powers-of-
+two levels and ApoT [28] further proposed additive powers-
+of-two quantization.
+However, it is typically difﬁcult to
+deploy nonuniform quantization efﬁciently on the general-
+purpose hardware [48], e.g., GPU and CPU. Since to ac-
+celerate nonuniform quantization with bitwise operations
+requires additional operations or designs like look-up ta-
+bles (LUTs) for mapping between ﬂoating-point quantiza-
+tion outputs and their binary digit representations [16, 24],
+which is less efﬁcient compared to uniform quantization.
+Our proposed N2UQ is motivated to combine the merits
+of uniform and nonuniform quantization by outputting uni-
+formly quantized levels for hardware-friendly implementa-
+tion while allowing effective input thresholds learning to ﬁt
+the underlying distributions for higher accuracy.
+Moreover, the quantization function is intrinsically a dis-
+continuous step function and nearly always has zero gradi-
+ents w.r.t. inputs. To circumvent this problem, early work
+proposed straight-through estimation (STE) [2] for gradient
+estimation, which is widely adopted in subsequent quanti-
+zation methods [8,12,21,48,49,52,55]. However, STE sim-
+ply backpropagates through the hard threshold function as
+if it had been the identity function, which is unable to incor-
+porate non-linearities in quantizer’s input and output to ﬁt
+various distributions. To deal with this restriction, previous
+works manually add non-linear functions before and/or after
+the STE-based quantizer. For example, LCQ [48] adds com-
+pressing and expanding function to STE-based quantizer
+to achieve nonuniform quantization.
+QIL [25] proposes
+to learn a power function before the STE-based quantizer
+for controlling quantization interval sizes. However, these
+methods relying on STE suffer from the discrepancy be-
+tween quantizer’s thresholds and nonlinear function’s turn-
+ing points [48] or the inﬂexibility of using a human-deﬁned
+smooth function to control all the quantization intervals
+with a single power hyper-parameter [25]. To overcome this
+limitation, we proposed Generalized Straight-Through Es-
+timator (G-STE) to incorporate ﬂexible non-linearity learn-
+ing inside the quantizer, as detailed in Sec. 3.
+3. Method
+In this section, we ﬁrst brieﬂy introduce the objective of
+quantization in Sec. 3.1. Then we present our nonuniform-
+to-uniform quantization (N2UQ) in Sec. 3.2 with three com-
+ponents: threshold learning quantizer in the forward pass
+in Sec. 3.2.1, its backward approximation with Generalized
+Straight-Through Estimator (G-STE) in Sec. 3.2.2 and an
+additional weight regularization method in Sec. 3.2.3.
+3.1. Preliminaries
+Matrix multiplication is the most computation-costly op-
+eration in deep neural networks. By quantizing the weights
+and activations in the convolutional layers and fully con-
+nected layers to ﬁxed bits, the matrix multiplication can be
+accelerated with bitwise operations [49,52]:
+aq · wq =
+M−1
+X
+i=0
+K−1
+X
+j=0
+2i+jpopcnt[and(ai, wj)],
+ai,wj∈{0, 1} ∀i∈{0, 1, ..., M −1}, j ∈{0, 1, ..., K−1}.
+(1)
+Here a and w are binary vectors of the quantized acti-
+vation aq and quantized weight wq. M and K denote the
+number of bits used in representing aq and wq, respectively.
+While Eq. 1 in general holds true for uniform quantiza-
+tion, the situation becomes complicated when considering
+the nonuniform quantization.
+3.2. Nonuniform-to-Uniform Quantization
+To sort out the inner mechanism of quantization, we
+summarize two properties of the quantizer:
+Property 1 (Quantizer’s output). The premise of quantized
+network being accelerated with Eq. 1 is that the quantizer’s
+output (i.e., quantized weights wq and activations aq) can
+be represented in OR mapped to binary digits within the
+ﬁxed bits: aq = PM−1
+i=0 ai2i , wq = PK−1
+j=0 wj2j [52].
+This property is straightforward since Eq. 1 takes place
+between binary vectors. While uniformly quantized aq and
+wq can be easily converted to binaries via linear mappings,
+it usually requires additional operations [28] or look-up
+tables (LUTs) [16, 48] for encoding ‘n-bit’ nonuniformly
+quantized aq and wq to n-bit binary digits, because outputs
+of n-bit nonuniform quantizer are actually 2n in-equidistant
+ﬂoating-point values, as illustrated in Fig. 1.
+This post-
+processing step incurs larger hardware area and more en-
+ergy consumption as mentioned in hardware studies [1,23].
+Property 2 (Quantizer’s input): The uniformness in input
+and output levels of the quantization function xq = FQ(xr)
+can be detached through a proper quantizer design, i.e.,
+uniform quantization levels in output xq do not necessar-
+ily need to represent uniform ranges from the input xr.
+This property originates from the observation that the
+quantizer represents real-valued variables xr with several
+quantized levels xq, while the quantized levels are ﬁxed, the
+real-valued distributions are diverse. Thus, allowing learn-
+able thresholds in dividing xr to ﬁxed quantized levels xq
+theoretically can incorporate more representational ﬂexibil-
+ity for achieving higher precision.
+
+
+3.2.1 Forward Pass: Threshold Learning Quantization
+Based on these two properties, we develop nonuniform-to-
+uniform quantizer (N2UQ) for activation quantization, with
+its forward pass formulated as:
+xq =
+
+
+
+
+
+
+
+0
+xr < T1
+1
+T1 ⩽xr < T2
+...
+...
+2n −1
+xr ⩾T2n−1
+,
+(2)
+where n is the number of bits, T represents learnable thresh-
+olds, and xr, xq represent the input real-valued variables
+and the output quantized variables, respectively. The goal
+of N2UQ is to encode threshold learning in the quantizer
+to allow more ﬂexibility, while output uniformly quantized
+weights and activations to accommodate fast bitwise opera-
+tions without the post-processing step between quantization
+and matrix multiplication.
+3.2.2
+Backward Pass: Generalized Straight-Through
+Estimator (G-STE)
+However, backpropagating through Eq. 2 is difﬁcult be-
+cause: (I) The derivatives of Eq. 2 w.r.t. input xr are al-
+most zero everywhere. (II) The gradient calculation w.r.t.
+threshold parameters is intractable.
+For challenge (I), previous quantization works adopt
+straight-through estimator (STE) to approximate the back-
+ward gradients in the quantization functions [8, 21, 30, 46,
+48, 52]. STE simply assigns the incoming gradients to a
+threshold operation to be the outgoing gradients:
+∂L
+∂xq
+i,l
+= ∂L
+∂xr
+i,l
+(3)
+xq
+i,l and xr
+i,l denote the ith quantized / real-valued vari-
+ables in lth layer, respectively. This simple approximation
+function works well for uniform quantizers. However, STE
+implicitly enforces the equal axis aspect ratio in the input
+and output intervals of the quantizer because it regards the
+quantization function as an identity function in the back-
+ward pass. This obstacles the quantizer design from allow-
+ing learnable input thresholds while ﬁxing the output levels.
+Moreover, STE cannot deal with challenge (II), gradient
+computation w.r.t. learnable thresholds since STE basically
+just bypasses the gradients as if the quantization function
+does not exist. Thus, to come up with a ﬁner-grained and
+more ﬂexible backward approximation that can tackle the
+gradient computation w.r.t. input thresholds, we revisit STE
+in stochastic binarization and derive the proposed General-
+ized Straight-Through Estimator (G-STE).
+Lemma 1.
+In binarization, straight-through estimation
+(STE) for gradient approximation to the forward determin-
+istic binarization function can be derived from the expecta-
+tion of the stochastic binarization function [21].
+The concept of stochastic binarization and determinis-
+tic binarization are ﬁrst proposed in [2, 9, 10]. In stochas-
+tic binarization, real-valued variables are binarized to −1/1
+stochastically according to their distances to −1/1:
+exb
+i,l =
+
+
+
+−1
+with probability p = clip(
+1−xr
+i,l
+2
+, 0, 1)
+1
+with probability p = clip(
+1+xr
+i,l
+2
+, 0, 1)
+, (4)
+where exb
+i,l denotes the stochastic binary variables. To up-
+date Wij,l (weights in layer l connecting neuron j in layer
+l −1 to neuron i in layer l), the expected gradients through
+the stochastic binarization function are computed:
+E[
+∂L
+∂Wij,l
+] = E/exb
+i,l[ ∂L
+∂exb
+i,l
+Eexb
+i,l[
+∂exb
+i,l
+∂xr
+i,l
+]
+∂xr
+i,l
+∂Wij,l
+],
+(5)
+where E, Eexb
+i,l and E/exb
+i,l are respectively, the expectation
+over the whole network, only the stochastic binary vari-
+ables and other parts except the stochastic binary variables.
+Speciﬁcally,
+Eexb
+i,l[
+∂exb
+i,l
+∂xr
+i,l
+] =
+∂
+∂xr
+i,l
+E[exb
+i,l]
+=
+∂
+∂xr
+i,l
+(−1 × p{exb
+i,l=−1} + 1 × p{exb
+i,l=1})
+=
+∂
+∂xr
+i,l
+(clip(xr
+i,l, −1, 1)
+(6)
+This arrives at the common straight-through estimator for
+the binarization functions [3, 38, 53], which transmits the
+gradients identically near the threshold and disregards the
+gradients when the real-valued inputs are too far from the
+threshold (i.e., xr > 1 or xr < −1).
+Meanwhile, the
+widely-adopted deterministic binarization function in for-
+ward pass [4,9,30,32,33] can be attained via setting a hard
+threshold on the probability (i.e., p = 0.5) in Eq. 4:
+xb
+i,l =
+(
+−1
+p{exb
+i,l=−1} > 0.5
+1
+p{exb
+i,l=−1} ⩽0.5 =
+ −1
+xr
+i,l < 0
+1
+xr
+i,l ⩾0
+(7)
+To this end, we show that STE encodes the expectation of
+stochastic binarization in the backward approximation to
+the forward deterministic binarization functions.
+Lemma 2.
+A quantization function xq can be regarded
+as a summation of binarization functions xb with different
+thresholds: xq = xb
+thre1 + xb
+thre2 + ... + xb
+thren.
+This lemma is self-evident, as illustrated in Fig. 2 (b).
+From here, we extend the concept of stochastic binarization
+to quantization for deriving G-STE to solve the threshold
+learning problem in nonuniform-to-uniform quantizer.
+We start with the ﬁrst quantization segment. We denote
+the initial point as s and its length as a1. For simpliﬁca-
+tion, we omit the subscripts here. Following the concept
+
+
+s s + a1
+(b1)
+a2
+(b2)
+a3
+a3
+(b3)
+(a) Binarization
+(b) Quantization
+Figure 2. (a) The deterministic binarization function and straight-
+through estimation (STE) as the backward approximation.
+(b)
+Quantization can be viewed as a summation of segments of
+binarization functions, which derives the proposed generalized
+straight-through estimator (G-STE).
+of stochastic binarization, in the range of [s, s + a1], real-
+valued variables can be quantized to 0/1 stochastically with
+the probability proportional to their distance to s/s + a1:
+exq{0,1} =
+( 0 with probability p=clip( s+a1−xr
+a1
+, 0, 1)
+1 with probability p=clip( xr−s
+a1 , 0, 1)
+, (8)
+exq{0,1} is the stochastic quantization output within this seg-
+ment. Similar to Eq. 6, the derivation of this quantization
+segment can be computed from the expectation of Eq. 8:
+E[∂exq{0,1}
+∂xr
+] =
+∂
+∂xr E[exq{0,1}]
+=
+∂
+∂xr (0 × p{exq=0} + 1 × p{exq=1})
+=
+∂clip( xr−s
+a1 , 0, 1)
+∂xr
+.
+(9)
+In this way, the inﬂuence of the threshold parameter a1 to
+the network is decently encoded in the backward approx-
+imation function Eq. 9 by altering the slopes. Further in
+the forward pass, instead of using stochastic quantization
+which requires random seeds generating process [44], de-
+terministic quantization are adopted and derived by setting
+the probability threshold to be p = 0.5,
+xq{0,1} =
+ 0
+p{exq=0} > 0.5
+1
+p{exq=0} ⩽0.5 =
+ 0
+xr <s + a1
+2
+1
+xr ⩾s + a1
+2
+. (10)
+Likewise, the forward deterministic quantization functions
+and the corresponding backward approximation functions
+for the remaining segments can be obtained from this prob-
+abilistic sense. Then, the nonuniform-to-uniform quantizer
+with its backward approximation for n-bit quantization can
+be naturally derived by summing up 2n−1 segments, as il-
+lustrated in Fig. 2. We name this proposed backward gradi-
+ent approximation method as Generalized Straight-Through
+Estimator (G-STE) and obtain the following theorem.
+Theorem 1 Generalized straight-through estimator:
+∂xq
+∂xr = E[∂exq
+∂xr ] =
+∂
+∂xr E[exq]
+=
+
+
+
+∂
+∂xr ( xr−di−1
+ai
++ i −1)
+di−1 ⩽xr < di
+i∈{1,...,2n−1}
+0
+otherwise
+,
+(11)
+as the backward gradient approximation function to an n-
+bit nonuniform-to-uniform quantizer:
+xq =
+
+
+
+
+
+
+
+
+
+0
+xr <d0 + a1
+2
+i
+di−1 + ai
+2 ⩽xr <di + ai+1
+2
+i∈{1,...,2n−2}
+2n −1
+xr ⩾d2n−2 + a2n−1
+2
+.
+(12)
+tackles the threshold learning problem by using the ex-
+pectation of the stochastic version of the nonuniform-to-
+uniform quantizer as its backward approximation.
+Here
+d0 = s, di = s + Pi
+j=1 aj, i ∈{1, ..., 2n −1}.
+The essence of the nonuniform-to-uniform quantizer
+with G-STE backward approximation is to encode the mean
+of stochastic quantization in the backward approximation
+function while having deterministic quantization function
+with hard thresholds in forward pass. This helps assimi-
+late the inﬂuence of threshold parameters of forcing outputs
+into particular values in the forward pass into approximat-
+ing the squeezed or expanded probability of quantization in
+the backward pass, in which the inﬂuence of the threshold
+parameters ai to the remaining neural networks is reﬂected
+in the slopes of the backward function. In turn the gradients
+w.r.t. threshold parameters can be easily computed as,
+∂xq
+∂ai
+= ∂E[xq]
+∂ai
+=
+
+
+
+
+
+
+
+
+
+
+
+−xr−di−1
+a2
+i
+di−1 ⩽xr < di
+−1
+aj
+dj−1 ⩽xr < dj
+j∈{i+1,...,2n−1}
+0
+otherwise
+. (13)
+We can see that, when all the intervals are equal-sized,
+G-STE degenerates to STE, while during training it learns
+to automatically adjust the input thresholds with the gradi-
+ents calculated from the network. Speciﬁcally, the output
+levels are scaled to {0, 2/(2n−1), ..., 2}. We additionally
+apply two learnable scaling parameters β1, β2 for scaling
+the input xr before the quantization: xr := xr × β1 and
+the output xq after the quantization: xq := xq × β2. β1, β2
+are initialized to 1, ai are initialized to 2/(2n−1) and en-
+forced to be positive. The proposed nonuniform-to-uniform
+quantizer introduces only 2n + 2 extra parameters per layer
+compared to a classical uniform quantizer, which is negligi-
+ble considering the large number of network weights.
+
+
+3.2.3
+Entropy Preserving Weight Regularization
+Further, we propose weight regularization to encourage
+more information-carrying capacity in quantized weights.
+An important observation is that weights in real-valued net-
+works are usually small in magnitude, e.g, ∼10−2 for
+weights in a pre-trained ResNet-18 network, but the quan-
+tized weights usually expand in the range of [−1, 1]. This
+mismatch in magnitude will cause quantized weights to col-
+lapse to a few quantization levels close to zero. The classic
+solution is using a tanh function and dividing the maximum
+absolute weight value to rescale weights to [−1, 1] [52].
+However, these rescaled weights are likely to be dominant
+by a few extrema and still not fully occupy the range of
+[−1, 1], as will further be illustrated in Fig. 3, which causes
+a huge information loss.
+From the perspective of information theory, more in-
+formation are preserved when quantized weights con-
+tain higher entropy.
+Thus, we are motivated to regular-
+ize the real-valued weights before the quantizer to ob-
+tain maximal entropy in quantized weights: max H =
+−pi log(pi), s.t. PN
+i=1 pi = 1. Here pi is the proportion
+of real-valued weights being quantized to ith quantization
+level and N is the number of quantization levels in total.
+Based on the Lagrange multiplier, it is easy to obtain the
+optimal p∗
+i =
+1
+N , i ∈{1, 2, ..., N}, meaning that, when
+the proportions of real-valued weights being quantized to
+multiple quantization levels are equal, the information en-
+tropy in the quantized weights reaches its maximum value.
+Given the quantization function FQ = round((clip(
+wr′,−1, 1) + 1) × 2n−1
+2 ) ×
+2
+2n−1 −1, we empirically solve
+that when real-valued weights are normalized to W r′ =
+2(n−1)
+2n−1
+|W r|
+||W r||l1 W r, the corresponding quantized weights
+wq = FQ(wr′, n) are approximately uniformly distributed
+in all quantization levels.
+Here, W r is the real-valued
+weight ﬁlter, |W r| denotes the number of entries in W r.
+Different from activations that are generated from images
+and vary from batch to batch, weights are static parame-
+ters that have high ﬂexibility to adjust each of their val-
+ues. Therefore, instead of learning the threshold parame-
+ters to determine all the quantized weights values, we adopt
+equidistant thresholds for weight quantization, letting each
+weight individually learn its value and scale the weights
+based on the overall statistics. More details of the deriva-
+tion can be found in Appendix.
+4. Experiments
+To verify the effectiveness of the proposed Nonuniform-
+to-Uniform Quantization (N2UQ), we conduct experiments
+on the ImageNet dataset. We ﬁrst introduce the dataset and
+training strategy in Sec. 4.1, followed by the comparison to
+state-of-the-art quantization methods in Sec. 4.2. We then
+analyze the effect of each proposed component of N2UQ in
+Sec. 4.3. Visualization results on how N2UQ captures ﬁne-
+grained underlying distributions are presented in Sec. 4.4.
+4.1. Experimental Settings
+Dataset The experiments are carried out on the ImageNet-
+2012 classiﬁcation dataset [39], with 1.2 million training
+images and 50, 000 validation images in 1000 classes.
+Training Strategy We follow the training scheme in [12,
+25, 48, 52] to use real-valued PyTorch pre-trained models
+as initialization for corresponding quantized networks. We
+use Adam optimizer [26] with a linear learning rate decay
+scheduler. The initial learning rate is set to 2.5e −3 for
+weight parameters and batch size is set to 512.
+We set
+weight decay to be 0 following [32, 33]. The models are
+trained for 128 epochs with the same knowledge distillation
+scheme as LSQ [12]. We adopt the basic data augmentation
+as ResNet [18]. Training images are randomly resized and
+cropped to 224 × 224 pixels and randomly ﬂipped horizon-
+tally. Test images are center-cropped to 224 × 224 pixels.
+For fair comparison, the ﬂoating-point (FP) model results
+reported in Table 1 are initialized and ﬁne-tuned with the
+same settings as quantized models.
+Learnable Parameters For the learnable parameters, s are
+initialized to 0, ai are initialized to 2/(2n−1) and enforced
+to be greater than 1e−3. The learnable scaling parameters
+β1, β2 are initialized to 1. All these learnable parameters
+use 1/10 of the learning rate as that for weight parameters.
+Network Structure We adopt Pre-Activation structures
+(i.e., NonLinear-Conv-BN structure) and use RPReLU [32]
+as non-linear function. All convolution and fully-connected
+layers are quantized with N2UQ except for the ﬁrst and the
+last one.
+4.2. Comparison with State-of-the-Art Methods
+Table 1 summarizes the accuracy of the proposed N2UQ
+on ResNet. Compared to uniform quantization, N2UQ al-
+lows more ﬂexibility in learning input thresholds, and the
+results demonstrate that N2UQ surpasses uniform meth-
+ods [8, 12, 15, 52] by a large margin. Moreover, the accu-
+racy improvements become more signiﬁcant with larger bit-
+width, as more ﬂexibility can be incorporated with thresh-
+old learning. For nonuniform quantization, the state-of-the-
+art method LCQ [48] intrinsically uses the same quantizer
+as the classic uniform quantizer [8, 52] and learns two ad-
+ditional non-linear functions to reshape the real-valued in-
+put and quantized output.
+Instead, the proposed N2UQ
+completely integrates the non-linearity learning inside the
+quantizer, which avoids the discrepancy between the non-
+linear functions’ turning points and the quantizers’ thresh-
+olds. Thus, the proposed N2UQ achieves up to 1.7% higher
+accuracy than LCQ, showing that N2UQ is well designed
+to incorporate threshold learning into the quantizers for
+
+
+Table 1. Accuracy comparison to the state-of-the-art quantization methods with ResNet structure on ImageNet dataset. Note that W/A
+denote the bit-width of weights and activations, respectively. FP denotes the top-1 accuracy of the full-precision models.
+Network
+Method
+Bit-width Accuracy(%) Bit-width Accuracy(%) Bit-width Accuracy(%)
+(W/A)
+Top-1 Top-5
+(W/A)
+Top-1 Top-5
+(W/A)
+Top-1 Top-5
+ResNet-18
+(FP: 71.8)
+PACT [8]
+2/2
+64.4
+85.6
+3/3
+68.1
+88.2
+4/4
+69.2
+89.0
+DoReFa-Net [52]
+2/2
+64.7
+84.4
+3/3
+67.5
+87.6
+4/4
+68.1
+88.1
+LQ-Nets [49]
+2/2
+64.9
+85.9
+3/3
+68.2
+87.9
+4/4
+69.3
+88.8
+DSQ [15]
+2/2
+65.2
+–
+3/3
+68.7
+–
+4/4
+69.6
+88.9
+FAQ [35]
+–
+–
+–
+–
+–
+–
+4/4
+69.8
+89.1
+QIL [25]
+2/2
+65.7
+–
+3/3
+69.2
+–
+4/4
+70.1
+–
+DAQ [27]
+2/2
+66.9
+–
+3/3
+69.6
+–
+4/4
+70.5
+–
+DNAS [46]
+–
+–
+–
+–
+–
+–
+∼4/∼4
+70.6
+–
+APoT [28]
+2/2
+67.3
+87.5
+3/3
+69.9
+89.2
+4/4
+70.7
+89.6
+LSQ [12]
+2/2
+67.6
+87.6
+3/3
+70.2
+89.4
+4/4
+71.1
+90.0
+LCQ [48]
+2/2
+68.9
+–
+3/3
+70.6
+–
+4/4
+71.5
+–
+N2UQ (Ours)
+2/2
+69.4
+88.4
+3/3
+71.9
+90.5
+4/4
+72.9
+90.9
+ResNet-34
+(FP: 74.9)
+LQ-Nets [49]
+2/2
+69.8
+89.1
+3/3
+71.9
+90.2
+–
+–
+–
+DSQ [15]
+2/2
+70.0
+–
+3/3
+72.5
+–
+4/4
+72.8
+–
+FAQ [35]
+–
+–
+–
+–
+–
+–
+4/4
+73.3
+91.3
+QIL [25]
+2/2
+70.6
+–
+3/3
+73.1
+–
+4/4
+73.7
+–
+APoT [28]
+2/2
+70.9
+89.7
+3/3
+73.4
+91.1
+4/4
+73.8
+91.6
+DAQ [27]
+2/2
+71.0
+–
+3/3
+73.1
+–
+4/4
+73.7
+–
+DNAS [46]
+–
+–
+–
+–
+–
+–
+∼4/∼4
+74.0
+–
+LSQ [12]
+2/2
+71.6
+90.3
+3/3
+73.4
+91.4
+4/4
+74.1
+91.7
+LCQ [48]
+2/2
+72.7
+–
+3/3
+74.0
+–
+4/4
+74.3
+–
+N2UQ (Ours)
+2/2
+73.3
+91.2
+3/3
+75.2
+92.3
+4/4
+76.0
+92.8
+ResNet-50
+(FP: 77.0)
+DoReFa-Net [52]
+2/2
+67.1
+87.3
+3/3
+69.9
+89.2
+4/4
+71.4
+89.8
+LQ-Nets [49]
+2/2
+71.5
+90.3
+3/3
+74.2
+91.6
+4/4
+75.1
+92.4
+FAQ [35]
+–
+–
+–
+–
+–
+–
+4/4
+76.3
+93.0
+PACT [8]
+2/2
+72.2
+90.5
+3/3
+75.3
+92.6
+4/4
+76.5
+93.2
+APoT [28]
+2/2
+73.4
+91.4
+3/3
+75.8
+92.7
+4/4
+76.6
+93.1
+LSQ [12]
+2/2
+73.7
+91.5
+3/3
+75.8
+92.7
+4/4
+76.7
+93.2
+Auxi [54]
+2/2
+73.8
+91.4
+3/3
+75.4
+92.4
+–
+–
+–
+LCQ [48]
+2/2
+75.1
+–
+3/3
+76.3
+–
+4/4
+76.6
+–
+N2UQ (Ours)
+2/2
+75.8
+92.3
+3/3
+77.5
+93.6
+4/4
+78.0
+93.9
+Table 2. Accuracy comparison with MobileNet structure.
+Network
+Method
+Top1 Acc (%) Top5 Acc (%)
+MobileNet-V2
+(FP: 72.0)
+DSQ [15]
+64.8
+–
+LLSQ [51]
+67.4
+88.0
+LCQ [48]
+70.8
+89.7
+PROFIT [37]
+71.6
+90.4
+N2UQ(Ours)
+72.1
+90.6
+higher ﬂexibility and better performance. Moreover, com-
+pared to nonuniform quantization, N2UQ not only saves
+the parameters by ﬁxing the output levels, but also results
+in uniformly quantized weights and activations for comput-
+ing the quantized matrix multiplication, which prevents the
+post-processing step of building look-up tables (LUTs) and
+mapping the ﬂoating-point levels to binaries, thus is much
+more hardware-friendly [13,22,24]. For the MobileNetV2
+structure, N2UQ also achieves the state-of-the-art result as
+shown in Table 2. It is remarkable that N2UQ can com-
+press the real-valued network to 4-bit without compromis-
+ing or even improving the accuracy, indicating that deep
+neural network structures have redundancy and N2UQ is
+well-designed to ﬁt underlying distributions and act as a
+good regularization to prevent overﬁtting as well [16].
+4.3. Ablation Study
+To investigate the effect of each component on the ﬁnal
+performance, we conduct thorough ablation studies on the
+2-bit quantized ResNet-18 network on ImageNet. As shown
+in Table 3, the proposed weight regularization and thresh-
+old learning quantizer with G-STE improve the accuracy by
+1.9% and 3.0%, respectively over the baseline [52]. By us-
+ing both techniques, our proposed N2UQ achieves 69.7%
+accuracy, narrowing the accuracy gap to the corresponding
+real-valued ResNet-18 to only 2.1%.
+In Table 4, based on the proposed threshold learning
+quantizer with G-STE, we make further ablation study on
+weight regularization. Compared to the proposed method of
+calculating the regularization factor from the overall weight
+statistics, learning regularization factors with gradients in-
+
+
+Real-valued weight initialization
+2-bit
+3-bit
+Baseline
+Ours
+Ours
+Baseline
+Quantization Function
+Quantized Activation
+2-bit Baseline
+Real-valued Activation
+Quantization Function
+Quantized Activation
+Real-valued Activation
+2-bit Ours
+(a) Weight
+(b) Activation
+More weights
+Less weights
+Small
+interval
+Big interval
+Figure 3. Histogram of the weight and activation distribution.
+Table 3. Effects of different components of N2UQ on the ﬁnal
+performance of a 2-bit quantized ResNet-18 network.
+Method
+Top-1 Acc
+Baseline [52] (our implementation)
+65.9
++ Threshold Learning Activation Quantizer with G-STE
+68.9
++ Entropy Preserving Weight Regularization
+67.8
++ Both (N2UQ)
+69.7
+Corresponding real-valued network
+71.8
+troduces unstableness since gradients are noisy, which af-
+fects the training negatively, as shown in 4th row of Table 4.
+Moreover, the previous weight norm [40] designed for train-
+ing real-valued network is not aware of weight quantization,
+but only scales the weights participating in matrix multipli-
+cation, which turns out unsuitable for quantized network, as
+shown in 3rd row of Table 4. In comparison, the entropy-
+based regularization considers the knowledge of weight dis-
+tribution, such that it can better reduce information loss in
+weight quantization for higher accuracy.
+4.4. Visualization
+To further understand the proposed N2UQ, we illustrate
+the initial weight distributions and the learned parameters in
+quantized networks. In Fig. 3 (a), given the real-valued pre-
+trained weights as initialization, the baseline method [52]
+of using tanh function and dividing the maximum weight
+value to normalize the weights is likely to be biased by the
+extrema. Speciﬁcally, for the 2-bit case, only 6 entries in the
+weight ﬁlter are quantized to 0.5 and 20 entries are quan-
+tized to −0.5 in the baseline method. In contrast, the pro-
+posed entropy-based regularization method produces more
+evenly distributed quantized weights, which evidently en-
+hances the amount of information that quantized weights
+carry. In Fig. 3 (b), the classic uniform quantization has
+ﬁxed input thresholds, making it hard to adjust itself to ﬁt
+different underlying distributions. In comparison, N2UQ
+Table 4.
+Comparison among different weight regularization
+schemes for a 2-bit quantized ResNet-18 on ImageNet, based on
+the proposed threshold learning quantizer with G-STE.
+Method
+Top-1 Acc
+No Regularization
+68.9
+Weight Norm [40]
+67.4
+Learnable Scaling Factor
+68.6
+Entropy Preserving Weight Regularization
+69.7
+learns the input thresholds with neural network training. As
+shown in the right dashed box of Fig. 3 (b), when the real-
+valued distribution is dense around zero and sparse in the
+tail, the quantization function learns smaller intervals for
+the dense area and larger intervals for the sparse part, which
+better represents the distribution and mitigates the quantiza-
+tion error.
+5. Conclusions
+We have introduced Nonuniform-to-Uniform Quanti-
+zation, abbreviated as N2UQ, for learning input thresh-
+olds in the uniform quantizer. Compared to nonuniform
+quantization, N2UQ enjoys the advantage of hardware-
+friendliness since the uniform outputs do not require addi-
+tional post-processing before the bitwise operations. Mean-
+while, N2UQ contains stronger representational capability
+than the classical uniform quantization by making the in-
+put thresholds learnable. To tackle the intractable gradient
+computation w.r.t. input thresholds, we derive the gener-
+alized straight-through estimator (G-STE) from the essence
+of stochastic quantization. Further, we propose entropy pre-
+serving weight regularization to further reduce quantization
+error. With these contributions, N2UQ achieves 0.8∼1.7%
+higher accuracy than previous state-of-the-art nonuniform
+methods under the harsh condition of having uniform output
+quantized levels. Particularly, the 2-bit N2UQ ResNet-50 is
+just 0.6% shy of its real-valued counterpart.
+
+
+Acknowledgments
+This research was partially supported by ACCESS - AI
+Chip Center for Emerging Smart Systems, sponsored by In-
+noHK funding, Hong Kong SAR. We would like to thank
+Turing AI Computing Cloud [47] and HKUST iSING Lab
+for providing us computation resources on their platform.
+References
+[1] S Arish and RK Sharma. An efﬁcient ﬂoating point multi-
+plier design for high speed applications using karatsuba algo-
+rithm and urdhva-tiryagbhyam algorithm. In 2015 Interna-
+tional Conference on Signal Processing and Communication
+(ICSC), pages 303–308. IEEE, 2015. 1, 2, 3
+[2] Yoshua Bengio, Nicholas L´eonard, and Aaron Courville.
+Estimating or propagating gradients through stochastic
+neurons for conditional computation.
+arXiv preprint
+arXiv:1308.3432, 2013. 2, 3, 4
+[3] Joseph Bethge, Christian Bartz, Haojin Yang, Ying Chen,
+and Christoph Meinel. Meliusnet: Can binary neural net-
+works achieve mobilenet-level accuracy?
+arXiv preprint
+arXiv:2001.05936, 2020. 4
+[4] Adrian Bulat and Georgios Tzimiropoulos. Xnor-net++: Im-
+proved binary neural networks. British Machine Vision Con-
+ference, 2019. 4
+[5] Han Cai, Chuang Gan, Tianzhe Wang, Zhekai Zhang, and
+Song Han. Once-for-all: Train one network and specialize
+it for efﬁcient deployment. In International Conference on
+Learning Representations, 2019. 2
+[6] Han Cai, Ligeng Zhu, and Song Han. Proxylessnas: Direct
+neural architecture search on target task and hardware. In In-
+ternational Conference on Learning Representations, 2018.
+1, 2
+[7] Jungwook Choi, Swagath Venkataramani, Vijayalakshmi
+Srinivasan, Kailash Gopalakrishnan, Zhuo Wang, and Pierce
+Chuang. Accurate and efﬁcient 2-bit quantized neural net-
+works. In MLSys, 2019. 3
+[8] Jungwook Choi, Zhuo Wang, Swagath Venkataramani,
+Pierce I-Jen Chuang, Vijayalakshmi Srinivasan, and Kailash
+Gopalakrishnan.
+Pact:
+Parameterized clipping activa-
+tion for quantized neural networks.
+arXiv preprint
+arXiv:1805.06085, 2018. 3, 4, 6, 7
+[9] Matthieu Courbariaux, Yoshua Bengio, and Jean-Pierre
+David. Binaryconnect: Training deep neural networks with
+binary weights during propagations. In Advances in neural
+information processing systems, pages 3123–3131, 2015. 4
+[10] Matthieu Courbariaux, Itay Hubara, Daniel Soudry, Ran
+El-Yaniv, and Yoshua Bengio. Binarized neural networks:
+Training deep neural networks with weights and activations
+constrained to+ 1 or-1.
+arXiv preprint arXiv:1602.02830,
+2016. 4
+[11] Xiaohan Ding, Xiangxin Zhou, Yuchen Guo, Jungong Han,
+Ji Liu, et al. Global sparse momentum sgd for pruning very
+deep neural networks. In Advances in Neural Information
+Processing Systems, pages 6379–6391, 2019. 2
+[12] Steven K Esser, Jeffrey L McKinstry, Deepika Bablani,
+Rathinakumar Appuswamy, and Dharmendra S Modha.
+Learned step size quantization. In International Conference
+on Learning Representations, 2020. 3, 6, 7
+[13] Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao,
+Michael W Mahoney, and Kurt Keutzer. A survey of quanti-
+zation methods for efﬁcient neural network inference. arXiv
+preprint arXiv:2103.13630, 2021. 1, 2, 3, 7
+[14] Xavier Glorot and Yoshua Bengio. Understanding the difﬁ-
+culty of training deep feedforward neural networks. In Pro-
+ceedings of the thirteenth international conference on artiﬁ-
+cial intelligence and statistics, pages 249–256. JMLR Work-
+shop and Conference Proceedings, 2010. 12
+[15] Ruihao Gong, Xianglong Liu, Shenghu Jiang, Tianxiang Li,
+Peng Hu, Jiazhen Lin, Fengwei Yu, and Junjie Yan. Differ-
+entiable soft quantization: Bridging full-precision and low-
+bit neural networks. In Proceedings of the IEEE/CVF Inter-
+national Conference on Computer Vision, pages 4852–4861,
+2019. 3, 6, 7
+[16] Song Han, Huizi Mao, and William J Dally.
+Deep com-
+pression: Compressing deep neural networks with pruning,
+trained quantization and huffman coding.
+arXiv preprint
+arXiv:1510.00149, 2015. 2, 3, 7
+[17] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+Delving deep into rectiﬁers: Surpassing human-level perfor-
+mance on imagenet classiﬁcation.
+In Proceedings of the
+IEEE international conference on computer vision, pages
+1026–1034, 2015. 12
+[18] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+Deep residual learning for image recognition. In Proceed-
+ings of the IEEE conference on computer vision and pattern
+recognition, pages 770–778, 2016. 1, 6
+[19] Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+Distill-
+ing the knowledge in a neural network.
+arXiv preprint
+arXiv:1503.02531, 2015. 2
+[20] Andrew G Howard, Menglong Zhu, Bo Chen, Dmitry
+Kalenichenko, Weijun Wang, Tobias Weyand, Marco An-
+dreetto, and Hartwig Adam. Mobilenets: Efﬁcient convolu-
+tional neural networks for mobile vision applications. arXiv
+preprint arXiv:1704.04861, 2017. 2
+[21] Itay Hubara, Matthieu Courbariaux, Daniel Soudry, Ran El-
+Yaniv, and Yoshua Bengio.
+Quantized neural networks:
+Training neural networks with low precision weights and
+activations.
+The Journal of Machine Learning Research,
+18(1):6869–6898, 2017. 3, 4
+[22] Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu,
+Matthew Tang, Andrew Howard, Hartwig Adam, and Dmitry
+Kalenichenko. Quantization and training of neural networks
+for efﬁcient integer-arithmetic-only inference. In Proceed-
+ings of the IEEE conference on computer vision and pattern
+recognition, pages 2704–2713, 2018. 3, 7
+[23] Shubham Jain,
+Swagath Venkataramani,
+Vijayalakshmi
+Srinivasan, Jungwook Choi, Pierce Chuang, and Leland
+Chang. Compensated-dnn: Energy efﬁcient low-precision
+deep neural networks by compensating quantization errors.
+In 2018 55th ACM/ESDA/IEEE Design Automation Confer-
+ence (DAC), pages 1–6. IEEE, 2018. 3
+[24] Yongkweon Jeon, Baeseong Park, Se Jung Kwon, Byeong-
+wook Kim, Jeongin Yun, and Dongsoo Lee. Biqgemm: ma-
+trix multiplication with lookup table for binary-coding-based
+
+
+quantized dnns. In SC20: International Conference for High
+Performance Computing, Networking, Storage and Analysis,
+pages 1–14. IEEE, 2020. 2, 3, 7
+[25] Sangil Jung, Changyong Son, Seohyung Lee, Jinwoo Son,
+Jae-Joon Han, Youngjun Kwak, Sung Ju Hwang, and
+Changkyu Choi. Learning to quantize deep networks by op-
+timizing quantization intervals with task loss. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pat-
+tern Recognition, pages 4350–4359, 2019. 3, 6, 7
+[26] Diederik P Kingma and Jimmy Ba. Adam: A method for
+stochastic optimization.
+arXiv preprint arXiv:1412.6980,
+2014. 6
+[27] Junghyup Lee, Bumsub Ham, et al. Distance-aware quanti-
+zation. In Proceedings of the IEEE International Conference
+on Computer Vision, 2021. 7
+[28] Yuhang Li, Xin Dong, and Wei Wang. Additive powers-of-
+two quantization: An efﬁcient non-uniform discretization for
+neural networks. In International Conference on Learning
+Representations, 2020. 3, 7
+[29] Zhuang Liu, Jianguo Li, Zhiqiang Shen, Gao Huang,
+Shoumeng Yan, and Changshui Zhang. Learning efﬁcient
+convolutional networks through network slimming. In Pro-
+ceedings of the IEEE International Conference on Computer
+Vision, pages 2736–2744, 2017. 1, 2
+[30] Zechun Liu, Wenhan Luo, Baoyuan Wu, Xin Yang, Wei Liu,
+and Kwang-Ting Cheng. Bi-real net: Binarizing deep net-
+work towards real-network performance. International Jour-
+nal of Computer Vision, pages 1–18, 2018. 4, 12
+[31] Zechun Liu, Haoyuan Mu, Xiangyu Zhang, Zichao Guo, Xin
+Yang, Kwang-Ting Cheng, and Jian Sun. Metapruning: Meta
+learning for automatic neural network channel pruning. In
+Proceedings of the IEEE International Conference on Com-
+puter Vision, pages 3296–3305, 2019. 1, 2
+[32] Zechun Liu, Zhiqiang Shen, Marios Savvides, and Kwang-
+Ting Cheng. Reactnet: Towards precise binary neural net-
+work with generalized activation functions.
+In European
+Conference on Computer Vision, pages 143–159. Springer,
+2020. 4, 6
+[33] Zechun Liu, Baoyuan Wu, Wenhan Luo, Xin Yang, Wei Liu,
+and Kwang-Ting Cheng.
+Bi-real net: Enhancing the per-
+formance of 1-bit cnns with improved representational ca-
+pability and advanced training algorithm. In Proceedings of
+the European conference on computer vision (ECCV), pages
+722–737, 2018. 1, 2, 4, 6, 12
+[34] Ningning Ma, Xiangyu Zhang, Hai-Tao Zheng, and Jian Sun.
+Shufﬂenet v2: Practical guidelines for efﬁcient cnn architec-
+ture design. In Proceedings of the European Conference on
+Computer Vision (ECCV), pages 116–131, 2018. 2
+[35] Jeffrey L McKinstry, Steven K Esser, Rathinakumar Ap-
+puswamy, Deepika Bablani, John V Arthur, Izzet B Yildiz,
+and Dharmendra S Modha. Discovering low-precision net-
+works close to full-precision networks for efﬁcient infer-
+ence.
+In 2019 Fifth Workshop on Energy Efﬁcient Ma-
+chine Learning and Cognitive Computing-NeurIPS Edition
+(EMC2-NIPS), pages 6–9. IEEE, 2019. 7
+[36] Daisuke Miyashita, Edward H Lee, and Boris Murmann.
+Convolutional neural networks using logarithmic data rep-
+resentation. arXiv preprint arXiv:1603.01025, 2016. 3
+[37] Eunhyeok Park and Sungjoo Yoo. Proﬁt: A novel training
+method for sub-4-bit mobilenet models. In European Con-
+ference on Computer Vision, pages 430–446. Springer, 2020.
+7
+[38] Mohammad Rastegari, Vicente Ordonez, Joseph Redmon,
+and Ali Farhadi. Xnor-net: Imagenet classiﬁcation using bi-
+nary convolutional neural networks. In European conference
+on computer vision, pages 525–542. Springer, 2016. 1, 4, 12
+[39] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, San-
+jeev Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy,
+Aditya Khosla, Michael Bernstein, et al.
+Imagenet large
+scale visual recognition challenge. International Journal of
+Computer Vision, 115(3):211–252, 2015. 6
+[40] Tim Salimans and Durk P Kingma. Weight normalization:
+A simple reparameterization to accelerate training of deep
+neural networks. Advances in neural information processing
+systems, 29:901–909, 2016. 8
+[41] Mark Sandler, Andrew Howard, Menglong Zhu, Andrey Zh-
+moginov, and Liang-Chieh Chen.
+Mobilenetv2: Inverted
+residuals and linear bottlenecks. In Proceedings of the IEEE
+Conference on Computer Vision and Pattern Recognition,
+pages 4510–4520, 2018. 2
+[42] Zhiqiang Shen, Zhankui He, and Xiangyang Xue.
+Meal:
+Multi-model ensemble via adversarial learning. In Proceed-
+ings of the AAAI Conference on Artiﬁcial Intelligence, vol-
+ume 33, pages 4886–4893, 2019. 2
+[43] Karen Simonyan and Andrew Zisserman. Very deep convo-
+lutional networks for large-scale image recognition. arXiv
+preprint arXiv:1409.1556, 2014. 1
+[44] Naoya Torii, Hirotaka Kokubo, Dai Yamamoto, Kouichi
+Itoh, Masahiko Takenaka, and Tsutomu Matsumoto. Asic
+implementation of random number generators using sr
+latches and its evaluation. EURASIP Journal on Information
+Security, 2016(1):1–12, 2016. 5
+[45] Bichen Wu, Xiaoliang Dai, Peizhao Zhang, Yanghan Wang,
+Fei Sun, Yiming Wu, Yuandong Tian, Peter Vajda, Yangqing
+Jia, and Kurt Keutzer. Fbnet: Hardware-aware efﬁcient con-
+vnet design via differentiable neural architecture search. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition, pages 10734–10742, 2019. 1
+[46] Bichen Wu, Yanghan Wang, Peizhao Zhang, Yuandong Tian,
+Peter Vajda, and Kurt Keutzer. Mixed precision quantiza-
+tion of convnets via differentiable neural architecture search.
+arXiv preprint arXiv:1812.00090, 2018. 4, 7
+[47] Kaiqiang Xu, Xinchen Wan, Hao Wang, Zhenghang Ren,
+Xudong Liao, Decang Sun, Chaoliang Zeng, and Kai Chen.
+Tacc: A full-stack cloud computing infrastructure for ma-
+chine learning tasks, 2021. 9
+[48] Kohei Yamamoto. Learnable companding quantization for
+accurate low-bit neural networks.
+In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 5029–5038, 2021. 2, 3, 4, 6, 7
+[49] Dongqing Zhang, Jiaolong Yang, Dongqiangzi Ye, and Gang
+Hua. Lq-nets: Learned quantization for highly accurate and
+compact deep neural networks. In Proceedings of the Eu-
+ropean conference on computer vision (ECCV), pages 365–
+382, 2018. 1, 2, 3, 7
+
+
+[50] Xiangyu Zhang, Xinyu Zhou, Mengxiao Lin, and Jian Sun.
+Shufﬂenet: An extremely efﬁcient convolutional neural net-
+work for mobile devices. In Proceedings of the IEEE con-
+ference on computer vision and pattern recognition, pages
+6848–6856, 2018. 2
+[51] Xiandong Zhao, Ying Wang, Xuyi Cai, Cheng Liu, and Lei
+Zhang. Linear symmetric quantization of neural networks for
+low-precision integer hardware. International Conference on
+Learning Representations, 2020. 7
+[52] Shuchang Zhou, Yuxin Wu, Zekun Ni, Xinyu Zhou, He Wen,
+and Yuheng Zou. Dorefa-net: Training low bitwidth convo-
+lutional neural networks with low bitwidth gradients. arXiv
+preprint arXiv:1606.06160, 2016. 1, 2, 3, 4, 6, 7, 8
+[53] Shilin Zhu, Xin Dong, and Hao Su. Binary ensemble neural
+network: More bits per network or more networks per bit?
+In Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition, pages 4923–4932, 2019. 4
+[54] Bohan Zhuang, Lingqiao Liu, Mingkui Tan, Chunhua Shen,
+and Ian Reid. Training quantized neural networks with a full-
+precision auxiliary module. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+pages 1488–1497, 2020. 7
+[55] Bohan Zhuang, Chunhua Shen, Mingkui Tan, Lingqiao Liu,
+and Ian Reid. Towards effective low-bitwidth convolutional
+neural networks. In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pages 7920–7928,
+2018. 2, 3
+
+
+Appendix
+In this appendix, we provide details omitted in main text:
+• Section A: Illustration and more details about the pro-
+posed Entropy Preserving Weight Regularization.
+• Section B: Visualization of learned parameters.
+• Section C: The results of keeping down-sampling layers
+to be real-valued in ResNet structures.
+A. Entropy Preserving Weight Regularization
+-0.0005 0.0005
+−4
+3
+4
+3
+−2
+3
+2
+3
+0
+−8
+7 −6
+7
+0
+−4
+7 −2
+7
+2
+7
+4
+7
+6
+7
+8
+7
+(a) Real-valued weights
+(c) 3-bit quantization
+(b) 2-bit quantization
+Rescale
+Rescale
+!!
+!!′
+!!′
+Figure 4. Illustration of the proposed entropy preserving weight
+regularization.
+The weight regularization function proposed in the main
+paper: W r′ = 2(n−1)
+2n−1
+|W r|
+||W r||l1 W r aims to rescale the real-
+valued weights for preserving information entropy in the
+corresponding quantized weights.
+Speciﬁcally,
+|W r|
+||W r||l1
+scales the W r to have the absolute mean value equal to
+1.
+When the real-valued weights are initialized as uni-
+formly and symmetrically distributed [14, 17],
+|W r|
+||W r||l1 W r
+will be evenly distributed in [−2, 2]. The factor 2(n−1)
+2n−1 fur-
+ther spread the real-valued weight distribution to [−
+2n
+2n−1,
+2n
+2n−1], for which, the corresponding quantized weights after
+the quantization function FQ =round((Clip(−1, W r′, 1)+
+1)× 2n−1
+2 )×
+2
+2n−1 −1 will be approximately uniformly quan-
+tized to 2n levels as shown in Fig. 4.
+During training,
+the real-valued weight distributions are not always uniform,
+in which case, regularization helps to better distribute the
+weights. After training, this regularization factor can be cal-
+culated ofﬂine from the optimized weights and be absorbed
+by the BatchNorm layers (if used) after the quantized con-
+volutional layers as mentioned in [30].
+B. Learned Parameters Visualization
+We visualize the optimized weights in the trained 2-bit
+ResNet-18. As shown in Fig. 5, many 3 × 3 weight ma-
+trices learn the same value in the baseline method, which
+can hardly extract useful features. In contrast, this phe-
+nomenon is much rarer with the proposed weight regular-
+(a1) Weight filters in
+baseline method
+(a2) Weight filters in
+our method
+(b) Threshold
+parameters
+!!!"!#
+Layers
+1.2
+1.0
+0.8
+0.6
+0.4
+Input channels
+Input channels
+Output channels
+"!""
+Figure 5. Quantized weights and learnable thresholds visualization
+ization. Speciﬁcally, for 2-bit case, 4.37% of quantized 3×3
+weight matrices contain the same values in baseline method,
+while this number is reduced to 1.69% in our method. Fur-
+ther, in Fig. 5 (b), the learned threshold parameters in the
+quantized ResNet-18 network have clear patterns. The pa-
+rameters in ﬁrst convolutional layers of the residual blocks
+(i.e., odd rows in Fig. 5 (b)) often have larger values in the
+threshold intervals a, and smaller values in the ﬁrst scaling
+factors β1. We deem it is because the real-valued activations
+in these layers are the summation of the residual connection
+and the previous layer output, thus are larger in magnitude,
+for which, larger a and smaller β1 are learned to better rep-
+resent these activations in ﬁxed bits.
+C. Results without Quantizing Downsampling
+Layers
+In previous quantization works, there is a practice [33,
+38] of keeping the down-sampling layers to be full-
+precision and quantizing the rest of the convolutional lay-
+ers.
+We follow these studies and conduct experiments
+on ResNet.
+As shown in Table 5, for lower bits, real-
+valued 1x1 downsampling layers can boost the accuracy for
+∼0.3%, while this effect becomes marginal for higher bits.
+Table 5. Accuracy comparison of quantizing the downsampling
+layers in ResNet. Both weights and activations are quantized to
+2-bit 3-bit or 4-bit. * denotes keeping the weights and activations
+to be full-precision in 1×1 downsampling layers and quantizing
+all the remaining convolutional and fully-connected layers except
+the ﬁrst and the last one.
+Network
+Method
+2-bit
+3-bit
+4-bit
+Top-1 Top-5 Top-1 Top-5 Top-1 Top-5
+ResNet-18 N2UQ
+69.4
+88.4
+71.9
+90.5
+72.9
+90.9
+N2UQ* 69.7
+88.9
+72.1
+90.5
+73.1
+91.2
+ResNet-34 N2UQ
+73.3
+91.2
+75.2
+92.3
+76.0
+92.8
+N2UQ* 73.4
+91.3
+75.3
+92.4
+76.1
+92.8
+ResNet-50 N2UQ
+75.8
+92.3
+77.5
+93.6
+78.0
+93.9
+N2UQ* 76.4
+92.9
+77.6
+93.7
+78.0
+94.0

@@ -1,0 +1,2273 @@
+Efficient Remote KV Cache Reuse with GPU-native Video Codec
+Liang Mi1∗† Weijun Wang2∗Jinghan Chen1 Ting Cao2‡ Haipeng Dai1‡ Yunxin Liu2
+1 Nanjing University 2Institute for AI Industry Research (AIR), Tsinghua University
+ABSTRACT
+Remote KV cache reuse fetches KV cache for identical con-
+texts from remote storage, avoiding recomputation, acceler-
+ating LLM inference. While it excels in high-speed networks,
+its performance degrades significantly in bandwidth-limited
+scenarios. Recent studies address this by transmitting KV
+caches in compressed form, but the associated heavyweight
+decompression counteracts the KV reuse benefits. In this
+paper, we propose an efficient and widely deployable remote
+KV cache reuse solution that leverages GPU-native video
+codecs. Our system, KVCodec, enables effective KV cache
+coding with two techniques. The codec-friendly tensor lay-
+out compresses the KV cache in a highly compact video
+format, enabling fast transmission. The efficient KV fetcher
+orchestrates the transmission, decoding, and restoration of
+compressed KV caches in an efficient pipelined manner, elim-
+inating resource contention, masking network fluctuations,
+and achieving minimum time-to-first-token (TTFT). We pro-
+totype KVCodec on diverse GPUs from high- to low-end. Ex-
+periments reveal that it reduces TTFT by up to 3.51× while
+maintaining lossless accuracy, compared to SOTA methods.
+1
+INTRODUCTION
+With context window trending to millions of tokens, Large
+Language Models (LLMs) have demonstrated superiority in
+many modern services. By ingesting informative contexts,
+including system prompts [14], retrieved documents [12, 23],
+and interaction histories [18, 19, 67, 81], together with re-
+quest queries, LLMs can generate high-quality outputs pow-
+ering diverse applications, from code generation [22, 32, 55]
+to agentic workflows [33, 63, 72]. For efficient serving, stor-
+ing the intermediate states, KV cache, during LLM inference
+has become a de facto choice.
+KV cache reuse further amortizes the computational costs
+across multiple requests. It persists KV caches in the first
+inference and reuses them when future requests share com-
+mon prefixes. Most LLM inference systems [1, 13, 30, 39,
+40, 54, 73, 79] today integrate KV cache reuse as their key
+feature. Their consensus is that KV caches are frequently
+reused. Mooncake [54] claims that 50% of KV caches will be
+reused in KiMi’s real-world workloads, while LMCache [13]
+∗Liang Mi and Weijun Wang contributed equally to this work.
+†This work was done while Liang Mi interns at the Institute for AI Industry
+Research (AIR), Tsinghua University.
+‡Corresponding author: Ting Cao and Haipeng Dai.
+(a) CacheGen: decompre-
+ssion with CUDA cores
+(b) ShadowServe: offload 
+decompression to SmartNIC
+(c) Ours: leverage free 
+GPU-native codec 
+SmartNIC
+GPU
+NVDEC
+NVENC
+Global
+Memory
+General-
+Purpose Cores
+Costly!
+NVDEC
+NVENC
+Global
+Memory
+GPU
+Cost-free &
+Interference-Free!
+NIC
+CPU
+General-
+Purpose Cores
+NIC
+NVDEC
+NVENC
+CPU
+GPU
+Interference!
+General-
+Purpose Cores
+Global
+Memory
+KV Cache
+Figure 1: Solutions of remote KV cache reuse. Our KVCodec
+exploits GPU-native video codecs, delivering the best cost-
+efficiency and system performance.
+believes this number is higher. Despite this benefit, the stor-
+age cost of KV caches can be huge [40, 68]. Storing 80K-token
+KV caches (e.g., Amazon’s annual report) of a medium-level
+34B model can consume up to 19GB of storage [46]. For this
+reason, hosting all reusable KV caches locally is impractical.
+To tackle this, KV cache reuse uses external storage and
+fetches them on demand from remote resources. Mooncake
+abstracts all GPU memory, host memory, and disks within
+GPU clusters into a disaggregated KV cache pool, and LM-
+Cache leverages dedicated storage servers. In such distributed
+setups, KV caches must be transmitted over the network. Al-
+though high-speed interconnections (e.g., RDMA) render
+transmission latency negligible [43, 54, 58, 80], economic
+considerations drive modern LLM services to deploy on mid-
+range GPUs typically paired with only constrained band-
+widths, tens of Gbps or less [24, 38, 48–50, 68].
+Recent studies [46, 68] mitigate this networking bottle-
+neck by transmitting KV caches in compressed form rather
+than raw tensors. It indeed yields bandwidth savings, but
+the associated decompression latency lies on the critical
+path of LLM inference, counteracting the network bene-
+fits. CacheGen [46] customizes a CUDA kernel to acceler-
+ate decompression, yet it competes for GPU resources with
+LLM inference engines, as the blue box shown in Fig.1(a),
+severely degrading LLM inference performance (§2.2). Shad-
+owServe [68] achieves interference-free inference by offload-
+ing decompression to SmartNIC, as shown in Fig.1(b); but,
+the prohibitive hardware cost hinders its widespread adop-
+tion. We believe KV cache compression is promising, but
+requires a cost-efficient redesign to be widely used.
+Modern GPUs are typically equipped with dedicated hard-
+ware for efficient video coding. Although initially designed
+1
+arXiv:2602.09725v3  [cs.DC]  12 May 2026
+
+
+for media processing, their independent on-chip computing
+and storage units offer a great opportunity to address the
+above limitations (§2.3). More importantly, as dashed boxes
+shown in Fig.1, they are completely idle throughout the LLM
+inference. Motivated by this, we ask: Can we implement a KV
+cache codec with GPU-native video codecs, enabling efficient
+remote KV cache reuse? A concurrent study, llm.265 [71], at-
+tempts to compress KV caches by video coding, but cannot be
+the answer to this question. It provides very limited compres-
+sion gain and lacks system co-design with inference engines
+(§2.4). To be the answer, we must tackle two challenges.
+First, to minimize transmission delay, efficient remote KV
+cache reuse necessitates highly compact compression. Dur-
+ing compression, it must map KV tensors to a video format
+and encode them into bitstreams using video encoders. How-
+ever, this is non-trivial. A successful compression strategy
+must comprehensively explore and judiciously exploit both
+the distribution of K and V values and the characteristics of
+the video coding, to maximize the compression ratio without
+compromising LLM generation quality. Blindly representing
+the KV tensor as individual video frames and directly encod-
+ing them into the bitstream, like llm.265 [71], results in both
+suboptimal compression ratios and generation quality (§2.4).
+Second, to minimize the Time to First Token, TTFT, only
+compact compression is not enough. It just accelerates the
+transmission of single video chunks, but efficient remote KV
+reuse still requires considerate scheduling as well as rapid
+and interference-free decoding and restoration∗. Existing KV
+cache reuse systems [13, 54] hardly meet these requirements.
+First, their schedulers indiscriminately batch all arriving
+requests, leading to non-reuse requests (requests without re-
+mote KV cache reuse) being blocked by the fetching stage of
+requests with remote reuse. Second, their bulk KV restoration
+consumes excessive memory from LLM inference engines, de-
+laying the TTFT. And last, their ill-considered design hardly
+copes with the networking jitter (§2.4).
+In this paper, we present KVCodec, an efficient remote KV
+cache reuse module powered by GPU-native video codecs,
+to address the challenges outlined above.
+To address the first challenge, we propose a codec-friendly
+tensor layout that enables a tenfold compression ratio with-
+out a drop in LLM inference accuracy. Its core idea is to skip
+the lossy Discrete Cosine Transform (DCT) and quantiza-
+tion steps of video encoding, and fully utilize the lossless
+intra- and inter-frame redundancy elimination capability. To
+achieve this, we conduct an in-depth analysis of the char-
+acteristics of video coding, the distribution of KV values,
+the properties of LLM architectures, and finally obtain the
+∗This paper follows the same setting as prior studies [46, 54, 68], where the
+KV caches are chunked and compressed in advance, and stored at remote
+storage nodes. So remote KV reuse (a.k.a., KV fetching) consists of KV
+transmission, decoding, and restoration.
+layout principle: slice KV tensors along the token dimension,
+scatter resulting tensors over continuous frames, and encode
+them in multiple-resolution versions (more in §3.2).
+To tackle the second challenge, we propose an efficient
+remote KV fetcher (§3.3) including three key techniques. The
+fetching-aware scheduler (§3.3.1) discriminates the requests
+w./w.o KV reuses and isolates the KV fetching in the back-
+ground, preventing blocking the inference of non-reuse re-
+quests. The adaptive-resolution KV fetching (§3.3.2) adjusts
+the video resolution to tune the video size, enabling effi-
+cient KV fetching across varying network bandwidths. The
+frame-wise tensor restoration minimizes the memory cost
+of restoring decoded frames to original KV tensors, without
+impacting LLM inference engines.
+We summarize our key contributions as follows:
+• To the best of our knowledge, we are the first to identify
+the opportunity of GPU-native video codecs for remote KV
+cache reuse to accelerate LLM inference.
+• We prototype KVCodec, an efficient remote KV cache
+reuse system powered by GPU-native video codecs. It in-
+volves two core techniques, codec-friendly tensor layout and
+efficient remote KV cache fetching.
+• We implement KVCodec and conduct evaluations on
+three GPUs from high- to low-end and three different size
+models from 7B to 70B over 1-40Gbps bandwidths. Experi-
+mental results show that KVCodec achieves 1.52-3.51× TTFT
+reduction compared to SOTA methods, while ensuring high
+accuracy and interference-free non-reuse requests inference.
+This work does not raise any ethical issues.
+2
+MOTIVATION AND CHALLENGES
+2.1
+Preliminary of Remote KV Cache Reuse
+LLM inference contains two phases. The prefilling phase pro-
+cesses the entire input tokens simultaneously to generate the
+first output token, while the decoding phase generates the
+subsequent ones in an autoregressive manner. For efficiency,
+LLM inference engines store intermediate tensors, i.e., the
+KV caches produced by each attention layer, to eliminate
+the redundant computation of autoregressive generation.
+Although KV cache significantly speeds up decoding, it pro-
+vides no acceleration for the prefilling phase.
+KV cache reuse operates as a storage-for-computation
+trade-off, substantially reducing prefilling latency. Its core
+principle is that KV caches generated by one request can be
+reused by subsequent requests sharing a common sequence
+prefix. This pattern is highly prevalent across modern LLM
+applications. For example, to maintain consistency, chat-
+bots [28, 29, 36, 76] feed conversation histories into the LLM
+at each chat round; in multi-agent code debuggers [7, 53, 72],
+2
+
+
+Context
+LLM
+Network
+1st 
+token
+Compressed 
+KV cache
+KV cache
+Decmpression
+Figure 2: Current three prefilling types: full prefill, raw KV
+reuse, compressed KV reuse. Their time costs are: prefill,
+transmission+prefill, transmission+decompression+prefill.
+web-search agents frequently reread buggy code from cod-
+ing agents to find related posts on the Internet; and Vision-
+Language-Action (VLA) models [41, 45, 56] in embodied AI
+continuously recall prior observations and actions to boost
+the quality of the next action. Since this repeated content
+can be leveraged after the first processing, LLM inference
+engines [39, 79] persist their KV caches, rather than imme-
+diately freeing them, to facilitate future reuse.
+Remote KV cache reuse significantly extends the ca-
+pacity of reusable KV cache by retrieving them from remote
+resources. In large-scale LLM services [1, 26, 46, 54, 68], since
+the limited capacity of single node and the strategies of load-
+aware [21, 35] and fairness-aware [57] request dispatching,
+reusable KV caches are typically scattered across distant
+nodes. To reuse these KV caches in this distributed envi-
+ronment, LLM inference engines must fetch them from the
+source nodes via the network interconnect. However, remote
+KV cache reuse is only beneficial when the KV cache fetch-
+ing speed exceeds the latency of recomputation. Early LLM
+serving systems [43, 54, 58] could easily achieve this bene-
+fit, as they were commonly deployed in High-Performance
+Computing (HPC) centers with >100Gbps RDMA intercon-
+nects. In contrast, for cost efficiency, modern serving sys-
+tems [20, 31, 49, 68] tend to be deployed on mid-range or
+even low-end GPUs, which communicate over bandwidth-
+limited networks with tens of Gbps or less. Some other sys-
+tems [1, 24] rent dedicated storage servers to scale the ca-
+pacity of reusable KV caches, yet their performance is still
+limited by constrained bandwidth (19 Gbps on AWS [2]).
+2.2
+Limitations of Existing Remote KV Cache Reuse
+Systems
+To mitigate the network bottleneck, SOTA systems [46, 68]
+transmit KV caches in compressed forms. While theoret-
+ically beneficial, our empirical analysis reveals that these
+bandwidth savings yield only a limited end-to-end latency
+reduction (as elaborated shortly). To explore the reason, we
+benchmark the TTFT of three approaches, as shown in Fig.2:
+(1) Full Prefill (baseline without KV reuse), (2) Raw KV Reuse
+(e.g., Mooncake [54], AIBrix [1]), and (3) Compressed KV Reuse
+(e.g., CacheGen [46], ShadowServe [68])†, as illustrated in
+†These transmission-oriented methods leverage aggressive arithmetic cod-
+ing to encode KV caches into bitstreams, which are orthogonal to prior KV
+Context Length (k)
+Basic Text Tasks
+Doc. QA /
+Short Video Ustd.
+Needle in a Haystack /
+Long Video Ustd.
+Regular Cloud Server
+RDMA Based
+Bandwidth (Gbps)
+Raw KV Reuse
+Full Prefill
+Existing
+Compressed 
+KV Reuse
+Ours
+Figure 3: “Winning areas” of three prefilling types under var-
+ious bandwidths and context lengths. KVCodec significantly
+extends the applicable scope of compressed KV reuse.
+Avg
+P95
+P99
+0
+10
+20
+30
+Prefill Time (s)
+0.0
+0.2
+0.4
+0.6
+Decode Time (s)
+Prefill w/o decmp.
+Prefill w/ decmp.
+Decode w/o decmp.
+Decode w/ decmp.
+Figure 4: Concurrent LLM in-
+ference and KV decompres-
+sion cause extra delay.
+0.0
+0.5
+1.0
+SM
+Infer.+Decmp.
+Only Infer..
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Time (s)
+0.0
+0.5
+1.0
+BW
+Prefill 
+finished  
+Figure
+5:
+Kernel
+switch
+yields SM underutilization
+and memory I/O contention.
+Fig.2. The evaluation is conducted on a 200k-context-window
+LWM-7B [74] model served by vLLM [40] on 2 NVIDIA H20
+GPUs. Requests arriving follow the real-world trace [64],
+and network bandwidth is regulated from 1 to 40 Gbps over
+TCP and 100/200 Gbps over RDMA. As shown in Fig. 3, the
+“winning area” of the existing compressed KV reuse solution
+(dashed box) is surprisingly small for three reasons.
+Limited TTFT gains due to suboptimal compression.
+Both ShadowServe and CacheGen treat KV tensors as generic
+byte streams and compress them with arithmetic coding,
+resulting in a low compression ratio. Such a compression
+strategy entirely ignores the unique distribution of K and V
+data (§3.2), rendering the reduced transmission time unable
+to amortize the substantial decompression delay and thus
+poor TTFT in most bandwidth-context-length scenarios.
+Severe resource contention of CUDA-based decom-
+pression. CacheGen customizes a CUDA kernel to accel-
+erate the decompression of KV caches. It truly decreases
+decompression time but causes a significant LLM inference
+delay, resulting in a 50% increase in prefilling time and a 20%
+increase in decoding time, as shown in Fig. 4. This stems
+from two factors. (i) Compute preemption: Fig.5 profiles the
+Streaming Multiprocessors (SM) and GPU I/O bandwidth
+utilization of standalone LLM inference versus concurrent
+cache compression methods (e.g., pruning [52, 78] or quantization [34, 47])
+that keeps tensor formats for GPUs directly use.
+3
+
+
+Cmpressed KV
+Original KV
+GPU Memory
+Time
+2.7x peak mem. 
+than original KV
+Extra memory
+Figure 6: Peak memory of decompression in CacheGen is
+2.7× that of the raw KV cache.
+Default / QP0
+llm.265
+Lossless / Ours
+Lossy
+Inter-frame
+Prediction
+DCT +
+Quant.
+Entropy
+Coding
+CacheGen & 
+ShadowServe
+Intra-frame
+Prediction
+Figure 7: Standard H.265 encoding pipeline. Default and QP0
+apply all steps to KV tensors while Lossless skips lossy steps.
+llm.265 [71] skips inter-frame prediction. CacheGen [46] and
+ShadowServe [68] only utilize arithmetic coding.
+with decompression. Compared to standalone (blue curve),
+concurrency triggers frequent kernel context switching (the
+fluctuation of the red curve), leading to SM underutiliza-
+tion, high memory I/O contention, and thus delaying the
+LLM inference. (ii) Memory bloat: CacheGen’s decompres-
+sion seizes a considerable amount of GPU memory from LLM
+inference engines. As shown in Fig.6, it pre-allocates 5.5GB
+of GPU memory, 2.7× larger than the original KV cache,
+to decompress only 4K tokens. This ill-considered memory
+management limits the batch size of LLM inference, further
+increasing the average inference time.
+Prohibitive deployment costs of SmartNIC-based de-
+compression. To avoid GPU contention, ShadowServe of-
+floads KV cache decompression to SmartNICs. It isolates the
+decompression from LLM inference but introduces signifi-
+cant deployment costs (>$3000 of each NVIDIA BlueField
+NIC) and hardware dependencies. These constraints limit
+the scalability and adoption of ShadowServe. In line with the
+current trend of deploying LLM inference systems on eco-
+nomical platforms, this paper aims to develop a cost-efficient
+and easy-deployed solution.
+2.3
+Opportunity of GPU-native Video Codec
+Modern GPUs are typically equipped with dedicated ASIC
+units, e.g., NVIDIA’s NVENC/NVDEC [5], AMD’s AMF [3],
+and Intel’s QSV [4], for efficient video coding. Despite being
+designed for video, their on-chip computing and storage
+resources, which are totally independent of general-purpose
+computing units, offer us a good chance. More importantly,
+current LLM inference engines (e.g., vLLM [40], SGLang [79])
+completely ignore these resources, leaving them fully idle
+during inference, as illustrated in Fig. 1.
+90
+100
+Ours
+QP0
+llm.265
+Loss-
+less
+CacheGen
+ShadowServe
+0
+5
+10
+15
+20
+Compression Ratio
+20
+40
+            Accuracy
+Default
+Better
+Figure 8: Current solutions
+yield an unsatisfactory trade-
+off between accuracy and
+compression.
+ϖυ2
+퐷ϡυ1
+ϖυ1
+I
+ϔ1ϔ2
+Trans.
+Decod.+Restore
+Inference
+Layer-wise async 
+fetching and 
+inference.
+ϖϧ2
+퐷ϧ2
+퐷ϧ1
+ϖϧ1
+ϋϧ1
+ϋϧ2
+ϖϧ3
+퐷ϧ2
+ϋϧ3
+LMCache
+Mooncake
+Chunk-wise sync fetching 
+then inference. 
+② Resource      
+   waste
+ ϔ1 w/ reuse  
+ϔ2 w/o reuse 
+ϯ3
+ϯ2
+ϯ1
+ϯ0
+① ϔ2 is batched with ϔ1 and 
+delayed by ϔ1’s fetching procedure
+퐷ϡυ2
+Fetching procedure
+Figure 9: SOTA KV manage-
+ment systems deliver ineffi-
+cient KV fetching on regular
+(non-RDMA) networks.
+Offloading KV cache compression and decompres-
+sion to GPU-native video codecs opens up a new design
+space for remote KV cache reuse. It presents a valuable oppor-
+tunity to address the limitations of existing methods. (i) Video
+codecs exploit spatial and temporal redundancies of images
+(tensors), offering the potential to achieve superior compres-
+sion ratios beyond generic AC methods. (ii) Offloading to
+independent hardware isolates the workload, effectively elim-
+inating the compute preemption and memory bloat, enabling
+interference-free simultaneous inference and KV decompres-
+sion. (iii) As ubiquitous components on modern GPUs, this
+ASIC provides a scalable solution with zero additional hard-
+ware cost. While llm.265 [71], a concurrent study, also at-
+tempts to compress KV caches with video coding, it fails to
+fully exploit the compression potential of video codecs and
+lacks co-design with LLM inference engines (§2.4).
+2.4
+Challenges of Compressed KV Streaming with
+GPU-native Video Codec
+Building an efficient remote KV cache reuse system using
+GPU-native codec hardware involves two challenges.
+C1: Difficult accuracy-compression tradeoff. To min-
+imize transmission latency, the system must maximize the
+compression ratio while guaranteeing the inference accuracy.
+However, naively encoding KV tensors with video codecs
+results in a suboptimal tradeoff. To demonstrate this, we com-
+pare three SOTA methods CacheGen [46], ShadowServe [68],
+and llm.265 [71], against three encoding configurations ap-
+plied on KV tensors‡ as illustrated in Fig.7: (1) Default (stan-
+dard NVENC settings), (2) QP0 (set quantization parameter
+as zero), and (3) Lossless (bypassing the lossy steps).
+As shown in Fig.8, all these methods fail to balance accu-
+racy and compression ratio. (i) Lossy step destroys accuracy.
+Default, QP0, and llm.265 achieve high compression ratios
+‡All three configurations first pad (nn.ZeroPad2d) KV cache in
+[𝑁, 32, 32, 128] shape, then reshape (torch.reshape) it to [𝑁, 256, 176, 3],
+i.e., 𝑁of [256, 176, 3] video frames, lastly encode them into video in H.265
+via NVENC.
+4
+
+
+with DCT and quantization, but suffer from accuracy drops.
+This is because of the different sensitivity of high-frequency
+information between human eyes and LLM inference. The
+high-frequency values imperceptible to human eyes and
+smoothed out by DCT and quantization typically correspond
+to activation outliers in LLMs, which act as critical attention
+sinks or salient features that contain essential information
+for accurate inference [25, 69]. (ii) The Lossless yields low
+compression ratios. While preserving accuracy, Lossless con-
+figuration only delivers a comparable compression ratio to
+CacheGen and ShadowServe. This implies it fails to exploit
+the inter- and intra-frame compression gain§, degenerating
+into a simple entropy coder. We attribute this failure to the
+naive mapping from KV tensors to video frames, which dis-
+rupts the inherent spatial-temporal redundancies (more in
+§3.2). Crucially, this result misled llm.265 to conclude that
+KV tensors lack temporal similarity and incorrectly discard
+the inter-frame prediction step as shown in Fig.7.
+C2: Inefficient remote KV fetching. While compact
+compression enables fast transmission of video chunks, effi-
+cient KV fetching remains a challenge. Naively integrating
+video codecs into existing remote KV reuse systems [13, 54]
+fails to meet this goal as three reasons. (i) Scheduling inter-
+ference (HOL Blocking). The schedulers of current systems
+naively orchestrate the fetching requests with normal ones
+(e.g., 𝑅1 with 𝑅2 in Fig.9) in one batch. This fetching-agnostic
+policy severely blocks non-reuse requests from inference,
+increasing the TTFT. (ii) Pipeline stalls and hardware under-
+utilization. As shown in Fig.9, LMCache’s inference-blocking
+fetch policy leaves GPU compute resources idle until receive
+all KV cache. Mooncake boosts the efficiency by a layer-wise
+fetching-inference pipeline. But, it still wastes resources be-
+cause it lacks mechanisms to handle the networking jitter
+(e.g., the longer T𝑙2 in Fig.9 when bandwidth drops) and un-
+derutilizes decoding hardware (i.e., <20% NVDEC utilization
+under Fig.9 setting). (iii) KV restoring memory contention.
+LMCache and Mooncake restore original KV tensors from
+compressed form at chunk granularity. This coarse-grained
+design causes sudden memory spikes (e.g., 2GB per chunk,
+details in §3.3.2), which contend with the inference memory
+access, worsening the TTFT.
+3
+KVCODEC DESIGN
+KVCodec is an efficient remote KV cache reuse solution that
+enables KV coding with GPU-native codec hardware by ad-
+dressing the above challenges. We first provide an overview
+of KVCodec, then describe the core techniques it leverages.
+§Video encoder exploits spatial and temporal redundancy through intra-
+and inter-frame prediction, eliminating them when pixels can be accurately
+predicted from neighboring pixels or reference frames, storing only the
+residual between the actual pixels and the prediction.
+LLM 
+Inference 
+Engine
+General-
+Purpose 
+Cores
+Scheduler
+Remote 
+Storage
+Backend 
+(Moon-
+cake, 
+Redis, ...)
+Paged 
+Memory
+KV Manager (LMCache)
+Serving Node
+KVCodec
+Video Codec HW.
+Cache Engine
+Efficient KV Decomp-
+ression (§3.3.2)
+Engine (vLLM)
+Transfer Engine
+Codec-friendly KV
+Compression (§3.2)
+Fetch-aware Scheduler
+（§3.3.1）
+Net
+Figure 10: KVCodec overview.
+3.1
+System Overview
+KVCodec integrates three modules into the original KV cache
+manager, as shown in Fig.10. Fetching-aware scheduler (§3.3.1)
+collaborates with the LLM inference engine, distinguishes
+the requests that need remote KV caches, and instructs the
+cache engine for KV fetching. KV decompression (§3.3.2),
+triggered by the scheduler, fetches video chunks from remote
+storage nodes, rapidly decodes them to video frames, restores
+the frames to the original KV caches, and writes them into
+the paged memory of the LLM engine for inference. KV com-
+pression ingests the KV tensors from the inference engine,
+reshapes them to a codec-friendly tensor layout (§3.2), and
+encodes them into videos. These KV videos are delivered
+to storage servers or stored in the local KV cache pool and
+registered as reusable. KV compression and decompression
+execute in the background, transparent to inference engines.
+KVCodec follows the same setup as prior studies [46, 54, 68],
+where KV caches are chunked and encoded offline.
+3.2
+Codec-friendly KV Compression
+To minimize the transmission delay, KV caches must be
+compressed in a highly compact format. The typical com-
+pression gain of video encoding comes from the lossless
+redundant image content elimination and the lossy numeri-
+cal approximation. To ensure LLM generation quality, KV-
+Codec skips lossy steps while aiming to fully leverage loss-
+less redundancy elimination. To this goal, it necessitates
+an appropriate mapping to map the KV cache with shape
+[𝑡𝑜𝑘𝑒𝑛,𝑙𝑎𝑦𝑒𝑟,ℎ𝑒𝑎𝑑𝑛𝑢𝑚,ℎ𝑒𝑎𝑑𝑑𝑖𝑚], as shown the left in Fig.13, to
+video format with shape [𝑓𝑟𝑎𝑚𝑒,ℎ𝑒𝑖𝑔ℎ𝑡,𝑤𝑖𝑑𝑡ℎ, 3] as the right
+in Fig.13, allowing it to be encoded in a minimum size.
+However, the simple mappings deliver very low compres-
+sion ratios. For example, map KV cache to 𝑙𝑎𝑦𝑒𝑟/3 number of
+video frames with shape [𝑡𝑜𝑘𝑒𝑛,𝑐ℎ𝑎𝑛𝑛𝑒𝑙, 3] (where 𝑐ℎ𝑎𝑛𝑛𝑒𝑙=
+ℎ𝑒𝑎𝑑𝑛𝑢𝑚× ℎ𝑒𝑎𝑑𝑑𝑖𝑚) like llm.265, i.e., slice the KV cache in
+Fig.13 horizontally and serve every three continuous layers
+as one frame, and encodes them to H.265 bitstream, yielding
+only 58% of ours compression ratio. Similarly, slicing the KV
+5
+
+
+cache along the token dimension, i.e., vertically in Fig.13, as
+in CacheGen, delivers only 42% of ours.
+To maximize the compression ratio, we propose a codec-
+friendly tensor layout comprising two stages. In inter-frame
+layout (§3.2.1), it determines how to split the KV cache and
+where to place the resulting tensors on each frame to expose
+the most redundancy that video encoding can leverage. In
+intra-frame layout (§3.2.2), it searches for the optimal tensor
+shape and inner-tensor element permutation to achieve the
+maximum compression ratio.
+3.2.1
+Inter-frame layout. To guide the inter-frame lay-
+out, we first analyze the characteristics of the KV cache and
+video encoding, deriving three observations.
+(i) Slicing KV cache along token dimension yields the highest
+image similarity. To identify the axis providing the most re-
+dundancy, we slice the KV cache along each dimension, treat
+sequential slices as consecutive frames, and evaluate their
+visual similarity with SSIM and PSNR¶. As shown in Fig.11,
+token dimension yields the highest similarity scores. We at-
+tribute this to the architectural properties of LLM. Modern
+LLMs’ causal self-attention injects information from preced-
+ing tokens into the subsequent ones, which makies them
+blend with each other; and the similar positional encoding
+of neighboring tokens further brings them closer.
+(ii) Placing a set of tensors over multiple frames delivers
+more compression gain than on one single frame. As shown in
+Fig.12(top), given four consecutive tensors sliced from the KV
+cache, serving them as four consecutive frames and encoding
+them into a video yields a 1.6× compression gain compared
+to stitching them in a single frame. This benefit stems from
+the differential compression nature of video encoding. When
+stitching into a single frame, each pixel block (tensor) can
+only refer to boundary pixels from its adjacent left and upper
+blocks (e.g., the red lines in Fig.12(top)), which wastes many
+referable opportunities within the blocks. In contrast, when
+serving the tensors as four consecutive frames, the pixel
+block can refer to all pixels in its predecessors, resulting in a
+higher compression ratio.
+(iii) Compression ratio is sensitive to the video resolutions.
+It seems we can easily serve each tensor as a video frame to
+minimize video size and transmission delay; however, such
+a video cannot be decoded (144P is the smallest feasible res-
+olution for NVDEC). As shown in Fig.12(bottom), while the
+video size increases with higher resolution as more tensors
+are stitched into a single frame, the decoding efficiency also
+benefits. Given this complex relationship, video resolution
+should be carefully set.
+¶Structural Similarity Index Measure (SSIM) and Peak Signal to Noise Ratio
+(PSNR) are the most widespread metrics to measure similarity of two images.
+The evaluation result of PSNR and visualization is detailed in Appx A.1.
+With these observations in mind, inter-frame layout obeys
+two principles. (1) Slice KV cache along the token dimension
+and place the token-adjacent tensors onto continuous frames
+(observations (i) and (ii)), constructing the maximum tem-
+poral redundancy. (2) Encode videos in multiple-resolution
+versions. Runtime can adaptively select the sweet-spot res-
+olution that minimizes TTFT (observation (iii)), balancing
+transmission and decoding time (§3.3.2).
+Following these two principles, our inter-frame layout
+consists of three steps as illustrated in Fig.13. 1) It first di-
+vides the KV cache into three-layer chunks and slices them
+along the token dimension; each chunk contains 𝑇tensors,
+each with shape [1, 3,𝑐ℎ𝑎𝑛𝑛𝑒𝑙]. 2) 𝑇tensors in each chunk,
+e.g., the dashed box in Fig.13, are sequentially partitioned
+into 𝑇
+𝐹groups, each containing 𝐹tensors. 3) Adjacent ten-
+sors in each group are placed at identical positions across
+consecutive 𝐾frames, and the best tensor layout is deter-
+mined with intra-frame layout. Such an inter-frame layout
+maintains the spatial alignment of consecutive token tensors,
+enabling the encoder to predict each tensor by referencing
+its temporal predecessor (green arrows in Fig.13), thereby
+maximizing temporal redundancy. Moreover, the three lay-
+ers (lowest similarity in Fig.11) are mapped to independently
+coded color channels (YUV/RGB).
+3.2.2
+Intra-frame layout. After slicing the KV cache into
+three-layer token tensors and placing them in the appro-
+priate locations, our next goal is to determine the mapping
+of remaining ℎ𝑒𝑎𝑑𝑛𝑢𝑚(H) and ℎ𝑒𝑎𝑑𝑑𝑖𝑚(D) dimensions. Keep-
+ing the original tensor layout without adjustment, e.g., the
+[1, 3,ℎ𝑒𝑎𝑑𝑛𝑢𝑚×ℎ𝑒𝑎𝑑𝑑𝑖𝑚] as shown the upper left in Fig.14, can
+only deliver an 8.7× compression ratio, much smaller than
+our ultimate 11.9×. Therefore, we must search for the best
+intra-frame layout to optimize the compression ratio.
+We formulate the inter-frame layout as a joint optimiza-
+tion problem that couples geometric tiling (tensor reshaping)
+with inner-element permutation. It creates a 𝑂(log 𝑁× 𝑁!)
+of solution space, 𝑁= 𝐻× 𝐷, where brute-force searching is
+intractable. As exemplified in Fig.14, given a (1, 4096) vector
+of one-layer tensor, there exists 13 geometric tiling times
+4096! permutation solutions. Enumerating such a huge num-
+ber of possibilities and evaluating the video size of each is
+impossible.
+To reduce the search space, we follow three rules deriving
+from the characteristics of LLM architecture.
+Rule (i): Do not exchange the elements from different atten-
+tion heads. In LLMs, each attention head captures a unique
+semantic feature. Exchanging elements between one head
+and another disrupts this semantic information. It breaks the
+similarity among continuous tokens and inter-frame predic-
+tion, leading to a large residual. Our experimental results
+6
+
+
+Key
+Value
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+SSIM ( better)
+.87
+.23
+.64.62
+.56
+.14
+.39.36
+token
+layer
+head num
+head dim
+Figure 11: Similarity analy-
+sis of slicing KV cache along
+different dimensions.
+Scatter them on 
+4 frames (10KB)
+Stitching 4 tensors 
+in 1 frame (16KB)
+Only refer 
+to adjacent 
+pixels
+Refer to 
+all pixels 
+in tensors
+Figure 12: Tensor encoding
+of diverse placement (top)
+and resolutions (bottom).
+𝐹
+Apply intra-
+frame layout
+(§3.2.2)
+Height
+Video format
+[𝑓𝑟𝑎𝑚𝑒, ℎ𝑒𝑖𝑔ℎ𝑡, 𝑤𝑖𝑑𝑡ℎ, 3]
+3. Place consecutive tensors at 
+identical location across 
+consecutive F frame
+Groups (
+𝑇
+𝐹)
+1
+2
+...
+...
+3
+Layer
+Token
+...
+...
+KV cache
+[token, 𝑙𝑎𝑦𝑒𝑟, ℎ𝑒𝑎𝑑𝑛𝑢𝑚, ℎ𝑒𝑎𝑑𝑑𝑖𝑚]
+Tensors (𝑇)
+1. Divide into 3-layer 
+chunks and slice along 
+token
+2. Partition each 
+chunk to F
+groups
+Figure 13: Inter-frame layout splits the KV cache into tensors and
+distributes them onto video frames to create the most temporal redun-
+dancy. The layout of each tensor is in §3.2.2.
+(32, 128)
+(8, 512)
+...
+Reshape      (8 ∗1, 4 ∗128)
+Map 3 layers 
+to the RGB 
+channels.
+ℎ𝑒𝑎𝑑𝑛𝑢𝑚∗ℎ𝑒𝑎𝑑𝑑𝑖𝑚
+...
+𝐻𝑒𝑎𝑑1
+𝐻𝑒𝑎𝑑31
+𝐹𝑟𝑎𝑚𝑒(8, 512, 3)
+(ℎ𝑒𝑎𝑑𝑛𝑢𝑚, ℎ𝑒𝑎𝑑𝑑𝑖𝑚)
+Exchanging elements 
+across heads cause 
+compression ratio 
+degradation.
+( 8, 4 , 1, 128 )
+×
+×
+Rule (i)
+Rule (ii)
+(1, 4096)
+𝐻𝑒𝑎𝑑0
+3
+Figure 14: Intra-frame layout searches for the optimal map-
+ping for the tensor providing the max compression ratio.
+demonstrate that exchanging 50% of elements across 32 atten-
+tion heads results in a 2.4× degradation in compression ratio.
+According to this, we isolate the element permutation across
+attention heads and separately consider ℎ𝑒𝑎𝑑𝑛𝑢𝑚and ℎ𝑒𝑎𝑑𝑑𝑖𝑚,
+as (1, 4096) to (32, 128) shown in Fig.14. It eliminates enumer-
+ating all 4096! permutation, reducing the entire searching
+space from 𝑂(log 𝑁× 𝑁!) to 𝑂((log𝐻× 𝐻!) × (log 𝐷× 𝐷!)).
+Rule (ii): Keep the order of elements within the attention
+head. As the attention head serves as the fundamental seman-
+tic unit of LLMs, elements within a head jointly represent a
+specific feature. Disarranging the elements of the attention
+head disrupts its structured feature correlations, hindering
+intra-frame prediction. In our experiments, exchanging 50%
+of elements in the attention head increases the 17% size of
+intra-predicted frames. For this reason, we preserve the inner-
+head element order, which omits the elements permutation
+of each attention head and reduces the searching space from
+𝑂((log𝐻× 𝐻!) × (log 𝐷× 𝐷!)) to 𝑂((log𝐻× 𝐻!) × log 𝐷.
+Rule (iii): Arrange the order of attention heads as initial.
+Since distinct heads extract independent semantic features
+without an explicit order, their relative positions have a
+negligible impact on compression. Our empirical studies
+demonstrate that random head orders yield only <0.3% of
+size variation. Accordingly, we do not permute the atten-
+tion heads but solely search the geometric tiling of ℎ𝑒𝑎𝑑𝑛𝑢𝑚,
+which ultimately reduces the search space to very limited
+𝑂(log𝐻× log 𝐷). As shown in Fig.14, it only requires evaluat-
+ing the compression ratio of log 32×log 128 = 35 possibilities.
+A
+Bitstream 
+buffer
+A
+Resolution
+Adapter
+Decoding 
+Pool
+NVDEC
+NVDEC
+NVDEC
+NVDEC
+NVDEC
+waiting_
+for_KV
+Fetching-aware Scheduler
+Async KV fetching
+Original inference logic
+Remote Storage
+Fetch Controller
+Running queue
+B
+Waiting queue
+A
+B
+C
+C
+Figure 15: Control flow of KV fetching. Fetching-aware sched-
+uler discriminates the requests. Fetch controller isolates the
+KV fetching procedure.
+Based on the principles above, the optimal layout con-
+verges to only a few dozen options. Since all these principles
+depend solely on the model architecture and video encoding,
+namely being input-agnostic (more in §5.3), we can search
+for the best layout offline. Spending only 1.5 hours, we obtain
+the best layouts (8, 512), (8, 128), and (16, 64) for all three
+models used in this paper, LWM-7B, Yi-34B, and Llama-70B,
+As exemplified in Fig.14, the ℎ𝑒𝑎𝑑𝑛𝑢𝑚and ℎ𝑒𝑎𝑑𝑑𝑖𝑚of LWM-7B
+are reshaped to (8, 4) and (1, 128), and then further reshape
+to (8, 512). Lastly, three (8, 512) matrices from each layer are
+batched into a (8, 512, 3) tensor.
+3.3
+Efficient Remote KV Fetching
+To minimize TTFT, we propse three key techniques, enabling
+KVCodec efficient remote KV cache fetching.
+3.3.1
+Fetching-aware scheduler. Existing remote KV
+reuse systems batch requests without discrimination, caus-
+ing requests with remote KV fetch to block the inference of
+non-reuse requests (§2.4). To tackle this, KV fetching must be
+isolated from the inference engine’s main execution flow. We
+propose a fetching-aware scheduler that enables asynchro-
+nous KV fetching, avoiding blocking non-reuse requests.
+As shown in Fig.15, our scheduler imports a dedicated
+queue, waiting_for_KV, to manage fetching requests. It is lo-
+cated outside the LLM inference engine and collaborates with
+the original queues. In each iteration, the scheduler distin-
+guishes the fetching requests, moves the eligible ones (e.g., re-
+quest A) from the waiting queue into the waiting_for_KV
+7
+
+
+CPU
+Packet Parser
+Video Parser
+On-chip Memory
+Host Memory
+NIC
+Entropy 
+Decoder
+NVDECs
+GPU 
+Bitstream Buffer
+Intra/Inter
+Predictor
+KV Tensor 
+Restoration
+Reference 
+frames
+< 70MB
+Global Memory
+Paged Memory
+Decompress Buffer
+Raw video 
+frames
+Net
+Transmission
+Decoding
+Restoration
+Figure 16: Dataflow of KV fetching, consisting of KV video
+transmission, KV video decoding, and KV tensor restoration.
+queue, and notifies the fetch controller to start fetching their
+KV caches in the background. The non-reuse requests (e.g., B
+and C) still follow the original logic of LLM inference engine,
+entering the running queue for immediate inference. Once
+fetching completes, the fetch controller asks the scheduler to
+dequeue request A from waiting_for_KV queue to running
+for immediate execution in the next iteration. Benefiting
+from this design, the inference engine remains unaffected
+by KV fetching, maintaining its non-reuse or user-defined
+scheduling policy and computation.
+3.3.2
+Efficient KV Decompression. Remote KV fetching
+consists of three phases, involving multiple hardware devices.
+During the transmission phase, the resolution adapter in
+Fig.15 specifies the KV video chunk, fetches it from remote
+storage, and stores it in the bitstream buffer in host memory
+(see Fig.16). During the decoding phase, the decoding pool,
+each instance combined with an NVDEC unit, ingests video
+chunks and decodes them to frames. Lastly, the restoration
+module restores decoded frames to original KV tensors and
+writes them to the paged memory of LLM inference engines.
+Adaptive resolution KV fetching. To minimize TTFT,
+we employ a pipelining mechanism to overlap transmission
+and decoding (restoration naturally overlaps with decod-
+ing, elaborated shortly). However, this is non-trivial for two
+reasons. First, the transmission and decoding efficiency ex-
+hibit opposite characteristics. While transmission favors low-
+resolution videos (e.g., 240P in observation (iii) of §3.2.1), it
+fails to saturate the block-parallel (64×64 pixels) decoding
+units [59], incurring 1.3× higher decoding latency than 1080p
+as the table shown in Fig. 17. Second, the entire KV fetch may
+take dozens of seconds, during which network conditions
+are very likely to fluctuate. Static video chunk sizes suffer
+from dynamic bandwidth, leading to pipeline bubbles.
+To remove these bubbles, we propose a bandwidth-aware
+resolution adaptation mechanism. Unlike CacheGen, which
+pursues transmission efficiency through aggressive quantiza-
+tion at the cost of accuracy, our approach adjusts the tensor-
+to-frame layout (i.e., resolution) and so the video chunk size,
+adapting to dynamic bandwidth without accuracy loss. As
+modern GPUs are equipped with abundant NVDECs (e.g., 5
+240p(180MB)
+480p(205MB) 1080p(256MB)
+Decoding
+460ms
+420ms
+350ms
+Transmit
+466ms
+530ms
+670ms
+Switch from 1080p to 
+240p to minimize bubble
+Fixed 1080p yields large bubbles
+Switch to 480p
+Figure 17: Adaptive resolution KV fetching significantly re-
+duces the pipelining bubbles between transmission and de-
+coding under dynamic bandwidth.
+NVDECs per A100), we abstract them into a decoding pool,
+as shown in Fig. 15, to simultaneously decode multiple video
+chunks. Once a decoding instance is idle, one chunk is de-
+queued from the bitstream buffer for immediate decoding.
+Our adaptation mechanism uses a profile-based table-
+lookup method to select the optimal resolution for the video
+chunk to be fetched. When fetching a video chunk, the resolu-
+tion adapter predicts the network bandwidth (for simplicity,
+calculated from the last chunk’s transmission delay), tra-
+verses the transmission latency for all resolutions, estimates
+decoding delay by table look up, and then selects the opti-
+mal resolution that delivers the minimum bubble (Appx.A.2
+details pseudo code and complete lookup tables). To make
+it concrete, Fig.17 illustrates an example. Before fetching
+the 2nd chunk, the bandwidth degrades from 6 to 3 Gbps.
+Resolution adapter estimates the transmission delay for all
+resolutions, looks up their decoding times (as shown in the
+table), and selects the optimal 240p that delivers the small-
+est 6ms bubble. Four chunks later, bandwidth increases to 4
+Gbps, so the adapter switches to 480p. Compared to the fixed
+1080p approach, our adaptive-resolution method eliminates
+most bubbles, thereby saving 21% in time cost.
+Frame-wise KV tensor restoration. During the decod-
+ing phase, as illustrated in Fig.16, the entropy decoder de-
+composes the bitstream into intra- and inter-frame parts and
+stores them into on-chip memory; then, the intra- and inter-
+frame predictor reads them out to reconstruct raw video
+frames. Due to the limited on-chip memory capacity, inter-
+frame prediction typically keeps the reference frames in GPU
+global memory, competing with the LLM inference engine.
+To achieve interference-free decoding, we propose frame-
+wise KV restoration, which minimizes reliance on global mem-
+ory via two strategies. (1) With careful tensor layout in KV
+compression, the number of reference frames is limited to
+less than four frames. This significantly reduces memory
+overhead to less than 20MB, even at 2K resolution. (2) Unlike
+CacheGen and ShadowServe that restore original KV tensors
+in chunks (1.5K tokens per chunk), our approach executes
+8
+
+
+frame-wise. Once a raw video frame is decoded, it is imme-
+diately mapped back to the original KV tensors and filled
+into the preallocated slots in the paged memory. Some local
+cache policies [29, 76] store the original KV tensors in host
+memory or disks. We follow the CacheGen and Shadowserve,
+filling them into paged memory directly.
+We implement this as a callback function, On_frame_probe.
+This delivers two-fold advantages. On the one hand, the
+callback function can be plugged into the codec, naturally
+pipelining with decoding phase. On the other hand, such a
+frame-wise restoration brings remarkable memory reduc-
+tion to the decompress buffer, from the prior chunk-wise
+1.5-2GB to the frame-wise 50MB. Consequently, combining
+the memory cost of reference frames, the overall decompress
+buffer is less than 70MB. Notably, although On_frame_probe
+executes on CUDA cores, it is super lightweight with only a
+few reshape operations. The frame-to-tensor mapping are
+on-hand encoded in the bitstreams during KV compression.
+4
+IMPLEMENTATION
+We implement KVCodec as a pluggable backend of LM-
+Cache(v0.3.7) [13], and use vLLM(v0.10.2) [40] as the LLM
+inference engine. The codebase primarily uses Python (v3.12),
+and the efficient KV fetcher is partially implemented in C++
+and CUDA, totaling ∼5K LOC. (1) The KV compression is
+implemented with FFmpeg [8] API interface with NVENC,
+and it falls back to CPU encoding when lacking NVENCs.
+The encoding follows H.265 with lossless=1 to skip lossy
+steps. As with CacheGen, the KV cache is quantized to in-
+tegers and encoded into video chunks (each containing 10K
+tokens across three layers) in multiple resolutions, before
+being registered as reusable. (2) For efficient KV fetching, the
+fetching-aware scheduler runs on a standalone thread inte-
+grated into LMCache, synchronizing with the vLLM sched-
+uler via thread events. Adaptive resolution adaptation is
+implemented simply in Python, but for concurrent video de-
+coding, all NVDECs are abstracted into a resource pool, with
+each instance pinned to an NVDEC for a decoding pipeline
+built on GStreamer [9] via nvv4l2decoder. The decoding
+pipeline is implemented in C++ and invoked by Pybind11
+with py::gil_scoped_release to bypass the Python GIL,
+ensuring that decoding does not block the vLLM main loop,
+and frame-wise KV tensor restoration is implemented as a
+On_frame_probe callback plugged in it, with a customized
+Sparse_frame_KV_transfer operator fast write KV tensors
+into paged memory. When multiple fetching requests are
+routed to a single serving node, KVCodec applies a FCFS pol-
+icy if a request consumes the entire bandwidth or GPU mem-
+ory; otherwise, it batches concurrent requests and partitions
+bandwidth evenly as CacheGen did for their KV fetching.
+Compatibility. Since the seamless integration between
+LMCache and vLLM, KVCodec maintains full compatibil-
+ity with vLLM’s native features. Notably, unlike LMCache’s
+blocking inference for fetching, KVCodec follows Moon-
+cake’s layer-wise fetching-inference pipelining. It immedi-
+ately enqueues fetching requests into vLLM’s running queue,
+provided the remaining layers’ fetching time can be hidden
+by inference. Thanks to the inherent chunked prefill from
+vLLM, the inference time cost can be precisely estimated,
+hence eliminating the pipelining bubbles of this layer-wise
+design. For more details, please see Appdx.A.3.
+5
+EVALUATION
+We evaluate KVCodec on three heterogeneous GPU clusters
+with real-world request traces. The key takeaways are:
+• KVCodec reduces up to 3.51× TTFT for fetching re-
+quests and 77% TTFT and 35.4% TPOT for non-reuse requests.
+The performance gains are consistent across diverse models,
+GPUs, and network bandwidths. (§5.2)
+• Codec-friendly KV compression and adaptive-resolution
+KV fetching bring remarkable bandwidth and TTFT sav-
+ings, and frame-wise KV tensor restoration guarantees the
+interference-free inference. (§5.3)
+5.1
+Experimental Setup
+Models. We evaluate KVCodec on three models of different
+sizes and context capabilities: LWM-7B [10] with 1M, Yi-
+34B [6] with 200K, and Llama3-70B [11] with 128K.
+Datasets. We evaluate KVCodec on three long-context
+benchmarks to comprehensively assess performance across
+various tasks and context lengths. (1) L-Eval [16] contains
+20 closed-ended QA tasks, including 508 long documents
+with lengths ranging from 3-200K tokens. (2) LV-Eval [77]
+further increases difficulty and mitigates knowledge leak-
+age, consists of single-hop and multi-hop QA of distrac-
+tion documents, fact confusion, and keyword replacement
+with lengths ranging from 16-256K. (3) LongBench-V2 [17]
+is the most systematic evaluation that employs a multiple-
+choice format to ensure objectivity across single- and multi-
+document QA, long-form conversations, coding, and struc-
+tured data tasks, with 13-167K context lengths.
+Metrics. We compare KVCodec’s accuracy, latency, and
+compression ratio with baselines. Accuracy follows the stan-
+dard metric of each dataset. For L-Eval and LongBench, it is
+the percentage of generated answers that correctly match
+the ground truth; for LV-Eval, it is the F1 score, harmonic
+mean of precision and recall, between the generated answer
+and the ground-truth answer for the QA task. Latency and
+compression ratio still follow §2.4.
+Baselines. To show the superiority brought by KVCodec,
+we compare it with: Full prefill executes the standard LLM
+9
+
+
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+TTFT (s)
+(a) LWM-7B in 2*L20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+10
+20
+30
+(b) LWM-7B in 2*H20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+10
+20
+(c) LWM-7B in 2*A100
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+TTFT (s)
+(d) Yi-34B in 4*L20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+(e) Yi-34B in 2*H20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+(f) Yi-34B in 2*A100
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+TTFT (s)
+(g) Llama-70B in 8*L20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+(h) Llama-70B in 4*H20
+10
+50
+100
+150
+200
+Context Length (K)
+0
+5
+10
+(i) Llama-70B in 4*A100
+CacheGen
+Raw KV reuse
+Full prefill
+Ours
+Figure 18: TTFT of the request with remote KV reuse across different context lengths over various devices and models.
+inference without any KV cache reuse; Raw KV reuse pulls
+the raw KV cache remotely and computes their cross atten-
+tion with query prompts; and three Compressed KV reuse
+methods, CacheGen, ShadowServe, and llm.265.
+Test platform. We test on three GPUs representing differ-
+ent market positions, each with a different number of cards,
+supporting different model sizes. For high-end NVIDIA A100
+(80GB) with 5 NVDECs and mid-range NVIDIA H20 (96GB)
+with 7 NVDECs, LWM, Yi, and Llama3 leverage 2, 2, and 4
+cards, respectively. For low-end NVIDIA L20 (48GB) with 3
+NVDECs, three models utilize 2, 4, and 8 cards.
+5.2
+End-to-End Performance
+This section reports the E2E performance of KVCodec on
+various devices. If not specified, all results are tested on H20
+with the Yi-34B model over a 16Gbps bandwidth network,
+which is typically offered by regular cloud platforms [68].
+TTFT saving of requests requiring KV fetching. As illus-
+trated in Fig. 18, KVCodec achieves the lowest TTFT for the
+fetching request across various hardware and models with
+varying context lengths. It outperforms Full prefill, Raw KV
+reuse, and CacheGen by 13.63×, 3.51×, and 1.52×, on aver-
+age. Full prefill is extremely inappropriate for long-context
+LLM serving; the superlinear computational complexity with
+context lengths causes unacceptable TTFT. Although raw KV
+reuse and CacheGen reuse remote KV caches to mitigate this
+heavy computation, their TTFTs are bottlenecked by trans-
+mission over regular cloud bandwidth because they lacks
+efficient KV compression. In contrast, KVCodec achieves
+Avg
+90%-tile 95%-tile
+0
+50
+100
+1000
+2000
+TTFT (s)
+Ours
+CacheGen
+Full prefill
+(a) TTFT
+Avg
+90%-tile 95%-tile
+0.0
+0.6
+1.2
+1.8
+TPOT (s)
+Ours
+CacheGen
+Full prefill
+(b) TPOT
+Figure 19: KVCodec’s KV fetching provides remarkable TTFT
+gain to non-reuse requests. KVCodec also offers TPOT benefit
+under PD-aggregated environments.
+highly compact KV compression, thereby significantly re-
+ducing transmission latency. The most limited speedup, as
+shown in Fig. 18 (d) and (g), occurs at serving on the L20
+GPUs. This phenomenon arises because L20 has only three
+NVDECs, which incur a queue up for decoding, and the
+Grouped Query Attention (GQA) used by Yi and Llama gen-
+erates a relatively smaller KV cache, which reduces the bene-
+fits of our compression. Even so, KVCodec saves remarkable
+TTFT for fetching requests.
+TTFT & TPOT benefits for non-reuse requests. Beyond
+TTFT reduction for fetching requests, KVCodec keeps al-
+most interference-free performance for non-reuse requests.
+We evaluate this on a real-world request trace [54] with
+request arrival rate at 0.2 req/s, and set 40K tokens as the
+reuse threshold for KVCodec and CacheGen, i.e., prefill re-
+quests with <40K context tokens and reuse remote KV for
+10
+
+
+5.0
+7.5
+10.0
+12.5
+Compression Ratio
+0.90
+0.95
+1.00
+Normalized Accuracy
+(a) LWM-7B
+Better
+6
+8
+10
+Compression Ratio
+(b) Yi-34B
+Better
+6
+8
+10
+Compression Ratio
+(c) Llama-70B
+Better
+Ours
+CacheGen
+ShadowServe
+llm.265
+LEval
+LvEval
+LongBench
+Figure 20: KVCodec achieves the best accuracy and compres-
+sion ratio tradeoff over diverse models and benchmarks.
+1
+3
+6
+10
+20
+40
+Bandwidth (Gbps)
+20
+30
+60
+100
+150
+200
+Context Length (K)
+2.97 2.77 2.12 1.68 1.42 1.23
+3.03 2.78 2.14 1.62 1.28 1.25
+3.23 3.24 2.67 2.02 1.53 1.51
+3.29 3.37 2.85 1.94 1.61 1.57
+3.26 3.23 2.70 1.92 1.52 1.46
+3.29 3.37 2.85 1.94 1.61 1.57
+(a) LWM-7B
+1
+3
+6
+10
+20
+40
+Bandwidth (Gbps)
+3.49 3.36 2.72 2.14 1.80 1.52
+3.50 3.12 2.52 1.93 1.51 1.28
+3.50 3.18 2.60 2.03 1.62 1.34
+3.44 3.03 2.42 1.79 1.43 1.26
+3.46 3.09 2.48 1.86 1.49 1.22
+3.44 3.03 2.42 1.79 1.43 1.26
+(b) Yi-34B
+1
+3
+6
+10
+20
+40
+Bandwidth (Gbps)
+3.05 3.21 3.04 2.36 1.61 1.43
+3.07 3.17 3.21 2.17 1.45 1.08
+3.09 3.22 2.96 2.14 1.53 1.18
+3.10 3.14 2.82 2.07 1.38 0.97
+2.88 2.97 2.74 1.99 1.35 1.03
+2.94 2.98 2.70 1.93 1.29 0.96
+(c) Llama-70B
+0.9×
+2.20×
+3.50×
+ 1.0×
+CacheGen Better
+Ours Better
+Figure 21: Performance comparison between CacheGen and
+ours. The value is the ratio of CacheGen’s TTFT ÷ our TTFT.
+>40K-token requests. All requests follow the vLLM’s default
+First-Come-First-Served (FCFS) policy. As illustrated in Fig.
+19(a), KVCodec reduces 77.1% and 98% of TTFT compared to
+CacheGen and Full prefill. This stems from a two-fold. For
+non-reuse requests orchestrated with fetching requests in a
+single batch, KVCodec’s fetching-aware scheduler enables
+KV fetching to run in the background, avoiding blocking
+the inference of non-reuse requests such as CacheGen and
+thereby reducing their TTFT. For non-reuse requests that
+arrive but are still in the waiting state, all techniques in KV-
+Codec work together, boosting the serving efficiency of run-
+ning requests, reducing the waiting time for all requests, and
+thus saving significant TTFT. KVCodec also reduce TPOT
+by 35.4% and 40% compared to CacheGen and Full prefill.
+Full prefill must compute the input contexts for all requests.
+Such a large amount of computing workload means vLLM
+must always piggyback decoding on prefilling requests, se-
+verely delaying their TPOT. Remote KV reuse in KVCodec
+and CacheGen eliminates the prefilling workload, allowing
+decoding to run in isolation and resulting in low TPOTs.
+Moreover, compared to CacheGen’s CUDA-based decom-
+pression, which competes for GPU resources, KVCodec’s
+codec-based method provides better performance.
+High compression ratio without accuracy drop. As shown
+in Fig.20, KVCodec achieves the best compression ratio across
+all datasets and models while maintaining lossless accuracy.
+It improves the compression ratio by 2.17× over CacheGen
+and 1.93× over ShadowServe, without accuracy degradation;
+LWM-7B Yi-34BLlama-70B
+0
+6
+12
+Compression Ratio
+quant
+quant+inter.&intra.
+quant+inter.
+Figure 22: Compression ratio
+breakdown on three models.
+Ours
+Ours
+w/o Ada.
+Cache-
+Gen
+Full
+prefill
+0
+5
+10
+15
+TTFT (s)
+Transfer
+Decompress
+Compute
+Figure 23: TTFT breakdown
+across different baselines.
+and against llm.265, KVCodec delivers a 12% accuracy en-
+hancement alongside 1.41× of compression ratio. The preser-
+vation of accuracy is achieved by strictly using the H.265
+lossless mode, which bypasses the lossy steps of video en-
+coding, and the same quantization method as CacheGen
+and ShadowServe. The superior compression performance
+stems from a codec-friendly tensor layout that appropriately
+maps KV tensors to pixel blocks, thereby maximizing data
+redundancy that can be eliminated by video coding.
+TTFT comparison of KVCodec v.s. CacheGen. KVCodec
+delivers robust performance across a wide range of band-
+width and context lengths. We conduct a comprehensive
+evaluation of TTFT against CacheGen across 1-40Gbps band-
+width and 20K-200K context lengths. Fig. 21 indicates that
+under bandwidth constraints of <40 Gbps, KVCodec achieves
+an average speedup of 1.29×–3.50× over CacheGen. The per-
+formance gain diminishes as the bandwidth increases. This
+is because, as bandwidth increases, the arrival rate of the
+fetched video chunk exceeds NVDEC’s decoding capacity,
+breaking the transmission-decoding pipeline and causing
+waiting (more in §5.3). Conversely, CacheGen’s CUDA-based
+decompression kernel can leverage all CUDA cores on GPUs
+to accelerate decompression; however, this significantly im-
+pacts the inference of non-reuse requests, as shown in Fig.19.
+Nevertheless, in almost all scenarios, typically under low-
+end GPU-paired bandwidth, KVCodec still beats CacheGen
+thanks to our careful design.
+5.3
+Ablation Study
+We evaluate the effectiveness of each component in KVCodec
+by ablation studies.
+Codec-friendly KV compression helps KVCodec achieve
+11.9× compression ratio while keeping high accuracy. Fig. 22
+breaks down the compression contribution of quantization,
+inter-frame layout, and intra-frame layout on all three mod-
+els. Compared to quantization, our inter-frame layout achieves
+an average compression gain of 2.2×, while the intra-frame
+layout further boosts this improvement to 2.96×. Further-
+more, compared to LWM-7B and Yi-34B, the proportion of
+intra-frame layout in Llama-70B is the largest due to its
+fewest attention heads and usage of GQA.
+11
+
+
+Decoding and restoring 
+KV cache of 7 concurrent 
+video chunks cost only 
+400MB GPU memory.
+Figure 24: GPU memory cost
+of concurrent 7 video chunks.
+L20*4
+H20*2 A100*2
+0
+30
+60
+90
+Decoding TPT
+(K tokens/s)
+Ours
+CacheGen
+Figure 25: Decoding through-
+put on different devices.
+Adaptive resolution KV fetching. As shown in Fig. 23,
+under the same bandwidth state as Fig. 17, KVCodec reduces
+the TTFT to 5.2s, representing a 20% improvement over the
+baseline without adaptive resolution. This flexibility allows
+KVCodec to handle network jitter without compromising
+accuracy, unlike CacheGen’s adaptive quantization level. Fur-
+thermore, pipelining transmission and decoding effectively
+hides the decoding overhead, resulting in less than 400ms la-
+tency per video chunk. And remote KV reuse reduces prefill
+computation to under 50ms.
+Frame-wise KV tensor restoration. As shown in Fig. 24,
+concurrently decoding and restoring KV caches of 7 video
+chunks only occupies 400MB of peak GPU memory. Such
+marginal overhead does not interfere with vLLM, which
+ensures memory safety in long-context scenarios. In particu-
+lar, a single KV fetching only needs NVDEC to pre-allocate
+40MB for video decoding, and the restoration to reshape and
+dequantize with 47MB.
+Decoding throughput is typically bottlenecked by avail-
+able NVDEC chips. We evaluate this with Yi-34B model on
+different platforms. As shown in Fig. 25, KVCodec achieves
+27K, 67K, and 47K tokens/s on 4 L20, 2 H20, and 2 A100
+platforms. They are only 0.3×, 1.34×, and 0.88× the perfor-
+mance of CacheGen. These unsatisfactory results stem from
+the hardware specifications: L20 has only 3 NVDECs, while
+H20 and A100 have 7 and 5. In contrast, CacheGen relies
+on CUDA cores, which can leverage the entire GPU com-
+puting resources. Despite unsatisfactory, KVCodec’s overall
+performance is much better than CUDA-base CacheGen. We
+believe that as researchers recognize the universality of codec
+ASICs, next-generation GPUs will overcome these resource
+limitations.
+6
+LIMITATION AND DISCUSSION
+Online KV compression is essential for P-D disaggrega-
+tion [80], where KV cache must be transmitted between
+disaggregated prefilling and decoding nodes, and for fault tol-
+erance [27, 60, 62] or instance preemption [50], that migrates
+KV cache across nodes. While KVCodec enables compact
+KV compression, limited NVENC resources make the KV
+compression procedure insufficient to meet runtime require-
+ments. We believe that compressed KV reuse is promising
+and will support a broader range of runtime scenarios with
+the next-generation, powerful NVENC released.
+Preallocate GPU memory for fetching requests. Align-
+ing with Mooncake and LMCache, KVCodec treats fetching
+requests as first-class citizens, preallocating memory for all
+KV caches upfront. Although this mechanism likely blocks
+the inference of non-reuse requests due to the memory bud-
+get, it ensures the timely inference of fetching requests. One
+feasible improvement is to store the fetched KV cache in
+local storage [37, 51, 70], making room for non-reuse request
+inference and swapping them to GPU memory when needed.
+We leave this for future work.
+7
+RELATED WORK
+LLM inference engines today employ a bunch of tech-
+niques to boost inference performance. Continuous batch-
+ing [66, 75] avoids ineffective zero padding by fine-grained
+orchestrating prefilling and decoding workloads together for
+higher efficiency. Chunked prefill [15, 65] further improves
+it to prefill long context in chunks, mitigating execution
+bubbles, while prefill-decoding disaggregation [80] isolates
+two inference phases, eliminating interference. Paged atten-
+tion [40] leverages paged management to eliminate memory
+fragmentation, while prefix caching [44, 79] reuses KV cache
+across requests to further reduce prefilling cost.
+KV cache management becomes increasingly critical
+as the context length increases. Beyond the above de facto
+paged memory, many studies [28, 29, 36, 76] store KV cache
+outside the GPU, leveraging host memory and disks. They
+swap the inactive KV cache out and swap it back into the
+GPU when needed. Some other methods [61, 69, 78] are
+much more aggressive, identifying the cold-spot KV cache
+and directly evicting it permanently. KVCodec is orthogonal
+to these methods that require maintaining tensor formats
+for GPU direct use, but encodes KV caches into bitstreams
+to enable efficient cross-node transmission.
+Distributed KV cache management further extends
+caching capabilities across distributed nodes, to overcome
+local memory constraints. Beyond the systems mentioned in
+the background, some work [27, 35, 43] proposes granular
+paging and prefetching mechanisms to speed up or mask
+retrieval delays. To tackle the transmission issue, some ar-
+chitectural works [42, 54] explore disaggregated memory
+pooling via RDMA, uses zero-copy to bypass CPU during
+data transfer. Other work [46, 68] compresses the KV cache
+before transmission, whereas KVCodec leverages hardware
+video codecs to enable efficient remote reuse of the KV cache.
+12
+
+
+8
+CONCLUSION
+In this paper, we study the remote KV cache reuse for LLM
+inference. We find that existing methods provide only subop-
+timal KV compression and their decompression either com-
+petes for inference resources or requires new hardware de-
+vices at extra cost. Unlike them, we leverages idle GPU-native
+chips and propose KVCodec system. KVCodec contains a
+codec-friendly tensor layout that compress KV caches to com-
+pact video formats, and an efficient remote KV fetcher that
+hides network latency and eliminates resource contention. In
+our evaluation across heterogeneous models and hardware,
+KVCodec delivers significant speedups in TTFT compared
+to SOTA methods while maintaining high accuracy.
+REFERENCES
+[1] Aibrix: An open-source, large-scale llm inference infrastructure for
+system research. https://github.com/vllm-project/aibrix.
+[2] Amazon
+ec2
+instance
+types.
+https://aws.amazon.com/ec2/
+instance-types/?nc1=h_ls.
+[3] Amd
+advanced
+media
+framework.
+https://gpuopen.com/
+advanced-media-framework/.
+[4] Intel quick sync video installation. https://www.intel.com/content/
+www/us/en/architecture-and-technology/quick-sync-video/
+quick-sync-video-installation.html?wapkw=quick%20sync%20video.
+[5] Nvidia video codec sdk. https://developer.nvidia.com/video-codec-sdk.
+[6] 01-ai/yi-34b.
+https://huggingface.co/01-ai/Yi-34B, (Accessed on
+02/04/2026).
+[7] Cursor - the ai code editor.
+https://cursor.com, (Accessed on
+02/04/2026).
+[8] Ffmpeg, a complete, cross-platform solution to record, convert and
+stream audio and video.
+https://www.ffmpeg.org/, (Accessed on
+02/04/2026).
+[9] Gstreamer: open source multimedia framework. https://gstreamer.
+freedesktop.org/, (Accessed on 02/04/2026).
+[10] Largeworldmodel/lwm-text-chat-1m.
+https://huggingface.co/
+LargeWorldModel/LWM-Text-Chat-1M, (Accessed on 02/04/2026).
+[11] meta-llama/llama-3.3-70b-instruct.
+https://huggingface.co/
+meta-llama/Llama-3.3-70B-Instruct, (Accessed on 02/04/2026).
+[12] Introducing claude 4. https://www.anthropic.com/news/claude-4, (Ac-
+cessed on 07/14/2025).
+[13] Lmcache.
+https://github.com/LMCache/LMCache, (Accessed on
+07/14/2025).
+[14] Long system prompts in claude.
+https://docs.anthropic.com/
+en/release-notes/system-prompts#august-5-2025,
+(Accessed
+on
+08/05/2025).
+[15] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+jee. Taming {Throughput-Latency} tradeoff in {LLM} inference with
+{Sarathi-Serve}. In 18th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 24), pages 117–134, 2024.
+[16] Chenxin An, Shansan Gong, Ming Zhong, Xingjian Zhao, Mukai Li, Jun
+Zhang, Lingpeng Kong, and Xipeng Qiu. L-eval: Instituting standard-
+ized evaluation for long context language models. In Proceedings of the
+62nd Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers), pages 14388–14411, 2024.
+[17] Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xiaozhi Wang, Xin Lv,
+Shulin Cao, Jiazheng Xu, Lei Hou, Yuxiao Dong, et al. Longbench v2:
+Towards deeper understanding and reasoning on realistic long-context
+multitasks. In Proceedings of the 63rd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pages 3639–3664,
+2025.
+[18] Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The
+long-document transformer. arXiv preprint arXiv:2004.05150, 2020.
+[19] Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai,
+Eliza Rutherford, Katie Millican, George Bm Van Den Driessche, Jean-
+Baptiste Lespiau, Bogdan Damoc, Aidan Clark, et al. Improving lan-
+guage models by retrieving from trillions of tokens. In International
+conference on machine learning, pages 2206–2240. PMLR, 2022.
+[20] Shiyi Cao, Shu Liu, Tyler Griggs, Peter Schafhalter, Xiaoxuan Liu,
+Ying Sheng, Joseph E Gonzalez, Matei Zaharia, and Ion Stoica. Moe-
+lightning: High-throughput moe inference on memory-constrained
+gpus. In ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems (ACM ASPLOS), 2025.
+[21] Shiyi Cao, Yichuan Wang, Ziming Mao, Pin-Lun Hsu, Liangsheng Yin,
+Tian Xia, Dacheng Li, Shu Liu, Yineng Zhang, Yang Zhou, Ying Sheng,
+Joseph Gonzalez, and Ion Stoica. Locality-aware fair scheduling in llm
+serving. arXiv preprint arXiv:2501.14312, 2025.
+[22] Mark Chen. Evaluating large language models trained on code. arXiv
+preprint arXiv:2107.03374, 2021.
+[23] Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat,
+Noveen Sachdeva, Inderjit Dhillon, Marcel Blistein, Ori Ram, Dan
+Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the frontier with ad-
+vanced reasoning, multimodality, long context, and next generation
+agentic capabilities. arXiv preprint arXiv:2507.06261, 2025.
+[24] NVIDIA Corporation. Dynamo distributed kv cache manager (nvidia
+dynamo sdk v0.2.0). In NVIDIA Corporation, 2025.
+[25] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer.
+Llm.int8(): 8-bit matrix multiplication for transformers at scale. Ad-
+vances in neural information processing systems (NeurIPS), 2022.
+[26] Tianyu Fu, Zihan Min, Hanling Zhang, Jichao Yan, Guohao Dai, Wanli
+Ouyang, and Yu Wang. Cache-to-cache: Direct semantic communica-
+tion between large language models. arXiv preprint arXiv:2510.03215,
+2025.
+[27] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii
+Ustiugov, Yuvraj Patel, and Luo Mai. {ServerlessLLM}:{Low-Latency}
+serverless inference for large language models. In 18th USENIX Sym-
+posium on Operating Systems Design and Implementation (OSDI 24),
+pages 135–153, 2024.
+[28] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevd-
+jic, Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. {Cost-
+Efficient} large language model serving for multi-turn conversations
+with {CachedAttention}. In 2024 USENIX Annual Technical Conference
+(USENIX ATC 24), pages 111–126, 2024.
+[29] Shiwei Gao, Youmin Chen, and Jiwu Shu. Fast state restoration in
+llm serving with hcache. In Proceedings of the Twentieth European
+Conference on Computer Systems, pages 128–143, 2025.
+[30] In Gim, Guojun Chen, Seung-seob Lee, Nikhil Sarda, Anurag Khan-
+delwal, and Lin Zhong. Prompt cache: Modular attention reuse for
+low-latency inference. arXiv preprint arXiv:2311.04934, 2023.
+[31] Tyler Griggs, Xiaoxuan Liu, Jiaxiang Yu, Doyoung Kim, Wei-Lin Chi-
+ang, Alvin Cheung, and Ion Stoica. M\’elange: Cost efficient large
+language model serving by exploiting gpu heterogeneity. arXiv preprint
+arXiv:2404.14527, 2024.
+[32] Daya Guo, Qihao Zhu, Dejian Yang, Zhenda Xie, Kai Dong, Wentao
+Zhang, Guanting Chen, Xiao Bi, Yu Wu, YK Li, et al. Deepseek-coder:
+When the large language model meets programming–the rise of code
+intelligence. arXiv preprint arXiv:2401.14196, 2024.
+[33] Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng
+Cheng, Jinlin Wang, Ceyao Zhang, Zili Wang, Steven Ka Shing Yau,
+13
+
+
+Zijuan Lin, et al. Metagpt: Meta programming for a multi-agent collab-
+orative framework. In The twelfth international conference on learning
+representations, 2023.
+[34] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W
+Mahoney, Yakun S Shao, Kurt Keutzer, and Amir Gholami. Kvquant:
+Towards 10 million context length llm inference with kv cache quanti-
+zation. Advances in Neural Information Processing Systems (NeurIPS),
+37:1270–1303, 2024.
+[35] Cunchen Hu, Heyang Huang, Junhao Hu, Jiang Xu, Xusheng Chen,
+Tao Xie, Chenxi Wang, Sa Wang, Yungang Bao, Ninghui Sun, et al.
+Memserve: Context caching for disaggregated llm serving with elastic
+memory pool. arXiv preprint arXiv:2406.17565, 2024.
+[36] Jinwoo Jeong and Jeongseob Ahn. Accelerating llm serving for multi-
+turn dialogues with efficient resource management. In Proceedings
+of the 30th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 2, pages 1–15,
+2025.
+[37] Jiazhi Jiang, Yao Chen, Zining Zhang, Bingsheng He, Pingyi Luo, Mian
+Lu, Yuqiang Chen, Hongbing Zhang, Jiangsu Du, Dan Huang, et al.
+Efficient kv cache spillover management on memory-constrained gpu
+for llm inference. IEEE Transactions on Parallel and Distributed Systems,
+37(1):90–105, 2025.
+[38] YOUHE JIANG, Fangcheng Fu, Xiaozhe Yao, Guoliang HE, Xupeng
+Miao, Ana Klimovic, Bin CUI, Binhang Yuan, and Eiko Yoneki. De-
+mystifying cost-efficiency in llm serving over heterogeneous gpus. In
+International Conference on Machine Learning (ICML), 2025.
+[39] Chao Jin, Zili Zhang, Xuanlin Jiang, Fangyue Liu, Xin Liu, Xuanzhe
+Liu, and Xin Jin. Ragcache: Efficient knowledge caching for retrieval-
+augmented generation. arXiv preprint arXiv:2404.12457, 2024.
+[40] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica.
+Efficient memory management for large language model serving with
+pagedattention. In 29th Symposium on Operating Systems Principles
+(ACM SOSP), 2023.
+[41] Mingcong Lei, Honghao Cai, Zezhou Cui, Liangchen Tan, Junkun
+Hong, Gehan Hu, Shuangyu Zhu, Yimou Wu, Shaohan Jiang, Ge Wang,
+et al. Robomemory: A brain-inspired multi-memory agentic framework
+for lifelong learning in physical embodied systems. In NeurIPS 2025
+Workshop on Space in Vision, Language, and Embodied AI, 2025.
+[42] Nandor Licker, Kevin Hu, Vladimir Zaytsev, and Lequn Chen. Rdma
+point-to-point communication for llm systems.
+arXiv preprint
+arXiv:2510.27656, 2025.
+[43] Bin Lin, Chen Zhang, Tao Peng, Hanyu Zhao, Wencong Xiao, Minmin
+Sun, Anmin Liu, Zhipeng Zhang, Lanbo Li, Xiafei Qiu, et al. Infinite-llm:
+Efficient llm service for long context with distattention and distributed
+kvcache. arXiv preprint arXiv:2401.02669, 2024.
+[44] Chaofan Lin, Zhenhua Han, Chengruidong Zhang, Yuqing Yang, Fan
+Yang, Chen Chen, and Lili Qiu. Parrot: Efficient serving of {LLM-
+based} applications with semantic variable. In 18th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 24), pages 929–
+945, 2024.
+[45] Fanqi Lin, Ruiqian Nai, Yingdong Hu, Jiacheng You, Junming Zhao,
+and Yang Gao. Onetwovla: A unified vision-language-action model
+with adaptive reasoning. arXiv preprint arXiv:2505.11917, 2025.
+[46] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang,
+Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Anantha-
+narayanan, et al. Cachegen: Kv cache compression and streaming
+for fast large language model serving. In Proceedings of the ACM
+SIGCOMM 2024 Conference, pages 38–56, 2024.
+[47] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu,
+Vladimir Braverman, Beidi Chen, and Xia Hu. Kivi: A tuning-free asym-
+metric 2bit quantization for kv cache. arXiv preprint arXiv:2402.02750,
+2024.
+[48] Ziming Mao, Tian Xia, Zhanghao Wu, Wei-Lin Chiang, Tyler Griggs,
+Romil Bhardwaj, Zongheng Yang, Scott Shenker, and Ion Stoica. Sky-
+serve: Serving ai models across regions and clouds with spot instances.
+In Proceedings of the Twentieth European Conference on Computer Sys-
+tems, pages 159–175, 2025.
+[49] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao
+Jia, and Rashmi Vinayak. Helix: Serving large language models over
+heterogeneous gpus and network via max-flow. In ACM International
+Conference on Architectural Support for Programming Languages and
+Operating Systems (ACM ASPLOS), 2025.
+[50] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin Cui,
+and Zhihao Jia. Spotserve: Serving generative large language models
+on preemptible instances. In Proceedings of the 29th ACM International
+Conference on Architectural Support for Programming Languages and
+Operating Systems, Volume 2, pages 1112–1127, 2024.
+[51] Xiurui Pan, Endian Li, Qiao Li, Shengwen Liang, Yizhou Shan, Ke Zhou,
+Yingwei Luo, Xiaolin Wang, and Jie Zhang. Instinfer: In-storage at-
+tention offloading for cost-effective long-context llm inference. arXiv
+preprint arXiv:2409.04992, 2024.
+[52] Zhuoshi Pan, Qianhui Wu, Huiqiang Jiang, Menglin Xia, Xufang Luo,
+Jue Zhang, Qingwei Lin, Victor Rühle, Yuqing Yang, Chin-Yew Lin, et al.
+Llmlingua-2: Data distillation for efficient and faithful task-agnostic
+prompt compression. In ACL (Findings), 2024.
+[53] Chen Qian, Xin Cong, Cheng Yang, Weize Chen, Yusheng Su, Juyuan
+Xu, Zhiyuan Liu, and Maosong Sun. Communicative agents for soft-
+ware development. arXiv preprint arXiv:2307.07924, 6(3):1, 2023.
+[54] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing
+Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. Mooncake:
+Trading more storage for less computation — a KVCache-centric ar-
+chitecture for serving LLM chatbot. In 23rd USENIX Conference on File
+and Storage Technologies (FAST 25), pages 155–170, Santa Clara, CA,
+February 2025. USENIX Association.
+[55] Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai
+Gat, Xiaoqing Ellen Tan, Yossi Adi, Jingyu Liu, Romain Sauvestre, Tal
+Remez, et al. Code llama: Open foundation models for code. arXiv
+preprint arXiv:2308.12950, 2023.
+[56] Hao Shi, Bin Xie, Yingfei Liu, Lin Sun, Fengrong Liu, Tiancai Wang,
+Erjin Zhou, Haoqiang Fan, Xiangyu Zhang, and Gao Huang. Memo-
+ryvla: Perceptual-cognitive memory in vision-language-action models
+for robotic manipulation. arXiv preprint arXiv:2508.19236, 2025.
+[57] Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, and
+Yiying Zhang. Preble: Efficient distributed prompt scheduling for llm
+serving. arXiv preprint arXiv:2407.00023, 2024.
+[58] Foteini Strati, Sara McAllister, Amar Phanishayee, Jakub Tarnawski,
+and Ana Klimovic. Déjàvu: Kv-cache streaming for fast, fault-tolerant
+generative llm serving. In Proceedings of the 41st International Confer-
+ence on Machine Learning, 2024.
+[59] Gary J Sullivan, Jens-Rainer Ohm, Woo-Jin Han, and Thomas Wiegand.
+Overview of the high efficiency video coding (hevc) standard. IEEE
+Transactions on circuits and systems for video technology, 22(12):1649–
+1668, 2012.
+[60] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang,
+Yong Li, and Wei Lin. Llumnix: Dynamic scheduling for large language
+model serving. In 18th USENIX symposium on operating systems design
+and implementation (OSDI 24), pages 173–191, 2024.
+[61] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci,
+and Song Han. Quest: Query-aware sparsity for efficient long-context
+llm inference. In International Conference on Machine Learning (ICML),
+2024.
+14
+
+
+[62] Alexey Tumanov, Timothy Zhu, Jun Woo Park, Michael A Kozuch, Mor
+Harchol-Balter, and Gregory R Ganger. Tetrisched: global reschedul-
+ing with adaptive plan-ahead in dynamic heterogeneous clusters. In
+Proceedings of the Eleventh European Conference on Computer Systems,
+pages 1–16, 2016.
+[63] Haoyu Wang, Christopher M Poskitt, and Jun Sun. Agentspec: Cus-
+tomizable runtime enforcement for safe and reliable llm agents. arXiv
+preprint arXiv:2503.18666, 2025.
+[64] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen, Dingyan Zhang,
+Chenguang Fang, Rong Chen, Wenyuan Yu, and Haibo Chen. Kvcache
+cache in the wild: Characterizing and optimizing kvcache cache at
+a large cloud provider. In 2025 USENIX Annual Technical Conference
+(USENIX ATC 25). USENIX Association, July 2025.
+[65] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu,
+and Xin Jin. Loongserve: Efficiently serving long-context large lan-
+guage models with elastic sequence parallelism. In Proceedings of the
+ACM SIGOPS 30th Symposium on Operating Systems Principles, pages
+640–654, 2024.
+[66] Bingyang Wu, Yinmin Zhong, Zili Zhang, Shengyu Liu, Fangyue Liu,
+Yuanhang Sun, Gang Huang, Xuanzhe Liu, and Xin Jin. Fast dis-
+tributed inference serving for large language models. arXiv preprint
+arXiv:2305.05920, 2023.
+[67] Junde Wu, Jiayuan Zhu, Yuyuan Liu, Min Xu, and Yueming Jin. Agentic
+reasoning: A streamlined framework for enhancing llm reasoning with
+agentic tools. arXiv preprint arXiv:2502.04644, 2025.
+[68] Xingyu Xiang, Raj Joshi, Yuhan Liu, Jiayi Yao, Chenxingyu Zhao,
+Junchen Jiang, Yang Zhou, Eddie Kohler, and Minlan Yu. Shadowserve:
+Interference-free kv cache fetching for distributed prefix caching. arXiv
+preprint arXiv:2509.16857, 2025.
+[69] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike
+Lewis. Efficient streaming language models with attention sinks. In
+International Conference on Learning Representations (ICLR), 2024.
+[70] Yi Xiong, Hao Wu, Changxu Shao, Ziqing Wang, Rui Zhang, Yuhong
+Guo, Junping Zhao, Ke Zhang, and Zhenxuan Pan. Layerkv: Optimizing
+large language model serving with layer-wise kv cache management.
+arXiv preprint arXiv:2410.00428, 2024.
+[71] Ceyu Xu, Yongji Wu, Xinyu Yang, Beidi Chen, Matthew Lentz,
+Danyang Zhuo, and Lisa Wu Wills. Llm. 265: Video codecs are se-
+cretly tensor codecs. In Proceedings of the 58th IEEE/ACM International
+Symposium on Microarchitecture (MICRO), 2025.
+[72] John Yang, Carlos E Jimenez, Alexander Wettig, Kilian Lieret, Shunyu
+Yao, Karthik Narasimhan, and Ofir Press. Swe-agent: Agent-computer
+interfaces enable automated software engineering. Advances in Neural
+Information Processing Systems, 37:50528–50652, 2024.
+[73] Lu Ye, Ze Tao, Yong Huang, and Yang Li. Chunkattention: Efficient
+self-attention with prefix-aware kv cache and two-phase partition.
+arXiv preprint arXiv:2402.15220, 2024.
+[74] Alex Young, Bei Chen, Chao Li, Chengen Huang, Ge Zhang, Guanwei
+Zhang, Guoyin Wang, Heng Li, Jiangcheng Zhu, Jianqun Chen, et al.
+Yi: Open foundation models by 01. ai. arXiv preprint arXiv:2403.04652,
+2024.
+[75] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+Byung-Gon Chun. Orca: A distributed serving system for transformer-
+based generative models. In USENIX Symposium on Operating Systems
+Design and Implementation (OSDI), pages 521–538, 2022.
+[76] Lingfan Yu, Jinkun Lin, and Jinyang Li. Stateful large language model
+serving with pensieve. In Proceedings of the Twentieth European Con-
+ference on Computer Systems, pages 144–158, 2025.
+[77] Tao Yuan, Xuefei Ning, Dong Zhou, Zhijie Yang, Shiyao Li, Minghui
+Zhuang, Zheyue Tan, Zhuyu Yao, Dahua Lin, Boxun Li, et al. Lv-eval:
+A balanced long-context benchmark with 5 length levels up to 256k.
+arXiv preprint arXiv:2402.05136, 2024.
+[78] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin
+Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark
+Barrett, et al. H2o: Heavy-hitter oracle for efficient generative infer-
+ence of large language models, 2023.
+[79] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. Sglang: Efficient
+execution of structured language model programs. 2024.
+[80] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. Distserve: Disaggregating prefill
+and decoding for goodput-optimized large language model serving. In
+18th USENIX Symposium on Operating Systems Design and Implemen-
+tation (OSDI 24), pages 193–210, 2024.
+[81] Yufan Zhuang, Xiaodong Yu, Jialian Wu, Ximeng Sun, Ze Wang,
+Jiang Liu, Yusheng Su, Jingbo Shang, Zicheng Liu, and Emad Bar-
+soum. Self-taught agentic long context understanding. arXiv preprint
+arXiv:2502.15920, 2025.
+A
+APPENDIX
+A.1
+Additional results of image similarity
+Key
+Value
+16
+20
+24
+28
+32
+36
+PSNR ( better)
+33
+21
+27 27
+25
+18
+24 23
+token
+layer
+head num
+head dim
+Figure 26: PSNR analysis of slicing KV cache along different
+dimensions.
+Fig. 26 plots the PSNR value of slicing the KV cache along
+different dimensions. The same as SSIM in Fig.11, slicing the
+KV cache along token dimensions brings the most image
+similarity.
+Fig. 27 visualizes the different image similarity levels. We
+add different levels of noise to the original picture, leading
+to the noised picture having a corresponding SSIM with
+the original picture. These SSIM values match the SSIM of
+continuous tensors sliced from the KV cache along different
+dimensions, e.g., the 0.87 of the token dimension as shown
+in Fig.11.
+A.2
+Algorithm of adaptive resolution and corre-
+sponding lookup table
+Adaptive resolution fetching algorithm is shown in Alg. 1,
+which aims to minimize pipeline bubbles by synchroniz-
+ing transmission and decoding stages. Initially, the avail-
+able bandwidth ˆ𝐵𝑡is predicted using historical traces B𝑡−1
+(line#1). Next, the algorithm iterates through the set of sup-
+ported resolutions R𝑎𝑙𝑙to evaluate each candidate 𝑟(line#4).
+15
+
+
+(a) original picture
+(b) SSIM=0.87(Token)
+(d) SSIM=0.23(Layer)
+(c) SSIM=0.62(Head)
+Figure 27: Visualization of structural similarity (SSIM) across
+different dimensions.
+Algorithm 1 Adaptive Resolution Selection via Bubble Min-
+imization
+Input: Historical Bandwidth B𝑡−1, Current Decompress Pool Load L𝑝𝑜𝑜𝑙,
+Profile Table T𝑝𝑟𝑜𝑓, Support resolution set R𝑎𝑙𝑙
+Output: Optimal Resolution 𝑟𝑜𝑝𝑡
+1: ˆ𝐵𝑡←EstBandwidth(B𝑡−1)
+⊲Predict current BW from history
+2: 𝛿𝑚𝑖𝑛←∞
+3: 𝑟𝑜𝑝𝑡←NULL
+4: for 𝑟in R𝑎𝑙𝑙do
+⊲Iterate through all candidate resolutions
+5:
+𝑆𝑟←GetVideoSize(𝑟)
+6:
+𝜏𝑡𝑟𝑎𝑛𝑠←𝑆𝑟/ ˆ𝐵𝑡
+⊲Calculate transmission latency
+7:
+𝜏𝑑𝑒𝑐,𝜏𝑝𝑒𝑛𝑎𝑙𝑡𝑦←LookupTable(T𝑝𝑟𝑜𝑓,𝑟, L𝑝𝑜𝑜𝑙)
+⊲Get decoding
+latency with switching penalty
+8:
+𝛿𝑏𝑢𝑏𝑏𝑙𝑒←|𝜏𝑡𝑟𝑎𝑛𝑠−𝜏𝑑𝑒𝑐−𝜏𝑝𝑒𝑛𝑎𝑙𝑡𝑦| ⊲Calculate the bubble gap
+9:
+if 𝛿𝑏𝑢𝑏𝑏𝑙𝑒< 𝛿𝑚𝑖𝑛then
+10:
+𝛿𝑚𝑖𝑛←𝛿𝑏𝑢𝑏𝑏𝑙𝑒
+11:
+𝑟𝑜𝑝𝑡←𝑟
+12:
+end if
+13: end for
+14: return 𝑟𝑜𝑝𝑡
+In each iteration, the transmission latency 𝜏𝑡𝑟𝑎𝑛𝑠is estimated
+from the predicted bandwidth and video size 𝑆𝑟(line#5-6).
+Regarding the decoding latency 𝜏𝑑𝑒𝑐, we query the lookup
+table T𝑝𝑟𝑜𝑓based on the current pool load L𝑝𝑜𝑜𝑙(line#7).
+The lookup table across different devices is shown in Tab. 1,
+Tab. 2 and Tab. 2. Furthermore, we observe that resolution
+switching within the pool affects the processing efficiency
+of lower-resolution videos. In addition, to account for resolu-
+tion switch overheads, a switching penalty𝜏𝑝𝑒𝑛𝑎𝑙𝑡𝑦whenever
+the candidate resolution differs from the active resolution
+in the decompression pool. Finally, the system identifies the
+optimal resolution 𝑟𝑜𝑝𝑡that minimizes the bubble 𝛿𝑏𝑢𝑏𝑏𝑙𝑒
+between transmission and decompression (line#8-11).
+Concurrency
+Latency (s)
+240P
+480P
+640P
+1080P
+1
+0.21
+0.2
+0.2
+0.19
+2
+0.22
+0.22
+0.21
+0.19
+3
+0.29
+0.30
+0.29
+0.26
+4
+0.32
+0.31
+0.30
+0.30
+5
+0.46
+0.42
+0.37
+0.35
+6
+0.52
+0.43
+0.41
+0.40
+7
+0.62
+0.51
+0.45
+0.43
+Penalty
+0.08
+0.06
+0.03
+0
+Size (MB)
+180
+205
+235
+256
+Table 1: Lookup table of different resolutions on H20.
+Concurrency
+Latency (s)
+240P
+480P
+640P
+1080P
+1
+0.18
+0.175
+0.17
+0.16
+2
+0.18
+0.178
+0.175
+0.16
+3
+0.19
+0.183
+0.175
+0.161
+Penalty
+0.06
+0.06
+0.04
+0
+Size (MB)
+180
+205
+235
+256
+Table 2: Lookup table of different resolutions on L20.
+Concurrency
+Latency (s)
+240P
+480P
+640P
+1080P
+1
+0.25
+0.24
+0.231
+0.20
+2
+0.252
+0.241
+0.235
+0.21
+3
+0.252
+0.25
+0.24
+0.22
+4
+0.26
+0.26
+0.25
+0.24
+5
+0.29
+0.27
+0.27
+0.25
+Penalty
+0.04
+0.04
+0.03
+0
+Size (MB)
+180
+205
+235
+256
+Table 3: Lookup table of different resolutions on A100.
+A.3
+Layer-wise fetching-inference pipeline.
+We propose a layer-wise KV fetching pipeline with a KV
+buffer to achieve a non-blocking execution pipeline as shown
+in Fig. 28. Following layer-wise pipeline design in Mooncake,
+16
+
+
+Quick start inference by layer-wise 
+fetching with KV buffer
+Fetched KV
+New generated KV
+Fetching order
+Inference order
+Figure 28: Layer-wise KV fetching with KV buffer.
+KVCodec also pre-allocates GPU memory that entire KV
+cache required, and fill the fetched remote KV cache into
+GPU memory in a layer-by-layer manner. To prevent fetching
+from stalling non-reuse requests, we maintain a KV buffer to
+track the state of each layer’s KV cache. Fetching requests are
+added to the running queue only when the pipeline satisfies
+following non-blocking condition:
+𝑘
+∑︁
+𝑗=1
+𝑇(𝑗)
+decode ≤
+𝑘−1
+∑︁
+𝑗=1
+𝑇(𝑗)
+comp,
+∀𝑘∈{𝐿buf + 1, . . . , 𝐿total}
+where 𝑇(𝑗)
+decode and 𝑇(𝑗)
+comp denote the decoding and computa-
+tion time for the 𝑗-th layer, 𝐿buf and 𝐿total denote the buffered
+layer number and total layer number. This ensures that for
+every unbuffered layer 𝑘, the KV cache data is ready exactly
+before the GPU completes the computation of layer 𝑘−1,
+thereby preventing any execution stalls. Thanks to the de
+facto chunked prefill and sequence parallelism techniques,
+the computation time of each layer can be predicted very
+precisely.
+17

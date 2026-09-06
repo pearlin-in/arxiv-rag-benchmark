@@ -1,0 +1,1037 @@
+Where Should LoRA Go? Component-Type
+Placement in Hybrid Language Models
+Héctor Borobiaa,∗, Elies Seguí-Masb, Guillermina Tormo-Carbóc
+aVRAIN – Valencian Research Institute for Artificial Intelligence, Universitat
+Politècnica de València, Valencia, Spain
+bDepartment of Economics and Social Sciences, Universitat Politècnica de
+València, Valencia, Spain
+cDepartment of Business Organisation, Universitat Politècnica de
+València, Valencia, Spain
+Abstract
+Hybrid language models that interleave attention with recurrent components
+are increasingly competitive with pure Transformers, yet standard LoRA
+practice applies adapters uniformly without considering the distinct func-
+tional roles of each component type. We systematically study component-
+type LoRA placement across two hybrid architectures—Qwen3.5-0.8B (se-
+quential, GatedDeltaNet + softmax attention) and Falcon-H1-0.5B (paral-
+lel, Mamba-2 SSM + attention)—fine-tuned on three domains and evaluated
+on five benchmarks. We find that the attention pathway—despite being the
+minority component—consistently outperforms full-model adaptation with
+5–10× fewer trainable parameters. Crucially, adapting the recurrent back-
+bone is destructive in sequential hybrids (−14.8 pp on GSM8K) but construc-
+tive in parallel ones (+8.6 pp). We further document a transfer asymmetry:
+parallel hybrids exhibit positive cross-task transfer while sequential hybrids
+suffer catastrophic forgetting. These results establish that hybrid topology
+fundamentally determines adaptation response, and that component-aware
+LoRA placement is a necessary design dimension for hybrid architectures.
+Keywords:
+LoRA, hybrid language models, parameter-efficient fine-tuning,
+state-space models, gated linear attention, component-type placement
+∗Corresponding author
+Email address: hecboar@doctor.upv.es (Héctor Borobia)
+arXiv:2604.22127v1  [cs.CL]  24 Apr 2026
+
+
+1. Introduction
+The past year has seen a proliferation of hybrid language models that com-
+bine softmax attention with alternative sequence-mixing mechanisms such as
+state-space models (SSMs) [10, 8] or gated linear attention (GLA) [7]. Pro-
+duction examples include Jamba [11], Zamba [12], Falcon-H1 [5], and Qwen3
+[6], all of which achieve competitive or superior performance to pure Trans-
+formers while offering sub-quadratic inference cost. As these models enter
+practical deployment, practitioners naturally turn to Low-Rank Adaptation
+(LoRA) [1] for domain-specific fine-tuning. However, a fundamental question
+remains unaddressed: given that hybrid models contain structurally and func-
+tionally distinct component types, which components should LoRA target?
+Current LoRA practice overwhelmingly targets attention projections—a
+convention inherited from the pure-Transformer setting. Recent work has
+begun exploring PEFT for SSM-based models [2], but the focus has been
+on pure-SSM architectures (Mamba, Mamba-2, Jamba) and individual SSM-
+internal parameters.
+No prior work has studied LoRA placement at the
+component-type level in native hybrid architectures—that is, systematically
+comparing whether to adapt the attention pathway, the recurrent backbone,
+the MLP, or combinations thereof.
+This question is particularly timely in light of recent evidence that the
+components of hybrid models serve asymmetric functional roles.
+Borobia
+et al. [4] demonstrated via functional component ablation that in both se-
+quential and parallel hybrids, the recurrent component acts as the “backbone”
+of the model (its removal causes perplexity degradation exceeding 35,000×),
+while attention functions as a “refinement” mechanism (degradation of ap-
+proximately 82×). If the components play fundamentally different roles dur-
+ing inference, it is reasonable to hypothesize that they will also respond
+differently to adaptation.
+In this paper, we present a controlled empirical study of component-type
+LoRA placement across two representative hybrid architectures:
+• Qwen3.5-0.8B (sequential hybrid): 24 layers with 18 GatedDeltaNet/linear-
+attention layers and 6 full softmax attention layers in a 3:1 ratio.
+• Falcon-H1-0.5B (parallel hybrid): 36 blocks, each containing a soft-
+max attention branch and a Mamba-2 SSM branch operating in paral-
+lel.
+For each model, we define six placement conditions that isolate or com-
+bine the three component types (attention, recurrent backbone, MLP), fine-
+2
+
+
+tune on three distinct domains (mathematics, code, general instruction), and
+evaluate across five standard benchmarks. Our contributions are as follows:
+1. We introduce component-type placement as a dimension of LoRA
+configuration and provide the first systematic comparison across two
+hybrid topologies.
+2. We show that attention-only placement matches or exceeds full-
+model adaptation with 5–10× fewer parameters in both architectures,
+establishing it as the recommended default for hybrid LM fine-tuning.
+3. We demonstrate that adapting the recurrent backbone is de-
+structive in sequential hybrids but safe in parallel ones, re-
+vealing the topology as the key determinant of adaptation response.
+4. We document a transfer asymmetry: parallel hybrids exhibit posi-
+tive cross-task transfer where sequential hybrids show catastrophic for-
+getting, with attention-only placement providing the best protection in
+both cases.
+2. Related Work
+2.1. Parameter-Efficient Fine-Tuning for Sequence Models
+LoRA [1] introduced trainable low-rank decomposition matrices along-
+side frozen pre-trained weights. Originally designed for Transformer atten-
+tion projections, LoRA has become the dominant PEFT method for large
+language models. Subsequent variants (AdaLoRA [13], DoRA [14]) refine
+the rank allocation or weight decomposition but retain the fundamental as-
+sumption that all target modules are architecturally homogeneous.
+2.2. PEFT for State-Space and Recurrent Models
+The emergence of SSM-based language models prompted investigation
+into which internal parameters are best suited for PEFT. Galim et al. [2]
+benchmarked LoRA, prefix tuning, and their proposed Selective Diagonal
+Tuning (SDT) across pure-SSM architectures (Mamba, Mamba-2, Jamba).
+Their key finding—that LoRA applied to linear projections outperforms
+LoRA on SSM-specific modules—is consistent with our results but does not
+extend to GatedDeltaNet or to parallel hybrid topologies. MambaPEFT [15]
+at ICLR 2025 explored similar territory for Mamba-1/2.
+Concurrently, Young [3] proposed S0 Tuning, which adapts only the ini-
+tial recurrent state S0 in Qwen3.5 and Falcon-H1. This approach is com-
+plementary to weight-based LoRA: at 4B+ parameters, S0 tuning is highly
+3
+
+
+competitive, but at the sub-1B scale studied here, gains are marginal (+2.6 ±
+3.7 pp, not statistically significant). Our work studies which weight matrices
+to adapt rather than whether to adapt weights versus states.
+2.3. Hybrid Architecture Analysis
+Wang et al. [9] provided a systematic analysis of hybrid linear-attention
+Transformers, characterizing the design space along dimensions of layer ratio,
+placement pattern, and attention mechanism. Borobia et al. [4] extended
+this via functional component ablation, establishing that both component
+types are essential and neither is bypassed, that the alternative component
+(GDN/SSM) serves as the primary language-modeling backbone, and that
+component importance follows a positional gradient with early layers being
+disproportionately critical. Our work builds directly on these functional in-
+sights to derive practical adaptation guidance.
+2.4. LoRA Targeting Strategies
+Prior work on where to apply LoRA has focused on layer-level selection:
+which layers of a homogeneous stack should receive adapters. Examples in-
+clude importance-based layer selection, adaptive rank allocation (AdaLoRA
+[13]), and dynamic rank distribution methods. All of these operate within
+a single component type (typically attention). Our work introduces the or-
+thogonal dimension of component-type selection, asking not “which layers”
+but “which kinds of modules.”
+3. Experimental Setup
+3.1. Models
+We select two sub-1B hybrid language models that represent the two
+dominant hybrid topologies:
+Qwen3.5-0.8B-Base. [6] is a sequential hybrid with 759M parameters or-
+ganized into 24 layers. Of these, 18 use GatedDeltaNet (GDN) [7] as the
+sequence-mixing mechanism with linear attention, while 6 use full softmax
+attention, yielding a 3:1 GDN-to-attention ratio. The GDN component con-
+stitutes approximately 18.8% of model parameters, softmax attention only
+4.4%, and the MLP 26.2% (Figure 1).
+4
+
+
+(a) Qwen3.5-0.8B
+(b) Falcon-H1-0.5B
+Figure 1: Parameter distribution by component type. In both architectures, the attention
+mechanism constitutes a small fraction of total parameters (4.4% for Qwen, 6.4% for
+Falcon), yet proves to be the most effective LoRA target.
+Falcon-H1-0.5B-Base. [5] is a parallel hybrid with 524M parameters orga-
+nized into 36 blocks. Each block contains a softmax attention branch and a
+Mamba-2 SSM [8] branch operating in parallel, with their outputs summed
+before the MLP. The SSM constitutes 34.6% of parameters, attention 6.4%,
+and the MLP 43.4%.
+Both architectures feature attention as a small minority of the parameter
+budget, with the recurrent component and MLP dominating.
+3.2. Module Discovery and Verification
+To ensure reproducibility and correctness, we implemented an automated
+module discovery pipeline rather than relying on manual inspection. The
+pipeline operates in four stages: (1) load the model and traverse the full
+module tree; (2) classify each module into a component type (attention,
+recurrent, MLP, norm, embedding) based on its position in the hierarchy
+and naming conventions; (3) construct exact dotted-path target lists for each
+placement condition; and (4) verify the resulting PEFT model by confirming
+that all expected modules received adapters and no forbidden modules were
+modified.
+5
+
+
+Table 1: Placement conditions and trainable parameter counts at rank r=16. “Attn” refers
+to softmax attention; “Rec” refers to the recurrent backbone (GDN for Qwen, SSM for
+Falcon).
+Model
+Condition
+Params (M)
+% Model
+Modules
+Qwen3.5-0.8B
+all_layers
+10.82
+1.42%
+186
+softmax_only
+1.08
+0.14%
+24
+gdn_only
+4.43
+0.59%
+90
+mlp_only
+5.31
+0.70%
+72
+softmax_plus_mlp
+6.39
+0.84%
+96
+gdn_plus_mlp
+9.74
+1.28%
+162
+Falcon-H1-0.5B
+all_eligible
+11.47
+2.15%
+289
+attention_only
+2.21
+0.42%
+108
+ssm_only
+2.52
+0.48%
+36
+mlp_only
+5.31
+1.01%
+108
+attention_plus_mlp
+7.52
+1.42%
+216
+ssm_plus_mlp
+7.83
+1.48%
+144
+For Falcon-H1, we exclude conv1d and out_proj modules from SSM
+adaptation, following the constraints identified in the PEFT library and con-
+firmed by preliminary experiments showing training instability when these
+modules are included. All 12 conditions (6 per model) passed verification
+with zero missing or unexpected adapter hosts.
+3.3. Placement Conditions
+For each model, we define six placement conditions that systematically
+isolate and combine the three component types. Table 1 summarizes the
+conditions and their parameter budgets.
+3.4. Fine-Tuning Domains
+We select three training domains representing distinct capability profiles:
+• GSM8K [16]: 2,000 samples of grade-school mathematics, targeting
+numerical reasoning.
+• CodeAlpaca [17]: 2,000 samples of code instruction-following, target-
+ing code generation.
+• UltraChat [18]: 2,000 samples of general conversational instruction,
+targeting broad instruction-following.
+6
+
+
+The choice of three semantically diverse domains enables cross-task evalu-
+ation: we train on one domain and evaluate on all benchmarks, allowing us to
+measure both target-task improvement and off-target forgetting or transfer.
+3.5. Evaluation Protocol
+We evaluate all conditions on five benchmarks:
+• MMLU [19]: 512 samples, measuring broad knowledge.
+• GSM8K [16]: 128–256 samples, measuring mathematical reasoning.
+• ARC-Challenge [20]: 299–512 samples, measuring scientific reason-
+ing.
+• HellaSwag [21]: 512 samples, measuring commonsense reasoning.
+• HumanEval [22]: 164 samples, measuring code generation (pass@1).
+At the sub-1B scale, no placement condition on either model produced
+functionally correct code on HumanEval (pass@1 ≤0.6% across all condi-
+tions). We therefore exclude HumanEval from quantitative comparisons and
+note this as a scale limitation. All evaluations use greedy decoding to ensure
+deterministic comparison.
+3.6. Training Configuration
+All experiments use identical hyperparameters: LoRA rank r=16, α=32
+(scaling factor 2.0), dropout 0.05, learning rate 2×10−4 with cosine sched-
+ule, 3 epochs, effective batch size 16 (batch size 4, gradient accumulation 4),
+maximum sequence length 1,024, 8-bit Adam optimizer, bf16 mixed preci-
+sion, and gradient checkpointing. Hardware consisted of NVIDIA L4 24 GB
+(Google Colab Pro) and RTX 4090 24 GB (RunPod). A single training run
+requires approximately 15–40 minutes depending on the model and hardware.
+4. Results
+4.1. Baselines
+Table 2 reports the pre-training baselines for both models. Despite its
+smaller parameter count, Falcon-H1-0.5B achieves higher MMLU and GSM8K
+scores than Qwen3.5-0.8B, while Qwen3.5-0.8B leads on ARC-Challenge and
+HellaSwag.
+7
+
+
+Table 2: Baseline accuracy (no fine-tuning) on four benchmarks.
+Model
+MMLU
+GSM8K
+ARC-C
+HellaSwag
+Qwen3.5-0.8B
+0.482
+0.297
+0.732
+0.416
+Falcon-H1-0.5B
+0.518
+0.383
+0.743
+0.330
+Table 3: Benchmark accuracy after fine-tuning on GSM8K. Bold marks the best condition
+per model. ∆base is the change in GSM8K accuracy relative to the pre-training baseline
+(percentage points). Conditions are ordered by GSM8K performance.
+Model
+Condition
+MMLU
+GSM8K
+ARC-C
+HSwag
+∆base
+Qwen3.5-0.8B
+softmax_only
+.490
+.398
+.726
+.398
++10.2
+mlp_only
+.477
+.383
+.709
+.459
++8.6
+all_layers
+.473
+.375
+.746
+.434
++7.8
+gdn_plus_mlp
+.502
+.203
+.712
+.434
+−9.4
+gdn_only
+.488
+.148
+.732
+.451
+−14.8
+softmax_plus_mlp
+.481
+.148
+.706
+.416
+−14.8
+Falcon-H1-0.5B
+attention_only
+.502
+.555
+.732
+.320
++17.2
+mlp_only
+.506
+.508
+.709
+.326
++12.5
+ssm_plus_mlp
+.516
+.508
+.712
+.307
++12.5
+all_eligible
+.516
+.504
+.712
+.303
++12.1
+attention_plus_mlp
+.510
+.492
+.709
+.326
++10.9
+ssm_only
+.523
+.469
+.729
+.305
++8.6
+4.2. Component-Specific Placement: Main Results
+Table 3 presents the core results for GSM8K-trained models, the do-
+main where placement effects are most pronounced. Complete results for all
+domain–benchmark combinations are provided in Tables 5 and 6.
+Several patterns emerge.
+First, attention-only placement achieves the
+highest GSM8K accuracy in both models—with the fewest trainable parame-
+ters. In Qwen3.5-0.8B, softmax_only reaches 0.398 with only 1.08M param-
+eters (0.14% of the model), outperforming all_layers (0.375) which uses
+10× more parameters. In Falcon-H1-0.5B, attention_only reaches 0.555
+with 2.21M parameters (0.42%), again surpassing all_eligible (0.504) at
+5.2× the parameter count.
+Second, the recurrent backbone responds strikingly differently depending
+on the topology. In the sequential Qwen3.5-0.8B, gdn_only destroys GSM8K
+8
+
+
+(a) Qwen3.5-0.8B trained on GSM8K
+(b) Falcon-H1-0.5B trained on GSM8K
+Figure 2: Benchmark × condition heatmaps (delta versus base accuracy). Warm colors
+indicate improvement, cool colors degradation. Falcon shows uniformly positive GSM8K
+gains across all conditions, while Qwen exhibits severe degradation for GDN-involved and
+softmax_plus_mlp conditions.
+performance (−14.8 pp below baseline), making it worse than the un-fine-
+tuned model. In the parallel Falcon-H1-0.5B, ssm_only improves GSM8K
+by +8.6 pp. This topology-dependent asymmetry is the central finding of
+this paper.
+Third, an unexpected destructive interference pattern appears: in Qwen3.5-
+0.8B, softmax_only (0.398) and mlp_only (0.383) both improve GSM8K, yet
+their union softmax_plus_mlp (0.148) is dramatically worse—a 25 pp col-
+lapse below either component alone. This anomaly is not a training failure:
+MMLU, ARC-Challenge, and HellaSwag remain normal for softmax_plus_mlp,
+and the pattern is consistent across all three training domains (Tables 5
+and 6).
+4.3. Cross-Task Transfer and Forgetting
+Fine-tuning on one domain inevitably affects performance on others. We
+quantify this via the forgetting score, defined as the mean accuracy change
+on non-target benchmarks relative to baseline. A positive forgetting score
+indicates degradation on off-target tasks; a negative score indicates positive
+transfer.
+Figure 3 reveals a dramatic asymmetry.
+After training on UltraChat
+(general instruction), Qwen3.5-0.8B loses up to 16.0 pp on GSM8K—a task it
+was never trained on—with the most severe forgetting in softmax_plus_mlp
+(−16.0 pp) and all_layers (−15.6 pp). In contrast, Falcon-H1-0.5B gains
+on GSM8K after UltraChat training, with improvements of up to +10.9 pp
+(attention_plus_mlp) and +10.5 pp (ssm_only).
+This positive transfer
+suggests that the parallel topology is fundamentally more robust: general
+9
+
+
+(a) Qwen3.5-0.8B trained on UltraChat
+(b) Falcon-H1-0.5B trained on UltraChat
+Figure 3: Cross-task transfer after UltraChat training. Qwen shows pervasive forgetting
+(cool tones, especially on GSM8K), while Falcon shows positive transfer on GSM8K (warm
+tones). The contrast is most visible in the GSM8K row.
+instruction tuning “lifts all boats” rather than overwriting domain-specific
+capabilities.
+Attention-only placement provides the best forgetting protection across
+both architectures.
+In the CodeAlpaca →GSM8K setting (code train-
+ing, math evaluation), Falcon’s attention_only shows near-zero forgetting
+(+0.8 pp on GSM8K), while all_eligible degrades by −2.3 pp. For Qwen,
+softmax_only loses −11.3 pp on GSM8K after code training—substantial,
+but less than all_layers at −21.9 pp.
+4.4. Efficiency Analysis
+The parameter efficiency of attention-only placement is striking. Figure 4
+shows the Pareto frontier of trainable parameters versus mean benchmark
+accuracy across all training domains.
+In both models, the attention-only
+condition consistently achieves the highest or near-highest mean accuracy at
+the lowest parameter cost, dominating the upper-left region of the Pareto
+plot.
+For GSM8K-trained Qwen, softmax_only achieves a target-task effi-
+ciency of 9.4 pp per million parameters versus 0.7 pp/M for all_layers—
+a 13× advantage.
+For Falcon, attention_only achieves 7.8 pp/M versus
+1.1 pp/M for all_eligible—a 7× advantage. These efficiency ratios are
+summarized in Table 4.
+4.5. Radar Profiles
+Figure 5 presents radar charts comparing the four single-component con-
+ditions after GSM8K training.
+The Falcon radar (Figure 5b) shows that
+attention_only dominates on GSM8K while maintaining competitive ARC-
+Challenge and MMLU, confirming its superiority is not limited to the target
+10
+
+
+(a) Qwen3.5-0.8B
+(b) Falcon-H1-0.5B
+Figure 4: Trainable parameters versus mean benchmark accuracy (Pareto scatter). Each
+point is one (condition, training domain) pair. Attention-only placements (upper left in
+both plots) dominate the Pareto frontier: highest accuracy at lowest parameter cost.
+Table 4: Efficiency comparison for GSM8K-trained conditions. Efficiency ratio is defined
+as target-task accuracy gain (pp) per million trainable parameters.
+Model
+Condition
+Params (M)
+∆GSM8K (pp)
+pp/M
+Qwen3.5-0.8B
+softmax_only
+1.08
++10.2
+9.4
+mlp_only
+5.31
++8.6
+1.6
+all_layers
+10.82
++7.8
+0.7
+Falcon-H1-0.5B
+attention_only
+2.21
++17.2
+7.8
+mlp_only
+5.31
++12.5
+2.4
+all_eligible
+11.47
++12.1
+1.1
+benchmark. The Qwen radar (Figure 5a) reveals a more differentiated profile:
+softmax_only leads on GSM8K but trades off HellaSwag, while mlp_only
+exhibits the opposite pattern.
+4.6. Statistical Validation
+We computed paired bootstrap confidence intervals for key comparisons
+using the UltraChat-trained conditions (the only setting where per-instance
+paired data was available across all benchmarks).
+For Falcon trained on
+UltraChat:
+• attention_only vs. all_eligible on HellaSwag:
+mean difference
++2.7 pp, 95% CI [+0.8, +4.7], significant.
+11
+
+
+(a) Qwen3.5-0.8B trained on GSM8K
+(b) Falcon-H1-0.5B trained on GSM8K
+Figure 5: Radar chart comparison of single-component conditions after GSM8K training.
+Four axes correspond to the four benchmarks (excluding HumanEval).
+Attention-only
+(orange) dominates the GSM8K axis in both models.
+• attention_only vs. all_eligible on GSM8K: mean difference +5.5 pp,
+95% CI [−1.2, +12.9], not significant at α=0.05 but trending.
+• ssm_only vs. attention_only on all benchmarks: CIs include zero,
+indicating comparable performance.
+The single-seed design (see Section 7) limits the statistical power of these
+comparisons. However, the large effect sizes observed—particularly the 17.2 pp
+GSM8K advantage of Falcon’s attention_only and the 14.8 pp destructive
+effect of Qwen’s gdn_only—greatly exceed typical run-to-run variance in
+LoRA fine-tuning, supporting the reliability of the primary findings.
+5. Full Results
+Tables 5 and 6 report the complete accuracy matrix across all training
+domain × condition × benchmark combinations for each model.
+6. Discussion
+6.1. Why the Minority Component is the Best Target
+The most striking result is that the attention pathway—the minority
+component by parameter count in both architectures—is the most effective
+LoRA target. We propose this reflects a division of labor established during
+12
+
+
+Table 5: Complete benchmark accuracy for Qwen3.5-0.8B across all placement conditions
+and training domains.
+Best result per column within each domain group is bolded.
+Baseline (no fine-tuning): MMLU = .482, GSM8K = .297, ARC-C = .732, HSwag = .416.
+Train Domain Condition
+MMLU GSM8K ARC-C HSwag
+GSM8K
+softmax_only
+.490
+.398
+.726
+.398
+mlp_only
+.477
+.383
+.709
+.459
+all_layers
+.473
+.375
+.746
+.434
+gdn_plus_mlp
+.502
+.203
+.712
+.434
+gdn_only
+.488
+.148
+.732
+.451
+softmax_plus_mlp
+.481
+.148
+.706
+.416
+CodeAlpaca
+softmax_only
+.506
+.184
+.719
+.428
+mlp_only
+.496
+.203
+.746
+.426
+gdn_plus_mlp
+.479
+.227
+.722
+.426
+all_layers
+.486
+.078
+.722
+.434
+gdn_only
+.479
+.102
+.736
+.397
+softmax_plus_mlp
+.494
+.098
+.729
+.412
+UltraChat
+softmax_only
+.488
+.258
+.746
+.422
+gdn_only
+.488
+.242
+.732
+.383
+gdn_plus_mlp
+.486
+.164
+.742
+.418
+mlp_only
+.492
+.145
+.746
+.416
+all_layers
+.486
+.141
+.732
+.373
+softmax_plus_mlp
+.500
+.137
+.722
+.400
+pre-training: the recurrent backbone (GDN or SSM) encodes a rigid sequen-
+tial prior that is highly optimized and does not tolerate perturbation, while
+attention provides a more “plastic” refinement mechanism that can absorb
+task-specific adaptations without disrupting the model’s core representations.
+This interpretation is consistent with the functional ablation results of
+Borobia et al. [4], who found that removing the recurrent component causes
+catastrophic performance collapse (35,200× perplexity increase) while re-
+moving attention causes moderate degradation (82×). A component that is
+“load-bearing” for forward-pass functionality may also be “fragile” under pa-
+rameter perturbation—precisely because its weights encode tightly coupled
+sequential dynamics that low-rank updates can easily disrupt.
+13
+
+
+Table 6: Complete benchmark accuracy for Falcon-H1-0.5B across all placement conditions
+and training domains.
+Best result per column within each domain group is bolded.
+Baseline (no fine-tuning): MMLU = .518, GSM8K = .383, ARC-C = .743, HSwag = .330.
+Train Domain Condition
+MMLU GSM8K ARC-C HSwag
+GSM8K
+attention_only
+.502
+.555
+.732
+.320
+mlp_only
+.506
+.508
+.709
+.326
+ssm_plus_mlp
+.516
+.508
+.712
+.307
+all_eligible
+.516
+.504
+.712
+.303
+attention_plus_mlp
+.510
+.492
+.709
+.326
+ssm_only
+.523
+.469
+.729
+.305
+CodeAlpaca
+attention_only
+.514
+.391
+.739
+.336
+ssm_plus_mlp
+.520
+.352
+.726
+.316
+attention_plus_mlp
+.506
+.363
+.729
+.318
+all_eligible
+.516
+.359
+.726
+.314
+ssm_only
+.518
+.320
+.729
+.326
+mlp_only
+.512
+.320
+.732
+.313
+UltraChat
+attention_plus_mlp
+.500
+.492
+.729
+.291
+ssm_only
+.518
+.488
+.739
+.307
+attention_only
+.508
+.484
+.736
+.314
+ssm_plus_mlp
+.508
+.473
+.739
+.301
+mlp_only
+.508
+.469
+.726
+.293
+all_eligible
+.510
+.430
+.729
+.287
+6.2. Sequential vs. Parallel: The Topology Matters
+The topology of the hybrid architecture—sequential versus parallel—
+emerges as the key determinant of adaptation behavior. In the sequential
+Qwen3.5-0.8B, the GDN component processes the full residual stream before
+attention; perturbing GDN therefore disrupts the input to all downstream
+computations, including attention and MLP. In the parallel Falcon-H1-0.5B,
+the SSM and attention branches process the same input independently, and
+their outputs are summed; perturbing one branch does not corrupt the other’s
+input. This architectural difference explains why GDN adaptation is destruc-
+tive in Qwen but SSM adaptation is safe in Falcon.
+This finding has immediate practical implications: for sequential hybrids,
+practitioners should avoid adapting the recurrent backbone entirely, whereas
+for parallel hybrids, all components are viable targets (though attention-only
+14
+
+
+remains most efficient).
+6.3. The Destructive Interference Anomaly
+The softmax_plus_mlp anomaly in Qwen3.5-0.8B merits discussion. When
+softmax_only and mlp_only each improve GSM8K individually (+10.2 pp
+and +8.6 pp respectively), their combination collapses to −14.8 pp below
+baseline. This is not explained by increased parameter count (the combined
+condition uses fewer parameters than all_layers, which achieves +7.8 pp)
+and is specific to GSM8K—other benchmarks remain normal.
+We hypothesize that this reflects a conflict in the optimization land-
+scape: when both the refinement pathway (attention) and the transforma-
+tion pathway (MLP) are simultaneously adapted in a sequential architec-
+ture where the backbone is frozen, gradient updates may push the two com-
+ponents toward incompatible representations. The backbone, being frozen,
+cannot mediate this conflict. In all_layers, the GDN backbone can co-
+adapt, which—despite the destructive effect of GDN adaptation on its own—
+paradoxically provides enough flexibility to prevent the interference between
+attention and MLP. This pattern is consistent across all three training do-
+mains (softmax_plus_mlp achieves 0.148 on GSM8K for the math domain,
+0.098 for code, and 0.137 for general instruction), reinforcing that it is a
+structural phenomenon rather than a training artifact.
+6.4. Connection to Functional Roles
+Our results directly extend the functional ablation framework of Boro-
+bia et al. [4]. That work established a hierarchy of functional importance
+during inference: backbone > attention.
+We now show that this hierar-
+chy is inverted for adaptation: attention > backbone. The component most
+important for forward-pass computation is the least suitable for low-rank
+modification, and vice versa. This creates a coherent picture: the backbone
+is a rigid, optimized structure that the model relies on heavily and that does
+not tolerate perturbation; attention is a flexible, secondary mechanism that
+readily absorbs task-specific changes.
+6.5. Practical Recommendations
+Based on our findings, we propose the following practitioner guidelines
+for LoRA placement in hybrid language models:
+15
+
+
+Table 7: Practitioner recipe: recommended placement condition per model and domain.
+Selected as the smallest-parameter condition achieving ≥95% of the full-model baseline
+accuracy.
+Model
+Domain
+Recommended
+Params (M)
+≥95%?
+Falcon-H1-0.5B
+GSM8K
+attention_only
+2.21
+✓
+Falcon-H1-0.5B
+Code
+attention_only
+2.21
+✓
+Falcon-H1-0.5B
+UltraChat
+attention_only
+2.21
+✓
+Qwen3.5-0.8B
+GSM8K
+softmax_only
+1.08
+✓
+Qwen3.5-0.8B
+Code
+all_layers
+10.82
+✓
+Qwen3.5-0.8B
+UltraChat
+softmax_only
+1.08
+✓
+1. Default to attention-only placement. This achieves competitive
+or superior accuracy with 5–10× fewer parameters and the lowest for-
+getting across both topologies.
+2. For sequential hybrids, avoid adapting the recurrent back-
+bone.
+GDN-only or GDN-involved conditions consistently degrade
+target-task performance in Qwen.
+3. For parallel hybrids, all components are viable. SSM adapta-
+tion is safe in Falcon, though attention-only remains most parameter-
+efficient.
+4. Beware destructive interference in sequential hybrids. Com-
+bining attention and MLP without the backbone can be worse than
+either alone.
+5. Prefer parallel hybrids when cross-task robustness matters.
+Falcon’s positive transfer contrasts sharply with Qwen’s catastrophic
+forgetting.
+Table 7 summarizes the recommended conditions from an automated se-
+lection procedure that identifies the smallest-parameter condition achieving
+≥95% of the full-model accuracy.
+6.6. Relation to Concurrent Work
+Our findings complement several concurrent efforts.
+Galim et al.
+[2]
+showed that LoRA on linear projections outperforms LoRA on SSM-specific
+parameters in pure-SSM models; our results extend this to hybrid archi-
+tectures and show that the attention projections specifically—not all linear
+projections—are the optimal target. Young’s S0 Tuning [3] takes the orthog-
+onal approach of adapting recurrent states rather than weights; at the 4B+
+16
+
+
+scale where S0 tuning excels, our component-type placement strategy could
+further refine which weight matrices receive LoRA alongside state tuning.
+The two approaches are complementary rather than competing.
+6.7. Implications for Architecture Design
+The dramatic difference between sequential and parallel topologies in
+adaptation robustness has implications beyond PEFT. If parallel hybrids
+are fundamentally more amenable to post-training modification—exhibiting
+positive transfer where sequential hybrids show forgetting, and tolerating
+backbone adaptation where sequential hybrids are destroyed—this may favor
+parallel designs for models intended to be extensively fine-tuned by down-
+stream practitioners.
+7. Limitations and Future Work
+Scale.. Both models are sub-1B parameters. The relative importance of com-
+ponent types may shift at larger scales (7B+), where attention capacity is
+greater and the recurrent backbone may become more tolerant of perturba-
+tion. Replication at the 7–70B scale is a priority.
+Single seed.. Experiments use a single random seed (3407). While the ob-
+served effect sizes (10–17 pp on GSM8K) substantially exceed typical LoRA
+variance, multi-seed replication would strengthen statistical claims.
+The
+bootstrap analysis on shared evaluation instances partially addresses this,
+but cannot substitute for independent training runs.
+Fixed rank.. All experiments use r=16. The optimal placement may interact
+with rank: at very low ranks (r=4), the expressiveness bottleneck may shift
+the balance between component types. Rank ablation is a natural extension.
+Three domains.. We evaluate on mathematics, code, and general instruc-
+tion. Other domains (biomedical, legal, multilingual) may exhibit different
+placement sensitivities.
+Two hybrid families.. We study one sequential (Qwen/GDN) and one parallel
+(Falcon/Mamba-2) hybrid.
+Other architectures (Jamba, Zamba, RWKV-
+based hybrids) may behave differently, particularly those with interleaved
+rather than strict sequential or parallel topologies.
+17
+
+
+Single PEFT method.. We study LoRA exclusively. Other PEFT methods
+(prefix tuning, adapters, IA3) may respond differently to component-type
+targeting. The interaction of component placement with methods like DoRA
+or AdaLoRA is unexplored.
+HumanEval at sub-1B scale.. No condition produced meaningful code gener-
+ation capability (pass@1 ≤0.6%). CodeAlpaca training may have improved
+code-related representations that our evaluation setup does not capture, or
+the sub-1B scale may simply be insufficient for functional code generation.
+8. Conclusion
+We have presented the first systematic study of component-type LoRA
+placement in hybrid language models. Across two architectures (sequential
+and parallel), three training domains, and five evaluation benchmarks, we
+find that:
+1. The attention pathway is the optimal LoRA target in both architec-
+tures, achieving competitive or superior accuracy with 5–10× fewer
+trainable parameters than full-model adaptation.
+2. The recurrent backbone—the functionally dominant component during
+inference—is a poor adaptation target in sequential hybrids (destruc-
+tive, up to −14.8 pp) but a viable one in parallel hybrids (constructive,
+up to +8.6 pp).
+3. The hybrid topology (sequential vs. parallel) is the primary determi-
+nant of adaptation behavior, affecting not only which components can
+be safely adapted but also cross-task transfer properties: parallel hy-
+brids exhibit positive transfer where sequential hybrids show catas-
+trophic forgetting.
+These findings establish component-type placement as a necessary consid-
+eration in PEFT configuration for hybrid architectures and provide action-
+able guidance: default to attention-only adaptation, and recognize that the
+topology of the hybrid determines whether the backbone is a viable target.
+Declaration of competing interest
+The authors declare that they have no known competing financial inter-
+ests or personal relationships that could have appeared to influence the work
+reported in this paper.
+18
+
+
+Data availability
+All code, configuration files, evaluation results, and trained adapters are
+available at https://github.com/hecboar/lora-placement-hybrid.
+Acknowledgments
+This work was supported by the Valencian Research Institute for Artificial
+Intelligence (VRAIN) at Universitat Politècnica de València. Computational
+resources were provided by Google Colab Pro and RunPod.
+References
+[1] E.J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang,
+W. Chen, LoRA: Low-Rank Adaptation of Large Language Models, in:
+ICLR, 2022. arXiv:2106.09685.
+[2] K. Galim, W. Kang, Y. Zeng, H.I. Koo, K. Lee, Parameter-Efficient
+Fine-Tuning of State Space Models, in: ICML, 2025. arXiv:2410.09016.
+[3] J. Young, S0 Tuning: Zero-Overhead Adaptation of Hybrid Recurrent-
+Attention Models, arXiv preprint arXiv:2604.01168, 2026.
+[4] H. Borobia, E. Seguí-Mas, G. Tormo-Carbó, Functional Component Ab-
+lation Reveals Specialization Patterns in Hybrid Language Model Archi-
+tectures, arXiv preprint arXiv:2603.22473, 2026.
+[5] J. Zuo, et al., Falcon-H1: A Family of Hybrid-Head Language Models,
+Technical Report, Technology Innovation Institute, 2025.
+[6] Qwen Team, Qwen3 Technical Report, arXiv preprint, 2025.
+[7] S. Yang, B. Wang, Y. Shen, R. Panda, Y. Kim, Gated Linear Attention
+Transformers with Hardware-Efficient Training, in: ICML, 2024.
+[8] T. Dao, A. Gu, Transformers are SSMs: Generalized Models and Ef-
+ficient Algorithms through Structured State Space Duality, in: ICML,
+2024.
+[9] S. Wang, et al., A Systematic Analysis of Hybrid Linear Attention, arXiv
+preprint, 2025.
+19
+
+
+[10] A. Gu, T. Dao, Mamba: Linear-Time Sequence Modeling with Selective
+State Spaces, arXiv preprint arXiv:2312.00752, 2023.
+[11] O. Lieber, et al., Jamba:
+A Hybrid Transformer-Mamba Language
+Model, arXiv preprint, 2024.
+[12] P. Glorioso, et al., Zamba: A Compact 7B SSM Hybrid Model, arXiv
+preprint, 2024.
+[13] Q. Zhang, M. Chen, A. Bukharin, P. He, Y. Cheng, W. Chen, T. Zhao,
+AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-
+Tuning, in: ICLR, 2023.
+[14] S.-Y. Liu, C.-Y. Wang, H. Yin, P. Molchanov, Y.-C.F. Wang, K.-T.
+Cheng, M.-H. Chen, DoRA: Weight-Decomposed Low-Rank Adapta-
+tion, in: ICML, 2024.
+[15] M.
+Yoshimura,
+T.
+Hayashi,
+Y.
+Maeda,
+MambaPEFT:
+Explor-
+ing Parameter-Efficient Fine-Tuning for Mamba, in:
+ICLR, 2025.
+arXiv:2411.03855.
+[16] K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser,
+M. Plappert, J. Tworek, J. Hilton, R. Nakano, C. Hesse, J. Schul-
+man, Training Verifiers to Solve Math Word Problems, arXiv preprint
+arXiv:2110.14168, 2021.
+[17] S. Chaudhary, Code Alpaca: An Instruction-Following LLaMA Model
+for Code Generation, GitHub repository, 2023.
+[18] N. Ding, Y. Chen, B. Xu, Y. Qin, Z. Zheng, S. Hu, Z. Liu, M. Sun,
+B. Zhou, Enhancing Chat Language Models by Scaling High-quality
+Instructional Conversations, in: EMNLP, 2023.
+[19] D. Hendrycks, C. Burns, S. Basart, A. Zou, M. Mazeika, D. Song, J.
+Steinhardt, Measuring Massive Multitask Language Understanding, in:
+ICLR, 2021.
+[20] P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick,
+O. Tafjord, Think you have Solved Question Answering? Try ARC, the
+AI2 Reasoning Challenge, arXiv preprint arXiv:1803.05457, 2018.
+20
+
+
+[21] R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, Y. Choi, HellaSwag: Can
+a Machine Really Finish Your Sentence?, in: ACL, 2019.
+[22] M. Chen, J. Tworek, H. Jun, Q. Yuan, H.P. de Oliveira Pinto, J. Ka-
+plan, et al., Evaluating Large Language Models Trained on Code, arXiv
+preprint arXiv:2107.03374, 2021.
+21

@@ -1,0 +1,2306 @@
+2026-02-20
+LoRA-Squeeze: Simple and Effective
+Post-Tuning and In-Tuning Compression of
+LoRA Modules
+Ivan Vulić1, Adam Grycner1, Quentin de Laroussilhe1 and Jonas Pfeiffer1
+1Google DeepMind
+Despite its huge number of variants, standard Low-Rank Adaptation (LoRA) is still a dominant technique
+for parameter-efficient fine-tuning (PEFT). Nonetheless, it faces persistent challenges, including the pre-
+selection of an optimal rank and rank-specific hyper-parameters, as well as the deployment complexity
+of heterogeneous-rank modules and more sophisticated LoRA derivatives. In this work, we introduce
+LoRA-Squeeze, a simple and efficient methodology that aims to improve standard LoRA learning by
+changing LoRA module ranks either post-hoc or dynamically during training. Our approach posits that it
+is better to first learn an expressive, higher-rank solution and then compress it, rather than learning a
+constrained, low-rank solution directly. The method involves fine-tuning with a deliberately high(er)
+source rank, reconstructing the full weight update matrix, and then using Randomized Singular Value
+Decomposition (RSVD) to create a new, compressed LoRA module at a lower target rank. Extensive
+experiments across 13 text-based and 10 vision-language tasks show that post-hoc compression often
+produces lower-rank adapters that outperform those trained directly at the target rank, especially if a
+small number of fine-tuning steps at the target rank is allowed. Moreover, a gradual, in-tuning rank
+annealing variant of LoRA-Squeeze consistently achieves the best LoRA size-performance trade-off. LoRA-
+Squeeze decouples the training rank from the deployment rank, this way improving module efficiency,
+reusability, portability, and interoperability.
+Keywords: PEFT, LoRA, module compression, SVD
+1. Introduction
+The ever-growing scale of large language models
+(LLMs) combined with the demand for their effi-
+cient adaptation has established Low-Rank Adap-
+tation (LoRA) (Hu et al., 2022) as a leading, go-
+to Parameter-Efficient Fine-Tuning (PEFT) tech-
+nique. LoRA operates on the hypothesis that the
+weight updates Δ𝑊∈ℝ𝑚×𝑛of the large model
+with initial weights 𝑊0 ∈ℝ𝑚×𝑛can be approxi-
+mated by a low-rank decomposition Δ𝑊= 𝐴𝐵,
+where 𝐴∈ℝ𝑚×𝑟and 𝐵∈ℝ𝑟×𝑛are trainable
+parameters, and 𝑟≪min(𝑚, 𝑛) is the LoRA
+rank. Despite its widespread adoption and suc-
+cess, there are several critical challenges that per-
+sist in the practical applications of LoRA:
+Challenge 1. Having lower-rank LoRA-s that main-
+tain performance of higher-rank LoRA-s is one
+of the key desiderata to improve efficiency and
+module portability while simultaneously reducing
+latency and module storage requirements.
+Challenge 2. Maintaining architectural homogene-
+ity of LoRA modules (i.e., relying on same-rank
+LoRA-s) is often crucial for infrastructural sim-
+plicity and deployment. Put simply, LoRA-s of
+varying ranks and of heterogeneous decompo-
+sitions may pose various challenges during de-
+ployment related to, e.g., inefficient batching and
+memory overheads during LoRA loading and un-
+loading (Chen et al., 2024; Sheng et al., 2024).
+Challenge 3. The selection of rank 𝑟typically must
+be done in advance of fine-tuning; the perfor-
+mance of a LoRA-adapted model is often highly
+sensitive to this choice (Valipour et al., 2023),
+and the optimal rank can vary across tasks and
+datasets of different complexities, and across dif-
+ferent models and model sizes (Zhang et al.,
+2023).
+Corresponding author(s): vulic@google.com
+© 2026 Google. All rights reserved
+arXiv:2602.10993v2  [cs.CL]  19 Feb 2026
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Challenge 4. Each rank might further necessitate
+its own hyperparameter sweeps to determine, e.g.,
+the best per-rank and per-LoRA-matrix learning
+rate and/or training schedule (Hayou et al., 2024;
+Schulman and Lab, 2025).
+In this work, with pragmatism and deployment-
+savvy solutions as the principal drivers, we focus
+on improving efficiency, portability, and reusabil-
+ity of standard, ubiquitous LoRA modules (see
+the rationale for this choice later in §2). To this
+end, we shed new light on and exploit tight con-
+nections between (i) standard LoRA modules, (ii)
+task arithmetic and task vectors (Ansell et al.,
+2022; Ilharco et al., 2023), and (iii) SVD de-
+composition, positing that the LoRA rank used
+for training should be decoupled from the rank
+used for deployment, which has positive impli-
+cations on the four challenges above. We intro-
+duce LoRA-Squeeze, a novel, computationally
+efficient methodology for changing the rank of
+standard LoRA modules. The changes can be ap-
+plied either post-hoc after LoRA fine-tuning, or
+dynamically during their fine-tuning. The LoRA-
+Squeeze methodology relies on the two key
+principles:
+Overparameterized Fine-Tuning: LoRA is fine-
+tuned on a target task with a deliberately high
+rank.
+Higher-rank tuning is used during the
+whole fine-tuning process or during its parts. This
+allows the model to learn task adaptation within
+a less constrained, higher-dimensional space.
+Compression: Higher-rank LoRA modules can
+then be (i) gradually reduced/annealed during
+fine-tuning (i.e., dynamic in-tuning transforma-
+tions, dubbed In-Squeeze, see Figure 2) or (ii) post-
+hoc after fine-tuning (i.e., static post-tuning trans-
+formations, dubbed Post-Squeeze, see Figure 1).
+Given that LoRA can be viewed as an approxima-
+tion of the ‘full delta’ Δ𝑊, LoRA matrices are first
+reconstructed into the ‘full model space’ yield-
+ing the Δ𝑊representation, and then compressed
+to a desired, lower rank using a very efficient
+implementation of Randomized Singular Value
+Decomposition (RSVD) (Halko et al., 2011).
+The two principles have several positive impli-
+cations on the efficiency, portability and reusabil-
+ity aspects of LoRA modules. For instance, as
+our results over 13 standard text-based and 10
+vision-text tasks demonstrate, LoRA-Squeeze
+helps unify LoRA structures after fine-tuning in
+cases when they were fine-tuned with different
+ranks without the need for retraining with other
+ranks, having positive impact on architectural ho-
+mogeneity. Further, it is not required to conduct
+hyperparameter search per each rank separately;
+it is possible to find a good setup for a subset of
+higher-order modules and create same- or even
+higher-quality lower-rank LoRA-s post-hoc, with-
+out any fine-tuning. Finally, we empirically vali-
+date that the gradual in-tuning LoRA-Squeeze
+procedure enables fine-tuning LoRA modules with
+a better trade-off between size and task perfor-
+mance than direct fine-tuning with a chosen rank.
+Put simply, our work shows that for LoRA it
+is often better to first learn a more expressive,
+higher-rank solution and then compress it, rather
+than attempting to learn a fixed low-rank solution
+from the outset. This paradigm not only offers
+immediate practical benefits, but also deepens
+our understanding of the mechanisms underlying
+parameter-efficient adaptation with LoRA-s.
+2. Background and Related Work
+On SVD and LoRA. Recent research has increas-
+ingly leveraged SVD—a fundamental technique
+for matrix factorization and optimal low-rank ap-
+proximation—to enhance the 1) initialization, 2)
+structure, and 3) optimization of LoRA.
+First, traditional LoRA initializes one matrix
+randomly and the other with zeros, which may
+not effectively leverage the structure of the pre-
+trained weights 𝑊0. SVD provides a principled
+approach to initialization by decomposing the
+original weight matrix. PiSSA (Principal Singular
+Value Adaptation) (Meng et al., 2024) and LoRA-
+Null (Tang et al., 2025) utilize this by initializ-
+ing the LoRA adapters with the principal com-
+ponents (i.e., those associated with the largest
+singular values) of the pretrained weights. This
+strategy aims to capture the most salient infor-
+mation from the base model, often leading to
+faster convergence. Furthermore, approaches like
+MiLoRA (Minor Low-Rank Adaptation) (Zhang
+et al., 2024) suggest focusing adaptation on the
+2
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+minor smallest singular values/components, argu-
+ing that the principal components already capture
+essential knowledge. SVD-informed initialization
+strategies have also been extended to more com-
+plex architectures; e.g., GOAT (Fan et al., 2025)
+introduces an SVD-structured Mixture-of-Experts
+framework where different experts are initialized
+with distinct SVD segments.
+Second, SVD has also been integrated directly
+into the LoRA structure to achieve extreme pa-
+rameter efficiency or inspire novel architectures.
+LoRA-XS (Balazy et al., 2024) achieves drastic
+parameter reduction by leveraging the SVD of the
+original weight matrix to create frozen low-rank
+matrices (U and V). A very small, trainable ma-
+trix is then inserted between them, significantly
+reducing the number of trainable parameters by
+only training the interaction between the frozen
+singular vectors.
+Finally, SVD provides a mathematical basis for
+analyzing and optimizing rank allocation dynam-
+ically. AdaLoRA (Zhang et al., 2023) directly
+addresses this by parameterizing the low-rank
+updates in an SVD form. It iteratively estimates
+the importance of weight updates based on an
+importance score derived from an SVD-based pa-
+rameterization of the weight updates, and then
+prunes the least significant ones. This dynami-
+cally optimizes the rank distribution across the
+model, allocating more capacity to critical lay-
+ers while reducing redundancy in others. While
+AdaLoRA addresses the same fundamental prob-
+lem as our work, the sub-optimality of a uniform,
+prespecified rank allocation across all layers and
+modules, it introduces extra complexity into the
+training loop; it requires importance scoring and
+budget scheduling. Moreover, by design it breaks
+the homogeneity of LoRA structures (Zhou et al.,
+2024) which might have detrimental impact on
+infrastructural simplicity of deployment and serv-
+ing LoRA modules (Sheng et al., 2024). LoRA-
+Squeeze offers a simple, more flexible alterna-
+tive without any training and serving overhead.
+Another very related line of work coupling SVD
+and LoRA focuses on finding lower-ranked LoRA
+subspaces for a set of 𝑁independently trained
+(higher-ranked) LoRA-s via spectral decomposi-
+tion techniques (Kaushik et al., 2025b; Panariello
+et al., 2025), formalizing the idea of the exis-
+tence of a shared lower-ranked subspace. In turn,
+this work combined with the universal weight sub-
+space hypothesis Kaushik et al. (2025a) hints that
+the ‘intrinsic dimension’ of the delta/update is
+lower than the actual chosen rank, which sets the-
+oretical foundations for LoRA-Squeeze. Here,
+we focus on a novel setup of retaining or improv-
+ing performance via spectral decomposition for
+a single LoRA, rather than finding a shared sub-
+space for 𝑁LoRA-s.
+More generally, beyond the methods that rely
+directly on SVD, the number of module variants
+derived from the standard LoRA architecture,
+and again focusing on improved initialization,
+structure or optimization, is immense (Kopiczko
+et al., 2024; Li et al., 2025, 2024; Liu et al.,
+2024; Tian et al., 2024; Wu et al., 2024; Yang
+et al., 2024, among others). Despite all the vari-
+ants, the standard LoRA design still remains
+a dominant paradigm due to its architectural
+and serving simplicity. More sophisticated vari-
+ants often imply intricate interventions into the
+training process (e.g., customized matrix decom-
+positions as with LoRA-XS, VeRA or DoRA), or
+creation of customized large base models (e.g.,
+residual models as with PiSSA and MiLoRA), or
+yield non-homogeneous LoRA-s across the base
+model incurring deployment and serving difficul-
+ties (AdaLoRA). Therefore, for the variety of prac-
+tical reasons including its wide adoption, in this
+work we deliberately focus on the setup which
+relies on the standard LoRA architecture, and
+where such modules are directly tied to standard
+LLM checkpoints. The extension of the LoRA-
+Squeeze principles to more sophisticated LoRA
+architectures is left for future research.
+Within this setup, LoRA-Squeeze thus aims
+to (1) reduce trainable parameters of standard
+LoRA-s via in-tuning or post-tuning rank reduc-
+tion, (2) initialize lower-rank LoRA-s with SVD of
+weights that originated from higher-rank LoRA
+training, and (3) optimize resource allocation of-
+fline or without any significant training overhead.
+3
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Figure 1 | LoRA-Squeeze after fine-tuning (Post-
+Squeeze). We fine-tune with a LoRA with a higher,
+‘source’ LoRA rank 𝑟𝑠𝑟𝑐and then transform it to a
+lower, ‘target’ LoRA rank 𝑟𝑡𝑔𝑡.
+3. Methodology
+The core of LoRA-Squeeze is a transformation
+that leverages Randomized SVD to compress a
+fine-tuned LoRA module from a high source rank
+to a lower target rank, as illustrated in Figure 1.
+Preliminaries I: LoRA as a Low-Rank Task Vec-
+tor/Tensor Approximation. Let us assume a
+pretrained LLM parameterized by a set of weight
+matrices {𝑊0,𝑙}, with 𝑙= 1, . . . , 𝐿, and 𝐿is the
+number of LLM layers.1 After fully fine-tuning
+for a task 𝑇, each weight matrix 𝑊0 is updated to
+a new state of weights 𝑊𝑇. The change induced
+by the fine-tuning process can be captured by the
+task vector (or, more accurately, the task tensor),
+defined as the element-wise difference between
+the fine-tuned and pretrained weights (Ilharco
+et al., 2023): Δ𝑊= 𝑊𝑇−𝑊0.
+The task tensor Δ𝑊resides in the same high-
+dimensional space as the original weights and
+encapsulates the knowledge required to adapt
+the model for task 𝑇. LoRA is predicated on the
+empirical observation that this task vector Δ𝑊typ-
+ically has a low intrinsic rank (Aghajanyan et al.,
+2021; Hu et al., 2022). Consequently, instead
+of learning the full dense matrix Δ𝑊, LoRA ap-
+proximates it with a low-rank factorization. Thus,
+LoRA can be understood as a method for learning
+a parameter-efficient, low-rank approximation of
+the full-space task vector, where higher-rank ap-
+proximations have more capacity, and can there-
+fore fit a better approximation of the task vector.
+Preliminaries II: Randomized SVD. The use
+of low-rank decomposition, particularly Singu-
+lar Value Decomposition (SVD), for compress-
+ing neural networks has a long history (Denton
+1For notational simplicity, we will drop indexing over
+layers.
+Algorithm 1 Randomized SVD for LoRA Creation
+Input: Input matrix 𝑊∈ℝ𝑚×𝑛, target rank 𝑟, over-
+sampling hyper-parameter 𝑘𝑜, number of power
+iterations 𝑘𝑞.
+Output: LoRA matrices 𝐴∈ℝ𝑚×𝑟and 𝐵∈ℝ𝑟×𝑛such
+that 𝑊≈𝐴𝐵.
+1: 𝑟′ ←𝑟+ 𝑘𝑜
+2: Draw a random Gaussian matrix Ω ∈ℝ𝑛×𝑟′
+3: 𝑌←𝑊Ω
+4: for 𝑖= 1 →𝑘𝑞do
+5:
+𝑄, _ ←qr_decomposition(𝑌)
+6:
+𝑌∗←𝑊𝑇𝑄
+7:
+𝑄∗, _ ←qr_decomposition(𝑌∗)
+8:
+𝑌←𝑊𝑄∗
+9: end for
+10: 𝑄, _ ←qr_decomposition(𝑌)
+11: 𝐷←𝑄𝑇𝑊
+12: ˜𝑈, 𝑆, 𝑉𝑇←svd_decomposition(𝐷)
+13: 𝑈←𝑄˜𝑈
+14: 𝑈𝑟←𝑈[:, 1 : 𝑟]
+15: 𝑆𝑟←𝑆[1 : 𝑟]
+16: 𝑉𝑇
+𝑟←𝑉𝑇[1 : 𝑟, :]
+17: Σ1/2
+𝑟
+←diag(√
+𝑆𝑟)
+18: 𝐴←𝑈𝑟Σ1/2
+𝑟
+19: 𝐵←Σ1/2
+𝑟
+𝑉𝑇
+𝑟
+20: return 𝐴, 𝐵
+et al., 2014). For any given matrix, truncated
+SVD provides the optimal low-rank approxima-
+tion in the sense of minimizing the Frobenius
+norm of the difference, making it a principled
+choice for weight matrix compression. To effi-
+ciently handle the potentially large dimensions
+of Δ𝑊for large LLMs, we apply a rank-𝑟trun-
+cated Randomized SVD (RSVD) (Halko et al.,
+2011).2 As the standard SVD, RSVD decomposi-
+tion of some matrix 𝑀∈ℝ𝑚×𝑛yields three ma-
+trices corresponding to the top 𝑟singular com-
+ponents: RSVD𝑟(𝑀) →𝑈, Σ, 𝑉𝑇. Here, 𝑈∈ℝ𝑚×𝑟
+contains the top left singular vectors, Σ ∈ℝ𝑟×𝑟is
+a diagonal matrix of the top singular values, and
+𝑉𝑇∈ℝ𝑟×𝑛contains the top right singular vectors.
+3.1. LoRA-Squeeze
+The main ‘building block’ of LoRA-Squeeze
+operates on a LoRA module that has already been
+(partially or fully) fine-tuned with a relatively
+2We refer the reader to this blog post for an informative
+overview of RSVD: https://gregorygundersen.com/
+blog/2019/01/17/randomized-svd/.
+4
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Figure 2 | LoRA-Squeeze during fine-tuning (In-Squeeze); we can gradually anneal the LoRA rank
+during fine-tuning by reconstructing the full delta Δ𝑊from the current LoRA, decompose it to a
+lower-rank LoRA via Randomized SVD and continue fine-tuning with a lower-rank. It repeats the
+main Post-Squeeze steps (Figure 1) multiple times during fine-tuning using a predetermined annealing
+scheme.
+Algorithm 2 Memory-Efficient LoRA-Squeeze
+Input: LoRA matrices 𝐴𝑠𝑟𝑐∈ℝ𝑚×𝑟𝑠𝑟𝑐, 𝐵𝑠𝑟𝑐∈ℝ𝑟𝑠𝑟𝑐×𝑛,
+target rank 𝑟𝑡𝑔𝑡
+Output: Pruned LoRA matrices 𝐴𝑡𝑔𝑡∈ℝ𝑚×𝑟𝑡𝑔𝑡, 𝐵𝑡𝑔𝑡∈
+ℝ𝑟𝑡𝑔𝑡×𝑛
+1: Step 1: Orthogonalize bases
+2: 𝑄𝐴, 𝑅𝐴←qr_decomposition(𝐴)
+3: 𝑄𝐵, 𝑅𝐵←qr_decomposition(𝐵⊤)
+4: Step 2: Compute core interaction matrix
+5: 𝑀←𝑅𝐴𝑅⊤
+𝐵
+⊲Dense matrix of size 𝑟𝑠𝑟𝑐× 𝑟𝑠𝑟𝑐
+6: Step 3: Full SVD or RSVD
+7: 𝑈𝑀, 𝑆𝑀, 𝑉⊤
+𝑀←(r)svd_decomposition(𝑀)
+8: Step 4: Truncate rank
+9: 𝑈𝑟←𝑈𝑀[:, 1 : 𝑟𝑡𝑔𝑡]
+10: 𝑆𝑟←𝑆𝑀[1 : 𝑟𝑡𝑔𝑡]
+11: 𝑉𝑇
+𝑟←𝑉𝑇
+𝑀[1 : 𝑟𝑡𝑔𝑡, :]
+12: Σ1/2
+𝑟
+←diag(√
+𝑆𝑟)
+13: Step 5: Reconstruct target-rank A and B
+14: 𝐴𝑡𝑔𝑡←𝑄𝐴𝑈𝑟Σ1/2
+𝑟
+15: 𝐵𝑡𝑔𝑡←Σ1/2
+𝑟
+𝑉⊤
+𝑟𝑄⊤
+𝐵
+16: return 𝐴𝑡𝑔𝑡, 𝐵𝑡𝑔𝑡
+high source rank, 𝑟𝑠𝑟𝑐, and transforms it into a new
+module with an arbitrary, typically lower, target
+rank, 𝑟𝑡𝑔𝑡. This process, illustrated in Figure 1,
+proceeds in three main steps:
+Step 1: (Higher-Rank) Fine-Tuning: First, a stan-
+dard LoRA fine-tuning process is executed for a
+given task, but with a source rank 𝑟𝑠𝑟𝑐chosen to
+be larger than the anticipated final deployment
+rank. This step yields the trained LoRA matrices,
+𝐴𝑠𝑟𝑐∈ℝ𝑚×𝑟𝑠𝑟𝑐and 𝐵𝑠𝑟𝑐∈ℝ𝑟𝑠𝑟𝑐×𝑛.
+Step 2: Full Task Vector Reconstruction: The high-
+rank LoRA matrices are multiplied to reconstruct
+the low-rank approximation of the task vector
+in the full parameter space. This results in the
+delta matrix Δ𝑊𝑠𝑟𝑐= 𝐴𝑠𝑟𝑐· 𝐵𝑠𝑟𝑐. Δ𝑊𝑠𝑟𝑐has the same
+dimensions as the original weight matrix 𝑊0 but
+is constrained to have a rank of at most 𝑟𝑠𝑟𝑐.
+Step 3: RSVD for LoRA Creation: Finally, the com-
+ponents from the RSVD applied to Δ𝑊𝑠𝑟𝑐are used
+to construct the new, compressed LoRA matri-
+ces, 𝐴𝑡𝑔𝑡and 𝐵𝑡𝑔𝑡, for the arbitrary target rank
+𝑟𝑡𝑔𝑡. The full procedure is summarized in Alg. 1,
+where Lines 1-13 depict the step-by-step formu-
+lation of RSVD; SVD in Line 12 defines standard,
+full SVD.3
+The resulting matrices, 𝐴𝑡𝑔𝑡∈ℝ𝑚×𝑟𝑡𝑔𝑡and 𝐵𝑡𝑔𝑡∈
+ℝ𝑟𝑡𝑔𝑡×𝑛, form a new LoRA of rank 𝑟𝑡𝑔𝑡. From the
+task arithmetic perspective, they constitute a new
+𝑟𝑡𝑔𝑡-rank approximation of the task vector.
+Post-Squeeze and In-Squeeze.
+The process de-
+scribed above may be done only once and offline,
+after fine-tuning a LoRA with 𝑟𝑠𝑟𝑐: we refer to it
+as Post-Squeeze. However, it also possible to iter-
+atively repeat it during fine-tuning, as a gradual
+rank annealing process. We refer to this variant
+as In-Squeeze, illustrated in Figure 2. A special
+case of In-Squeeze, labeled Cont-Squeeze, contin-
+ues fine-tuning at the final target rank, without
+any subsequent iterations (i.e., it does only a sin-
+gle iteration). Allowing additional fine-tuning af-
+ter the rank reduction allows for recovering task
+performance when a lot of information gets dis-
+carded via RSVD decomposition (e.g., in cases
+when 𝑟𝑡𝑔𝑡≪𝑟𝑠𝑟𝑐).
+Memory-Efficient LoRA-Squeeze.
+A ma-
+jor constraint of the proposed LoRA-Squeeze
+method lies in Step 2 of the procedure (see Fig-
+ure 1) which requires full task vector reconstruc-
+tion. This effectively creates a set of parame-
+3To balance the magnitudes of the two resulting matrices,
+the singular values are distributed between them (L18-19
+of Alg 1).
+5
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+ters of the size of the original LLM, which can
+be memory-inefficient for large-scale LLMs. We
+thus propose a memory-efficient variant of LoRA-
+Squeeze whose memory requirements are not
+bound by the full rank, but rather than on rank
+𝑟𝑠𝑟𝑐, and can be used for Post-Squeeze, In-Squeeze,
+and Cont-Squeeze. It is summarized in Alg. 2.
+The
+main
+idea
+is
+identifying
+the
+least-
+contributing dimensions without the need to re-
+construct Δ𝑊at the full rank. The matrix 𝑀is
+valid for our purpose because QR decompositions
+of 𝐴𝑠𝑟𝑐and 𝐵𝑠𝑟𝑐matrices create orthogonal ma-
+trices 𝑄𝐴and 𝑄𝐵which only do rotation. They
+do not change the length (magnitude) or ‘impor-
+tance’ of the vectors they multiply (which are
+placed in the 𝑅matrices). This means that the
+information about ‘how important a dimension is’
+(the singular values) is preserved perfectly inside
+the smaller interaction matrix 𝑀. A formal deriva-
+tion describing the relationship between the stan-
+dard and memory-efficient LoRA-Squeeze is
+provided in Appendix D.
+Memory-efficient LoRA-Squeeze does not
+require the full 𝑚× 𝑛Δ𝑊interaction matrix on
+which Full or Randomized SVD operates, but it
+is based on a smaller 𝑟𝑠𝑟𝑐× 𝑟𝑠𝑟𝑐matrix (see line
+5 of Alg. 2) which gets decomposed by SVD. In
+consequence, this creates a smaller ‘𝑟𝑠𝑟𝑐-bound’
+rather than ‘{𝑚, 𝑛}-bound’ memory footprint. Ad-
+ditional insights into (approximated) computa-
+tional complexity of different compositions within
+LoRA-Squeeze are in Appendix E.
+4. Experimental Setup
+We conduct a comprehensive set of experiments
+across multiple model sizes, task domains and
+tasks of varying complexity, as well as over var-
+ious rank configurations. The experiments are
+centered around the Gemma 3 family of mod-
+els (Team et al., 2025); the primary model for
+development and the majority of experiments is
+the instruction-tuned Gemma 3 4B IT variant. We
+also conduct supplementary experiments with the
+smaller (text-only) Gemma 3 1B IT and the larger
+Gemma 3 12B IT variants.4
+4Preliminary experiments on pretrained (PT) model vari-
+ants such as Gemma 3 1B/4B/12B PT resulted in very similar
+Evaluation Tasks. For the majority of our empir-
+ical analysis, we rely on a suite of 13 standard
+scoring-based, text-based evaluation tasks. These
+tasks were selected for their diversity, simplicity
+of evaluation, as well as for covering a range of
+natural language understanding capabilities. We
+also experiment with 10 well-established vision-
+language (VL) QA tasks. For all tasks, evaluation
+is run on the standard test splits where available,
+and on dev otherwise; Appendix C lists the tasks
+and the corresponding datasets.
+4.1. LoRA Fine-Tuning Protocols
+Following a standard practice (Dai et al., 2023;
+Liu et al., 2023), in all experiments LoRA-s are ap-
+plied exclusively to the weight matrices of the text-
+processing components of the Gemma 3 models.
+This means that for the multi-modal experiments,
+the vision encoder (SigLIP) (Zhai et al., 2023)
+and the multi-modal projection layers were kept
+frozen. The main baseline are LoRA-s trained
+directly at a target rank.
+Rank Configurations. We trained baseline LoRA
+modules directly at a range of ranks:
+𝑟
+∈
+{1, 2, 4, 8, 16, 32, 64, 128}. For Post-Squeeze, we
+compressed them to various lower target ranks
+(𝑟𝑡𝑔𝑡). For In-Squeeze, we also validated a range
+of source and target rank configurations.
+Learning Rate Selection. For all direct LoRA fine-
+tuning experiments, we first determined the opti-
+mal learning rate for each LoRA rank and model
+size combination to ensure that our baseline com-
+parisons were as strong as possible (Schulman
+and Lab, 2025). We used the Adafactor opti-
+mizer (Shazeer and Stern, 2018) with a linear
+warmup of 1000 steps and no subsequent learning
+rate decay. The optimal learning rate was selected
+via a grid search over the set {0.001, 0.003, 0.01,
+0.03, 0.1}. The finally selected learning rates are
+provided in Table 2 in Appendix A. In another ex-
+periment, we also analyze how LoRA-Squeeze
+can be used to create strong lower-rank LoRA
+modules without running any hyperparameter
+sweeps for the target rank.
+RSVD Configuration. Following standard prac-
+findings.
+6
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+tices (Halko et al., 2011), we set the number of
+oversampling dimensions 𝑘𝑜= 10 and perform
+two subspace iterations 𝑘𝑞= 2; see Alg. 1. These
+choices provide a strong trade-off between effi-
+ciency and approximation quality.5 6 The same
+RSVD config is used with the memory-efficient
+LoRA-Squeeze.
+Other Hyperparameters. In all experiments, we
+rely on a batch size of 8 and max sequence length
+is set to 1,024. To ensure convergence, mod-
+els were fine-tuned for 10,000 steps on smaller
+datasets and 15,000 steps on larger datasets.
+In-Squeeze Fine-Tuning Setup. For continued
+fine-tuning (i.e., the Cont-Squeeze variant), di-
+rectly trained as well as ‘post-squeezed’ LoRA-s
+of the same rank 𝑟𝑡𝑔𝑡are subjected to additional,
+short and inexpensive fine-tuning for 200 and 700
+steps, using a 100-step warmup and the optimal
+learning rate previously determined for 𝑟𝑡𝑔𝑡-rank
+LoRA-s.
+For the more general In-Squeeze variant, fine-
+tuning starts at a high rank (e.g., 128) for a frac-
+tion of the total steps, after which LoRA gets
+squeezed to the next lower rank (e.g., 64). This
+process is repeated through subsequent lower
+ranks until the end rank (e.g., 𝑟𝑡𝑔𝑡= 1). The total
+number of training steps is kept constant across
+all experiments for a fair comparison. We test
+two schemes for allocating the training budget
+across these stages. (1) Standard Scheme: The
+total step budget is distributed among the rank
+stages proportionally to the rank value; e.g., in
+the setup where we anneal 128 →64 →32 →
+16 →8 →4 →2 →1, the ‘rank-128 stage’ re-
+ceives 128/(128 + 64 + ... + 1) of the total steps;
+(2) Minimum Steps Scheme: To ensure that lower
+ranks receive adequate training, each stage is first
+allocated a minimum of 200 steps. The remaining
+training budget is then distributed proportionally,
+5Given the stochastic nature of RSVD, we also ran it with
+multiple random seeds, but observed minimal variation in
+task performance. In our preliminary experiments we also
+verified that resorting to cheap and efficient RSVD instead of
+full SVD yielded minimal, if any, degradation in performance
+for our set of tasks.
+6The computation cost of RSVD, even when used multiple
+times as in case of In-Squeeze, is negligible compared to the
+other components of LoRA fine-tuning, and RSVD can be
+run on CPU.
+as in the standard scheme.
+5. Results and Discussion
+Our key experiments provide robust evidence that
+the LoRA-Squeeze methodology not only offers
+greater flexibility, but also often surpasses per-
+formance of standard (direct) LoRA fine-tuning,
+especially for the lowest ranks.
+Reducing Hyperparameter Search. We first in-
+vestigate a scenario where the aim is to obtain 𝑟𝑡𝑔𝑡-
+rank LoRA-s while reducing the number of per-
+rank hyperparameter sweeps (e.g., for the learn-
+ing rate). Put simply, we conduct a hyperparame-
+ter sweep only for a single, source rank 𝑟𝑠𝑟𝑐= 128,
+then create a series of lower-rank LoRA-s with
+Post-Squeeze, and compare against directly fine-
+tuned 𝑟𝑡𝑔𝑡-rank LoRA-s using the same learning
+rate, which potentially might be suboptimal for
+the lower-rank LoRA-s.
+The results for three text tasks are in Figures 3a-
+3c, and the results for two VL tasks are in Fig-
+ures 8a-8b in Appendix H. They clearly show
+how (i) suboptimal learning rates can yield sub-
+optimal results with direct fine-tuning of LoRA-s
+with different ranks (i.e., the practitioner thus
+indeed has to carefully fine-tune crucial hyper-
+parameters per LoRA rank), and how (ii) per-rank
+hparam sweep for a multitude of target ranks can
+be avoided with LoRA-Squeeze.
+Nonetheless, in order to enable fair per-rank
+comparisons, all the remaining experiments
+rely on per-rank optimized learning rates; see
+again §4.1 and Appendix A.
+Post-Squeeze versus Direct Fine-Tuning. We
+now examine the performance difference be-
+tween Post-Squeeze and direct LoRA fine-tuning
+across all possible source-target rank configura-
+tions, for ranks 1, 2, 4, 8, 16, 32, 64, 128. The
+overview of the results averaged over the 13 text-
+only tasks is provided in Figures 4a (Gemma 4B)
+and Figures 4b (Gemma 1B), with additional re-
+sults for the VL tasks in Figure 9, also in Ap-
+pendix H (4B).
+The central finding is that fine-tuning a LoRA
+module at a high source rank (𝑟𝑠𝑟𝑐) and subse-
+7
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+(a) ANLI-r2
+(b) DROP
+(c) HellaSwag
+Figure 3 | Performance over 3 representative text-based tasks when we do hyperparameter search
+for the learning rate or LoRA-s only for the highest rank in the figures (𝑟𝑠𝑟𝑐= 128), and keep the
+same lr for direct fine-tuning at all the other (lower) ranks. A simple offline Post-Squeeze method can
+bypass the hyperparameter search and yield better-performing LoRA-s without any fine-tuning at the
+lower ranks. Similar patterns are observed for the VL tasks; see the selection of plots in Figure 8 in
+Appendix H. Remark: For the higher results with 𝑟𝑡𝑔𝑡-rank LoRAs, where a learning rate sweep for 𝑟𝑡𝑔𝑡
+was performed, we refer the reader later to Table 1.
+(a) Gemma 3 4B IT.
+(b) Gemma 3 1B IT.
+Figure 4 | Performance difference heatmaps on text tasks for (a) Gemma 3 4B IT and (b) Gemma 3
+1B IT. Each heatmap plots the average performance gain of Post-Squeeze from a given source rank
+𝑟𝑠𝑟𝑐(y-axis) to a target rank 𝑟𝑡𝑔𝑡(x-axis), relative to a baseline LoRA module trained directly at 𝑟𝑡𝑔𝑡.
+Red cells indicate a positive gain, signifying that Post-Squeeze outperforms direct fine-tuning.
+quently compressing it to a lower target rank (𝑟𝑡𝑔𝑡)
+on average yields on-par or even higher-quality
+𝑟𝑡𝑔𝑡LoRA-s (e.g., 16 →4 or 128 →8 setups) than
+the ones obtained via direct fine-tuning with 𝑟𝑡𝑔𝑡;
+we again remind the reader that we ran hyper-
+parameter sweeps for 𝑟𝑡𝑔𝑡to avoid having subop-
+timal baselines, directly tuned 𝑟𝑡𝑔𝑡-rank LoRA-s.
+For the latter two configurations, we observe at
+least small gains for 9/13 tasks, with substantial
+gains on some tasks.
+On the Transformation Step and Performance
+Collapse.
+The capability of Post-Squeeze is a
+function of (i) its starting rank, where the as-
+sumption is that higher ranks would typically
+provide higher task performance, and (ii) of the
+actual transformation step (i.e., the difference be-
+tween 𝑟𝑡𝑔𝑡and 𝑟𝑠𝑟𝑐). The larger the step, the more
+components get discarded during the RSVD com-
+pression, which potentially may result in perfor-
+mance loss or even performance collapse. A clear
+and consistent pattern emerges from the visual-
+izations in Figures 4a-4b. The benefits of Post-
+Squeeze are most pronounced when compressing
+from a higher rank to a lower one when the dif-
+ference between 𝑟𝑠𝑟𝑐and 𝑟𝑡𝑔𝑡is (arguably) large
+but not extreme, and thus not leading to severe
+information loss. This trend holds true both for
+8
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Table 1 | Performance comparison (Accuracy %) of different fine-tuning strategies for Gemma 3 4B
+IT on text tasks. 0-S refers to zero-shot performance of the base model without any task-specific
+fine-tuning. +M steps refers to continued fine-tuning after the initial N fine-tuning steps. The best
+result in each row is highlighted in bold.
+Direct Fine-tuning (𝑟= 1)
+Cont-Squeeze (128 →1)
+In-Squeeze (128 ...→1)
+Task
+0-S
++0 steps
++200 steps
++700 steps
++0 steps
++200 steps
++700 steps
+Standard
+Min steps
+WNG-L
+27.0
+90.73
+90.94
+90.60
+90.69
+91.58
+91.41
+91.07
+91.88
+BOOLQ
+49.8
+94.39
+94.28
+94.34
+94.11
+94.39
+94.06
+94.30
+94.47
+PIQA
+35.0
+93.05
+93.11
+93.02
+92.49
+92.97
+93.22
+92.89
+92.80
+DROP
+52.6
+88.80
+87.97
+87.70
+86.41
+88.03
+87.67
+88.25
+88.66
+ANLI-r2
+19.9
+79.30
+77.23
+78.57
+29.30
+78.46
+79.52
+79.63
+81.14
+PAWS
+35.3
+97.56
+97.57
+96.94
+74.82
+97.15
+97.39
+97.40
+97.60
+HSWAG
+50.8
+97.19
+97.19
+97.09
+96.79
+97.42
+97.16
+97.49
+97.51
+OBQA
+42.4
+94.95
+94.95
+94.83
+94.71
+94.47
+94.71
+94.59
+94.71
+GoE
+46.0
+83.25
+83.54
+81.91
+81.32
+83.26
+82.73
+83.83
+83.90
+ARC-E
+44.8
+95.12
+95.23
+95.12
+86.74
+95.03
+95.01
+94.92
+95.23
+ARC-C
+36.6
+88.80
+88.59
+89.02
+59.68
+89.11
+88.76
+88.80
+88.80
+SIQA
+35.8
+88.78
+89.35
+87.87
+88.13
+89.33
+89.35
+89.77
+89.85
+MMLU
+42.6
+79.19
+76.61
+78.69
+29.97
+79.43
+80.17
+79.75
+80.16
+Avg
+39.9
+90.08
+89.74
+89.67
+77.32
+90.05
+90.09
+90.21
+90.51
+4B and 1B models. While starting from a higher
+rank is beneficial, the choice of the source rank
+𝑟𝑠𝑟𝑐is not arbitrary, and an excessively large gap
+between 𝑟𝑠𝑟𝑐and 𝑟𝑡𝑔𝑡can be detrimental or even
+lead to a performance collapse (e.g., see the drop
+for the 128 →1 configuration in Figure 4b). This
+empirical finding has two practical implications:
+First, it directly motivates the Cont-Squeeze
+method, positing the following question: if the
+collapse is encountered, can performance after
+the Post-Squeeze compression be quickly recov-
+ered via short continued fine-tuning?
+Second, given a desired target rank, there seems
+to be a ‘sweet spot’ for the source rank, which
+should be sufficiently large to facilitate good op-
+timization, but not so large that the subsequent
+compression step becomes overly lossy, and this is
+also partially model-specific (cf., 4B and 1B vari-
+ants with 𝑟𝑡𝑔𝑡= 2). We preliminarily analyze the
+patterns of performance collapse through the lens
+of variance/energy retention after pruning singu-
+lar values; see the full discussion in Appendix B. A
+promising direction for future work is thus to use
+the rate of retention of the singular values as a
+proxy to anticipate this collapse and guide the se-
+lection of an optimal 𝑟𝑠𝑟𝑐if continued fine-tuning
+is not possible.
+Cont-Squeeze and In-Squeeze Performance. We
+now compare the performance of continued fine-
+tuning after Post-Squeeze (the Cont-Squeeze vari-
+ant) as well as the effect of gradual in-tuning rank
+annealing (the general In-Squeeze variant). The
+main experimental setup is as follows: 𝑟𝑡𝑔𝑡= 1,
+where 𝑟𝑠𝑟𝑐= 128 for Cont-Squeeze, and 128 is also
+the starting rank for the iterative annealing. For
+a fair comparison, we keep the total number of
+training steps equal across all the method variants
+in the comparison: if the original number of fine-
+tuning steps for the task was N (e.g., 𝑁= 10, 000),
+for direct fine-tuning we continue fine-tuning for
+the additional 𝑀= 200 or 𝑀= 700 steps (so that
+the total number of steps is 𝑁+ 𝑀), while for
+Cont-Squeeze we continue fine-tuning also for 𝑀
+steps with 𝑟𝑡𝑔𝑡after the 𝑟𝑠𝑟𝑐→𝑟𝑡𝑔𝑡transformation.
+Finally, for the standard In-Squeeze, we distribute
+the 𝑁+ 𝑀steps according to the two schemes
+described in §4.1.
+The results with 4B IT on text-only tasks are
+provided in Table 1. The results of the 4B model
+on the VL tasks and the results with the 1B model
+are provided in the respective Tables 8 and 7 in
+Appendix H. First, we observe that the directly
+trained rank-1 LoRA seems already saturated;
+continued fine-tuning offers no performance bene-
+fit and can sometimes even lead to minor degrada-
+tions. In stark contrast, the ‘squeezed’ (128→1)
+LoRA benefits significantly from this brief refine-
+9
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Figure 5 | Performance difference between the
+memory-efficient LoRA-Squeeze and the stan-
+dard Post-Squeeze variant, averaged over the 13
+text-only tasks.
+ment of Cont-Squeeze. The additional fine-tuning
+steps help it recover from the information loss in-
+curred during the aggressive compression. Cont-
+Squeeze can fully recover performance after mere
+𝑀= 200 additional steps, even when the collapse
+happens (e.g., see the recovery on ANLI-r2 and
+MMLU). In the case of VL tasks, Cont-Squeeze
+often improves beyond its initial Post-Squeeze per-
+formance. Overall, this demonstrates that quick
+continued fine-tuning is an effective and efficient
+strategy for refining transformed LoRA-s.
+Further, the gradual rank annealing, In-Squeeze,
+is proven to be highly effective across the board.
+As shown in the final two columns of the tables,
+the ‘Minimum Steps’ sub-variant shows consis-
+tently strong performance across all models and
+task types, and also hits peak performance for
+the majority of tasks (e.g., 8/13 tasks in Table 1).
+This suggests that a gradual, curriculum-based
+in-tuning compression schedule is a superior op-
+timization strategy for discovering a robust and
+high-performing low-rank solution.
+5.1. Additional Experiments and Ablations
+Memory-Efficient LoRA-Squeeze. A compari-
+son between memory-efficient Post-Squeeze and
+its standard variant is provided in a heatmap in
+Figure 5. As a general finding, as expected (see
+Appendix D) we do not see any significant differ-
+ence between the two variants. We further note
+that the observed patterns (e.g., observed perfor-
+mance collapse or the rate of performance decay)
+are also very well aligned across individual tasks
+for the two variants. The tiny fluctuation in the re-
+sults is only due to non-exactness of Randomized
+SVD used across the two variants.
+(Low) Variation over Random Seeds. To ensure
+that the observed gains with LoRA-Squeeze
+(especially with Cont-Squeeze and In-Squeeze) are
+not due to the randomness-bound variation of the
+chosen random seed and RSVD, we also compute
+the standard error of the mean (SEM) across mul-
+tiple runs with different random seeds. The SEM
+scores, as evidenced in Table 3 in Appendix B, are
+extremely low, and we observe particulary low
+variance for the lowest ranks. This has two impli-
+cations: (i) direct fine-tuning with lower ranks is
+more likely to get stuck in local minima; (ii) abso-
+lute gains of LoRA-Squeeze are typically much
+larger than the observed SEM scores, confirming
+that LoRA-Squeeze can create 𝑟𝑡𝑔𝑡-rank LoRA-s
+that avoid those local minima.
+What If 𝑟𝑡𝑔𝑡≥𝑟𝑠𝑟𝑐? Note that, strictly speaking, it
+is possible to create a target LoRA where 𝑟𝑡𝑔𝑡≥𝑟𝑠𝑟𝑐.
+However, the target LoRA cannot capture any new
+information not captured by the source LoRA. It
+merely provides a higher-rank SVD-based approx-
+imation of the source LoRA unrolled into the full
+weights space. Basically, the target rank controls
+the ‘fine-grainedness’ of approximating the ap-
+proximation of the delta vector provided by the
+source-rank LoRA.7 However, this feature of hav-
+ing an arbitrary target rank (including the setting
+where the target rank is higher than the source
+rank) might be used, e.g., if a designer wants to
+have a single LoRA rank across different LoRA-s
+(trained with different values for 𝑟𝑠𝑟𝑐), without
+the need to retrain them.
+VL Tasks and Other Model Sizes. Additional
+results on text-only tasks (1B) are in Table 7, and
+the results on the VL tasks (4B) are in Table 8;
+Appendix H. The key findings, with some slight
+differences (e.g., the performance on the VL tasks
+seems more saturated and the gains with LoRA-
+Squeeze, while still visible are less pronounced
+than on text-only tasks), still hold. As expected,
+7The fact that RSVD is the best 𝑟𝑡𝑔𝑡-rank approximation
+of the Δ𝑊𝑠𝑟𝑐= 𝐴𝑠𝑟𝑐× 𝐵𝑠𝑟𝑐task vector is also the root cause of
+slight variance in performance when setting 𝑟𝑠𝑟𝑐= 𝑟𝑡𝑔𝑡with
+Post-Squeeze; see the diagonals of Figures 4a and 4b.
+10
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+the performance collapse with too large trans-
+formation steps (e.g., 128 →1) is more salient
+with a smaller, 1B model - nonetheless, Cont-
+Squeeze can again recover performance extremely
+quickly after 200 additional fine-tuning steps and
+In-Squeeze remains the most powerful model vari-
+ant on average (see Table 7). Finally, a small
+experiment with Post-Squeeze) on 12B for a selec-
+tion of tasks further confirms the robustness of
+LoRA-Squeeze; see Figure 10 in Appendix H.
+Finally, we also provide a brief discussion on
+theoretical implications (e.g., relationship to lot-
+tery ticket hypothesis) of LoRA-Squeeze in
+Appendix G.
+6. Conclusion
+We introduced LoRA-Squeeze, a simple yet effec-
+tive methodology for compressing LoRA modules
+either post-hoc or dynamically during fine-tuning.
+Our experiments over a suite of 13 text-based
+and 10 vision-language VQA tasks demonstrated
+that it is often more advantageous to fine-tune
+with a higher, ‘overparameterized’ LoRA rank and
+then compress to a lower target rank, rather than
+fine-tuning at the fixed target rank directly. This
+approach not only yields modules with a better
+size-to-performance trade-off but also simplifies
+deployment by decoupling the training rank from
+the deployment rank and reducing the need for
+rank-specific hyperparameter tuning. The grad-
+ual, in-tuning rank annealing variant delivered
+the most robust results in general.
+Due to its wide adoption, extensive use and ar-
+chitectural simplicity, in this work we focused on
+the standard LoRA design. For future work, one
+research direction is to extend the LoRA-Squeeze
+principles beyond standard LoRA setups to more
+sophisticated LoRA variants. We also plan to uti-
+lize LoRA-Squeeze principles in techniques for
+module merging (Stoica et al., 2025). Further-
+more, we plan to explore methods for automati-
+cally determining the optimal source rank or grad-
+ual rank annealing schedules for a given target
+rank by extending our preliminary analyses (see
+Figure 7 in the Appendix) on the rate of decay of
+singular values during decomposition.
+References
+M. Acharya, K. Kafle, and C. Kanan. TallyQA:
+Answering complex counting questions. In The
+Thirty-Third AAAI Conference on Artificial In-
+telligence, AAAI 2019, The Thirty-First Innova-
+tive Applications of Artificial Intelligence Confer-
+ence, IAAI 2019, The Ninth AAAI Symposium on
+Educational Advances in Artificial Intelligence,
+EAAI 2019, Honolulu, Hawaii, USA, January 27
+- February 1, 2019, pages 8076–8084. AAAI
+Press, 2019.
+A. Aghajanyan, S. Gupta, and L. Zettlemoyer. In-
+trinsic dimensionality explains the effective-
+ness of language model fine-tuning. In Pro-
+ceedings of the 59th Annual Meeting of the As-
+sociation for Computational Linguistics and the
+11th International Joint Conference on Natural
+Language Processing, ACL/IJCNLP 2021, (Vol-
+ume 1: Long Papers), Virtual Event, August 1-6,
+2021, pages 7319–7328. Association for Com-
+putational Linguistics, 2021.
+A. Ansell, E. Ponti, A. Korhonen, and I. Vulić.
+Composable sparse fine-tuning for cross-lingual
+transfer. In Proceedings of the 60th Annual Meet-
+ing of the Association for Computational Linguis-
+tics (Volume 1: Long Papers), pages 1778–1796.
+Association for Computational Linguistics, May
+2022.
+A. Ansuini, A. Laio, J. H. Macke, and D. Zoccolan.
+Intrinsic dimension of data representations in
+deep neural networks. In Advances in Neural In-
+formation Processing Systems 32: Annual Confer-
+ence on Neural Information Processing Systems
+2019, NeurIPS 2019, December 8-14, 2019, Van-
+couver, BC, Canada, pages 6109–6119, 2019.
+K. Balazy, M. Banaei, K. Aberer, and J. Ta-
+bor. LoRA-XS: Low-rank adaptation with ex-
+tremely small number of parameters. CoRR,
+abs/2405.17604, 2024.
+L. Beyer, A. Steiner, A. S. Pinto, A. Kolesnikov,
+X. Wang, D. Salz, M. Neumann, I. Alabdul-
+mohsin, M. Tschannen, E. Bugliarello, T. Un-
+terthiner, D. Keysers, S. Koppula, F. Liu, A. Gryc-
+ner, A. A. Gritsenko, N. Houlsby, M. Kumar,
+K. Rong, J. Eisenschlos, R. Kabra, M. Bauer,
+11
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+M. Bosnjak, X. Chen, M. Minderer, P. Voigtlaen-
+der, I. Bica, I. Balazevic, J. Puigcerver, P. Pa-
+palampidi, O. J. Hénaff, X. Xiong, R. Soricut,
+J. Harmsen, and X. Zhai. PaliGemma: a ver-
+satile vision-language model for image and
+video captioning, and visual question answer-
+ing, 2024.
+Y. Bisk, R. Zellers, R. L. Bras, J. Gao, and Y. Choi.
+PIQA: reasoning about physical commonsense
+in natural language. In The Thirty-Fourth AAAI
+Conference on Artificial Intelligence, AAAI 2020,
+The Thirty-Second Innovative Applications of Ar-
+tificial Intelligence Conference, IAAI 2020, The
+Tenth AAAI Symposium on Educational Advances
+in Artificial Intelligence, EAAI 2020, New York,
+NY, USA, February 7-12, 2020, pages 7432–
+7439. AAAI Press, 2020.
+L. Chen, Z. Ye, Y. Wu, D. Zhuo, L. Ceze, and
+A. Krishnamurthy. Punica: Multi-tenant lora
+serving. In Proceedings of the Seventh Annual
+Conference on Machine Learning and Systems,
+MLSys 2024, Santa Clara, CA, USA, May 13-16,
+2024. mlsys.org, 2024.
+C. Clark, K. Lee, M. Chang, T. Kwiatkowski,
+M. Collins, and K. Toutanova. Boolq: Explor-
+ing the surprising difficulty of natural yes/no
+questions. In Proceedings of the 2019 Confer-
+ence of the North American Chapter of the Asso-
+ciation for Computational Linguistics: Human
+Language Technologies, NAACL-HLT 2019, Min-
+neapolis, MN, USA, June 2-7, 2019, Volume 1
+(Long and Short Papers), pages 2924–2936. As-
+sociation for Computational Linguistics, 2019.
+P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sab-
+harwal, C. Schoenick, and O. Tafjord. Think
+you have solved question answering?
+Try
+ARC, the AI2 reasoning challenge.
+CoRR,
+abs/1803.05457, 2018.
+W. Dai, J. Li, D. Li, A. M. H. Tiong, J. Zhao,
+W. Wang, B. Li, and S. C. H. Hoi.
+In-
+structBLIP: Towards General-purpose Vision-
+Language Models with Instruction Tuning. In
+Thirty-seventh Conference on Neural Information
+Processing Systems (NeurIPS), 2023.
+D. Demszky, D. Movshovitz-Attias, J. Ko, A. S.
+Cowen, G. Nemade, and S. Ravi. Goemotions: A
+dataset of fine-grained emotions. In Proceedings
+of the 58th Annual Meeting of the Association
+for Computational Linguistics, ACL 2020, Online,
+July 5-10, 2020, pages 4040–4054. Association
+for Computational Linguistics, 2020.
+E. L. Denton, W. Zaremba, J. Bruna, Y. LeCun, and
+R. Fergus. Exploiting linear structure within
+convolutional networks for efficient evaluation.
+In Advances in Neural Information Processing
+Systems 27: Annual Conference on Neural In-
+formation Processing Systems 2014, December
+8-13 2014, Montreal, Quebec, Canada, pages
+1269–1277, 2014.
+D. Dua, Y. Wang, P. Dasigi, G. Stanovsky, S. Singh,
+and M. Gardner. DROP: A reading comprehen-
+sion benchmark requiring discrete reasoning
+over paragraphs. In Proceedings of the 2019 Con-
+ference of the North American Chapter of the As-
+sociation for Computational Linguistics: Human
+Language Technologies, NAACL-HLT 2019, Min-
+neapolis, MN, USA, June 2-7, 2019, Volume 1
+(Long and Short Papers), pages 2368–2378. As-
+sociation for Computational Linguistics, 2019.
+C. Fan, Z. Lu, S. Liu, X. Qu, W. Wei, C. Gu,
+and Y. Cheng.
+Make LoRA great again:
+Boosting LoRA with adaptive singular val-
+ues and Mixture-of-Experts optimization align-
+ment. CoRR, abs/2502.16894, 2025.
+J. Frankle and M. Carbin.
+The lottery ticket
+hypothesis: Finding sparse, trainable neural
+networks. In 7th International Conference on
+Learning Representations, ICLR 2019, New Or-
+leans, LA, USA, May 6-9, 2019. OpenReview.net,
+2019.
+N. Halko, P.-G. Martinsson, and J. A. Tropp. Find-
+ing structure with randomness: Probabilistic
+algorithms for constructing approximate matrix
+decompositions. SIAM review, 53(2):217–288,
+2011.
+S. Hayou, N. Ghosh, and B. Yu. Lora+: Efficient
+low rank adaptation of large models. In Forty-
+first International Conference on Machine Learn-
+ing, ICML 2024, Vienna, Austria, July 21-27,
+2024. OpenReview.net, 2024.
+12
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+D. Hendrycks, C. Burns, S. Basart, A. Zou,
+M. Mazeika, D. Song, and J. Steinhardt. Mea-
+suring massive multitask language understand-
+ing. In 9th International Conference on Learning
+Representations, ICLR 2021, Virtual Event, Aus-
+tria, May 3-7, 2021. OpenReview.net, 2021.
+E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li,
+S. Wang, L. Wang, and W. Chen. LoRA: Low-
+rank adaptation of large language models. In
+The Tenth International Conference on Learning
+Representations, ICLR 2022, Virtual Event, April
+25-29, 2022. OpenReview.net, 2022.
+G.
+Ilharco,
+M.
+T.
+Ribeiro,
+M.
+Wortsman,
+L. Schmidt, H. Hajishirzi, and A. Farhadi. Edit-
+ing models with task arithmetic. In The Eleventh
+International Conference on Learning Represen-
+tations, ICLR 2023, Kigali, Rwanda, May 1-5,
+2023. OpenReview.net, 2023.
+P. Kaushik, S. Chaudhari, A. Vaidya, R. Chellappa,
+and A. L. Yuille. The universal weight subspace
+hypothesis. arXiv preprint arXiv:2512.05117,
+2025a.
+P. Kaushik, A. Vaidya, S. Chaudhari, and A. L.
+Yuille. Eigenlorax: Recycling adapters to find
+principal subspaces for resource-efficient adap-
+tation and inference. In IEEE/CVF Conference
+on Computer Vision and Pattern Recognition
+Workshops, CVPR Workshops 2025, Nashville,
+TN, USA, June 11-15, 2025, pages 649–659.
+Computer Vision Foundation / IEEE, 2025b.
+A. Kembhavi, M. Salvato, E. Kolve, M. J. Seo,
+H. Hajishirzi, and A. Farhadi. A diagram is
+worth a dozen images. In Computer Vision -
+ECCV 2016 - 14th European Conference, Ams-
+terdam, The Netherlands, October 11-14, 2016,
+Proceedings, Part IV, volume 9908 of Lecture
+Notes in Computer Science, pages 235–251.
+Springer, 2016.
+D. J. Kopiczko, T. Blankevoort, and Y. M. Asano.
+VeRA: Vector-based random matrix adapta-
+tion.
+In The Twelfth International Confer-
+ence on Learning Representations, ICLR 2024,
+Vienna, Austria, May 7-11, 2024. OpenRe-
+view.net, 2024.
+K. Li, S. Han, Q. Su, W. Li, Z. Cai, and S. Ji.
+Uni-LoRA: One vector is all you need. CoRR,
+abs/2506.00799, 2025.
+Y. Li, S. Han, and S. Ji. VB-LoRA: Extreme pa-
+rameter efficient fine-tuning with vector banks.
+In Advances in Neural Information Processing
+Systems 38: Annual Conference on Neural Infor-
+mation Processing Systems 2024, NeurIPS 2024,
+Vancouver, BC, Canada, December 10 - 15, 2024,
+2024.
+H. Liu, C. Li, Q. Wu, and Y. J. Lee. Visual instruc-
+tion tuning. In Advances in Neural Informa-
+tion Processing Systems 36: Annual Conference
+on Neural Information Processing Systems 2023,
+NeurIPS 2023, New Orleans, LA, USA, December
+10 - 16, 2023, 2023.
+S. Liu, C. Wang, H. Yin, P. Molchanov, Y. F.
+Wang, K. Cheng, and M. Chen. DoRA: Weight-
+decomposed low-rank adaptation. In Forty-first
+International Conference on Machine Learning,
+ICML 2024, Vienna, Austria, July 21-27, 2024.
+OpenReview.net, 2024.
+P. Lu, S. Mishra, T. Xia, L. Qiu, K.-W. Chang, S.-
+C. Zhu, O. Tafjord, P. Clark, and A. Kalyan.
+Learn to explain: Multimodal reasoning via
+thought chains for science question answering.
+In The 36th Conference on Neural Information
+Processing Systems (NeurIPS), 2022.
+K. Marino, M. Rastegari, A. Farhadi, and R. Mot-
+taghi. OK-VQA: A visual question answering
+benchmark requiring external knowledge. In
+IEEE Conference on Computer Vision and Pattern
+Recognition, CVPR 2019, Long Beach, CA, USA,
+June 16-20, 2019, pages 3195–3204. Computer
+Vision Foundation / IEEE, 2019.
+M. Mathew, D. Karatzas, and C. V. Jawahar.
+DocVQA: A dataset for VQA on document im-
+ages. In IEEE Winter Conference on Applica-
+tions of Computer Vision, WACV 2021, Waikoloa,
+HI, USA, January 3-8, 2021, pages 2199–2208.
+IEEE, 2021.
+M. Mathew, V. Bagal, R. Tito, D. Karatzas, E. Val-
+veny, and C. V. Jawahar. Infographicvqa. In
+IEEE/CVF Winter Conference on Applications of
+Computer Vision, WACV 2022, Waikoloa, HI,
+13
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+USA, January 3-8, 2022, pages 2582–2591.
+IEEE, 2022.
+F. Meng, Z. Wang, and M. Zhang. PiSSA: Princi-
+pal singular values and singular vectors adap-
+tation of large language models. In Advances
+in Neural Information Processing Systems 38:
+Annual Conference on Neural Information Pro-
+cessing Systems 2024, NeurIPS 2024, Vancouver,
+BC, Canada, December 10 - 15, 2024, 2024.
+T. Mihaylov, P. Clark, T. Khot, and A. Sabharwal.
+Can a suit of armor conduct electricity? A new
+dataset for open book question answering. In
+Proceedings of the 2018 Conference on Empirical
+Methods in Natural Language Processing, Brus-
+sels, Belgium, October 31 - November 4, 2018,
+pages 2381–2391. Association for Computa-
+tional Linguistics, 2018.
+A. Mishra,
+S. Shekhar,
+A. K. Singh,
+and
+A. Chakraborty. OCR-VQA: visual question an-
+swering by reading text in images. In 2019
+International Conference on Document Analysis
+and Recognition, ICDAR 2019, Sydney, Australia,
+September 20-25, 2019, pages 947–952. IEEE,
+2019.
+Y. Nie, A. Williams, E. Dinan, M. Bansal, J. We-
+ston, and D. Kiela.
+Adversarial NLI: A new
+benchmark for natural language understand-
+ing. In Proceedings of the 58th Annual Meeting
+of the Association for Computational Linguistics,
+ACL 2020, Online, July 5-10, 2020, pages 4885–
+4901. Association for Computational Linguis-
+tics, 2020.
+A. Panariello, D. Marczak, S. Magistri, A. Porrello,
+B. Twardowski, A. D. Bagdanov, S. Calderara,
+and J. van de Weijer. Accurate and efficient
+low-rank model merging in core space. arXiv
+preprint arXiv:2509.17786, 2025.
+K. Sakaguchi, R. L. Bras, C. Bhagavatula, and
+Y. Choi. WinoGrande: An adversarial wino-
+grad schema challenge at scale. In The Thirty-
+Fourth AAAI Conference on Artificial Intelligence,
+AAAI 2020, The Thirty-Second Innovative Appli-
+cations of Artificial Intelligence Conference, IAAI
+2020, The Tenth AAAI Symposium on Educa-
+tional Advances in Artificial Intelligence, EAAI
+2020, New York, NY, USA, February 7-12, 2020,
+pages 8732–8740. AAAI Press, 2020.
+M. Sap, H. Rashkin, D. Chen, R. L. Bras, and
+Y. Choi.
+Social IQa: Commonsense reason-
+ing about social interactions. In Proceedings
+of the 2019 Conference on Empirical Methods in
+Natural Language Processing and the 9th In-
+ternational Joint Conference on Natural Lan-
+guage Processing, EMNLP-IJCNLP 2019, Hong
+Kong, China, November 3-7, 2019, pages 4462–
+4472. Association for Computational Linguis-
+tics, 2019.
+J. Schulman and T. M. Lab. LoRA without regret.
+Thinking Machines Lab: Connectionism, 2025.
+https://thinkingmachines.ai/blog/lora/.
+D. Schwenk, A. Khandelwal, C. Clark, K. Marino,
+and R. Mottaghi. A-OKVQA: A benchmark for
+visual question answering using world knowl-
+edge. In Computer Vision - ECCV 2022 - 17th Eu-
+ropean Conference, Tel Aviv, Israel, October 23-
+27, 2022, Proceedings, Part VIII, volume 13668
+of Lecture Notes in Computer Science, pages 146–
+162. Springer, 2022.
+N. Shazeer and M. Stern. Adafactor: Adaptive
+learning rates with sublinear memory cost. In
+J. G. Dy and A. Krause, editors, Proceedings of
+the 35th International Conference on Machine
+Learning, ICML 2018, Stockholmsmässan, Stock-
+holm, Sweden, July 10-15, 2018, volume 80
+of Proceedings of Machine Learning Research,
+pages 4603–4611. PMLR, 2018.
+Y. Sheng, S. Cao, D. Li, C. Hooper, N. Lee, S. Yang,
+C. Chou, B. Zhu, L. Zheng, K. Keutzer, J. Gon-
+zalez, and I. Stoica. SLoRA: Scalable serving
+of thousands of LoRA adapters. In Proceedings
+of the Seventh Annual Conference on Machine
+Learning and Systems, MLSys 2024, Santa Clara,
+CA, USA, May 13-16, 2024. mlsys.org, 2024.
+A. Singh, V. Natarjan, M. Shah, Y. Jiang, X. Chen,
+D. Batra, D. Parikh, and M. Rohrbach. Towards
+VQA models that can read. In Proceedings of the
+IEEE Conference on Computer Vision and Pattern
+Recognition, pages 8317–8326, 2019.
+G. Stoica, P. Ramesh, B. Ecsedi, L. Choshen, and
+J. Hoffman. Model merging with SVD to tie
+14
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+the knots. In The Thirteenth International Con-
+ference on Learning Representations, ICLR 2025,
+Singapore, April 24-28, 2025. OpenReview.net,
+2025.
+P. Tang, Y. Liu, D. Zhang, X. Wu, and D. Zhang.
+LoRA-Null:
+Low-rank adaptation via null
+space for large language models.
+CoRR,
+abs/2503.02659, 2025.
+G. Team, A. Kamath, J. Ferret, S. Pathak, N. Vieil-
+lard, R. Merhej, S. Perrin, T. Matejovicova,
+A. Ramé, M. Rivière, L. Rouillard, T. Mes-
+nard, G. Cideron, J. bastien Grill, S. Ramos,
+E. Yvinec, M. Casbon, E. Pot, I. Penchev, G. Liu,
+F. Visin, K. Kenealy, L. Beyer, X. Zhai, A. Tsit-
+sulin, R. Busa-Fekete, A. Feng, N. Sachdeva,
+B. Coleman, Y. Gao, B. Mustafa, I. Barr,
+E. Parisotto, D. Tian, M. Eyal, C. Cherry,
+J.-T. Peter, D. Sinopalnikov, S. Bhupatiraju,
+R. Agarwal, M. Kazemi, D. Malkin, R. Ku-
+mar, D. Vilar, I. Brusilovsky, J. Luo, A. Steiner,
+A. Friesen, A. Sharma, A. Sharma, A. M. Gi-
+lady, A. Goedeckemeyer, A. Saade, A. Feng,
+A. Kolesnikov, A. Bendebury, A. Abdagic,
+A. Vadi, A. György, A. S. Pinto, A. Das, A. Bapna,
+A. Miech, A. Yang, A. Paterson, A. Shenoy,
+A. Chakrabarti, B. Piot, B. Wu, B. Shahriari,
+B. Petrini, C. Chen, C. L. Lan, C. A. Choquette-
+Choo, C. Carey, C. Brick, D. Deutsch, D. Eisen-
+bud, D. Cattle, D. Cheng, D. Paparas, D. S.
+Sreepathihalli, D. Reid, D. Tran, D. Zelle,
+E. Noland, E. Huizenga, E. Kharitonov, F. Liu,
+G. Amirkhanyan, G. Cameron, H. Hashemi,
+H. Klimczak-Plucińska, H. Singh, H. Mehta,
+H. T. Lehri, H. Hazimeh, I. Ballantyne, I. Szpek-
+tor, I. Nardini, J. Pouget-Abadie, J. Chan,
+J. Stanton, J. Wieting, J. Lai, J. Orbay, J. Fernan-
+dez, J. Newlan, J. yeong Ji, J. Singh, K. Black,
+K. Yu, K. Hui, K. Vodrahalli, K. Greff, L. Qiu,
+M. Valentine, M. Coelho, M. Ritter, M. Hoff-
+man, M. Watson, M. Chaturvedi, M. Moyni-
+han, M. Ma, N. Babar, N. Noy, N. Byrd, N. Roy,
+N. Momchev, N. Chauhan, N. Sachdeva, O. Bun-
+yan, P. Botarda, P. Caron, P. K. Rubenstein,
+P. Culliton, P. Schmid, P. G. Sessa, P. Xu,
+P. Stanczyk, P. Tafti, R. Shivanna, R. Wu,
+R. Pan, R. Rokni, R. Willoughby, R. Vallu,
+R. Mullins, S. Jerome, S. Smoot, S. Girgin,
+S. Iqbal, S. Reddy, S. Sheth, S. Põder, S. Bhat-
+nagar, S. R. Panyam, S. Eiger, S. Zhang,
+T. Liu, T. Yacovone, T. Liechty, U. Kalra,
+U. Evci, V. Misra, V. Roseberry, V. Feinberg,
+V. Kolesnikov, W. Han, W. Kwon, X. Chen,
+Y. Chow, Y. Zhu, Z. Wei, Z. Egyed, V. Cotruta,
+M. Giang, P. Kirk, A. Rao, K. Black, N. Babar,
+J. Lo, E. Moreira, L. G. Martins, O. Sanse-
+viero, L. Gonzalez, Z. Gleicher, T. Warkentin,
+V. Mirrokni, E. Senter, E. Collins, J. Barral,
+Z. Ghahramani, R. Hadsell, Y. Matias, D. Scul-
+ley, S. Petrov, N. Fiedel, N. Shazeer, O. Vinyals,
+J. Dean, D. Hassabis, K. Kavukcuoglu, C. Fara-
+bet, E. Buchatskaya, J.-B. Alayrac, R. Anil,
+Dmitry, Lepikhin, S. Borgeaud, O. Bachem,
+A. Joulin, A. Andreev, C. Hardin, R. Dadashi,
+and L. Hussenot. Gemma 3 technical report,
+2025.
+C. Tian, Z. Shi, Z. Guo, L. Li, and C. Xu. Hy-
+draLoRA: An asymmetric LoRA architecture for
+efficient fine-tuning. In Advances in Neural In-
+formation Processing Systems 38: Annual Confer-
+ence on Neural Information Processing Systems
+2024, NeurIPS 2024, Vancouver, BC, Canada,
+December 10 - 15, 2024, 2024.
+M. Valipour, M. Rezagholizadeh, I. Kobyzev, and
+A. Ghodsi. DyLoRA: Parameter-efficient tuning
+of pre-trained models using dynamic search-
+free low-rank adaptation.
+In Proceedings of
+the 17th Conference of the European Chapter
+of the Association for Computational Linguistics,
+EACL 2023, Dubrovnik, Croatia, May 2-6, 2023,
+pages 3266–3279. Association for Computa-
+tional Linguistics, 2023.
+X. Wu, S. Huang, and F. Wei. Mixture of lora
+experts. In The Twelfth International Confer-
+ence on Learning Representations, ICLR 2024,
+Vienna, Austria, May 7-11, 2024. OpenRe-
+view.net, 2024.
+Y. Yang, X. Li, Z. Zhou, S. Song, J. Wu, L. Nie, and
+B. Ghanem. Corda: Context-oriented decom-
+position adaptation of large language models
+for task-aware parameter-efficient fine-tuning.
+In Advances in Neural Information Processing
+Systems 38: Annual Conference on Neural Infor-
+mation Processing Systems 2024, NeurIPS 2024,
+Vancouver, BC, Canada, December 10 - 15, 2024,
+2024.
+15
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and
+Y. Choi. Hellaswag: Can a machine really fin-
+ish your sentence? In Proceedings of the 57th
+Conference of the Association for Computational
+Linguistics, ACL 2019, Florence, Italy, July 28-
+August 2, 2019, Volume 1: Long Papers, pages
+4791–4800. Association for Computational Lin-
+guistics, 2019.
+X. Zhai, B. Mustafa, A. Kolesnikov, and L. Beyer.
+Sigmoid Loss for Language Image Pre-Training.
+In Proceedings of the IEEE/CVF International
+Conference on Computer Vision (ICCV), pages
+11997–12007, 2023.
+J. Zhang, Y. Zhao, D. Chen, X. Tian, H. Zheng,
+and W. Zhu. MiLoRA: Efficient mixture of low-
+rank adaptation for large language models fine-
+tuning, Nov. 2024.
+Q. Zhang, M. Chen, A. Bukharin, N. Karam-
+patziakis, P. He, Y. Cheng, W. Chen, and
+T. Zhao. AdaLoRA: Adaptive Budget Alloca-
+tion for Parameter-Efficient Fine-Tuning. In
+The Eleventh International Conference on Learn-
+ing Representations (ICLR), 2023.
+Y. Zhang, J. Baldridge, and L. He. PAWS: para-
+phrase adversaries from word scrambling. In
+Proceedings of the 2019 Conference of the North
+American Chapter of the Association for Compu-
+tational Linguistics: Human Language Technolo-
+gies, NAACL-HLT 2019, Minneapolis, MN, USA,
+June 2-7, 2019, Volume 1 (Long and Short Pa-
+pers), pages 1298–1308. Association for Com-
+putational Linguistics, 2019.
+H. Zhou, X. Wan, I. Vulić, and A. Korhonen.
+AutoPEFT: Automatic configuration search for
+parameter-efficient fine-tuning. Transactions
+of the Association for Computational Linguistics,
+12:525–542, 2024.
+16
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+A. Learning Rate Selection Details
+For all direct fine-tuning experiments on text tasks, we first determined the optimal learning rate for
+each LoRA rank and model size combination to ensure that our baseline comparisons were as strong
+as possible. We used the Adafactor optimizer with a linear warmup of 1000 steps and no subsequent
+learning rate decay.
+The optimal learning rate was selected via a grid search over the set {0.001, 0.003, 0.01, 0.03, 0.1}.
+For each (model, rank) pair, we chose the learning rate that yielded the highest average performance
+across all 12 of our text-only tasks. This process revealed a consistent trend: lower-rank LoRA
+configurations (e.g., 𝑟≤4) benefited from a higher learning rate, whereas higher-rank configurations
+achieved better performance with a more conservative rate.
+The specific learning rates identified and used for the baseline models in our experiments are
+detailed in Table 2.
+Table 2 | Optimal learning rates determined by grid search for different model sizes and LoRA ranks
+on the text task suite. The chosen rate maximized the average performance across all tasks.
+Model Size
+LoRA Rank (𝑟)
+Optimal LR
+Gemma 3 4B
+1, 2, 4
+0.03
+≥8
+0.01
+Gemma 3 1B
+1, 2
+0.03
+≥8
+0.01
+Gemma 3 4B VL
+≥1
+0.01
+B. Varianc over Random Seeds
+The results in Table 3 are obtained over 3 random seeds: {42, 43, 44}.
+Table 3 | Average performance and standard error of the mean (SEM) across all text tasks for different
+LoRA ranks and learning rates for Gemma 3 4B.
+LoRA Rank (𝑟)
+LR
+Acc (%)
+SEM
+1
+0.01
+89.96
+0.061
+0.03
+90.21
+0.061
+32
+0.01
+90.55
+0.075
+0.03
+88.02
+0.080
+128
+0.01
+90.67
+0.010
+0.03
+80.87
+0.127
+C. Evaluation Tasks and Datasets
+The summary of text-based and VL tasks is provided in Tables 4 and 5.
+17
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Table 4 | Summary of text-based evaluation datasets.
+Dataset
+Abbreviation
+Reference
+Train Split
+Dev /Test Split
+WinoGrande
+WNG-L*
+Sakaguchi et al. (2020)
+10,234*
+1,267 / 1,767
+BoolQ
+BOOLQ
+Clark et al. (2019)
+9,427
+3,270 / 3,245
+PIQA
+PIQA
+Bisk et al. (2020)
+16,113
+1,838 / 3,084
+DROP
+DROP
+Dua et al. (2019)
+77,409
+9,536 / 9,653**
+ANLI (Round 2)
+ANLI-r2
+Nie et al. (2020)
+45,460
+1,000 / 1,000
+PAWS Wiki
+PAWS
+Zhang et al. (2019)
+49,401
+8,000 / 8,000
+HellaSwag
+HSWAG
+Zellers et al. (2019)
+39,905
+10,004 / 10,042
+OpenBookQA
+OBQA
+Mihaylov et al. (2018)
+4,957
+500 / 500
+GoEmotions
+GoE
+Demszky et al. (2020)
+43,410
+5,426 / 5,427
+ARC-Easy
+ARC-E
+Clark et al. (2018)
+2,251
+570 / 2,376
+ARC-Challenge
+ARC-C
+Clark et al. (2018)
+1,119
+299 / 1,172
+SocialIQA
+SIQA
+Sap et al. (2019)
+33,410
+1,954 / 2,223
+MMLU
+MMLU
+Hendrycks et al. (2021)
+99,842***
+1,540 / 14,042
+* We use the train_l (large) subset for fine-tuning.
+** The DROP test set is hidden and requires submission to a leaderboard for evaluation, we thus evaluate on
+the development set
+*** MMLU is an evaluation benchmark and does not have a designated training set; we fine-tune LoRA-s on
+the standard auxiliary training set.
+Table 5 | Summary of VL evaluation datasets.
+Dataset
+Reference
+Train Split
+Dev /Test Split
+AI2D
+Kembhavi et al. (2016)
+8,129
+1,000 / 1,000
+A-OKVQA
+Schwenk et al. (2022)
+17,056
+1,146 / 4,524
+CountBenchQA
+Beyer et al. (2024)
+DocVQA
+Mathew et al. (2021)
+39,463
+5,349 / 5,188
+InfoVQA
+Mathew et al. (2022)
+31,481
+4,342 / 8,690
+OCR-VQA
+Mishra et al. (2019)
+801,316
+95,572 / 101,632
+OK-VQA
+Marino et al. (2019)
+9,009
+5,046 / N/A*
+ScienceQA
+Lu et al. (2022)
+12,726
+4,241 / 4,241
+TallyQA
+Acharya et al. (2019)
+252,477
+N/A** / 53,941
+TextVQA
+Singh et al. (2019)
+34,602
+5,000 / 7,764
+* OK-VQA has no public test split; evaluation is performed on the validation split.
+** TallyQA does not have a public validation split.
+D. Derivation of Memory-Efficient LoRA-Squeeze
+Here, we provide further details on the derivation of the memory-efficient variant of LoRA-Squeeze,
+described in Algorithm 2 in the main paper. We seek to compute SVD of Δ𝑊𝑠𝑟𝑐(i.e., the full model
+update as approximated by the source-rank LoRA) to truncate the least-contributing dimensions
+efficiently without explicitly constructing the (typically large) dense 𝑚× 𝑛matrix.
+For simplicity of notation, in the following derivation we assume that 𝑟= 𝑟𝑠𝑟𝑐, Δ𝑊= Δ𝑊𝑠𝑟𝑐, 𝐴= 𝐴𝑠𝑟𝑐,
+and 𝐵= 𝐵𝑠𝑟𝑐. We first perform QR decomposition on the factor matrices 𝐴and 𝐵to isolate their
+18
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+orthonormal bases:
+𝐴= 𝑄𝐴𝑅𝐴
+where 𝑄𝐴∈ℝ𝑚×𝑟, 𝑅𝐴∈ℝ𝑟×𝑟
+(1)
+𝐵⊤= 𝑄𝐵𝑅𝐵
+where 𝑄𝐵∈ℝ𝑛×𝑟, 𝑅𝐵∈ℝ𝑟×𝑟
+(2)
+By definition of the QR decomposition, 𝑄𝐴and 𝑄𝐵have orthonormal columns:
+𝑄⊤
+𝐴𝑄𝐴= 𝐼𝑟,
+𝑄⊤
+𝐵𝑄𝐵= 𝐼𝑟
+(3)
+We then substitute the decompositions back into the expression for Δ𝑊:
+Δ𝑊= (𝑄𝐴𝑅𝐴)(𝑅⊤
+𝐵𝑄⊤
+𝐵)
+(4)
+Δ𝑊= 𝑄𝐴(𝑅𝐴𝑅⊤
+𝐵)𝑄⊤
+𝐵,
+(5)
+and we can then define the core interaction matrix 𝑀∈ℝ𝑟×𝑟as:
+𝑀= 𝑅𝐴𝑅⊤
+𝐵
+(6)
+Thus, Δ𝑊= 𝑄𝐴𝑀𝑄⊤
+𝐵.
+We then perform (full or randomized) SVD on the small matrix 𝑀𝑟×𝑟:
+𝑀= 𝑈𝑀𝑆𝑀𝑉⊤
+𝑀
+(7)
+where 𝑈𝑀, 𝑉𝑀∈ℝ𝑟×𝑟are orthogonal matrices and 𝑆𝑀is the diagonal matrix of singular values.
+Substituting this back into Δ𝑊:
+Δ𝑊= 𝑄𝐴(𝑈𝑀𝑆𝑀𝑉⊤
+𝑀)𝑄⊤
+𝐵
+(8)
+If we regroup the factor matrices above, we can write:
+Δ𝑊= (𝑄𝐴𝑈𝑀)
+|   {z   }
+New 𝑈
+𝑆𝑀(𝑉𝑇
+𝑀𝑄𝑇
+𝐵)
+|   {z   }
+New 𝑉𝑇
+(9)
+Since 𝑄𝐴is orthogonal and 𝑈𝑀is orthogonal, their product (𝑄𝐴𝑈𝑀) is also orthogonal. The same
+applies to the right side. Therefore, 𝑆𝑀is exactly equal to 𝑆derived from directly applying SVD on
+Δ𝑊.
+If we then prune the rank of matrices in Eq. (9) to 𝑟𝑡𝑔𝑡, we then create an 𝑟𝑡𝑔𝑡-rank approximation
+of Δ𝑊𝑠𝑟𝑐, which is exactly the central mechanism of LoRA-Squeeze.
+E. On (Coarsely Approximated) Computational Complexity of Different Decom-
+positions
+Doing 1) full SVD decomposition on matrix Δ𝑊𝑚×𝑛has a total complexity of 𝑂(𝑚𝑛min(𝑚, 𝑛)), while
+2) using Randomized SVD instead decreases it to 𝑂(𝑚𝑛(𝑟𝑡𝑔𝑡+ 𝑘𝑜)). Finally, 3) the efficient variant
+from Algorithm 2 decreases it further to 𝑂((𝑚+ 𝑛) 𝑟2
+𝑠𝑟𝑐). Let’s assume that 𝑚= 2, 048, 𝑛= 2, 048, 𝑟𝑠𝑟𝑐=
+64, 𝑟𝑡𝑔𝑡= 8, 𝑘𝑜= 10. In this case, the total, theoretically estimated number of FLOPs required for
+version 1 (full SVD on Δ𝑊) is ∼8.6𝐵FLOPs, it is ∼75.5𝑀FLOPs for version 2 (randomized SVD on
+Δ𝑊), and it is only ∼16.8𝑀FLOPs for the memory-efficient LoRA-Squeeze variant.8
+8Note that versions 1 and 2 also need to spend additional 𝑚× 𝑛× 𝑟𝑠𝑟𝑐FLOPs on creating Δ𝑊, which is bypassed by the
+memory-efficient variant.
+19
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+F. On Task Knowledge Retention
+We hypothesise that the collapse observed with some tasks when the Post-Squeeze transformation
+step is too large (e.g., 128→1, see Figures 4a and 4b in the main paper) is due to discarding too
+much information. We quantify the amount of kept task-related information from 𝑟𝑠𝑟𝑐to 𝑟𝑡𝑔𝑡as
+variance/energy retention, and compute it based on sorted singular values:
+𝑉𝑟(𝑟𝑠𝑟𝑐→𝑟𝑡𝑔𝑡) =
+Í𝑟𝑡𝑔𝑡
+𝑖=1 𝑠2
+𝑖
+Í𝑟𝑠𝑟𝑐
+𝑖=1 𝑠2
+𝑖
+,
+(10)
+where 𝑠𝑖denotes the 𝑖-th singular value from matrix 𝑆obtained via RSVD. By design, 𝑉𝑟= 100% when
+𝑟𝑠𝑟𝑐= 𝑟𝑡𝑔𝑡and then it starts decreasing with the decrease of 𝑟𝑡𝑔𝑡.
+Variance retention scores averaged across the 13 text-only tasks for 3 different 𝑟𝑠𝑟𝑐ranks are provided
+in Figure 6 in while per-task 𝑉𝑟are available in Figures 7a-7l.
+Figure 6 | Variance retention scores averaged over 13 text-only tasks for 3 different source ranks 𝑟𝑠𝑟𝑐.
+Per-task scores are provided in Figures 7a-7l in the appendix.
+In general, we see unequal retention curves for different tasks, and the tasks for which the retention
+is the lowest for large transformation steps yield the observed performance collapse (e.g., ARC-C,
+MMLU). On the other hand, there is a large retention for smaller transformation steps: e.g., 𝑉𝑟scores
+when halving the rank are ∼96%+ (𝑟𝑠𝑟𝑐= 128) or ∼94%+ (𝑟𝑠𝑟𝑐= 32) for all the tasks, and retention,
+although it depends on 𝑟𝑠𝑟𝑐, remains high when 𝑟𝑡𝑔𝑡= 𝑟𝑠𝑟𝑐/4 and 𝑟𝑡𝑔𝑡= 𝑟𝑠𝑟𝑐/8, which explains why there
+is no performance collapse for transformation steps of this magnitude. In future research, we also
+hope to further analyze variance retention as a proxy towards quantifying task complexity.
+G. Further Discussion: On Theoretical Motivation and Connections
+Connections to Intrinsic Task Dimensionality. As established in prior work, the main motivation
+for the LoRA-style task adaptation relies on the fact that the adaptation lies on a low-dimensional
+manifold within the high-dimensional parameter space (Aghajanyan et al., 2021; Ansuini et al., 2019).
+This implies that the task vector Δ𝑊has a low intrinsic rank. The objective of LoRA training is to find
+a good low-rank approximation of this vector. However, directly optimizing within a low-rank space
+(i.e., training LoRA with a small, fixed rank 𝑟𝑡𝑔𝑡from the start) is a non-convex and highly constrained
+optimization problem. Such a process can easily converge to a suboptimal local minimum, failing
+to fully capture the essential structure of the task adaptation. Fine-tuning with higher ranks also
+bypasses the issue of setting a LoRA rank lower than the intrinsic task dimensionality before fine-
+20
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+(a) ANLI-r2
+(b) ARC-C
+(c) BoolQ
+(d) DROP
+(e) GoE
+(f) HSWAG
+(g) MMLU
+(h) OBQA
+(i) PAWS
+(j) PIQA
+(k) SIQA
+(l) WNG-L
+Figure 7 | Per-task variance retention scores for 12 text-only tasks for 3 different source ranks 𝑟𝑠𝑟𝑐.
+The scores for ARC-E are not shown for clarity of presentation and because they closely align with
+the shown curves for ARC-C.
+tuning which can yield suboptimal performance for more complex tasks; intrinsic task dimensionality
+can be encountered during fine-tuning or post-hoc as proposed by LoRA-Squeeze.
+Connections to Overparameterization and the Lottery Ticket Hypothesis. By training with a higher
+source rank 𝑟𝑠𝑟𝑐> 𝑟𝑡𝑔𝑡, we essentially perform the optimization in a less constrained, overparameterized
+space. This larger search space provides more degrees of freedom, making it easier to navigate the
+complex loss landscape and find a high-quality solution that effectively captures the low-dimensional
+manifold corresponding to the task. This principle may be seen as analogous to the findings of Frankle
+and Carbin (2019), termed the Lottery Ticket Hypothesis, where an overparameterized network
+provides a richer substrate from which an efficient, high-performing subnetwork can be identified.
+In our case, RSVD serves as a principled, data-driven, and efficient pruning mechanism; SVD
+guarantees the best low-rank approximation of a matrix with respect to the Frobenius norm. By
+retaining the top 𝑟𝑡𝑔𝑡singular values and their corresponding singular vectors, we are preserving the
+21
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+(a) OK-VQA
+(b) TallyQA
+Figure 8 | Performance over 2 VL tasks when we do hyperparameter search for the learning rate or
+LoRA-s only for the highest rank in the figures (𝑟𝑠𝑟𝑐= 32, higher ranks already saturate performance),
+and keep the same learning rate for direct fine-tuning at all the other (lower) ranks. A simple offline
+Post-Squeeze method can bypass the hyperparameter search and yield better-performing LoRA-s
+without any fine-tuning at the lower ranks. See Figure 3 in the main paper for similar patterns
+observed for text-based tasks.
+directions of greatest variance in the learned delta matrix Δ𝑊𝑠𝑟𝑐. This effectively isolates the most
+significant, principal components of the task adaptation while filtering out potential noise or less
+impactful components that may have been learned due to overparameterization.
+H. Additional Experiments
+For the sake of brevity and clarity of presentation in the main paper, we have relegated additional
+experiments and analyses to this appendix. These results substantiate the work’s primary claims
+and are consistent with the trends presented in the main paper body. Figure 8 shows creation of
+lower-rank LoRA-s via Post-Squeeze for 2 VL tasks when hyperparameter optimization is conducted
+only for the higher, source rank; the model is Gemma 3 4B IT.
+Figure 9 shows averaged performance of various source-target rank configurations for Post-Squeeze in
+the VL tasks; the model is Gemma 3 4B IT.
+Figure 10 shows a selection of results with Post-Squeeze on Gemma 12B IT as the base model.
+Table 6 shows per-task results of direct fine-tuning and Post-Squeeze for two source-target rank
+combinations, where the averaged results are available as cell values in the heatmap in the main
+paper (Figure 4a); the model is Gemma 3 4B IT.
+Table 7 and Table 8 compare the per-task scores of direct fine-tuning with Cont-Squeeze and In-Squeeze
+for Gemma 1B IT on text-only tasks and for Gemma 4B IT on VL tasks, respectively.
+Figure 7 shows per-task variance retention scores over text-only tasks for three different source ranks
+𝑟𝑠𝑟𝑐.
+22
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Figure 9 | Performance difference heatmap for the Gemma 3 4B IT model averaged over the 10 VL
+tasks.
+(a) WNG-L
+(b) DROP
+(c) ANLI-r2
+Figure 10 | Performance over 3 representative text-based tasks with Gemma 12B IT as the base models.
+𝑟𝑠𝑟𝑐= 16.
+Table 6 | Performance overview per single task (Accuracy %) of Post-Squeeze versus Direct Fine-Tuning
+on the Gemma 4B IT model across 13 text-only tasks for two source-target rank configurations. Δ
+indicates the absolute gain/loss of Post-Squeeze.
+Target Rank = 4
+Target Rank = 8
+Task
+Direct (𝑟= 4)
+P-Squeeze (16→4)
+Δ
+Direct (𝑟= 8)
+P-Squeeze (128→8)
+Δ
+WNG-L
+91.07
+90.99
+-0.08
+89.16
+91.92
++2.76
+BOOLQ
+94.31
+94.37
++0.06
+94.11
+94.28
++0.17
+PIQA
+93.05
+92.72
+-0.33
+92.94
+93.69
++0.75
+DROP
+88.51
+89.63
++1.12
+89.60
+89.71
++0.11
+ANLI-r2
+80.13
+81.08
++0.95
+81.31
+80.97
+-0.34
+PAWS
+97.45
+97.28
+-0.17
+97.37
+97.59
++0.22
+HSWAG
+97.32
+97.44
++0.12
+97.42
+97.58
++0.16
+OBQA
+94.71
+95.19
++0.48
+94.71
+95.31
++0.60
+GoE
+82.81
+83.38
++0.57
+83.71
+82.79
+-0.92
+ARC-E
+95.01
+94.94
+-0.07
+95.14
+95.05
+-0.09
+ARC-C
+88.89
+89.11
++0.22
+88.98
+88.76
+-0.22
+SIQA
+89.74
+89.25
+-0.49
+89.53
+90.16
++0.63
+MMLU
+78.69
+79.93
++1.24
+79.92
+80.36
++0.44
+Average
+90.13
+90.41
++0.28
+90.30
+90.63
++0.33
+23
+
+
+LoRA-Squeeze: Simple and Effective Post-Tuning and In-Tuning Compression of LoRA Modules
+Table 7 | Performance comparison (Accuracy %) of different fine-tuning strategies for Gemma 3 1B IT
+on text tasks. The best result in each row is highlighted in bold.
+Direct Fine-tuning (𝑟= 1)
+Cont-Squeeze (128 →1)
+In-Squeeze (128 ...→1)
+Task
++0 steps
++200 steps
++700 steps
++0 steps
++200 steps
++700 steps
+Standard
+Min steps
+WNG-L
+81.97
+82.02
+81.80
+37.67
+81.16
+81.38
+82.44
+81.29
+BOOLQ
+91.26
+91.00
+90.79
+51.30
+90.81
+90.56
+90.29
+90.92
+PIQA
+86.94
+86.44
+86.47
+82.39
+87.17
+87.53
+88.17
+87.28
+DROP
+78.24
+76.18
+75.21
+69.83
+75.72
+76.39
+76.58
+78.17
+ANLI-r2
+75.11
+74.72
+72.38
+21.26
+73.66
+72.88
+74.16
+74.33
+PAWS
+96.59
+96.61
+96.48
+63.47
+96.43
+96.70
+96.28
+96.65
+HSWAG
+89.14
+87.11
+87.99
+65.55
+88.41
+88.89
+89.76
+90.58
+OBQA
+87.74
+87.50
+88.10
+87.74
+88.22
+89.06
+87.26
+88.70
+GoE
+82.51
+81.84
+81.28
+80.23
+82.16
+81.94
+83.15
+83.17
+ARC-E
+85.20
+85.07
+85.39
+35.94
+85.50
+85.89
+85.35
+86.00
+ARC-C
+74.70
+75.48
+75.13
+43.01
+74.13
+74.18
+73.61
+74.78
+SIQA
+83.68
+83.16
+84.25
+34.00
+83.68
+84.25
+84.41
+85.24
+MMLU
+71.02
+70.37
+69.71
+27.50
+71.92
+71.38
+71.64
+72.29
+Avg
+83.39
+82.88
+82.69
+53.84
+83.00
+83.16
+83.32
+83.80
+Table 8 | Performance comparison (Accuracy %) of different fine-tuning strategies for Gemma 3
+4B IT on vision-language tasks. 0-S refers to zero-shot performance of the base model without any
+task-specific fine-tuning. The best result in each row is highlighted in bold.
+Direct Fine-tuning (𝑟= 1)
+Cont-Squeeze (128 →1)
+In-Squeeze (128 ...→1)
+Task
+0-S
++0 steps
++200 steps
++700 steps
++0 steps
++200 steps
++700 steps
+Standard
+Min steps
+ai2d
+59.0
+67.73
+67.16
+66.29
+67.37
+68.30
+67.73
+68.71
+67.73
+aokvqa
+89.0
+91.94
+91.33
+91.27
+92.68
+92.44
+92.37
+92.00
+91.70
+countbenchqa
+87.4
+91.84
+91.47
+91.94
+91.20
+92.59
+92.49
+92.22
+92.59
+docvqa
+80.3
+89.63
+89.52
+89.44
+77.86
+89.44
+89.22
+89.58
+89.52
+infovqa
+56.2
+81.56
+81.07
+81.61
+67.01
+81.36
+80.92
+81.45
+81.45
+ocrvqa
+65.3
+83.14
+83.06
+83.66
+82.73
+83.82
+84.86
+83.79
+83.93
+okvqa
+52.9
+73.06
+73.35
+72.35
+73.71
+75.29
+73.88
+74.94
+73.71
+scienceqa
+92.3
+98.00
+98.00
+97.94
+96.17
+97.58
+98.18
+97.55
+98.06
+tallyqa
+78.9
+94.09
+93.53
+94.06
+72.50
+93.56
+93.78
+93.75
+94.03
+textvqa
+73.3
+80.96
+81.04
+80.63
+79.27
+80.72
+79.71
+80.84
+80.31
+Avg
+73.5
+85.20
+84.95
+84.92
+80.05
+85.51
+85.31
+85.48
+85.30
+24

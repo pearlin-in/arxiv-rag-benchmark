@@ -1,0 +1,1483 @@
+When to Prune? A Policy towards Early Structural Pruning
+Maying Shen, Pavlo Molchanov, Hongxu Yin, Jose M. Alvarez
+NVIDIA
+{mshen, pmolchanov, dannyy, josea}@nvidia.com
+Abstract
+Pruning enables appealing reductions in network mem-
+ory footprint and time complexity.
+Conventional post-
+training pruning techniques lean towards efﬁcient inference
+while overlooking the heavy computation for training. Re-
+cent exploration of pre-training pruning at initialization
+hints on training cost reduction via pruning, but suffers
+noticeable performance degradation. We attempt to com-
+bine the beneﬁts of both directions and propose a policy
+that prunes as early as possible during training without
+hurting performance. Instead of pruning at initialization,
+our method exploits initial dense training for few epochs
+to quickly guide the architecture, while constantly evaluat-
+ing dominant sub-networks via neuron importance ranking.
+This unveils dominant sub-networks whose structures turn
+stable, allowing conventional pruning to be pushed earlier
+into the training. To do this early, we further introduce an
+Early Pruning Indicator (EPI) that relies on sub-network
+architectural similarity and quickly triggers pruning when
+the sub-network’s architecture stabilizes. Through exten-
+sive experiments on ImageNet, we show that EPI empow-
+ers a quick tracking of early training epochs suitable for
+pruning, offering same efﬁcacy as an otherwise “oracle”
+grid-search that scans through epochs and requires orders
+of magnitude more compute. Our method yields 1.4% top-1
+accuracy boost over state-of-the-art pruning counterparts,
+cuts down training cost on GPU by 2.4×, hence offers a
+new efﬁciency-accuracy boundary for network pruning dur-
+ing training.
+1. Introduction
+The Success of convolutional neural networks (CNNs)
+fuels the recent progress in computer vision, boosting up
+performance for classiﬁcation, detection, and segmentation
+tasks [16, 36, 38]. While enjoying the accuracy beneﬁts
+CNNs bring, a simultaneous increase in network complex-
+ity imposes higher memory footprint and computing power
+consumption, making deployment of CNNs on resource-
+constrained devices a challenging task [6, 30, 31]. In lieu of
+Figure 1. Pruning paradigm overview.
+Train-Prune-Finetune
+prunes after training, effective but costs additional training time;
+Prune-at-Initialization prunes right before training towards a
+smaller network, cuts down on training time but suffers notable
+performance degradation; Pruning-aware-Training (ours) prunes
+during training aiming at beneﬁts from two worlds. It governs on
+post-pruning performance while aiming to minimize training time,
+via a new policy around Early Pruning Indicator (EPI) that signals
+an early optimal point to start pruning during training.
+computation-intensive networks, recent work turn to com-
+pression techniques for efﬁcient models leveraging prun-
+ing [3, 15, 26, 30], quantization [5, 44, 47], knowledge dis-
+tillation [19, 32, 46], neural architecture search [39, 42, 45],
+and architecture redesigns [21, 29, 40]. Among these, prun-
+ing demonstrates to be a widely adopted method that com-
+presses pre-trained models before deployment. The primary
+goal of pruning aims to remove insigniﬁcant network pa-
+rameters without impacting accuracy. In particular, struc-
+tural pruning removes entire ﬁlters (or neurons) as such
+the resulting structural sparsity beneﬁts legacy off-the-shelf
+platforms, e.g., CPUs, DSPs, and GPUs.
+In general, network pruning involves three key steps: (i)
+original training of a dense model for high accuracy, (ii)
+pruning away insigniﬁcant weights to remove redundancy,
+and ﬁnally (iii) ﬁne-tuning the pruned model to recover per-
+formance [15, 27, 31]. Despite remarkable compactness de-
+livered by the last two steps, the original training of an over-
+parameterized network remains mostly untouched.
+Such
+approaches require a twice long time (resource) as an origi-
+nal training recipe given similar required computes for ﬁne-
+1
+arXiv:2110.12007v1  [cs.CV]  22 Oct 2021
+
+
+tuning, making the entire pipeline slow, sometimes infeasi-
+ble. For example, a very recent breakthrough in language
+modeling, a GPT-3 model [4], requires millions of dollars
+(more than 300 NVIDIA V100 GPU years) just for the ini-
+tial training. Already aware of post-training redundancy, an
+interesting question arises - can we somehow prune a net-
+work during its initial training, as such the resulting sparsity
+can (i) immediately beneﬁt training and (ii) save us from the
+costly additional ﬁne-tuning upon training ends?
+One intuitive and ideal solution to this problem is prun-
+ing the network right at initialization even before training
+starts. The intriguing observation from the Lottery Ticket
+Hypothesis [9] hints potential to this task: it shows the
+(i) existence of small sub-models, identiﬁable via prun-
+ing, within a large dense model, that can (ii) be trained in
+isolation to achieve the same accuracy as its dense coun-
+terpart [9, 26]. This ﬁeld has quickly evolved and recent
+approaches have enhanced policy for optimal sub-network
+at the initialization by preserving the loss or the gradient
+ﬂow [7, 24, 43]. Despite rapid progress, the approaches of
+sub-network identiﬁcation at the initialization remain chal-
+lenging and still suffer noticeable accuracy loss [10, 12].
+Instead of zero training, in this work, we showcase the
+beneﬁts and practicability of pruning early during training.
+Doing so allows one to (i) save compute by training only
+pruned models most of the time, (ii) alleviate any extra ﬁne-
+tuning by aligning the process with original training, while
+(iii) suppressing accuracy loss by moving slightly later into
+the training regime for pruning guidance. We name this ap-
+proach pruning-aware-training (PaT). As shown in Fig. 1,
+unlike pruning-at-initialization, PaT takes full advantage of
+early-stage dense model training that is beneﬁcial for rapid
+learning and optimal architecture exploration [1, 11], while
+aiming to identify the best sub-network as early as possi-
+ble, rather than waiting till training ends as in conventional
+pruning.
+The key of beneﬁting from the training efﬁciency of PaT
+and saving training time relies on ﬁnding an early yet eligi-
+ble point during training to start pruning. Existing methods
+that perform pruning during training [3, 10, 28, 34] have
+shown the efﬁcacy of this direction by reducing the turn-
+around time. However, in most cases a ﬁxed initial interval
+for pruning is set heuristically, or post-training statistics are
+required. In this work we focus on understanding how the
+starting point of pruning can be set automatically.
+We start by analyzing in depth the evolution of pruned
+architectures via performing trimming across all epochs rig-
+orously and compare their suitability for pruning. Though
+laborious, this oracle estimate offers key insights on pruning
+during training. We observe an important property: agnos-
+tic of magnitude or gradient criterion, (i) pruning at early
+epochs results in different ﬁnal architectures, but (ii) domi-
+nant architecture emerges within just a few epochs and sta-
+bilizes thereafter till training ends, allowing conventional
+pruning to be pushed earlier into the training.
+Amid such property we further propose a novel met-
+ric, called Early Pruning Indicator (EPI), that estimates the
+structure similarity between networks resulted in pruning at
+consecutive epochs of the same base model. Given intrinsic
+access to model weights and gradients during training, EPI
+can be calculated very efﬁciently alongside initial training
+without bells and whistles, while helping avoid the other-
+wise lengthy grid search for starting epochs. Once the re-
+sulting pruning structure will not vary between epochs we
+argue and demonstrate it is safe to prune. As prior work [26]
+and we observe, structural pruning acts as an architecture
+search and tries to ﬁnd the optimal number of neurons per
+layer. Therefore, we hypothesize that pruning can be per-
+formed as soon as the architecture of the dominant sub-
+network becomes stable. We demonstrate that the proposed
+metric works across varying network architectures, pruning
+ratios, delivering consistent reductions in training time.
+Our main contributions are as follows:
+• We propose a novel metric called Early Pruning Indi-
+cator (EPI) that indicates an early point to start pruning
+during training. Our metric enables training to beneﬁt
+from sparsity, signiﬁcantly reducing training resources
+with minor accuracy drop.
+• We demonstrate that for structural pruning (output
+channel pruning), initial dense training fuels accuracy
+boosts. Augmented by EPI, our pruning-aware-training
+outperforms pruning-at-initialization alternatives by a
+large margin.
+• We show that EPI is agnostic to the pruning method
+used by showing efﬁcacy for both magnitude-based and
+gradient-based pruning, enabling a new state-of-the-art
+boundary for training speedup through in-situ pruning.
+2. Related Work
+Network pruning. Mainstream pruning methods can be
+divided into three categories depending on when pruning is
+performed: 1) train-prune-ﬁnetune, 2) prune at initializa-
+tion, and 3) prune while training.
+The ﬁrst group, train-prune-ﬁnetune, performs pruning
+on a densely pre-trained network and then, ﬁne-tune the re-
+sulting structure to recover the performance loss caused by
+pruning. There are many methods aiming at preserving the
+ﬁnal accuracy [17, 30, 31] and minimize the output change
+of each layer [18, 27]. A key focus of these work resides
+in identifying redundant connections whose removal brings
+the least perturbation to the overall performance. While en-
+abling plausible performance and improving efﬁciency at
+test time, the aforementioned approaches cannot yet bring
+any efﬁciency beneﬁt to training. Quite in contrary, most
+recipes result in nearly doubled training time amid the re-
+2
+
+
+quirement for lengthy ﬁne-tuning.
+Prune at initialization methods, backed by the Lottery
+Ticket Hypothesis [9], question the necessity of dense train-
+ing for performance convergence [26]. A forerunner in this
+group is SNIP [24], an approach that identiﬁes a trainable
+sub-network at initialization. Subsequently, other methods
+such as FORCE [7], GraSP [43], or SynFlow [41] have been
+proposed to improve performance. These methods make the
+training more efﬁcient as they only train the sparse network.
+However, the reliability of pruning at initialization remains
+unsatisfactory facing inevitable performance gaps [10].
+Prune while training methods rest in the middle by ﬁnd-
+ing a trade-off between training efﬁciency and ﬁnal accu-
+racy. Literature falls under two streams towards this task: a)
+regularization-based methods that encourage sparsity dur-
+ing training [3, 13, 28], and b) sub-ticket selection methods
+via saliency that discard redundancy [2, 14, 17]. Our work
+belongs to the latter given its efﬁcacy to quickly enforce
+a pruning ratio and ease-of-control during training.
+Un-
+der this realm, one line of work learns sub-networks during
+training [3, 28, 34]. Others, such as Frankle et al. [10], study
+the need of few training iterations before pruning in order
+to maximize the performance. These methods struggle to
+automatically identify the starting points at which pruning
+can be performed, while heavily relying on hand-crafted or
+post-training heuristics for decision making.
+Network similarity. Our policy explores the network sim-
+ilarity of two sub-networks resulted from pruning. A com-
+prehensive review of network similarity measures was pre-
+sented in [23]. These methods aim at comparing the rep-
+resentation between two fully trained models with different
+initialization, hence are not applicable to in-training gaug-
+ing for pruning where weights and dominant architectures
+are both changing. To get the structural similarity for prun-
+ing, we focus on the number of remaining neurons across
+layers in a network when comparing with another one. The
+difference between these skeletons using coefﬁcients can
+be directly measured by Spearman’s [37] and Kendall’s tau
+[22] rank correlation. However, these rank correlation met-
+rics take into account the speciﬁc ranking and, more impor-
+tantly, they would rely on all neurons in the network. Thus,
+they provide the same value for all pruning ratios.
+Of particular relevance to this work is [10] by Frankle et
+al. that proposes an approach to measure the instability of
+a network structure to understand pruning viability. One
+noticeable ﬁnding by this work shows that the best time to
+perform iterative magnitude pruning tends to be after some
+initial training. Interestingly it identiﬁes a relationship be-
+tween the model instability and the accuracy of the pruned
+network, though the instability measure proposed by the
+method can only be measured after training is completed,
+hence remains insufﬁcient to directly signal when to start
+pruning during training.
+Algorithm 1 Iterative pruning within one epoch
+1: For prune ratio α, schedule the number of neurons to
+prune per step for S steps via exponential scheduler [7],
+forming m ∈RS
+2: while |P| ≤α|F| do
+3:
+Average importance calculated by (2) or (3) over
+multiple minibatches
+4:
+P is the indices of mi bottom-ranked neurons
+5:
+WP ←0
+▷remove pruned neurons
+6:
+R = F −P
+▷the remaining neurons
+7:
+Update WR; i ←i + 1
+8: end while
+3. Method
+We next elaborate our early pruning algorithm in details.
+3.1. Objective Function
+Consider a neural network with L layers, each layer
+speciﬁed by its weight Wl ∈RCl
+O×Cl
+I×Kl×Kl, K being
+the kernel size and CI and CO being the number of in-
+put and output channels/neurons, respectively. Altogether,
+these parameters form the parameter set W = {Wl}L
+l=1
+for the network. Given a training set consisting of N input-
+output pairs {(xi, yi)}N
+i=1, learning the parameters of a net-
+work under ﬁlter sparsity constraints can be expressed as
+solving the following optimization problem:
+arg min
+W
+1
+N
+N
+X
+i=1
+ℓ(yi, f(xi, W)) + r(W),
+s.t.
+|P|
+|F| ≥α
+(1)
+where ℓ(·) denotes the loss function that compares the net-
+work prediction to the ground-truth, f(·) encodes the net-
+work transformation, r(·) is a regularizer acting on the net-
+work parameters, and α is the target pruning ratio. F =
+{Fl}L
+l=1 represents the index set of all the neurons in the
+network. This index set can be divided into two disjoints
+sets P = {Pl}L
+l=1 and R = {Rl}L
+l=1, representing the
+index sets of the pruned and remaining neurons respec-
+tively.
+We have F = P ∪R and P ∩R = ∅.
+PaT
+involves three stages:
+dense training, network pruning,
+and sparse training. During initial dense training, the for-
+ward/backward passes are computed using all the ﬁlters in
+the network f(xi, WF). While during sparse training, the
+forward/backward passes only use the remaining neurons
+f(xi, WR). Akin to [30, 31], we follow the paradigm of
+iterative pruning that ﬁnishes within one epoch. More pre-
+cisely, as shown in Algorithm 1, the process consists of the
+following two steps. First, at each training iteration, we
+compute the importance metric of each neuron according
+to a pruning criterion. Meanwhile we keep updating net-
+work weights as normal. Then, at each pruning step, we
+3
+
+
+get the averaged importance score for all neurons, and then
+remove the neurons with the smallest importance values.
+Each pruning step is carried out after seeing multiple train-
+ing batches, usually several hundreds of batches are more
+than sufﬁcient [30]. Note that though containing several
+quick interactive steps, the entire pruning can be ﬁnished
+very quickly within one training epoch.
+For comprehensiveness we consider two popular criteria
+from literature - both magnitude-based and gradient-based
+schemes for neuron importance ranking:
+Magnitude-based criterion uses the l2-norm of the neuron
+weights to measure the relevance of a neuron:
+Il
+n = ||Wl
+n||2/
+√
+P l,
+(2)
+where P l = Cl
+I × Kl × Kl denotes the number of parame-
+ters per ﬁlter at layer l, and n speciﬁes the output neuron in-
+dex within Wl. Such normalization ensures its comparabil-
+ity for neurons from different layers with different sizes [3].
+Gradient-based criterion considers the Taylor expansion of
+the loss change to approximate the importance of a neuron.
+Initially, Molchanov et al. [31] proposed to estimate impor-
+tance as a magnitude of the gradient-activation product, and
+more recently, SNIP [24] and FORCE [7] extended the idea
+to a parameter level. Speciﬁcally, gradient-based criterion
+using Taylor expansion for neurons can be deﬁned as:
+Il
+n =
+
+X
+w∈Wl
+n
+gww
+
+,
+(3)
+where gw is the gradient of the weight w. The metric esti-
+mates an approximate change in the loss function once the
+neuron is removed. As suggested in [30], for networks us-
+ing batch normalization, the best way to apply pruning is on
+the batch normalization layers instead of convolutional ﬁl-
+ters directly. Additionally, the loss of removing the channel
+can be approximated via accumulative effect of the learn-
+able scale and shift: Il
+n =
+gγlnγl
+n + gβlnβl
+n
+, where γ and
+β are the weight and bias of the batch normalization layer,
+respectively. We empirically observe slight improvements
+using L1 for pruning during training rather than the original
+L2 as in [30] for post-training pruning.
+3.2. Towards Early Pruning
+Recall that our goal is to maximize the accuracy of the
+network while minimizing the compute required for train-
+ing. This compute is usually dominated by the amount of
+time performing dense training. The sooner we prune the
+network, the less resources it requires to ﬁnish training.
+As both prior work [11] and we empirically observe,
+the early stage of neural network training imposes a rapid
+motion in parameter space with large gradient magnitudes.
+This generates fruitful information for initial network con-
+vergence and a quick accuracy boost. With such a fact,
+Figure 2. Structure of different sub-networks. Colored circles and
+solid lines are active neurons and connections. Sub-ﬁgures (a), (b)
+and (c) are three different sub-networks of the original network
+on the left. While these sub-networks having the same number of
+neurons in total, sub-networks (b) and (c) are in higher similarity.
+an intuitive option for early pruning can be to analyze the
+emergence of important neurons at different training stages
+that the network gradually picks up for the underlying task,
+and then prune the insigniﬁcant ones right away.
+Given its intrinsic access to weights and gradients, train-
+ing allows one to quickly rank all the neurons globally with
+very little extra compute. This allows the network to take a
+quick glimpse into the problem from the architecture space
+that is empirically observed informative [16, 20, 38], while
+we can quite efﬁciently track architectural convergence.
+To this end, we check after each training epoch for a
+sub-network speciﬁed by the top k most important neurons
+globally according to the chosen pruning criterion. Close
+to but different from a ﬁnal winning ticket, an interme-
+diate helps identify dominant neurons, but remains not as
+strong as its ﬁnal version, while constantly changing dur-
+ing training. However, as we will show later, the architec-
+ture of such sub-networks changes rapidly in the ﬁrst few
+epochs, then surprisingly shows minimal changes thereafter
+for the remaining epochs. Knowingly exploiting such fast
+convergence to stability and slow changes of dominate sub-
+network thereafter, we argue and demonstrate pruning can
+be started as early as when its Top-k sub-network stabilizes.
+Next, we explore network similarity to signal such stability.
+3.3. Early Pruning Indicator (EPI)
+We look into the structural similarity between dominant
+sub-networks to quantify architectural changes during train-
+ing. Under a global neuron pruning scheme, merely using
+pruning ratio as a guidance fells short for this task: each
+pruning ratio can be easily satisﬁed by multiple variants,
+each sharing the same number of neurons while differing in
+architectures (see examples in Fig. 2). As an alternative, we
+examine the distribution of the number of remaining neu-
+rons across all layers per pruned network.
+Consider two sub-networks N1 and N2 under the same
+prune ratio containing the same number of remaining neu-
+rons.
+Let n(1,l) and n(2,l) be the number of neurons
+of lth layer in nets N1 and N2 respectively, then set
+{n(1,1), n(1,2), · · · , n(1,L)} describes the structure of the
+sub-network N1, and similarly for N2. For the lth layer,
+we deﬁne the normalized difference between N1 and N2 as
+dl(N1, N2) = |n(1,l) −n(2,l)|
+n(1,l) + n(2,l)
+,
+(4)
+4
+
+
+Algorithm 2 Pruning-aware-Training (PaT)
+Input: Network with random initialized weights WF,0,
+stability threshold τ, pruning ratio α, total epochs T as in
+original recipe
+Output: Pruned structure R; trained weights WR,T
+1: enforce epoch status ∈{dense, prune, sparse}
+2: epoch status ←dense
+3: for epoch t = 0, 1, . . . , T do
+4:
+if epoch status is dense then
+5:
+Train WF,t by gradient descent
+6:
+Get importance score averaged over the epoch
+7:
+Get Nt
+8:
+Get EPIt with Eq. (6)
+9:
+if (EPIt ≥τ) and (EPIt ≥EPIt−j)1≤j≤5 then
+10:
+epoch status ←prune
+11:
+end if
+12:
+else if epoch status is prune then
+13:
+Prune α|F| neurons with Algorithm 1
+14:
+Get P, update R
+15:
+epoch status ←sparse
+16:
+else
+17:
+Train WR,t by gradient descent
+18:
+end if
+19: end for
+20: Return R, WR,T
+yielding a range from zero to one. The lower the distance,
+the closer the layer structure is. On top of this we can now
+construct a pruning stability indicator Ψ combining the sim-
+ilarity for all the layers in the network:
+Ψ(N1, N2) = 1 −1
+L
+L
+X
+l=1
+dl(N1, N2),
+(5)
+where Ψ ranges from 0 to 1, with a lower value indicates
+high variations between the two sub-networks, and a high
+value indicates stability in the resulting network structure.
+Given a pruning stability indicator, the algorithm to de-
+cide when to prune is described in Algorithm 2. We ﬁrst
+calculate the neurons’ importance scores according to the
+pruning criterion at the end of each epoch t.
+Get the
+top k neurons by ranking the importance scores and the
+structure indicator Nt = {n(t,1), n(t,2), · · · , n(t,L)} where
+PL
+l=1 n(t,l) = k and nt,l is the number of neurons in the
+lth layer. Then calculate the sub-network structure similar-
+ities between Nt and Nt−j for 1 ≤j ≤r where r is the
+range of past epochs that we want to have a structure com-
+parison. We use the averaged structure similarity to reﬂect
+the structure stability, namely:
+EPIt = 1
+r
+r
+X
+j=1
+Ψ(Nt, Nt−j).
+(6)
+Figure 3. The performance of the PaT algorithm vs. lottery ticket
+hypothesis [9] on ResNet50-ImageNet, the dense version achieves
+77.32% accuracy. Green line: the accuracy of PaT (jointly prun-
+ing and training) pruning at epoch x with 90-epoch training in to-
+tal; Gray line: the network accuracy by applying the correspond-
+ing mask in PaT to initialization and train the sub-network from
+scratch, as the lottery ticket hypothesis [9] does.
+This structure stability score is constantly increasing dur-
+ing training.
+When it reaches a certain threshold τ, we
+can safely say that the resultant sub-network is reliable to
+achieve a good performance and we can start the pruning.
+4. Experiments
+We next experiment with varying architectures and prun-
+ing methods to showcase the strength of our proposed
+method for the classiﬁcation task. In the appendix, we also
+demonstrate applicability to the task of object detection.
+Experimental Settings.
+We prune ResNet34, ResNet50
+and MobileNetV1 neural network architectures on the Im-
+ageNet ILSVRC 2012 dataset [35] (1.3M images, 1000
+classes).
+Unless otherwise stated each pruning uses one
+single node with 8 NVIDIA Tesla V100 GPUs. All ex-
+periments share the original training pipeline following Py-
+Torch mixed-precision training under NVIDIA’s recipe [33]
+with 90 epochs in total. The learning rate is warmed up lin-
+early in the ﬁrst 8 epochs, then follows a cosine decay over
+the entire training. We use PyTorch Distributed Data Paral-
+lel training and for each GPU with an individual batch size
+at 128. Our unpruned models achieve 77.32% top-1 accu-
+racy with ResNet50, 74.36% with ResNet34 and 72.93%
+with MobileNetV1.
+4.1. Understanding Early Pruning Epochs
+We start with understanding in depth the variations in
+ﬁnal accuracy as a function of the starting pruning epoch.
+To do so, we analyze the accuracy changes by varying the
+starting pruning epoch, and continue training to the ﬁnal
+epoch and check the associated accuracies.
+Pruning at different epochs. Fig. 3, in green, shows the
+top-1 accuracy obtained by pruning 50% of the neurons on
+a ResNet50 using gradient-based criterion at various epochs
+during the 90-epoch training cycle. As shown, the accuracy
+drop for late pruning is signiﬁcant as there is not enough
+time left for recovering. We also observe that, compared to
+pruning at initialization (at epoch 0), pruning after a few
+epochs consistently yields better performance. However,
+5
+
+
+for all these experiments there is always a certain accuracy
+drop compared to the unpruned upper bound (77.32%).
+Lottery ticket hypothesis for structural pruning. To bet-
+ter understand the role of early training with a dense model
+rather than a pruned model, we evaluate the idea of lottery-
+ticket hypothesis for structural pruning. We follow [9] and
+train from scratch a sub-network obtained by pruning using
+the original initialization. All pruning masks are collected
+from the previous experiment (Fig. 3). Results are shown
+in the same plot with a gray line. Note that, due to iterative
+nature of the pruning algorithm, for pruning at 0 we use the
+mask when the epoch is ﬁnished. When it is applied at the
+initialization as a lottery ticket, the ﬁnal accuracy is slightly
+different. From these results, we can conclude that, in the
+structural pruning case, the lottery ticket hypothesis may not
+hold. Pruning the network during training performs better
+than training a winning ticket in isolation from scratch.
+Varying pruning ratio and architecture. We now take a
+closer look at the accuracy drop incurred when pruning oc-
+curs during the early stage of training (ﬁrst 30 epochs from
+Fig. 3). Fig. 4 shows these results for different architectures
+using magnitude-based and gradient-based pruning respec-
+tively. As we can see, for magnitude-based pruning, there is
+a signiﬁcant drop in accuracy if the pruning occurs too early,
+especially for large prune ratios. This effect is particularly
+clear if, for instance, we prune 50% neurons of a ResNet50
+at epoch 0 which makes the network not trainable. This
+is expected as the pruning ratio is large and the weights
+have not been updated at all. Therefore, it is not possible
+to estimate the importance of each neuron correctly. For
+gradient-based pruning, the accuracy drop varies depending
+on the architecture. In this case, pruning at initialization
+has less impact compared to magnitude-based pruning. For
+instance, pruning a ResNet34 or a MobileNetV1 leads to
+minimal drop in accuracy. For ResNet50, however, the ac-
+curacy drop increases as the pruning ratio increases. Thus,
+late pruning would be preferred to maximize performance.
+Let’s see how we can ﬁnd the optimal pruning epoch during
+a single training session.
+4.2. EPI-guided Pruning
+Given the previous results, we now demonstrate the abil-
+ity of our approach to determine the optimal pruning epoch.
+Thus, in this experiment we compare our policy to a heuris-
+tic and a random policies. For heuristic policy, we consider
+setting the pruning epoch to 0 which is equivalent to prun-
+ing at initialization [7, 24]. For the random policy, we select
+randomly a pruning epoch during the early stage of training,
+i.e. in the range [0, 30]. We repeat the random policy exper-
+iment 100 times and report the mean of the results.
+Selecting the EPI threshold (τ). Our method introduces
+a hyperparameter τ such that when EPI (Eq. 6) reaches it
+we can start pruning. We ﬁnd that a universal value can
+Network(s)
+Starting epoch for pruning
+Random
+Init. [7, 24]
+Pre-deﬁned [11]
+EPI (ours)
+Magnitude
+ResNet50
+0.940
+3.604
+0.115
+0.091
+ResNet34
+0.267
+0.838
+0.353
+0.169
+MobileNet-v1
+6.285
+–
+0.135
+0.135
+Overall
+2.497
+2.221
+0.201
+0.132
+Gradient
+ResNet50
+0.992
+2.738
+0.267
+0.092
+ResNet34
+0.153
+0.122
+0.221
+0.195
+MobileNet-v1
+0.132
+0.186
+0.110
+0.178
+Overall
+0.426
+1.015
+0.199
+0.155
+Table 1. Absolute top-1 accuracy change relative to the results per
+oracle grid search for optimal pruning starting point. Lower is bet-
+ter. Init. refers to pruning at initialization using a structural ver-
+sion of FORCE [7], also equivalent to the structural and iterative
+SNIP [24]. Pre-deﬁne refers to heuristically pre-deﬁne a prun-
+ing start epoch 30, which we ﬁnd empirically the last epoch not
+leading to a signiﬁcant accuracy drop. This is aligned with [10]
+suggesting waiting for several training iterations before pruning.
+be used for all architectures and all pruning ratios, how-
+ever, it is sensitive to the pruning algorithm. To this end,
+we perform a sensitivity analysis on ResNet50 over prun-
+ing ratios of 10%–50% with increments of 10% and use a
+grid search to set the value that yields the best pruning re-
+sult. As a result, we ﬁnd τ = 0.983 for magnitude-based
+pruning and τ = 0.944 for gradient-based pruning to be the
+best. We tuned this value for ResNet50, however, we will
+show its generalizability by performing tests on ResNet34,
+MobileNetV1 in the main text and SSD in the Appendix.
+Policy comparison.
+Tab. 1 shows the results of experi-
+ments for importance and magnitude based pruning under
+the guidance of our proposed EPI and the universal EPI
+threshold τ. We compare the results with random policy and
+heuristic policy of pruning at initialization. We report the
+average accuracy drop compared to best accuracy achieved
+via grid search for each network. The values for ResNet50
+gradient-based pruning is averaged over prune ratios 10%–
+90%; all the rests are averaged over prune ratios 10%–50%.
+We also report the overall average accuracy drop over three
+networks when using different policies to guide the prun-
+ing in row “overall”. As shown, our policy clearly yields a
+signiﬁcantly higher performance compared to random prun-
+ing. In the case of gradient-based pruning, our approach
+performs on par compared to heuristics on ResNet34 and
+MobileNetV1. Overall our approach performs better with
+less top-1 accuracy change. For magnitude-based pruning,
+our approach yields signiﬁcantly better results compared to
+heuristics. The optimal pruning epoch varies for different
+architectures and different prune ratios, see the appendix
+for the sensitivity analysis to the stability threshold.
+4.3. Training Speedup
+We also calculate the actual training speedup when using
+our proposed EPI (Eq. 6) policy and the heuristic ones on
+ResNet50 gradient-based pruning. Fig. 5 shows the policies
+comparison result.
+6
+
+
+(a) Magnitude-based pruning
+(b) Gradient-based pruning
+Figure 4. The ﬁnal ImageNet Top-1 accuracy of the pruned network when pruning occurs at different epochs during the early stage of
+training. We observe pruning at initialization tends to result in untrainable network with magnitude-based pruning method. For gradient-
+based method, we observe a higher degradation occur when more ﬁlters are pruned, and show pruning ratios up to 90% on ResNet50.
+[Prune Ratio] denotes the percentage of neurons removed.
+Figure 5. Actual training speed-ups on ResNet50 with different
+prune ratios using different pruning policies. Actual speed mea-
+sured on an NVIDIA TITAN V GPU at batch size 64. Top-right
+corner is preferred.
+Comparing to pruning at initialization. When compared
+with pruning at initialization (heuristic pruning at epoch 0),
+we achieve larger speed-up although we start prune later.
+That happens because of structural pruning, where pruning
+at different epochs might result in different structures: faster
+or slower. It turns out that pruning at epoch 0 is very inef-
+ﬁcient, as most neurons pruned are from deeper layers re-
+sulting in slow models; therefore, training speed-up is not
+huge and training such a model is more expensive than the
+one resulted from pruning at a later epoch. In the meantime,
+pruning at zero leads to larger accuracy drop especially with
+large prune ratios.
+Latency-aware pruning. We further apply latency-aware
+pruning using our policy, which aims to reduce the latency
+of the model and not only the number of parameters. For
+that, we penalize the neuron group’s saliency with the la-
+tency reduction resulting from pruning them. Those neu-
+rons requiring larger compute will have lower importance
+Method
+Top-1 acc. ↑
+FLOPs (G)↓
+FLOPs reduc.(%) ↑
+Starting epoch ↓
+ResNet34
+GPWP [2]
+73.64
+3.087
+15.90
+40
+PaT (ours)
+73.50
+2.911
+20.70
+11
+ResNet50
+PT [28]
+74.73
+2.303
+44.00
+90
+LFPC [17]
+74.18
+1.612
+60.80
+35
+PaT (ours)
+74.85
+1.695
+58.78
+13
+Table 2. Comparison with state-of-the-art in-training pruning
+methods. For a fair comparison we report here 10% ﬁlter pruning
+for ResNet34 and 40% ﬁlter pruning for ResNet50 as literature.
+and, therefore, more likely to be pruned.
+As shown in
+Fig. 5, using EPI-latency aware pruning yields models that
+are more GPU-friendly and faster.
+Training cost comparison. Training a dense ResNet50 on
+ImageNet with 8 NVIDIA Tesla V100 GPUs takes around
+9 hours and costs around $220 on AWS. Considering a 50%
+pruning ratio, the training cost of our method is $154 as
+we achieve up to 30% training time reduction. In contrast,
+the total training cost for train-prune-ﬁnetune methods is
+around $364 as they need 90 additional retraining epochs.
+Thus, a 2.4× training cost reduction.
+4.4. Comparisons with the State-of-the-art
+We also compare our method to prior arts on Ima-
+geNet dataset and present results in Tab. 2. Compared to
+GPWP [2], our method yields lower accuracy but a higher
+reduction in FLOPs.
+Compared to PruneTrain [28], we
+achieve signiﬁcantly higher accuracy and a larger reduction
+in FLOPs. LFPC [17] reduces 2% more FLOPs, but the
+accuracy loss is 0.67% larger. Importantly, LFPC requires
+longer training time as it needs additional epochs to train a
+sampler. Overall, we prune much earlier than other tech-
+niques, and, therefore, reduce more training time. More-
+over, while other techniques use heuristics to deﬁne the
+7
+
+
+(a) magnitude-based EPI
+(b) gradient-based EPI
+Figure 6. Structure stability analysis for ResNet architectures for magnitude-based (a) and gradient-based (b) pruning. Dashed line shows
+the EPI threshold selected for each network under the pruning criterion. Results for MobilnetV1 can be found in the supplemental material.
+pruning epoch, we propose an automatic metric that scales
+with a universal threshold to automatically determine an
+early point. This helps create a new benchmark protocol
+by evaluating prior methods under the same setting.
+4.5. Ablation Studies
+Stability analysis. The goal of this experiment is to demon-
+strate that during the early stage of training, the dominate
+sub-network architecture varies signiﬁcantly and slowly
+converges to the ﬁnal architecture as the training progresses.
+To this end, we train different architectures to convergence
+and, in the process, we compute their EPI scores for sub-
+networks under different pruning ratios. Fig. 6 shows the re-
+sults for this experiment for magnitude-based and gradient-
+based criterion respectively. As shown, the EPI score de-
+creases as the pruning ratio increases.
+We also observe
+that, independently of the pruning method used, the stability
+grows rapidly in the early stage of training and then contin-
+ues increasing steadily for later stages. These results are
+consistent with those presented in [11] showing a signiﬁ-
+cant change in the network architecture at the beginning but
+not towards the end of training.
+Performance of similar structures. The goal of this ex-
+periment is to provide empirical support to the assumption
+that sub-networks with similar structures will likely per-
+form similarly. That is, the performance relies on the struc-
+ture rather than the neurons being selected during pruning.
+We use the ResNet50 and obtain the neuron pruning mask
+at epoch 10 using 50% pruning ratio using gradient-based
+ranking. Next, we obtain 10 variations of this mask by se-
+lecting different neurons in each layer while maintaining
+the number of neurons per layer. As a result, we get differ-
+ent neuron masks but the same sub-network structure. We
+train the initially pruned network to convergence and obtain
+a top1 accuracy of 73.98%. Finally, we evaluate the perfor-
+mance of training to completion the 10th checkpoint pruned
+using the 10 mask variations yielding an average top1 ac-
+curacy difference of only 0.36% ± 0.13%. We also ran-
+domly generate 5 variations of masks that lead to different
+sub-network structures, which have an around 0.8 similarity
+score to the structure resulted from the original mask. We
+get an average performance difference of 0.53% ± 0.39%.
+Note that, for a fair comparison, we use the same check-
+point to minimize randomness due to different initialization.
+prune ratio
+post trained pruning
+EPI, equal epochs
+EPI, equal training time
+10%
+77.17%
+77.69%
+77.74%
+20%
+76.78%
+76.82%
+76.83%
+30%
+76.18%
+76.23%
+76.55%
+Table 3. Comparison between pruning during training with EPI
+and pruning a pre-trained model.
+From these results, we can conclude networks with the same
+structure perform similarly. With different structures, the
+performance varies more.
+Compared to pruning pre-trained models. In many prac-
+tical scenarios, people train a model (or use a pre-trained
+backbone) to solve the task at hand. However, there are
+computation or latency constraints at deployment. People
+might want to train a smaller model from scratch or prune
+and ﬁnetune the existing model. Both scenarios would ben-
+eﬁt from EPI, as we show next.
+We compare pruning during training versus pruning pre-
+trained models in Tab. 3. For pruning a pre-trained model
+(loading Pytorch weights from ResNet50 trained for 90
+epochs, with acc.
+77.32%), we do pruning in the same
+setting and then ﬁnetune it for 90 epochs (marked as post
+trained pruning). For a fair comparison when we apply EPI
+on a model trained from scratch we increase the total num-
+ber of epochs to 90+90 = 180 (column EPI, equal epochs).
+We clearly outperform pruning pre-trained weights, while
+saving compute costs. We get pruned models earlier, mak-
+ing the training even faster. Models from EPI can be ﬁne-
+tuned for the same amount of clock time as post trained
+pruning, shown as column EPI, equal training time. This
+improves results even more as models get trained for more
+epochs. Again, applying EPI speeds up training right after
+pruning is complete, while pruning on pre-trained beneﬁts
+pruning only after the training is ﬁnished.
+5. Conclusions
+We have introduced an approach to automatically deter-
+mine when pruning can be performed during training with-
+out affecting the ﬁnal accuracy and with the additional con-
+straint of doing so as early as possible. To this end, we have
+proposed a policy based on Early Pruning Indicator (EPI), a
+metric to measure the stability of the sub-network structure.
+Our experiments on multiple pruning algorithms and prun-
+ing ratios have demonstrated the beneﬁts of our method to
+reduce the accuracy drop when pruning a network and ob-
+serve a signiﬁcant reduction in training time.
+8
+
+
+References
+[1] Alessandro Achille, Matteo Rovere, and Stefano Soatto.
+Critical learning periods in deep networks. In International
+Conference on Learning Representations, 2018.
+[2] S. A. Aketi, S. Roy, A. Raghunathan, and K. Roy. Gradual
+channel pruning while training using feature relevance scores
+for convolutional neural networks. IEEE Access, 8:171924–
+171932, 2020.
+[3] Jose M Alvarez and Mathieu Salzmann. Learning the num-
+ber of neurons in deep networks. In Advances in Neural In-
+formation Processing Systems, pages 2270–2278, 2016.
+[4] Tom B Brown, Benjamin Mann, Nick Ryder, Melanie Sub-
+biah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakan-
+tan, Pranav Shyam, Girish Sastry, Amanda Askell, et al.
+Language models are few-shot learners.
+arXiv preprint
+arXiv:2005.14165, 2020.
+[5] Yaohui Cai, Zhewei Yao, Zhen Dong, Amir Gholami,
+Michael W Mahoney, and Kurt Keutzer.
+Zeroq: A novel
+zero shot quantization framework.
+In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 13169–13178, 2020.
+[6] X. Dai, P. Zhang, B. Wu, H. Yin, F. Sun, Y. Wang, M.
+Dukhan, Y. Hu, Y. Wu, Y. Jia, P. Vajda, M. Uyttendaele, and
+N. Jha. ChamNet: Towards efﬁcient network design through
+platform-aware model adaptation. In CVPR, 2019.
+[7] Pau de Jorge, Amartya Sanyal, Harkirat S Behl, Philip HS
+Torr, Gregory Rogez, and Puneet K Dokania. Progressive
+skeletonization: Trimming more fat from a network at ini-
+tialization. arXiv preprint arXiv:2006.09081, 2020.
+[8] Mark Everingham, Luc Van Gool, Christopher KI Williams,
+John Winn, and Andrew Zisserman. The pascal visual object
+classes (voc) challenge. International journal of computer
+vision, 88(2):303–338, 2010.
+[9] Jonathan Frankle and Michael Carbin. The lottery ticket hy-
+pothesis: Finding sparse, trainable neural networks. In Inter-
+national Conference on Learning Representations, 2019.
+[10] Jonathan Frankle, Gintare Karolina Dziugaite, Daniel M
+Roy, and Michael Carbin. Linear mode connectivity and the
+lottery ticket hypothesis. In International Conference on Ma-
+chine Learning, 2020.
+[11] Jonathan Frankle, David J. Schwab, and Ari S. Morcos. The
+early phase of neural network training. In International Con-
+ference on Learning Representations, 2020.
+[12] Trevor Gale, Erich Elsen, and Sara Hooker. The state of spar-
+sity in deep neural networks. In International Conference on
+Machine Learning, 2020.
+[13] Susan Gao, Xin Liu, Lung-Sheng Chien, William Zhang, and
+Jose M Alvarez. Vacl: Variance-aware cross-layer regular-
+ization for pruning deep residual networks. In Proceedings
+of the IEEE/CVF International Conference on Computer Vi-
+sion Workshops, pages 0–0, 2019.
+[14] Yue-Seng Goh and Eng-Chong Tan.
+Pruning neural net-
+works during training by backpropagation. In Proceedings
+of TENCON’94-1994 IEEE Region 10’s 9th Annual Interna-
+tional Conference on:’Frontiers of Computer Technology’,
+pages 805–808. IEEE, 1994.
+[15] Song Han, Huizi Mao, and William J Dally.
+Deep com-
+pression: Compressing deep neural networks with pruning,
+trained quantization and huffman coding.
+arXiv preprint
+arXiv:1510.00149, 2015.
+[16] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian
+Sun.
+Deep residual learning for image recognition. corr
+abs/1512.03385 (2015), 2015.
+[17] Yang He, Yuhang Ding, Ping Liu, Linchao Zhu, Hanwang
+Zhang, and Yi Yang. Learning ﬁlter pruning criteria for deep
+convolutional neural networks acceleration. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pat-
+tern Recognition, pages 2009–2018, 2020.
+[18] Yang He, Ping Liu, Ziwei Wang, Zhilan Hu, and Yi Yang.
+Filter pruning via geometric median for deep convolutional
+neural networks acceleration. In Proceedings of the IEEE
+Conference on Computer Vision and Pattern Recognition,
+pages 4340–4349, 2019.
+[19] Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+Distill-
+ing the knowledge in a neural network.
+arXiv preprint
+arXiv:1503.02531, 2015.
+[20] A. Howard, Menglong Zhu, Bo Chen, D. Kalenichenko, W.
+Wang, Tobias Weyand, M. Andreetto, and H. Adam. Mo-
+bilenets: Efﬁcient convolutional neural networks for mobile
+vision applications. ArXiv, abs/1704.04861, 2017.
+[21] Andrew G Howard, Menglong Zhu, Bo Chen, Dmitry
+Kalenichenko, Weijun Wang, Tobias Weyand, Marco An-
+dreetto, and Hartwig Adam. Mobilenets: Efﬁcient convolu-
+tional neural networks for mobile vision applications. arXiv
+preprint arXiv:1704.04861, 2017.
+[22] Maurice G Kendall.
+A new measure of rank correlation.
+Biometrika, 30(1/2):81–93, 1938.
+[23] Simon Kornblith, Mohammad Norouzi, Honglak Lee, and
+Geoffrey Hinton. Similarity of neural network representa-
+tions revisited. volume 97 of Proceedings of Machine Learn-
+ing Research, pages 3519–3529, 09–15 Jun 2019.
+[24] Namhoon Lee, Thalaiyasingam Ajanthan, and Philip Torr.
+SNIP: Single-shot network pruning based on connection sen-
+sitivity. In International Conference on Learning Represen-
+tations, 2019.
+[25] Wei Liu, Dragomir Anguelov, Dumitru Erhan, Christian
+Szegedy, Scott Reed, Cheng-Yang Fu, and Alexander C
+Berg. Ssd: Single shot multibox detector. In European con-
+ference on computer vision, pages 21–37. Springer, 2016.
+[26] Zhuang Liu, Mingjie Sun, Tinghui Zhou, Gao Huang, and
+Trevor Darrell.
+Rethinking the value of network pruning.
+In International Conference on Learning Representations,
+2019.
+[27] Jian-Hao Luo, Jianxin Wu, and Weiyao Lin. Thinet: A ﬁlter
+level pruning method for deep neural network compression.
+In Proceedings of the IEEE international conference on com-
+puter vision, pages 5058–5066, 2017.
+[28] Sangkug Lym, Esha Choukse, Siavash Zangeneh, Wei Wen,
+Sujay Sanghavi, and Mattan Erez. Prunetrain: fast neural
+network training by dynamic sparse model reconﬁguration.
+In Proceedings of the International Conference for High
+Performance Computing, Networking, Storage and Analysis,
+pages 1–13, 2019.
+9
+
+
+[29] Ningning Ma, Xiangyu Zhang, Hai-Tao Zheng, and Jian Sun.
+Shufﬂenet v2: Practical guidelines for efﬁcient cnn architec-
+ture design. In Proceedings of the European conference on
+computer vision (ECCV), pages 116–131, 2018.
+[30] Pavlo Molchanov, Arun Mallya, Stephen Tyree, Iuri Frosio,
+and Jan Kautz. Importance estimation for neural network
+pruning. In Proceedings of the IEEE Conference on Com-
+puter Vision and Pattern Recognition, pages 11264–11272,
+2019.
+[31] Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila,
+and Jan Kautz. Pruning convolutional neural networks for re-
+source efﬁcient inference. arXiv preprint arXiv:1611.06440,
+2016.
+[32] Ravi Teja Mullapudi, Steven Chen, Keyi Zhang, Deva Ra-
+manan, and Kayvon Fatahalian. Online model distillation for
+efﬁcient video inference. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision, pages 3573–
+3582, 2019.
+[33] Nvidia.
+Convolutional
+networks
+for
+image
+clas-
+siﬁcation
+in
+pytorch.
+https://github.com/
+NVIDIA/DeepLearningExamples/tree/
+master/PyTorch/Classification/
+ConvNets#convolutional-networks-for-
+image-classification-in-pytorch, 2020.
+[34] Oyebade Oyedotun, Djamila Aouada, and Bjorn Ottersten.
+Structured compression of deep neural networks with debi-
+ased elastic group lasso. In The IEEE Winter Conference on
+Applications of Computer Vision, pages 2277–2286, 2020.
+[35] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, San-
+jeev Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy,
+Aditya Khosla, Michael Bernstein, Alexander C. Berg, and
+Li Fei-Fei. Imagenet large scale visual recognition challenge.
+Int. J. Comput. Vision, 115(3):211–252, Dec. 2015.
+[36] Karen Simonyan and Andrew Zisserman. Very deep convo-
+lutional networks for large-scale image recognition. In Inter-
+national Conference on Learning Representations, 2015.
+[37] Charles Spearman. The proof and measurement of associa-
+tion between two things. 1961.
+[38] Christian Szegedy, Wei Liu, Yangqing Jia, Pierre Sermanet,
+Scott Reed, Dragomir Anguelov, Dumitru Erhan, Vincent
+Vanhoucke, and Andrew Rabinovich.
+Going deeper with
+convolutions.
+In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pages 1–9, 2015.
+[39] Mingxing Tan, Bo Chen, Ruoming Pang, Vijay Vasudevan,
+Mark Sandler, Andrew Howard, and Quoc V Le.
+Mnas-
+net: Platform-aware neural architecture search for mobile.
+In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, pages 2820–2828, 2019.
+[40] Mingxing Tan and Quoc Le. Efﬁcientnet: Rethinking model
+scaling for convolutional neural networks. In International
+Conference on Machine Learning, pages 6105–6114. PMLR,
+2019.
+[41] Hidenori Tanaka, Daniel Kunin, Daniel LK Yamins, and
+Surya Ganguli. Pruning neural networks without any data
+by iteratively conserving synaptic ﬂow.
+arXiv preprint
+arXiv:2006.05467, 2020.
+[42] Arash Vahdat, Arun Mallya, Ming-Yu Liu, and Jan Kautz.
+Unas: Differentiable architecture search meets reinforce-
+ment learning. In Proceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pages 11266–
+11275, 2020.
+[43] Chaoqi Wang, Guodong Zhang, and Roger Grosse. Pick-
+ing winning tickets before training by preserving gradient
+ﬂow. In International Conference on Learning Representa-
+tions, 2020.
+[44] Tianzhe Wang, Kuan Wang, Han Cai, Ji Lin, Zhijian Liu,
+Hanrui Wang, Yujun Lin, and Song Han. Apq: Joint search
+for network architecture, pruning and quantization policy. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition, pages 2078–2087, 2020.
+[45] Bichen Wu, Xiaoliang Dai, Peizhao Zhang, Yanghan Wang,
+Fei Sun, Yiming Wu, Yuandong Tian, Peter Vajda, Yangqing
+Jia, and Kurt Keutzer. Fbnet: Hardware-aware efﬁcient con-
+vnet design via differentiable neural architecture search. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition, pages 10734–10742, 2019.
+[46] Hongxu Yin, Pavlo Molchanov, Jose M Alvarez, Zhizhong
+Li, Arun Mallya, Derek Hoiem, Niraj K Jha, and Jan Kautz.
+Dreaming to distill: Data-free knowledge transfer via Deep-
+Inversion.
+In Proceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pages 8715–
+8724, 2020.
+[47] Chenzhuo Zhu, Song Han, Huizi Mao, and William J
+Dally.
+Trained ternary quantization.
+arXiv preprint
+arXiv:1612.01064, 2016.
+10
+
+
+Pruning
+ratio
+Oracle
+estimate
+Init.
+[7, 24]
+Pre-def
+[17]
+EPI (ours)
+ResNet50
+10%
+76.90
+76.80
+76.74
+76.83(5)
+20%
+76.37
+76.23
+76.32
+76.34(9)
+30%
+75.78
+74.88
+75.60
+75.75(11)
+40%
+74.93
+73.73
+74.85
+74.91(12)
+50%
+73.89
+71.92
+73.62
+73.84(12)
+60%
+71.97
+70.04
+71.92
+71.79(12)
+70%
+69.00
+66.65
+68.49
+68.92(13)
+80%
+63.77
+60.65
+62.68
+63.40(17)
+90%
+61.65
+48.73
+61.65
+61.65(30)
+ResNet34
+10%
+73.76
+73.58
+73.67
+73.59(5)
+20%
+72.56
+72.24
+72.42
+72.31(10)
+30%
+70.63
+70.53
+70.24
+70.28(13)
+40%
+68.20
+68.20
+68.04
+68.00(7)
+50%
+65.54
+65.52
+65.22
+65.53(13)
+MobileNetV1
+10%
+72.50
+72.34
+72.40
+72.27(5)
+20%
+71.66
+71.48
+71.59
+71.59(5)
+30%
+70.69
+70.38
+70.56
+70.49(6)
+40%
+69.22
+69.09
+69.07
+69.05(12)
+50%
+67.25
+67.10
+67.15
+67.03(5)
+all nets avg acc drop
+–
+1.378
+0.214
+0.142
+automatic
+
+✓
+
+✓
+Table 4. The detailed top1 accuracy (in %) of the network with
+gradient-based neuron pruning, under different policies as in Sec-
+tion 4.2 of the main paper. Each reported value under our proposed
+EPI policy is in the format of [top1 acc](prune epoch). The summarize
+of the accuracy drop is the averaged accuracy drop (in %) com-
+pared to the oracle method.
+Appendices
+We provide more experimental details in the following sec-
+tions.
+A. Additional EPI-guided pruning results
+We perform EPI-guided pruning, with gradient-based
+criterion, on ResNet50, ResNet34 and MobileNetV1 with
+different prune ratios and get the ﬁnal accuracy as shown
+in Tab. 4. It can be observed that over all pruning ratios,
+EPI demonstrates superior capability over prior methods in
+achieving similar performance to oracle while pushing the
+start of pruning earlier into training.
+Similarly, for magnitude-based pruning in Tab. 5 we
+show the results of pruning with the magnitude universal
+threshold. In this case, as before, EPI-guided pruning per-
+forms better than heuristic pruning. Note that in magnitude-
+based pruning, pruning at initialization (heuristically prun-
+ing at epoch 0) tends to lead to non-trainable networks given
+a more challenging task amid model compactness.
+B. Stability analysis for MobileNetV1
+We provide here additional stability analysis results for
+a MobileNetV1 architecture. As in Section 4.5 of the main
+paper, the goal is to demonstrate that the sub-network archi-
+tecture varies signiﬁcantly during the early stage of training
+prune
+ratio
+Oracle
+estimate
+Init.
+[7, 24]
+Pre-def
+[17]
+EPI (ours)
+ResNet50
+10%
+76.9
+74.50
+76.90
+76.76(15)
+20%
+76.25
+72.71
+76.13
+76.12(17)
+30%
+75.56
+70.69
+75.42
+75.46(18)
+40%
+74.53
+–
+74.46
+74.49(20)
+50%
+72.95
+–
+72.71
+72.90(26)
+ResNet34
+10%
+73.78
+73.49
+73.71
+73.64(15)
+20%
+72.97
+72.20
+72.78
+72.86(16)
+30%
+71.63
+71.40
+71.53
+71.58(19)
+40%
+69.94
+67.90
+69.78
+69.84(21)
+50%
+67.42
+–
+66.19
+66.97(24)
+MobileNetV1
+10%
+71.87
+–
+71.65
+71.87(5)
+20%
+70.59
+–
+70.34
+70.58(9)
+30%
+68.91
+–
+68.88
+68.52(6)
+40%
+66.60
+–
+66.60
+66.50(15)
+50%
+63.28
+–
+63.11
+63.11(30)
+all nets avg acc drop
+–
+2.023a
+0.204
+0.132
+automatic
+
+✓
+
+✓
+a is averaged over the trainable pruning results.
+Table 5. The detailed top1 accuracy (in %) of the network with
+magnitude-based neuron pruning, under different policies as in
+Section 4.2 of the main paper. “–” refers to pruning leads to not-
+trainable network. Each reported value under our proposed EPI
+policy is in the format of [top1 acc](prune epoch). The summarize of
+the accuracy drop is the averaged accuracy drop (in %) compared
+to the oracle method.
+and then slowly converges to the ﬁnal architecture as the
+training progresses. In this case, we train a MobileNetV1
+to convergence and, in the process, compute the EPI value
+for different prune ratios. Fig. 7(a) and (b) show the EPI
+curves with magnitude-based and gradient-based, respec-
+tively. Consistent with our main paper results, the stability
+indicator increases rapidly in the early stage of training and
+continues increasing steadily for later training stages.
+(a) magnitude-based EPI
+(b) gradient-based EPI
+Figure 7. Structure stability analysis for MobileNetV1 for
+magnitude-based (a) and gradient-based (b) pruning with differ-
+ent ratios. Dashed line in black shows the EPI threshold.
+C. Comparison to other similarity criteria
+In this experiment, we aim at comparing our proposed
+EPI to other ranking criteria to measure the difference be-
+tween two network structures. To this end, we consider
+two ranking correlation measures (spearman and Kendall
+tau) and the instability measure proposed in [10]. Rank-
+ing correlation approaches directly measure the difference
+11
+
+
+Figure 8. Instability [10] of the networks obtained by pruning at
+different epochs. In this case, the prune ratio is involved, but the
+curves are not distinguishable among different prune ratios. More-
+over, such instability can only be calculated after training.
+Figure 9. Kendall and Spearman correlation calculated based on
+gradient-based neuron metric ranking. Each value is the calcu-
+lated between epoch x and epoch x −1. With rank correlation, no
+prune ratio would be involved. That means if we set a threshold
+to the correlation value, then for whatever prune ratio, we need to
+perform pruning at the same epoch.
+in the neuron ranking. These ranking correlation measures
+require all the neurons in the architecture and can not dis-
+criminate between different pruning ratios. Instability fo-
+cuses on identical architectures trained with different SGD
+noise and is computed after training is completed. Fig. 8
+and Fig. 9 show the results for this experiment on ResNet50.
+As expected, using other measures, we not only can not dis-
+tinguish different pruning ratios but also do not have enough
+discriminative power even during the early stages of train-
+ing. In contrast, as our approach focuses only on the archi-
+tecture changes can, as shown in Fig. 6 in the main paper,
+provide better insights into the stability of the network.
+D. EPI-guided Pruning on Object Detection
+In this experiment, we extend our proposed EPI policy
+to object detection. We use a Single Shot multibox Detector
+(SSD) [25] as our detection network, with a ResNet34 back-
+bone and an input size resolution of 300 × 300. We run the
+experiments on PASCAL VOC07+12 (union of VOC2007
+and VOC2012) [8].
+For training, we use PyTorch Distributed Data Parallel
+and mixed precision. We train the model for 800 epochs
+in total, with an individual batch per GPU of 128.
+The
+learning rate is warmed up linearly to 8e −3 in the ﬁrst
+(a)
+(b)
+Figure 10. Object detection using SSD300-RN34 on Pascal VOC.
+(a) The magnitude-based pruning result and (b) Structure stabil-
+ity analysis (EPI curve) for SSD300-RN34. Dashed line in black
+shows the EPI threshold.
+50 epochs, remains at the maximum value until epoch 600,
+and decays every 50 epochs. As an upper bound and base-
+line, we consider the accuracy of the unpruned model where
+we obtained 76.8% mAP.
+We test magnitude-based pruning with 9% and 40%
+pruning ratio and compare the performance to grid-search
+pruning with 50 epochs. Fig. 10(a) shows the results for
+this experiment. As we can see, pruning too early leads
+to large accuracy drops. However, if we delay the pruning
+epoch, especially with a lower pruning ratio, we do achieve
+on-par accuracies with the upper bound.
+We also compute the EPI value, see Eq.(6) in the main
+paper, for these two pruning ratios. In this case, different
+from our classiﬁcation set up, we calculate the sub-network
+structure similarity among the past 50 epochs, i.e., r = 50.
+Fig. 10(b) shows the EPI curve for this experiment.
+As
+shown, the EPI value increases rapidly at the early stage
+of training and then increases gradually as the training pro-
+gresses. The tendency is consistent with or pruning results
+in Fig. 10(a). As in our previous experiments, we set an
+EPI threshold to the magnitude universal threshold value
+τ = 0.983. Given this threshold, for this architecture, us-
+ing EPI-guided pruning leads to pruning in the 96th epoch
+for 9% pruning ratio and pruning in the 255th for a pruning
+ratio of 40%. The mAp drop with respect to the grid-search
+result is 0.589% and 0.212% mAP respectively.
+12

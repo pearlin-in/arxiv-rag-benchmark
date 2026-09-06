@@ -1,0 +1,1712 @@
+arXiv:2505.16210v1  [cs.LG]  22 May 2025
+NQKV: A KV Cache Quantization Scheme Based on Normal
+Distribution Characteristics
+Zhihang Caia, Xingjun Zhanga,∗, Zhendong Tana and Zheng Weia
+aSchool of Computer Science and Technology, Xi’an Jiaotong University, Xi’an 710049
+A R T I C L E I N F O
+Keywords:
+Large Language Model
+KV Cache
+Quantization
+A B S T R A C T
+Large Language Models (LLMs) have demonstrated remarkable proficiency across a wide range of
+tasks. However, LLMs often require larger batch sizes to enhance throughput or longer context lengths
+to meet task demands, which significantly increases the memory resource consumption of the Key-
+Value (KV) cache during inference, becoming a major bottleneck in LLM deployment. To address
+this issue, quantization is a common and straightforward approach. Currently, quantization methods
+for activations are limited to 8-bit, and quantization to even lower bits can lead to substantial accuracy
+drops. To further save space by quantizing the KV cache to even lower bits, we analyzed the element
+distribution of the KV cache and designed the NQKV algorithm. Since the elements within each
+block of the KV cache follow a normal distribution, NQKV employs per-block quantile quantization
+to achieve information-theoretically optimal quantization error. Without significantly compromising
+model output quality, NQKV enables the OPT model to perform inference with an 2× larger batch
+size or a 4× longer context length, and it improves throughput by 9.3× compared to when the KV
+cache is not used.
+1. Introduction
+Large Language Models (LLMs) have shown impressive
+performance across a wide range of tasks [1, 2, 3]. As LLMs
+are tasked with increasingly complex problems, they often
+require larger batch sizes to maximize GPU utilization and
+throughput, or longer context lengths to generate higher qual-
+ity and more relevant output. However, large batch sizes and
+long context lengths significantly increase the memory foot-
+print of LLMs during inference, posing new challenges for
+deploying and running LLMs [4]. As shown in Fig. 1, the
+GPU memory usage during LLM inference time increases
+sharply with larger batch sizes and longer sequence lengths.
+This effect is particularly pronounced for models with a greater
+number of parameters. In this scenario, compared to the
+model weights, the KV cache, which stores the keys and val-
+ues of the attention mechanism during inference to prevent
+redundant calculations, occupies the majority of the GPU
+memory space. We present the proportion of GPU mem-
+ory usage by the KV cache under different batch sizes and
+sequence lengths in Fig. 2. For example, the proportion of
+KV cache memory usage during inference for the OPT-175B
+model reaches 83.78% when the batch size is 64 and the se-
+quence length is 8192. Specifically, the KV cache would
+occupy 2.3TB of space, which is seven times the size of the
+model’s own parameters. In such cases, the KV cache be-
+comes the primary bottleneck for deploying and performing
+inference on large language models [5]. Therefore, reducing
+the memory overhead of the KV cache while maintaining
+model accuracy is an important way to lower the deployment
+costs of large language models.
+Currently, there are several approaches to reducing the
+∗Corresponding author
+xjzhang@xjtu.edu.cn (X. Zhang)
+ORCID(s): 0000-0003-1434-7016 (X. Zhang); 0000-0002-2293-5427 (Z.
+Wei)
+memory footprint of the KV cache in resource-constrained
+scenarios to improve memory efficiency. Some efforts at-
+tempt to address the issue at the system level. Offloading [6]
+is a practical method to alleviate memory pressure during
+model inference when dealing with excessively long con-
+texts. Although offloading can effectively reduce memory
+usage, it poses a complex challenge due to its high depen-
+dency on data transmission bandwidth. There are also efforts
+that attempt to incorporate virtual memory and paging tech-
+niques into the attention mechanism [7]. Additionally, some
+methods focus on reducing the number of heads in the KV
+cache, such as multi-query attention [8] and multi-group at-
+tention [9]. However, these methods modify the model’s ar-
+chitecture, requiring subsequent retraining or fine-tuning of
+the model. Other methods employ cache eviction strategies
+( 1 , 2 0 4 8 )
+( 1 , 4 0 9 6 )
+( 1 , 8 1 9 2 )
+( 8 , 2 0 4 8 )
+( 8 , 4 0 9 6 )
+( 8 , 8 1 9 2 )
+( 6 4 , 2 0 4 8 )
+( 6 4 , 4 0 9 6 )
+( 6 4 , 8 1 9 2 )
+0
+5 0 0
+1 0 0 0
+1 5 0 0
+2 0 0 0
+2 5 0 0
+3 0 0 0
+M
+e m o r y C o n s u m p t i o n ( G B )
+( B a t c h S i z e , S e q u e n c e L e n g t h )
+ O P T - 3 0 b
+ O P T - 6 6 b
+ O P T - 1 7 5 b
+Figure 1: The memory comsumption of OPT models in differ-
+ent scales under various batch size and sequence length con-
+figurations.
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 1 of 11
+
+
+NQKV
+2 . 8 %
+9 7 . 2 %
+W
+e i g h t s
+K V C a c h e
+S e q L e n 2 0 4 8 , B a t c h S i z e 1
+1 0 . 4 %
+8 9 . 6 %
+S e q L e n 8 1 9 2 , B a t c h S i z e 1
+K V C a c h e
+W
+e i g h t s
+3 5 . 0 %
+6 5 . 0 %
+S e q L e n 2 0 4 8 , B a t c h S i z e 6 4
+W
+e i g h t s
+K V C a c h e
+1 1 . 9 %
+8 8 . 1 %
+S e q L e n 8 1 9 2 , B a t c h S i z e 6 4
+K V C a c h e
+W
+e i g h t s
+Figure 2: The memory usage percentages of different compo-
+nents during inference for the OPT-175B model. As the batch
+size and sequence length increase, the memory space allocated
+to the KV cache ignificantly increases.
+to evict less important tokens from the KV cache [10]. Each
+of these methods has its own challenges, including complex
+implementation and difficulty in integrating with existing
+models.
+Quantization offers a promising approach to reducing the
+cost of LLMs. By quantizing the KV cache into a lower-bit
+data type, we can reduce memory requirements. For exam-
+ple, a 8-bit quantization of KV cache can reduce memory
+usage by half, while a 4-bit quantization would result in a
+memory space occupancy that is only one quarter of the orig-
+inal. There are numerous methods for quantizing weights
+[11], [12] and both weights and activations [13], [14], [15].
+However, these methods can not be directly used to quantize
+the KV cache for three reasons. Firstly, current quantization
+methods for activations struggle to maintain relatively low
+model accuracy loss at 4 bits [16]. Secondly, these methods
+also quantize the weights, but in scenarios where the batch
+size is very large and the sequence length is very long, the
+benefits of quantizing the weights are minimal and can lead
+to an accuracy drop. An even more challenging issue is that,
+due to the streaming nature of KV cache, existing methods
+cannot be directly applied to the KV cache. In this paper,
+we propose NQKV, which quantizes KV cache based on its
+normal distribution characteristics and uses data types that
+better align with the normal distribution. NQKV is based on
+the following insights:
+• In the transformer [17] architecture, the elements of
+keys and values in the decoder layer follow a normal
+distribution. Most quantization methods currently use
+integer (int) as the data type [13, 11, 15]. To lever-
+age the normal distribution characteristics of the data,
+there are also quantization methods that use floating-
+point (float) data types [18, 19]. By using data types
+that are closer to the normal distribution, it is possible
+to further reduce quantization error.
+• The token dimension, when partitioned by block size,
+results in blocks that still conform to the normal distri-
+bution. We have observed that keys and values adhere
+to the normal distribution along the token dimension,
+allowing for per-token quantization. Furthermore, if
+each token is divided into blocks of a certain block
+size, the resulting tensors also conform to the normal
+distribution. This suggests that we can perform quan-
+tization at an even finer granularity beyond per-token
+quantization by using data types that align with the
+normal distribution to quantize each block. This ap-
+proach confines quantization error within a block, pre-
+venting it from propagating across the entire token.
+• The KV cache has a streaming nature. In the gener-
+ative inference of LLMs, the KV cache stores all the
+keys and values computed by the attention mechanism
+in previous calculations. When generating new to-
+kens, these cached values can be reused, thus avoid-
+ing redundant computations. After the new key and
+value tensors for the newly generated tokens are com-
+puted, they are appended directly to the end of the KV
+cache. During this process, the old keys and values
+remain stored in the KV cache and do not change over
+time; that is, the KV cache is append-only. This char-
+acteristic of the KV cache means that in addition to
+computational data types like int and float, we can also
+use other storage data types such as NormalFloat [20].
+• It is more appropriate to quantize the KV cache along
+the token dimension rather than the channel dimen-
+sion. In text generation tasks, this ensures that newly
+generated tokens will not affect the quantization of
+other tokens. Furthermore, after quantization, newly
+generated keys and values can be directly appended to
+the end of the KV cache. This aligns with the stream-
+ing nature of KV cache.
+Inspired by these insights, we propose NQKV, a KV cache
+quantization method based on normal distribution. NQKV
+uses storage data types such as Normal Float [20] rather than
+computational data types to represent quantized values. With
+a limited number of bits, storage data types allow for more
+flexible data point values. Therefore, we can select quantile
+points from a normal distribution as data points to minimize
+quantization error. NQKV divides each token into several
+blocks based on a specified block size and quantizes each
+block separately. This not only utilizes the normal distribu-
+tion properties of keys and values, but also limits quantiza-
+tion errors within a single block without spreading across the
+entire token. To accelerate KV cache quantization, NQKV
+employs padding techniques, allowing for the use of more
+efficient BMM kernels for matrix multiplication operations.
+Our contributions are summarized as follows:
+• Extensive analysis of the element distribution within
+KV cache. We found that both within individual to-
+kens and within individual blocks, the elements follow
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 2 of 11
+
+
+NQKV
+a normal distribution. Our observations suggest that
+using data types whose data points follow a normal
+distribution for per-block quantization of KV cache.
+• A new 4bit KV cache quantization algorithm with-
+out any finetuning. Based on the normal distribu-
+tion characteristics of the KV cache, we propose an
+algorithm specifically designed for quantizing the KV
+cache, called NQKV. This method is orthogonal to
+other advanced model quantization techniques or sys-
+tem level memory management strategies and can be
+used in combination with them.
+• Quantizing the KV cache to 4 bits with minimal
+accuracy drop. Our experiments demonstrate that
+NQKV has a negligible impact on the model’s accu-
+racy. It enables an 2× larger batch size or 4× longer se-
+quence length for inference when the KV cache is en-
+abled, and it improves throughput by 9.3× compared
+to not using the KV cache.
+2. Related Work
+Weight-only quantization. Quantization is a commonly
+used technique to compress model size and reduce model in-
+ference overhead [21, 22, 23]. Some works focus on quantiz-
+ing model weights, representing weights with lower bit data
+types to decrease model size. In scenarios with small batch
+size and sequence length, model weights are the primary
+source of memory consumption, thus these methods can ef-
+fectively reduce the model size. GPTQ [11] utilizes approx-
+imate second-order information to quantize model weights
+with negligible impact on model performance. AWQ [24]
+perceives the importance of weights based on the magnitude
+of activation values rather than the weights themselves, and
+further protects important weights, successfully quantizing
+weights to 4 bits and 3 bits. SpQR [12] observes that out-
+liers in weights are the main cause of quantization difficulty.
+Therefore, SpQR can identify outliers in weights and store
+them using higher precision data types to reduce the accu-
+racy drop caused by quantization. SqueezeLLM [25] lever-
+ages a second-order information driven strategy to search for
+the optimal bit precision, while also encoding outliers in a
+sparse format to mitigate quantization errors. These meth-
+ods are orthogonal to our approach, as our method only oper-
+ates on activations without involving weights, and thus does
+not conflict with these methods in implementation.
+Weight-activation quantization. If only the weights are
+quantized, the model still uses 16-bit floating point opera-
+tions during inference, and thus cannot effectively utilize ef-
+ficient low-bit matrix multiplication kernels to enhance com-
+putational speed and reduce inference latency. To address
+this problem and further reduce LLM’s memory footpring,
+some works simultaneously quantize weights and activation
+values. SmoothQuant [13] quantizes both weights and acti-
+vations to INT8. It has been observed that weights are rel-
+atively easier to quantize compared to activations. Smooth-
+Quant achieves smaller quantization errors on activations by
+transferring the quantization difficulty from activations to
+weights through a mathematically equivalent transformation.
+This approach allows SmoothQuant to quantize the KV cache
+to INT8. However, when attempting to push activations to
+4-bit quantization, SmoothQuant experiences a significant
+drop in accuracy. Qdrop [26] pushes the limit of PTQ to
+the 2-bit activation for the first time. It accomplishes this
+by randomly dropping the quantization of activations during
+PTQ. Outlier Suppression+ [27] finds that outliers are con-
+centrated in specific channels and exhibit asymmetry across
+channels. It utilizes channel-wise shifting to eliminate this
+asymmetry characteristic. GPT3.int8() [15] reduces the dif-
+ficulty of activations quantization through another approach:
+it uses FP16 to represent outliers in activation values and
+INT8 to represent other activation values. However, this im-
+plementation leads to increased inference latency, even ex-
+ceeding that of FP16 models. Although these methods can
+be used to quantize the KV cache, they are not specifically
+designed for it and do not take its streaming nature into ac-
+count. As a result, quantizing the KV cache to lower bit lev-
+els such as 4-bit can lead to a severe drop in accuracy. There-
+fore, there are still difficulties in pushing the quantization of
+KV cache to lower bit levels.
+KV cache-only quantization. Furthermore, there are some
+works specifically targeting KV cache quantization. Llm-
+qat [28] can quantize the KV cache to 4 bits, but it requires
+retraining or fine-tuning to maintain performance. This pro-
+cess is extremely costly for LLMs. Another concurrent work
+[29] observes the differences between key cache and value
+cache, and proposes per-token quantization for key cache and
+per-channel quantization for value cache. However, due to
+the streaming nature of KV cache, per-channel quantization
+cannot be directly applied to value cache, necessitating a spe-
+cialized implementation. Additionally, this implementation
+cannot avoid a portion of value cache still needing to be rep-
+resented in FP16 during inference.
+Memory-efficient system. In addition to quantization, other
+works attempt to address this problem from different per-
+spectives. vLLM [30] and S3 [31] are system-level works.
+They integrate memory management strategies like Page-
+dAttention or memory usage prediction to diminish the mem-
+ory footprint of the KV cache. These methods not only alle-
+viate memory requirements but also enhance model through-
+put. StreamingLLM [32] is built upon the insight of the "at-
+tention sink" phenomenon and retains only a small number
+of initial tokens to preserve performance. These methods
+are orthogonal to NQKV, and these improvements can also
+be leveraged to enhance the performance of our algorithm.
+3. Method
+In scenarios with large batch size and long context infer-
+ence, we find that the memory storage occupied by KV cache
+significantly increases, becoming the main bottleneck for de-
+ploying LLM inference. To address this issue, quantization
+is a simple and effective method. It reduces the number of
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 3 of 11
+
+
+NQKV
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+probability density
+Layer0: self attn keys
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer7: self attn keys
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer16: self attn keys
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer23: self attn keys
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer0: self attn values
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer7: self attn values
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+probability density
+Layer16: self attn values
+pdf
+data
+2.5
+1.5
+0.5
+0.5
+1.5
+2.5
+normalized values
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+probability density
+Layer23: self attn values
+pdf
+data
+Figure 3: Demonstration of the data distribution of randomly selected tokens in OPT-6.7B decoder layers. Even if the data within
+each token follows a normal distribution, their standard deviations may differ. Therefore, we standardized the data to make their
+standard deviations equal to 1, allowing for easy comparison with the standard normal distribution. For ease of observation, we
+also plotted the probability density function curve of the standard normal distribution in the figure.
+2
+0
+2
+Normal theoretical quantiles
+4
+3
+2
+1
+0
+1
+2
+3
+Normal data quantiles
+(a) token
+2
+0
+2
+Normal theoretical quantiles
+2
+1
+0
+1
+2
+3
+Normal data quantiles
+(b) block1
+2
+0
+2
+Normal theoretical quantiles
+2
+1
+0
+1
+2
+3
+Normal data quantiles
+(c) block2
+2
+0
+2
+Normal theoretical quantiles
+3
+2
+1
+0
+1
+2
+Normal data quantiles
+(d) block3
+Figure 4: Quantile-Quantile plots of data distribution in tokens and blocks of the OPT-6.7B model. The hidden states size of
+OPT-6.7B is 4096. With a block size of 256, we can obtain 16 blocks. For the sake of demonstration, only the Quantile-Quantile
+plots of three of these blocks are shown here. The identity line 𝑦= 𝑥represents the Q-Q plot of a standard normal distribution,
+while other data points are plotted based on the distribution of the data. If the data points approximately lie on the line 𝑦= 𝑥,
+it indicates that the two distributions being compared are similar, that is, the data follows a normal distribution.
+bits occupied by each activation, thereby reducing the over-
+all memory space occupied by the KV cache. Although there
+are many methods for quantizing weights and activation val-
+ues, they are not specifically tailored for KV cache and can
+only quantize the KV cache to a maximum of 8 bits. When
+quantized to 4 bits, the model will suffer a significant accu-
+racy drop. Following this motivation, we first analyze the
+data distribution of elements in the KV cache in Section 3.1
+and find that these elements follow a normal distribution in
+token dimensions and even within each block. Based on this
+observation, we propose in Section 3.2 to use data types that
+conform to the normal distribution to quantize at the block
+granularity, thereby minimizing quantization errors as much
+as possible. To reduce the additional overhead caused by
+quantization, Section 3.3 proposes a strategy to pad in token
+dimensions, thereby improving the efficiency of quantiza-
+tion and dequantization operations.
+3.1. Data Distribution in KV cache
+Nowadays, the weights of LLMs can be quantized to 4
+bits or even lower with minimal impact on model perfor-
+mance [11]. However, quantizing activations remains a chal-
+lenging task due to the presence of outliers [13] [20]. Since
+the KV cache essentially stores activations generated dur-
+ing the model inference process, quantizing the KV cache
+is also affected by outliers. Therefore, observing the data
+distribution in the KV cache is necessary, as it can help us
+understand the difficulties in quantizing the KV cache.
+We collected the KV cache generated by each layer of
+the OPT-6.7B model during the inference process. Random
+samples of tokens were selected from the KV cache of each
+layer to observe their data distribution. As shown in Fig. 3,
+the data within each token mostly conforms to a normal dis-
+tribution, and the standardized data closely matches the prob-
+ability density function curve of the standard normal distri-
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 4 of 11
+
+
+NQKV
+Table 1
+Results of the D’Agostino-Pearson (DAP) test for the data
+within each block. When the p-value is greater than the sig-
+nificance level 𝛼= 0.05, we fail to reject the null hypothesis,
+indicating that the data follows a normal distribution.
+The
+DAP test results for most blocks showed p-values much greater
+than the significance level 𝛼= 0.05, hence indicating that the
+data within each block follows a normal distribution.
+block
+pvalue
+> 𝛼?
+block
+pvalue
+> 𝛼?
+0
+0.61048
+✓
+8
+0.79392
+✓
+1
+0.19510
+✓
+9
+0.89790
+✓
+2
+0.26376
+✓
+10
+0.74527
+✓
+3
+0.57718
+✓
+11
+0.08653
+✓
+4
+0.32071
+✓
+12
+0.71710
+✓
+5
+0.97007
+✓
+13
+0.16879
+✓
+6
+0.51170
+✓
+14
+0.59332
+✓
+7
+0.10981
+✓
+15
+0.14138
+✓
+bution. Therefore, we can conclude that, for the KV cache,
+the activation values within each token follow a normal dis-
+tribution.
+In addition, we divided each token into several blocks
+using a fixed block size and explored the data distribution
+within each block. Q-Q (Quantile-Quantile) plots were cre-
+ated separately for the data distribution within tokens and
+within blocks. In statistics, a Quantile-Quantile plot is a
+probability plot, a graphical method for comparing two prob-
+ability distributions by plotting their quantiles against each
+other [33]. If the data points are as close as possible to the
+identity line 𝑦= 𝑥, it indicates that the data conforms to
+a standard normal distribution. As shown in Fig. 4(a), the
+data within tokens follow a normal distribution. When the
+block size is set to 256, each token in the OPT-6.7B model
+is divided into 16 blocks. As shown in Fig. 4(b), 4(c), and
+4(d), the data points within each block in the Q-Q plot ap-
+proximately lie on the identity line 𝑦= 𝑥. Therefore, the
+data within blocks also conforms to a normal distribution.
+In Table 1, we also conducted the D’Agostino-Pearson(DAP)
+test [34] to further test the normality of the data within each
+block. D’Agostino-Pearson (DAP) test is a statistical test
+used to determine whether a given sample of data comes
+from a normally distributed population. The null hypoth-
+esis for the D’Agostino-Pearson test is that the data follows
+a normal distribution. By performing the test and comparing
+the p-value to a significance level 𝛼= 0.05, we can deter-
+mine whether to reject the null hypothesis or not. For blocks
+within each token, the p-value is much greater than the sig-
+nificance level 𝛼, so we fail to reject the null hypothesis, sug-
+gesting that the data within each block follows a normal dis-
+tribution.
+3.2. NQKV Algorithm
+As we previously analyzed, the data within each block
+of the KV cache follows a normal distribution. Based on
+this observation, we propose a novel KV cache quantization
+approach called NQKV. The main idea of this approach is
+to partition the KV cache into blocks and use data types that
+16.6
+1.2
+-2.9
+-4.6
+-2.9
+12.3
+16.6
+1.2
+-2.9
+-4.6
+-2.9
+12.3
+8
+5
+4
+5
+14
+15
+8
+5
+4
+5
+14
+15
+16bit
+4bit
+One of Blocks
+Quantized Block
+(Stored in KV Cache)
+Block Size = 6
+Attention Key Split into 1024×4 Blocks
+Hidden States Dimension(24)
+Dequantize
+16.6
+1.3
+-3.1
+-4.7
+-3.1
+12.0
+16.6
+1.3
+-3.1
+-4.7
+-3.1
+12.0
+16bit
+Dequantized 
+Block
+Index
+Value
+0
+-1.00
+…
+14
+0.72
+15
+1.00
+Quantize
+Look Up Index Table
+Input Token Dimension(1024)
+Figure 5: Block-wise quantile quantization. For demonstration
+purposes, let’s assume the hidden states size is 24, input token
+dimension size is 1024, the block size is 6, and the dimensions
+of the keys matrix are 1024×24 (ignoring batch size). There-
+fore, each token of the keys can be divided into 4 blocks, and
+a keys matrix has 1024×4 blocks.
+We quantize each block
+separately, obtaining NF4 indices after quantization, which are
+stored in the KV cache. During dequantization processs, the
+NF4 indices stored in the KV cache can be used to look up
+the index table and get corresponding values, which are then
+restored to FP16 data type for computation.
+conform to a normal distribution, such as Normal Float [20],
+for quantization of each block. In NQKV, we employ 4-bit
+Normal Float (NF4) [20] data type for block-wise quantiza-
+tion, as shown in Fig.5.
+The LLM attention inference process can be divided into
+two phases: the prefill phase and the decoding phase. In the
+prefill phase, the input prompt is used to generate keys and
+values for each transformer layer within LLMs. NQKV di-
+vides the generated keys and values into blocks along the to-
+ken dimension, and applies NF4 quantization to each block,
+storing the resulting indices in the KV cache. The NQKV
+algorithm stores indices in the KV cache rather than directly
+storing floating point numbers. Although indices cannot be
+directly used for computation, we can retrieve correspond-
+ing floating point values based on the indices through ta-
+ble lookup. Since indices are stored using 4 bits, this ef-
+fectively reduces the number of bits required to store the KV
+cache, saving approximately four times more memory com-
+pared to directly storing 16-bit floating-point numbers. Sub-
+sequently, in the decoding phase, newly generated keys and
+values are first quantized using per-block NF4 quantization
+and directly appended to the end of the KV cache, aligning
+with the streaming nature of the KV cache. Then, the KV
+cache is dequantized, and the resulting tensors are directly
+used in the subsequent computation of the attention mecha-
+nism. More specifically, we formalize the NQKV algorithm
+as the following process, which is also illustrated in Fig.6:
+Prefill Phase. Let 𝑋∈𝑅𝑏×𝑙𝑝𝑟𝑜𝑚𝑝𝑡×𝑑, where 𝑏is the batch
+size, 𝑙𝑝𝑟𝑜𝑚𝑝𝑡is the length of the input prompt, and 𝑑is the
+size of hidden states. 𝑋𝑄, 𝑋𝐾, and 𝑋𝑉are the query, key,
+and value in the attention mechanism, respectively, and they
+are calculated by the following formulas:
+𝑋𝑄= 𝑋𝑊𝑄,
+𝑋𝐾= 𝑋𝑊𝐾,
+𝑋𝑉= 𝑋𝑊𝑉,
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 5 of 11
+
+
+NQKV
+Prefill Phase
+Decoding Phase
+K
+X
+A
+Matmul
+O
+X O
+X
+V
+X
+Q
+X
+KI
+VI
+Quantile Quantization
+Quantile Quantization
+Matmul
+Quantize
+Concat
+Dequantize
+Matmul
+Kt
+KtI
+Qt
+A
+KtI
+KI
+KtI
+KI
+4-bit Value Cache
+4-bit Value Cache
+4-bit Key Cache
+4-bit Key Cache
+FP16 Activations
+FP16 Activations
+Attention QKV
+Attention QKV
+NF4 Indexes
+NF4 Indexes
+4-bit Value Cache
+4-bit Key Cache
+FP16 Activations
+Attention QKV
+NF4 Indexes
+'
+K
+X
+Figure 6: Execution flow of the NQKV algorithm. For ease of description, only the scenario of Key cache is described in the
+decoding phase, with the situation for Value cache being identical.
+𝑊𝑄, 𝑊𝐾, 𝑊𝑉∈𝑅𝑑×𝑑are the query, key, and value layer
+weights in the attention mechanism, respectively. Let 𝐼𝐾,
+𝐼𝑉be the indices obtained after NF4 quantization, and they
+satisfy:
+𝐼𝐾= 𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝑋𝐾)
+𝐼𝑉= 𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝑋𝑉)
+where 𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4 represents the block-wise NF4 quanti-
+zation operation, as shown in Fig.5. 𝐼𝐾, 𝐼𝑉are stored in the
+KV cache to avoid redundant computation during the decod-
+ing phase.
+Decoding Phase. Let 𝑡∈𝑅𝑏×1×𝑑be the newly generated
+input token embeding, and 𝑡𝐾= 𝑡𝑊𝐾and 𝑡𝑉= 𝑡𝑊𝑉be
+the newly generated key and value, respectively. We first
+perform NF4 block-wise quantization on 𝑡𝐾and 𝑡𝑉:
+𝐼𝑡𝐾= 𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝑡𝐾),
+𝐼𝑡𝑉= 𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝑡𝑉),
+Where 𝐼𝑡𝐾and 𝐼𝑡𝑉are the 4-bit indices obtained after quanti-
+zation. Then, we update the KV cache by directly appending
+𝐼𝑡𝐾and 𝐼𝑡𝑉to the end of the KV cache:
+𝐼𝐾←𝐶𝑜𝑛𝑐𝑎𝑡(𝐼𝐾, 𝐼𝑡𝐾),
+𝐼𝑉←𝐶𝑜𝑛𝑐𝑎𝑡(𝐼𝑉, 𝐼𝑡𝑉),
+Finally, since indices cannot be directly used for computa-
+tion, we need to dequantize the KV cache to obtain floating
+point numbers for subsequent attention computation:
+𝑋′
+𝐾= 𝑑𝑒𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝐼𝐾)
+𝑋′
+𝑉= 𝑑𝑒𝑞𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑁𝐹4(𝐼𝑉)
+𝑡𝑄= 𝑡𝑊𝑄
+𝐴= 𝑆𝑜𝑓𝑡𝑚𝑎𝑥(𝑡𝑄𝑋′𝑇
+𝐾),
+𝑡𝑂= 𝐴𝑋′
+𝑉
+where 𝑡𝑂is the output of the attention, 𝑡is the new token
+generated from the previous inference, and 𝑡𝑄is the attention
+query of this token. For the ease of illustration, we ignore the
+other part of the decoder layer.
+3.3. Padding
+Our implementation of the NQKV algorithm is based on
+Nvidia’s Cutlass template library. To leverage the GEMM
+(General Matrix Multiply) functionality provided by Cutlass
+and efficiently perform matrix multiplication operations, we
+employ padding techniques for the KV cache. Prior to com-
+putation, padding is applied to the KV cache along the token
+dimension to ensure that the token dimension size is a mul-
+tiple of 16, meeting both GPU hardware requirements and
+optimization considerations.
+As illustrated in Fig. 7, we can apply padding directly
+to the KV cache, or we can perform padding after dequan-
+tizing the KV cache into computational values. The latter
+approach is indeed more efficient. Firstly, if padding is ap-
+plied directly to the KV cache, the newly added elements
+will incur additional computational overhead during the de-
+quantization process. Secondly, given the large number of
+layers in LLMs and the presence of KV caches in each layer,
+direct padding of the KV cache would result in additional
+storage overhead for each layer. However, during inference
+time, only one layer is active at any given time. Therefore,
+Keys and Values
+KV Cache
+padding
+padding
+padding zeros
+Keys and Values
+KV Cache
+(Already Padded)
+padding zeros
+dequantize
+dequantize
+dequantize
+dequantize
+Keys and Values
+No Additional Computa-
+tion Overhead
+Less Peak Memory Usage
+Less Peak Memory Usage
+No Additional Computa-
+tion Overhead
+Less Peak Memory Usage
+Figure 7: Padding the KV cache during computation would
+result in lower peak memory usage and has no additional com-
+putation overhead compared to directly padding the KV cache.
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 6 of 11
+
+
+NQKV
+Table 2
+The impact of NQKV on the accuracy of the OPT models across different zero-shot tasks. NQKV has almost no
+impact on the accuracy of the OPT models, despite using a KV cache stored with only 4 bits.
+Model
+PIQA
+WinoGrande
+HellaSwag
+ARC(Challenge)
+RTE
+boolq
+Average
+OPT-125M
+FP16
+63.00%
+50.36%
+29.18%
+19.11%
+49.82%
+55.47%
+44.49%
+NQKV
+62.68%
+49.88%
+28.94%
+18.96%
+51.26%
+55.96%
+44.61%
+OPT-1.3B
+FP16
+71.55%
+59.51%
+41.51%
+23.38%
+51.99%
+57.77%
+50.95%
+NQKV
+71.07%
+58.33%
+40.48%
+23.29%
+51.62%
+56.75%
+50.26%
+OPT-6.7B
+FP16
+76.22%
+65.35%
+50.50%
+30.63%
+55.23%
+66.06%
+57.33%
+NQKV
+76.17%
+64.25%
+50.16%
+30.38%
+55.60%
+65.63%
+57.03%
+OPT-13B
+FP16
+75.95%
+65.04%
+52.45%
+32.94%
+58.12%
+65.93%
+58.41%
+NQKV
+75.84%
+65.19%
+52.14%
+32.68%
+59.21%
+66.91%
+58.66%
+performing padding during the computation phase will only
+incur additional storage overhead for the KV cache of that
+single layer rather than each layer.
+4. Experiment
+4.1. Settings
+Baselines. To demonstrate the orthogonality of NQKV
+with other state-of-the-art quantization methods, we apply
+NQKV to SmoothQuant and test its impact on the accuracy
+of SmoothQuant. In our configuration for SmoothQuant, we
+quantize the weights at the per-tensor granularity and per-
+form static per-tensor quantization for activations, i.e., scal-
+ing factors are computed and determined during the cali-
+bration phase and remain static during inference. We ran-
+domly select 512 sentences from the validation set of the
+Pile dataset [35] to generate scaling factors for activations,
+using a migration strength of 𝛼= 0.5.
+Models and Datasets. We evaluate NQKV using OPT
+[3] model families. The OPT model is a decoder-only ar-
+chitecture based on the transformer’s multi-head attention
+mechanism. We implemented the NQKV algorithm based
+on the Hugging Face[36] transformers codebase. To achieve
+the best trade-off between accuracy and memory space oc-
+cupation, we adopted 4-bit quantization with a block size of
+256. We evaluated the model accuracy using seven zero-shot
+evaluation tasks, including PIQA [37], WinoGrande [38],
+HellaSwag [39], ARC (Easy) [40], ARC (Challenge) [40],
+RTE [41], and BoolQ [42]. We utilized the lm-eval-harness1
+to evaluate OPT models ranging from 125M to 30B parame-
+ters. The experiments were conducted on a server equipped
+with 1 Nvidia A100 GPU (80GB).
+4.2. Accuracy Analysis
+4.2.1. Accuracy on Zero-Shot Tasks
+To demonstrate that applying 4-bit Normal Float quan-
+tization to the KV cache only results in negligible accuracy
+degradation, we applied the NQKV method to the inference
+process of OPT models of various scales and evaluated their
+performance on various zero-shot tasks. We enabled the KV
+cache mechanism of the OPT model and applied 4-bit Nor-
+mal Float quantization only to the keys and values within the
+1https://github.com/EleutherAI/lm-evaluation-harness
+multi-head attention mechanism of the OPT model during
+the inference process, while other activation values remained
+represented in the form of 16-bit floating point numbers. To
+demonstrate the impact of NQKV on model prediction per-
+formance, we did not apply any quantization strategy to the
+weights to avoid interference with the results.
+Similar to SmoothQuant [13] and RPTQ [5], we eval-
+uated the accuracy on zero-shot tasks, and the results are
+shown in Table 2. We observed that NQKV had almost no
+impact on the accuracy of the OPT model, despite the KV
+cache being stored with only 4 bits. Furthermore, as the
+model scale increased, the robustness of the LLM improved,
+and this impact became even smaller. Specifically, OPT-
+1.3B suffered an average accuracy loss of 0.7%, but this loss
+was further reduced in the OPT-6.7B and OPT-13B models.
+4.2.2. Orthogonality to Other Methods
+To lower the barrier for deploying large models and ac-
+celerate inference, there are many advanced quantization meth-
+ods available, such as SmoothQuant [13], GPTQ [11], and
+others. Since NQKV is specifically designed for quantiz-
+ing KV cache, it does not conflict with existing advanced
+weight and activation quantization methods; they are orthog-
+onal and can be used in combination. To demonstrate or-
+thogonality, we applied the NQKV algorithm to Smooth-
+Quant [13], further quantizing KV cache to 4 bits based on
+SmoothQuant’s W8A8 quantization. SmoothQuant offers
+various quantization granularities, and here we chose to use
+per-tensor quantization for both weights and activations.
+Table 3 indicates that the NQKV method has only a mi-
+nor impact on the prediction accuracy of SmoothQuant, and
+in some cases, its prediction accuracy is even slightly higher
+than that of SmoothQuant. On the OPT-1.3B model, NQKV
+caused a relatively noticeable performance drop for Smooth-
+Quant. However, as the model size increases, the robustness
+of large language models also improves. On the OPT-6.7B
+and OPT-30B models, NQKV actually brought an improve-
+ment in accuracy for SmoothQuant. Especially on the OPT-
+30B model, NQKV achieved higher accuracy than Smooth-
+Quant on tasks such as WinoGrande, ARC(Easy), RTE, and
+BoolQ, with accuracy drop controlled within 0.1% on other
+tasks. Our experiments show that, NQKV can work well
+in conjunction with SmoothQuant on large language models
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 7 of 11
+
+
+NQKV
+Table 3
+Accuracy comparison on zero-shot tasks when combining NQKV with SmoothQuant. SQ represents the performance of
+original SmoothQuant algorithm, where weights, activations, and KV cache are all quantized to 8 bits(W8A8KV8). SQ-
+NQKV represents the performance of SmoothQuant combining with NQKV, where the KV cache is further quantized to 4
+bits(W8A8KV4). NQKV demonstrates good orthogonality with other advanced quantization methods, as it does not cause
+catastrophic degradation in model performance. NQKV only incurs minimal accuracy drops, particularly on larger models.
+Model
+PIQA
+WinoGrande
+HellaSwag
+ARC(Easy)
+ARC(Challenge)
+RTE
+boolq
+Average
+FP16
+63.00%
+50.36%
+29.18%
+43.52%
+19.11%
+49.82%
+55.47%
+44.35%
+OPT-125M
+SQ
+62.46%
+51.30%
+28.85%
+41.96%
+19.28%
+49.82%
+56.21%
+44.27%
+SQ-NQKV
+62.24%
+50.67%
+28.63%
+42.59%
+18.94%
+50.18%
+56.36%
+44.23%
+FP16
+71.55%
+59.51%
+41.51%
+57.11%
+23.38%
+51.99%
+57.77%
+51.83%
+OPT-1.3B
+SQ
+70.40%
+58.72%
+41.26%
+56.65%
+24.40%
+51.26%
+56.54%
+51.32%
+SQ-NQKV
+70.24%
+59.27%
+40.16%
+53.62%
+23.29%
+50.18%
+55.35%
+50.30%
+FP16
+76.22%
+65.35%
+50.50%
+65.66%
+30.63%
+55.23%
+66.06%
+58.52%
+OPT-6.7B
+SQ
+76.50%
+65.82%
+50.42%
+65.49%
+30.08%
+55.60%
+66.33%
+58.61%
+SQ-NQKV
+76.44%
+66.61%
+50.08%
+65.28%
+29.69%
+56.68%
+66.06%
+58.69%
+FP16
+75.95%
+65.04%
+52.45%
+67.13%
+32.94%
+58.12%
+65.93%
+59.65%
+OPT-13B
+SQ
+75.68%
+64.56%
+52.15%
+66.75%
+33.11%
+57.40%
+64.65%
+59.19%
+SQ-NQKV
+75.73%
+65.11%
+51.70%
+65.70%
+32.25%
+55.60%
+64.56%
+58.66%
+FP16
+77.64%
+68.35%
+54.30%
+70.12%
+34.56%
+57.76%
+70.49%
+61.89%
+OPT-30B
+SQ
+77.53%
+67.64%
+54.04%
+69.99%
+34.39%
+56.68%
+69.94%
+61.46%
+SQ-NQKV
+77.48%
+67.88%
+53.94%
+70.16%
+34.13%
+58.84%
+70.58%
+61.86%
+0
+4 0
+8 0
+1 2 0
+1 6 0
+0
+2 0
+4 0
+6 0
+8 0
+P e a k M
+e m o r y ( G B )
+B a t c h S i z e
+ N Q K V
+ S Q
+ F P 1 6
+Figure 8: For the OPT-6.7B model, NQKV can perform infer-
+ence with 4 × batch size compared to a standard FP16 model,
+and with 2 × batch size compared to SmoothQuant.
+without causing catastrophic performance degradation.
+4.3. Speedup and Memory Saving
+To measure the impact of NQKV on the throughput and
+memory usage of LLMs with enabled KV cache, we use the
+wikitext-2 dataset as the workload for text generation tasks.
+The number of the input tokens of the model is determined
+by the sequence length, and the output length 𝑙𝑔𝑒𝑛is 338.
+By varying the batch size and sequence length, we observe
+the performance of the OPT-6.7B and OPT-30B models un-
+der this workload. Here, our GPU is the Nvidia A100 GPU
+(80GB). We measure the throughput of OPT models and
+measure the peak memory usage during inference time as
+a metric for memory efficiency.
+In Fig.8 and Fig.9, we show that NQKV can save a sig-
+nificant amount of memory space, allowing for larger batch
+sizes or longer contexts for inference. For OPT-6.7B model,
+when the FP16 model cannot continue inference due to in-
+0
+450
+900
+1350
+1800
+20
+40
+60
+80
+Peak Memory(GB)
+Sequence Length
+ NQKV
+ SQ
+ FP16
+Out of Mmeory
+Figure 9: For the OPT-6.7B model, NQKV can perform infer-
+ence with 2.5 × sequence length compared to a standard FP16
+model, and with 1.5 × sequence length compared to Smooth-
+Quant.
+sufficient memory, NQKV allows the model to still perform
+inference with 4× batch size or 2.5× sequence length. For
+larger models, the memory saving effect of NQKV will be
+even more significant.
+As shown in Table 4, with the KV cache enabled, NQKV
+allows SmoothQuant to perform inference with an 2× larger
+batch size or a 4× longer sequence length, with a throughput
+loss of less than 20%. For OPT-30B model, when the batch
+size is 64 and the sequence length is 512, SmoothQuant can-
+not enable the KV cache normally because it would result
+in an out of memory error. However, with NQKV, Smooth-
+Quant can enable KV cache and perform inference at a speed
+9.3 × faster, with only a 5% increase in memory usage. Over-
+all, NQKV can save an additional 60%-80% of memory com-
+pared to SmoothQuant when the batch size and sequence
+length are very large.
+We observed that the throughput of NQKV is slightly
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 8 of 11
+
+
+NQKV
+Table 4
+Comparison of throughput and memory usage of OPT models under different configurations. BS represents Batch
+Size, SeqLen represents Sequence Length. SQ is SmoothQuant without using KV cache, SQKV is SmoothQuant with
+KV cache, and NQKV represents using NQKV algorithm to further quantizes the KV cache based on SQKV. OOM
+indicates out of memory errors.
+Model
+BS
+SeqLen
+Throughput(token/s)
+Peak Mem(GB)
+SQ
+SQKV
+NQKV
+Speedup(↑)
+SQ
+SQKV
+NQKV
+Saving (↑)
+OPT-6.7B
+8
+128
+45.55
+139.78
+118.69
+2.61
+7.42
+8.28
+6.92
+1.20
+512
+18.17
+103.94
+91.38
+5.03
+8.95
+9.84
+7.91
+1.24
+32
+128
+57.65
+275.48
+258.13
+4.48
+9.07
+11.96
+8.39
+1.43
+512
+19.63
+151.97
+131.86
+6.72
+14.41
+18.28
+12.41
+1.47
+64
+128
+58.53
+311.23
+289.31
+4.94
+14.46
+21.39
+15.39
+1.39
+512
+20.61
+172.28
+153.64
+7.45
+26.72
+33.73
+18.40
+1.83
+OPT-30B
+8
+128
+14.07
+85.02
+70.84
+5.03
+29.97
+33.43
+29.76
+1.12
+512
+5.55
+59.88
+51.68
+9.31
+32.43
+37.36
+31.87
+1.17
+32
+128
+19.66
+97.14
+93.26
+4.74
+32.00
+42.19
+33.50
+1.26
+512
+6.21
+60.32
+54.27
+8.74
+40.26
+58.23
+41.97
+1.39
+64
+128
+18.36
+112.79
+98.91
+5.39
+40.45
+67.50
+41.53
+1.63
+512
+5.71
+–
+53.10
+9.30
+60.12
+OOM
+62.49
+–
+lower than that of SmoothQuant. This is because NQKV
+uses storage types instead of computation types to store the
+quantized KV cache, resulting in additional overhead to de-
+quantize the KV cache into computation values during calcu-
+lations. Nonetheless, compared to scenarios without using
+KV cache, NQKV still provides a significant inference ac-
+celeration. For smaller models (such as OPT-6.7B), NQKV
+enables the use of KV cache almost without additional mem-
+ory overhead. This means we can accelerate the inference of
+these models with nearly no extra memory cost incurred. For
+larger models, when other methods are unable to enable KV
+cache due to memory limitations, NQKV can still enable KV
+cache and achieve accelerated inference.
+It’s worth noting that in some cases (such as OPT-6.7B,
+with a batch size of 8 and sequence length of 512), the peak
+memory usage of NQKV may even be lower than that of
+SmoothQuant without enabling KV cache. This seems coun-
+terintuitive, as enabling KV cache would inevitably incur ad-
+ditional memory overhead, making it impossible to achieve
+a smaller peak memory footprint. In fact, this is because our
+implementation is based on PyTorch, and PyTorch’s mem-
+ory allocation strategy may allocate more memory than nec-
+essary for the model, leading to such results. The peak mem-
+ory usage determines whether the model can perform infer-
+ence on the GPU, so we use this metric instead of the average
+memory usage during inference.
+5. Conclusion and Future Work
+In this paper, we conducted an extensive analysis of the
+element distribution within the KV cache and found that both
+within individual tokens and within individual blocks, the el-
+ements follow a normal distribution. Based on this observa-
+tion, we conclude that using data types whose data points fol-
+low a normal distribution for per-block quantization of KV
+cache can further reduce quantization errors. Furthermore,
+we propose the NQKV algorithm, an effective quantization
+method that specifically designed for KV cache and does not
+need any retraining or finetuning. Our experiments demon-
+strate that our method allows for an 2× larger batch size or
+4× larger sequence length for inference when KV cache is
+enabled, and it improves throughput by 9.3× compared to
+the scenario without using KV cache. In the future, we will
+further optimize the implementation of NQKV to reduce the
+overhead of quantization on LLM inference. Additionally,
+we will explore the design of new data types in hopes of fur-
+ther reducing quantization errors.
+CRediT authorship contribution statement
+Zhihang Cai: Conceptualization, Methodology, Soft-
+ware, Writing - original draft. Xingjun Zhang: Resources,
+Funding acquisition, Project administration, Supervision. Zhen-
+dong Tan: Writing - review & editing, Validation. Zheng
+Wei: Writing - review & editing, Validation.
+Acknowledgements
+This research is supported by the National Natural Sci-
+ence Foundation of China (62372366).
+References
+[1] Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J.D., Dhari-
+wal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., et al.,
+2020. Language models are few-shot learners. Advances in neural
+information processing systems 33, 1877–1901.
+[2] Yuan, J., Tang, R., Jiang, X., Hu, X., 2023.
+Llm for patient-trial
+matching: Privacy-aware data augmentation towards better perfor-
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 9 of 11
+
+
+NQKV
+mance and generalizability, in: American Medical Informatics As-
+sociation (AMIA) Annual Symposium.
+[3] Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M., Chen,
+S., Dewan, C., Diab, M., Li, X., Lin, X.V., et al., 2022.
+Opt:
+Open pre-trained transformer language models.
+arXiv preprint
+arXiv:2205.01068 .
+[4] Chen, Y., Qian, S., Tang, H., Lai, X., Liu, Z., Han, S., Jia, J., 2023.
+Longlora: Efficient fine-tuning of long-context large language mod-
+els. arXiv preprint arXiv:2309.12307 .
+[5] Yuan, Z., Niu, L., Liu, J., Liu, W., Wang, X., Shang, Y., Sun, G., Wu,
+Q., Wu, J., Wu, B., 2023. Rptq: Reorder-based post-training quan-
+tization for large language models. arXiv preprint arXiv:2304.01089
+.
+[6] Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen, B., Liang,
+P., Ré, C., Stoica, I., Zhang, C., 2023. Flexgen: High-throughput
+generative inference of large language models with a single gpu, in:
+International Conference on Machine Learning, PMLR. pp. 31094–
+31116.
+[7] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C.H., Gonza-
+lez, J., Zhang, H., Stoica, I., 2023. Efficient memory management for
+large language model serving with pagedattention, in: Proceedings of
+the 29th Symposium on Operating Systems Principles, pp. 611–626.
+[8] Shazeer, N., 2019. Fast transformer decoding: One write-head is all
+you need. arXiv preprint arXiv:1911.02150 .
+[9] Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebrón,
+F., Sanghai, S., 2023.
+Gqa:
+Training generalized multi-query
+transformer models from multi-head checkpoints.
+arXiv preprint
+arXiv:2305.13245 .
+[10] Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai, R., Song,
+Z., Tian, Y., Ré, C., Barrett, C., et al., 2024. H2o: Heavy-hitter oracle
+for efficient generative inference of large language models. Advances
+in Neural Information Processing Systems 36.
+[11] Frantar, E., Ashkboos, S., Hoefler, T., Alistarh, D., 2022. Gptq: Accu-
+rate post-training quantization for generative pre-trained transformers.
+arXiv preprint arXiv:2210.17323 .
+[12] Dettmers, T., Svirschevski, R., Egiazarian, V., Kuznedelev, D., Fran-
+tar, E., Ashkboos, S., Borzunov, A., Hoefler, T., Alistarh, D., 2023.
+Spqr: A sparse-quantized representation for near-lossless llm weight
+compression. arXiv preprint arXiv:2306.03078 .
+[13] Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., Han, S., 2023.
+Smoothquant: Accurate and efficient post-training quantization for
+large language models, in: International Conference on Machine
+Learning, PMLR. pp. 38087–38099.
+[14] Yao, Z., Yazdani Aminabadi, R., Zhang, M., Wu, X., Li, C., He, Y.,
+2022. Zeroquant: Efficient and affordable post-training quantization
+for large-scale transformers. Advances in Neural Information Pro-
+cessing Systems 35, 27168–27183.
+[15] Dettmers, T., Lewis, M., Belkada, Y., Zettlemoyer, L., 2022. Gpt3.
+int8 (): 8-bit matrix multiplication for transformers at scale. Advances
+in Neural Information Processing Systems 35, 30318–30332.
+[16] Dettmers, T., Zettlemoyer, L., 2023. The case for 4-bit precision: k-
+bit inference scaling laws, in: International Conference on Machine
+Learning, PMLR. pp. 7750–7774.
+[17] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez,
+A.N., Kaiser, Ł., Polosukhin, I., 2017. Attention is all you need. Ad-
+vances in neural information processing systems 30.
+[18] Kuzmin, A., Van Baalen, M., Ren, Y., Nagel, M., Peters, J.,
+Blankevoort, T., 2022. Fp8 quantization: The power of the expo-
+nent. Advances in Neural Information Processing Systems 35, 14651–
+14662.
+[19] Zhang, Y., Zhao, L., Cao, S., Wang, W., Cao, T., Yang, F., Yang, M.,
+Zhang, S., Xu, N., 2023. Integer or floating point? new outlooks
+for low-bit quantization on large language models.
+arXiv preprint
+arXiv:2305.12356 .
+[20] Dettmers, T., Pagnoni, A., Holtzman, A., Zettlemoyer, L., 2024.
+Qlora: Efficient finetuning of quantized llms. Advances in Neural
+Information Processing Systems 36.
+[21] Nagel,
+M.,
+Fournarakis,
+M.,
+Amjad,
+R.A.,
+Bondarenko,
+Y.,
+Van Baalen, M., Blankevoort, T., 2021. A white paper on neural net-
+work quantization. arXiv preprint arXiv:2106.08295 .
+[22] Zhu, X., Li, J., Liu, Y., Ma, C., Wang, W., 2023.
+A survey
+on model compression for large language models.
+arXiv preprint
+arXiv:2308.07633 .
+[23] Han, S., Mao, H., Dally, W.J., 2015. Deep compression: Compressing
+deep neural networks with pruning, trained quantization and huffman
+coding. arXiv preprint arXiv:1510.00149 .
+[24] Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., Han, S., 2023. Awq:
+Activation-aware weight quantization for llm compression and accel-
+eration. arXiv preprint arXiv:2306.00978 .
+[25] Kim, S., Hooper, C., Gholami, A., Dong, Z., Li, X., Shen, S., Ma-
+honey, M.W., Keutzer, K., 2023.
+Squeezellm: Dense-and-sparse
+quantization. arXiv preprint arXiv:2306.07629 .
+[26] Wei, X., Gong, R., Li, Y., Liu, X., Yu, F., 2022. Qdrop: Randomly
+dropping quantization for extremely low-bit post-training quantiza-
+tion. arXiv preprint arXiv:2203.05740 .
+[27] Wei, X., Zhang, Y., Li, Y., Zhang, X., Gong, R., Guo, J., Liu, X.,
+2023. Outlier suppression+: Accurate quantization of large language
+models by equivalent and optimal shifting and scaling. arXiv preprint
+arXiv:2304.09145 .
+[28] Liu, Z., Oguz, B., Zhao, C., Chang, E., Stock, P., Mehdad, Y., Shi, Y.,
+Krishnamoorthi, R., Chandra, V., 2023. Llm-qat: Data-free quan-
+tization aware training for large language models.
+arXiv preprint
+arXiv:2305.17888 .
+[29] Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman, V., Chen,
+B., Hu, X., . Kivi: Plug-and-play 2bit kv cache quantization with
+streaming asymmetric quantization .
+[30] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C.H., Gonza-
+lez, J., Zhang, H., Stoica, I., 2023. Efficient memory management for
+large language model serving with pagedattention, in: Proceedings of
+the 29th Symposium on Operating Systems Principles, pp. 611–626.
+[31] Jin, Y., Wu, C.F., Brooks, D., Wei, G.Y., 2024. 𝑠3: Increasing gpu uti-
+lization during generative inference for higher throughput. Advances
+in Neural Information Processing Systems 36.
+[32] Xiao, G., Tian, Y., Chen, B., Han, S., Lewis, M., 2023.
+Effi-
+cient streaming language models with attention sinks. arXiv preprint
+arXiv:2309.17453 .
+[33] Gnanadesikan, R., Wilk, M.B., 1968. Probability plotting methods
+for the analysis of data. Biometrika 55, 1–17.
+[34] D’Agostino, R.B., Stephens, M., 1986. Tests for normal distribution
+in goodness-of-fit techniques. Marcel Decker .
+[35] Gao, L., Biderman, S., Black, S., Golding, L., Hoppe, T., Foster, C.,
+Phang, J., He, H., Thite, A., Nabeshima, N., et al., 2020. The pile: An
+800gb dataset of diverse text for language modeling. arXiv preprint
+arXiv:2101.00027 .
+[36] Jain, S.M., 2022. Hugging face, in: Introduction to transformers for
+NLP: With the hugging face library and models to solve problems.
+Springer, pp. 51–67.
+[37] Bisk, Y., Zellers, R., Gao, J., Choi, Y., et al., 2020. Piqa: Reasoning
+about physical commonsense in natural language, in: Proceedings of
+the AAAI conference on artificial intelligence, pp. 7432–7439.
+[38] Sakaguchi, K., Bras, R.L., Bhagavatula, C., Choi, Y., 2021. Wino-
+grande: An adversarial winograd schema challenge at scale. Com-
+munications of the ACM 64, 99–106.
+[39] Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., Choi, Y., 2019. Hel-
+laswag: Can a machine really finish your sentence? arXiv preprint
+arXiv:1905.07830 .
+[40] Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A., Schoenick,
+C., Tafjord, O., 2018. Think you have solved question answering? try
+arc, the ai2 reasoning challenge. arXiv preprint arXiv:1803.05457 .
+[41] Wang, A., Singh, A., Michael, J., Hill, F., Levy, O., Bowman, S.R.,
+2018. Glue: A multi-task benchmark and analysis platform for natural
+language understanding. arXiv preprint arXiv:1804.07461 .
+[42] Devlin, J., Chang, M.W., Lee, K., Toutanova, K., 2018. Bert: Pre-
+training of deep bidirectional transformers for language understand-
+ing. arXiv preprint arXiv:1810.04805 .
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 10 of 11
+
+
+NQKV
+Zhihang Cai received the B.S. degrees from the
+school of Xi’an Jiaotong University, Xi’an, China,
+in 2019 and 2023, respectively. He is currently pur-
+suing a M.S. degree with Xi’an Jiaotong Univer-
+sity, Xi’an, China. His research interests include
+machine learning and computer architecture.
+Xingjun Zhang (Member, IEEE) received his
+Ph.D. degree in Computer Architecture from Xi’an
+Jiaotong University, China, in 2003.
+From Jan.
+2004 to Dec. 2005, he was Postdoctoral Fellow
+at the Computer School of Beihang University,
+China.From Feb. 2006 to Jan. 2009, he was Re-
+search Fellow in the Department of Electronic En-
+gineering of Aston University, United Kingdom.
+He is now a Full Professor and the Dean of the
+School of Computer Science & Technology, Xi’an
+Jiaotong University. His research interests include
+high-performance computing, big data storage sys-
+tem, and distributed machine learning.
+Zhendong Tan received the B.S. degrees from the
+school of Xi’an Jiaotong University, Xi’an, China,
+in 2019 and 2023, respectively. He is currently pur-
+suing a Ph.D. degree with Xi’an Jiaotong Univer-
+sity, Xi’an, China. His research interests include
+efficient machine learning and computer architec-
+ture.
+Zheng Wei received the B.S. and M.S. degrees
+from the school of Communication Engineering
+from Xidian University, Xi’an, China, in 2013
+and 2016, respectively.
+He is currently pursu-
+ing a Ph.D. degree with Xi’an Jiaotong University,
+Xi’an, China. His research interests include ma-
+chine learning, computer architecture, and hard-
+ware accelerators for deep learning.
+Zhihang Cai et al.: Preprint submitted to Elsevier
+Page 11 of 11

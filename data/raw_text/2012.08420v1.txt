@@ -1,0 +1,2617 @@
+Exploring Neural Networks Quantization via Layer-Wise
+Quantization Analysis
+Shachar Gluska
+Mark Grobman
+Hailo Technologies
+{shacharg, markg}@hailo.ai
+Abstract
+Quantization is an essential step in the efﬁcient
+deployment of deep learning models and as such
+is an increasingly popular research topic. An im-
+portant practical aspect that is not addressed in
+the current literature is how to analyze and ﬁx
+fail cases where the use of quantization results in
+excessive degradation. In this paper, we present
+a simple analytic framework that breaks down
+overall degradation to its per layer contributions.
+We analyze many common networks and observe
+that a layer’s contribution is determined by both
+intrinsic (local) factors – the distribution of the
+layer’s weights and activations – and extrinsic
+(global) factors having to do with the the inter-
+action with the rest of the layers.
+Layer-wise
+analysis of existing quantization schemes reveals
+local fail-cases of existing techniques which are
+not reﬂected when inspecting their overall perfor-
+mance. As an example, we consider ResNext26
+on which SoTA post-training quantization meth-
+ods perform poorly. We show that almost all of
+the degradation stems from a single layer. The
+same analysis also allows for local ﬁxes – ap-
+plying a common weight clipping heuristic only
+to this layer reduces degradation to a minimum
+while applying the same heuristic globally results
+in high degradation. More generally, layer-wise
+analysis allows for a more nuanced examination
+of how quantization affects the network, enabling
+the design of better performing schemes.
+1. Introduction
+Quantized neural networks are networks which have their
+weights and/or activations constrained to low-bit represen-
+tation, usually 8-bit and below. Neural networks are re-
+source intensive algorithms and quantization is an easy and
+efﬁcient way to reduce both the computational and memory
+load of deployed networks. In recent years, quantization of
+deep neural networks has become ubiquitous: indeed, just
+3 years ago the frontier for quantization was 8-bits for both
+quantize(activations)
+de-quantize(activations)
+j+1
+...
+n
+Full
+Precision
+j
+Quantized
+1
+...
+j-1
+Full
+Precision
+(a) Basic building block of layer-wise analysis
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv9
+conv10
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+fc1
+layer
+−0.05
+0.00
+0.05
+0.10
+0.15
+0.20
+degradation
+Degradation per layer - Resnet 18 (8 bit)
+(b) ResNet18 on ImageNet-1K validation set
+Figure 1. (a) The building block of our layer-wise analysis is the
+creation of a network with only a single quantized layer j. The
+input and output of the layer is quantized as well as the weights.
+The rest of the network is kept at full precision. (b) Layer-wise
+analysis applied to Resent-18 . This breakdown gives insight into
+which layers preform poorly under quantization
+activations and weights (Jacob et al., 2017), while state-of-
+the-art works operate at 4-bits and below (Banner et al.,
+2018; Uhlich et al., 2019; Fang et al., 2020; Jain et al.,
+2019; Stock et al., 2019; Dong et al., 2019a; Wang et al.,
+2018; Choukroun et al., 2019).
+arXiv:2012.08420v1  [cs.LG]  15 Dec 2020
+
+
+An existing gap in the literature is tools for quantization
+post-mortem. Once a quantization method has been ap-
+plied it is evaluated solely on the basis of its degradation
+with respect to the full-precision network. We claim that
+an investigation into the sources of quantization degrada-
+tion is valuable for (a) a better characterization of quanti-
+zation methods in general and their fail cases in particular,
+(b) directing future research to address common fail-cases
+and (c) quick ad-hoc ﬁxes of quantization problems in spe-
+ciﬁc networks.
+In this paper we take a step in addressing the above gap. We
+present layer-wise quantization analysis which is based on
+previously observed properties of quantization: The noise
+and degradation of individually quantized layers can be
+summed to get the overall noise and degradation of a fully
+quantized network (Zhou et al., 2017). Our method consists
+of iterating over the layers of a full precision network and at
+each step quantizing only a single layer and measuring the
+resulting noise at the output of the network. Given a quan-
+tization method and a network, we can quickly evaluate the
+layer-wise composition of the overall network degradation.
+The basic premise of this tool can be summarized by noting
+that for quantization the whole is the sum of its parts. The
+typical output of such an analysis is shown in Figure 1
+In section 4 we explore the quantization of many neural
+networks through the prism of layer-wise analysis and ob-
+serve some interesting phenomena – most of the degra-
+dation is usually caused by few layers. Interestingly, the
+common practice (Banner et al., 2018; Baskin et al., 2018;
+Esser et al., 2019; Yang et al., 2019; Dong et al., 2019b; Liu
+et al., 2020; Haroush et al., 2019; Nahshan et al., 2019) of
+refraining from quantizing the ﬁrst and last layers doesn’t
+seem warranted as these are seldom the worst offenders.
+The proposed method makes such analysis easy for a given
+quantized network and also signiﬁcantly reduces the level
+of expertise required in order to achieve successful quanti-
+zation as it highlights problematic layers on which the ef-
+fort should to be focused.
+In summary, the main contributions of this paper are:
+• Quantization post-mortem – We develop a simple
+and efﬁcient way of analyzing quantization degrada-
+tion by breaking it down to layer-wise contribution.
+Such analysis can be used for better characterization
+of quantization methods and gaining insights about
+the mechanisms by which degradation occurs. An-
+other important aspect of our method is that it enables
+practitioners without quantization expertise to quickly
+debug and ﬁx poor quantization by focusing their ef-
+forts on speciﬁc layers.
+• Improving efﬁcacy of existing methods – We show
+that applying some of the existing techniques in a
+global manner results in worse performance compared
+to applying them locally. Our method gives an ef-
+ﬁcient way by which to identify layers that require
+special treatment and allows targeted application. In
+section 4.2 we show that we can out-perform existing
+SoTA techniques by taking this approach.
+2. Previous Work
+Quantization has a rich taxonomy but can roughly be di-
+vided into two major branches: Post-training quantization
+(PTQ), where the quantization takes place directly on the
+original full-precision model and quantization-aware train-
+ing (QAT) where training is used to offset the adverse ef-
+fects of quantization. Post-training methods often try to
+apply some heuristic to each layer in order to reduce the
+quantization noise at the output of the layer.
+Common
+methods include clipping (Zhao et al., 2019; Banner et al.,
+2018), channel equalization via inversely-proportional fac-
+torization (Meller et al., 2019; Nagel et al., 2019) and bias-
+compensation (Finkelstein et al., 2019; Banner et al., 2018;
+Nagel et al., 2019). A shortcoming of these methods is
+that they use a local optimization of layer noise in order
+to achieve global performance optimization. A notable ex-
+ception is the work of Zhou et. al. (2017) which derived a
+measure of the layer sensitivity to quantization via noise
+measurement at the output of the network.
+Their work
+was the ﬁrst to decompose overall quantization into layer-
+wise contributions. In contrast to our work, they use the
+decomposition in order to establish an analytic correspon-
+dence between output noise and degradation in classiﬁers.
+Heuristics for ranking layers based on sensitivity have also
+been used in the context of network compression where one
+looks at the optimal bit-assignment per layer. The layer bit-
+width is determined either explicitly by a measured met-
+ric (Zhou et al., 2017; Dong et al., 2019b; Cai et al., 2020)
+or implicitly via a constrained optimization process (Wang
+et al., 2018; Elthakeb et al., 2018) which is resource in-
+tensive as it involves re-training the network from scratch.
+Recently Uhlich et al. (2019), proposed a simpler method
+which does not require full re-training.
+These methods
+all rank layers based on their contribution of degradation,
+however, the ranking is also affected by how much can be
+gained from the compression of the layer. Compared to
+this methods, our ranking of layers is both more computa-
+tionally cheap and more direct, not relying on any proxies.
+Recent works have also assumed individual layer contribu-
+tions. Cai et al. (2020) employ a similar method to ours but
+using KL-divergence instead of noise and network perfor-
+mance. They use their method for mixed-precision quan-
+tization in a data-free settings whereas we use our method
+for analysis of quantization in any settings. Nagel et al.
+(2020) use a layer-local loss in their method and Hubara
+
+
+et al. (2020) explicitly optimize over the sum of per-layer
+loss. Both of these methods are used for post-training opti-
+mization and not for analysis. A similar technique to ours
+was recently used Wu et al. (2020) to rank layers for exclu-
+sion when using partial quantization. This method there-
+fore sidesteps the problem whereas our aim is to both im-
+prove full quantization performance and to explore degra-
+dation mechanisms. To the best of our knowledge, ours is
+the ﬁrst work to use layer-wise quantization as an empirical
+analysis tool.
+3. Methods
+Here we present our method for layer-wise quantization
+analysis. We ﬁrst show how to get the individual degrada-
+tion of each layer. Then we show that, under practical set-
+tings, these contributions are mostly independent and thus
+can be summed to arrive at the overall network degradation
+when all layers are quantized. We discuss some limitations
+of our approach in section 4.3 and section 4.4.
+3.1. Layer-Wise Quantization Analysis
+Consider a neural network L with n layers. We topologi-
+cally sort the layers and enumerate them l1, . . . , ln. A layer
+is considered to consist of a typical operation (e.g. convolu-
+tion, fully-connected, pooling) followed by a non-linearity
+(e.g. ReLU). The basic step of our method is the creation
+of a network with only a single layer, lj, being quantized
+while the rest of the network is kept at full precision. The
+quantization of a single layers entails the following: the
+layer’s weights are quantized as well as it’s input and out-
+put activations. The output of the layer is then de-quantized
+and propagated onward. See Figure 1a for an illustration.
+We use y for the full-precision network output and ˆyj for
+the output of the network with a quantized layer lj. The full
+method consists of iterating over all layers and computing
+ˆyj for each layer. The evaluation is done over a dataset D.
+In this work we consider two metrics: the ℓ2 norm of the
+quantization noise ||y−ˆyj||2
+2 and the performance degrada-
+tion HD(y) −HD( ˆyj). Where HD(y) is the metric of the
+task performed by the network (e.g. top-1 accuracy for a
+classiﬁcation network). The full method is described more
+formally in Algorithm 1.
+Measuring the individual degradation of each layer is valu-
+able in itself as it immediately shows which layers produce
+high degradation. It is not clear that we can say something
+meaningful about the overall network degradation without
+taking into account the interaction of quantized layers with
+each other, however, Zhou et al. (2017) previously estab-
+lished analytically that the overall noise in the output of
+a network can be approximated by summing together the
+output noises of individually quantized layers. The basic
+Algorithm 1 Description of our method for measuring
+the individual contribution of each layer. For each layer
+we measure both the noise and degradation resulting from
+quantization of that layer.
+Input: Dataset D, Evaluation function H, network L
+composed of n layers l1, l2, . . . , ln
+Output: {noisei|i ∈{1 . . . n}}, {perfi|i ∈{1 . . . n}}
+for i = 1 to n do
+noisei =
+1
+|D|
+P
+x∈D
+||y −ˆyi||2
+2
+perfi = HD(y) −HD( ˆyi)
+end for
+assumption underpinning their analysis is that (a) the quan-
+tization noises of each layer are independent, (b) quantiza-
+tion noises are small compared to activations and (c) quan-
+tization noise has zero mean. In practical settings, these as-
+sumptions hold well. Empirically, Zhou et al. (2017) show
+their results hold for noise when only the weights of the
+network are quantized, however, it is easy to see that their
+analytical analysis will hold also for the case when activa-
+tions are also quantized and that the additive nature of noise
+should extend to degradation as well. To conﬁrm this, we
+compare the degradation from the sum of individual layers
+contribution with the measured degradation when quantiz-
+ing the whole network. The results are shown in Figure 2.
+We see that additivity holds well into the ∼10% degrada-
+tion range which is much larger than the permissible degra-
+dation in practice. In BRECQ (Anonymous, 2021) it is sug-
+gested that the inter-layer dependence is not negligible. We
+note that they showed this when quantizing to 2-bits. Other
+recent works (Wang et al., 2020; Nagel et al., 2020; Hubara
+et al., 2020) show good results even when assuming inter-
+layer independence.
+4. Experiments
+In this section we experiment with layer-wise quantiza-
+tion and show its two main beneﬁts – analysis of degra-
+dation errors and improving network quantization by ap-
+plying layer-speciﬁc ﬁxes. We ﬁrst analyze the results of
+applying layer-wise analysis to a variety of ImageNet (Rus-
+sakovsky et al., 2015) classiﬁers. We then show how the
+quantization of a given network can be improved using the
+layer-wise breakdown as a compass to pinpoint us to prob-
+lematic layers.
+Unless otherwise stated, we follow the post-training quan-
+tization scheme presented in (Jacob et al., 2017). Per-layer
+quantization is used for both weights and activations. Batch
+Normalization (Ioffe & Szegedy, 2015) layers are folded
+into the previous layers. While these are the settings of our
+experiments, our method is general and can be used both in
+channel-wise and in group-wise settings.
+
+
+0
+10
+20
+30
+40
+50
+60
+70
+Expected Accuracy
+0
+10
+20
+30
+40
+50
+60
+70
+Measured Accuracy
+resnet_v1_18 quantization
+measurements
+fitted linear curve r2=0.951
+Figure 2. Expected accuracy vs the measured accuracy. Expected
+degradation is the sum of individual layer degradations. Measure-
+ments were done on ImageNet-1K validation set. Each data point
+is a different quantization of ResNet18. To induce large degrada-
+tion we quantize a random subset of layers weights to 4 bits while
+the rest of the layers are quantized to 8 bits. Activations are al-
+ways quantized to 8 bits. Moving more layers to 4 bits results in
+larger degradation. We see that the additivity assumption holds
+well even for very high degradation.
+4.1. Analyzing ImageNet Classiﬁers
+We apply our layer-wise analysis to several popular Ima-
+geNet classiﬁers: ResNet18 (He et al., 2015), MobileNet-
+V1-1.0 (Howard et al., 2017), Inception-V1 (Szegedy et al.,
+2014), ResNext26 (Xie et al., 2016), MobileNet-V2-1.0
+and MobileNet-V2-1.4 (Sandler et al., 2018b). For each
+network, we analyze the degradation when quantizing each
+layer’s weights between 3-8 bits. Activations are quantized
+to 8-bits. Degradation is measured over the full ImageNet
+validation set. The results are shown in Figure 3.
+Looking at the results, we can make several observations.
+We see that some layers are very sensitive to quantization
+while others can be quantized to as little as 3-bits with little
+degradation. A natural question is whether a layer’s sensi-
+tivity is determined by the network’s architecture or is it the
+result of a speciﬁc training. When comparing MobileNet-
+V2-1.0 and MobileNet-V2-1.4 we see that they have almost
+identical proﬁles. These networks share the same archi-
+tecture but differ in hyper-parameters and are the results
+of two different training sessions. This would seem to in-
+dicate that, under the same training scheme, the sensitiv-
+ity of layers to quantization is strongly tied to network ar-
+chitecture. To examine whether the results will be similar
+even under different training settings, we apply Two-Step
+Equalization (Meller et al., 2019). Under equalization the
+network’s output and architecture remain unchanged while
+the network parameters are changed. This simulates a dif-
+ferent training scheme while controlling for the network’s
+performance and architecture. As we can see in Figure 4,
+the equalized model has a different proﬁle than the non-
+equalized baseline. This suggests that the training process
+also plays a role in the network’s noise proﬁle under quan-
+tization. The question of how much the quantization proﬁle
+is affected by architecture vs training has important impli-
+cations. Models in deployment are continuously trained
+and quantized.
+Knowing that repeated training session
+don’t require changing quantization schemes can greatly
+simplify quantization ﬂows, especially those that involve
+lengthy ﬁne-tuning session – one should always focus on
+the layers that do the most harm. It is interesting to note
+that many works (Banner et al., 2018; Baskin et al., 2018;
+Esser et al., 2019; Yang et al., 2019; Dong et al., 2019b; Liu
+et al., 2020; Haroush et al., 2019; Nahshan et al., 2019) re-
+frain from quantizing the ﬁrst and last layers since it seems
+to be a commonly held belief that they are harder to quan-
+tize. We ﬁnd that for classiﬁers the last layer is generally in-
+different to quantization and with the exception of ResNet,
+the ﬁrst layer is also not the most sensitive layer. Another
+salient feature is that the depthwise layers in the MobileNet
+architecture are more sensitive to quantization compared to
+standard conv2d layers, with the ﬁrst depthwise layer being
+particularly ﬁnicky.
+4.2. Improving Quantization
+In this section we show how layer-wise analysis can be
+leveraged to improve the quantization of a network. To that
+end, We choose ResNext26 (Xie et al., 2016) which has
+a >1% degradation even when using SoTA post-training
+techniques such as Equalization (Meller et al., 2019) and
+IBC (Finkelstein et al., 2019). The results of running the
+analysis on the network are shown in Figure 5. We see that
+almost all of the degradation stems from a single layer –
+conv4. Since 8-bit quantization usually gives good results,
+it is expected that layer exhibiting large degradation will be
+rare. We now examine the problematic layer. Since quanti-
+zation noise is the result of the trade-off between represen-
+tation range and precision, excess degradation is commonly
+due to large ranges of kernel values. In Figure 6 we plot the
+weights histogram of conv4 and indeed we see signiﬁcant
+outliers. At this juncture, it is reasonable to try and use a
+standard weight clipping technique such as SAWB* (Choi
+et al., 2018) on conv4 which results in near lossless quan-
+tization. We emphasize that this result is possible due to
+the local application of clipping, as applying SAWB glob-
+ally degrades the network performance even below base-
+line as shown in Table 1. This example illustrates a general
+principle: quantization techniques can be beneﬁcial locally
+but degrade performance when used globally. Since PTQ
+*The results we report are not sensitive to the type of clipping
+used provided it is aggressive enough to handle the outliers
+
+
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv9
+conv10
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20fc1
+3
+4
+5
+6
+7
+8
+#Bits
+68
+54
+9
+23
+8.1
+64
+39
+66
+26
+19
+52
+2
+68
+67
+39
+68
+8.5
+64
+66
+36
+19
+54
+12
+4.5
+5.1
+4.3
+7.7
+4.5
+18
+2.8
+3.4
+2.8
+1.1
+14
+9.9
+5.8
+17
+3
+25
+12
+2.8
+3.4
+16
+3.6
+1.1
+1.3
+0.5
+1.6
+2
+1.1
+0.6
+0.2
+0.6
+0.2
+1.3
+0.6
+1.3
+0.9
+0.6
+1
+1.3
+0.4
+0.8
+2.1
+0.2
+0.1
+0.1
+0
+0.2
+0.6
+0.5
+0.1
+0.1
+0.1
+0.1
+0.5
+0.2
+0.3
+0.3
+0.1
+0.5
+0.2
+0.1
+0.3
+0.5
+0.1
+0
+0.1
+0.1
+0
+0.1
+0
+0.1
+0.1
+0.1
+-0
+0.2
+-0
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0
+0.2
+0
+0
+-0
+0
+-0
+0
+0.1
+0
+0
+0
+0
+0
+0
+0.1
+0.1
+0
+-0
+-0
+-0
+0.1
+(a) ResNet18
+0
+1
+2
+3
+4
+5
+Degredation
+conv1
+dw1
+conv2
+dw2
+conv3
+dw3
+conv4
+dw4
+conv5
+dw5
+conv6
+dw6
+conv7
+dw7
+conv8
+dw8
+conv9
+dw9
+conv10
+dw10
+conv11
+dw11
+conv12
+dw12
+conv13
+dw13
+conv14fc1
+3
+4
+5
+6
+7
+8
+#Bits
+65
+70
+70
+70
+70
+70
+70
+65
+70
+70
+69
+19
+70
+68
+70
+70
+69
+68
+70
+68
+70
+68
+70
+8.4
+70
+70
+59
+29
+13
+52
+56
+62
+65
+68
+68
+1.9
+54
+36
+45
+0.6
+64
+36
+35
+67
+19
+13
+62
+22
+69
+6.1
+50
+0.3
+70
+70
+10
+5
+2.7
+32
+50
+18
+16
+57
+58
+-0.2
+30
+13
+4.6
+-0.4
+20
+4
+4
+14
+2.5
+1.7
+15
+1.7
+26
+0.4
+14
+-0.4
+38
+54
+1.4
+0.8
+-0.2
+17
+14
+3.2
+4.2
+14
+7.6
+-0.2
+6.2
+1
+0.9
+-0.4
+3.8
+0.5
+0.5
+1.1
+0.3
+0.1
+2.7
+-0.1
+6
+-0.2
+2.1
+-0.4
+6.9
+8.1
+-0.1
+-0
+-0.4
+3
+4.2
+-0.2
+0.6
+2.8
+2
+-0.5
+1.1
+0.2
+-0.3 -0.5
+-0
+-0.2 -0.1
+0.1
+-0.3 -0.3
+0.1
+-0.4
+0.9
+-0.5
+0.3
+-0.5
+1.1
+-0.1 -0.4 -0.5
+-0.3
+0.9
+0.4
+-0.3
+0.1
+0.4
+0.3
+-0.4 -0.2 -0.3 -0.4 -0.5 -0.3 -0.4 -0.4 -0.3 -0.4 -0.5 -0.3 -0.4 -0.3 -0.4 -0.3 -0.5
+0
+-0.3 -0.4 -0.4
+(b) MobileNetV1
+0
+2
+4
+Degredation
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv9
+conv10
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+conv30
+conv31
+conv32
+conv33
+conv34
+conv35
+conv36
+conv37
+conv38
+conv39
+conv40
+conv41
+conv42
+conv43
+conv44
+conv45
+conv46
+conv47
+conv48
+conv49
+conv50
+conv51
+conv52
+conv53
+conv54
+conv55
+conv56
+conv57fc1
+3
+4
+5
+6
+7
+8
+#Bits
+70
+70
+69
+65
+66
+2.7
+20
+7.1
+17
+16
+5.2
+1.8
+10
+2.7
+11
+62
+7.8
+1.4
+18
+12
+30
+8.4
+4.7
+0.8
+20
+6
+2.7
+12
+9.1
+1.2
+14
+4.5
+4.9
+7.6
+8.8
+0.6
+17
+3.4
+4.2
+7.6
+8.1
+0.9
+19
+6.5
+10
+9.1
+6.4
+0.6
+27
+5.1
+6.2
+3.7
+26
+6.7
+8.8
+1.3
+1.8
+2.1
+44
+69
+34
+13
+7.7
+0.3
+3.2
+1.1
+2.8
+4
+1.1
+0.1
+0.9
+0.3
+1.5
+7.5
+2.1
+0.1
+1.6
+12
+16
+1.4
+0.6
+0.1
+2.9
+0.2
+0.2
+2
+1.1
+0.2
+0.3
+1
+0.5
+1.4
+1.9
+0.3
+0.4
+0.4
+0.2
+0.9
+1.1
+0.2
+0.7
+0.4
+1.2
+4.4
+1
+0.1
+0.4
+0.2
+1
+1.4
+4.9
+0.7
+0.5
+0.1
+0.7
+0.4
+9.4
+47
+4
+1.1
+1.6
+0.1
+0.4
+0.7
+0.7
+0.4
+0.2
+0.1
+0.1
+0.1
+0.4
+0.8
+0.4
+0.1
+0.2
+1.9
+2.4
+0.4
+0.1
+0.1
+0.3
+0.2
+0.1
+0.4
+0.2
+0.1
+0.3
+0.1
+0.2
+0.3
+0.4
+0.1
+0.1
+0.1
+0.1
+0.1
+0.3
+-0
+0.1
+0
+0.2
+0.8
+0.3
+0.1
+0.2
+0.1
+0.1
+0.2
+0.7
+0.2
+0
+0.1
+0.1
+0.1
+2.3
+24
+0.5
+0.4
+0.4
+0
+0.2
+0.2
+0.1
+0.2
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.2
+0
+0.1
+0.3
+0.3
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.2
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.2
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.6
+4.1
+0.2
+0.1
+0.2
+0
+0
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0
+0
+0.2
+0
+0
+0.1
+0.1
+0.1
+0
+0
+0.1
+0
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0
+0
+0
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+1.7
+0
+0.1
+0.1
+0
+0.1
+0.1
+0
+0
+0.1
+0.1
+0
+0
+0.1
+0.1
+0
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0
+0
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0
+0
+0
+0.1
+0
+0
+-0
+0.1
+0
+0.1
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0.1
+(c) InceptionV1
+0
+1
+2
+3
+4
+5
+Degredation
+conv1
+dw1
+conv2
+conv3
+dw2
+conv4
+conv5
+dw3
+conv6
+conv7
+dw4
+conv8
+conv9
+dw5
+conv10
+conv11
+dw6
+conv12
+conv13
+dw7
+conv14
+conv15
+dw8
+conv16
+conv17
+dw9
+conv18
+conv19
+dw10
+conv20
+conv21
+dw11
+conv22
+conv23
+dw12
+conv24
+conv25
+dw13
+conv26
+conv27
+dw14
+conv28
+conv29
+dw15
+conv30
+conv31
+dw16
+conv32
+conv33
+dw17
+conv34
+conv35fc1
+3
+4
+5
+6
+7
+8
+#Bits
+66
+72
+71
+70
+72
+64
+24
+72
+64
+35
+72
+68
+1.3
+70
+47
+1.3
+69
+12
+10
+15
+71
+1.5
+68
+5.5
+1.2
+57
+3.1
+1
+18
+12
+11
+70
+43
+2.9
+71
+24
+5.1
+71
+70
+9.5
+70
+72
+5.6
+71
+29
+9.9
+71
+70
+58
+72
+71
+1.2
+1.7
+12
+72
+40
+64
+69
+14
+2.7
+70
+36
+4.2
+20
+11
+0.4
+50
+7.2
+0.6
+70
+6.1
+1.4
+0.5
+22
+0.4
+8.5
+2.4
+0.4
+40
+1.3
+0.4
+4.2
+4.4
+1.7
+20
+5.3
+0.6
+70
+4
+1.1
+66
+43
+1.5
+5.5
+38
+1.5
+40
+7.4
+2.8
+57
+55
+14
+72
+26
+0.3
+0.4
+3
+68
+12
+21
+20
+3.5
+0.6
+67
+4.3
+1.3
+1.4
+2.1
+0.3
+53
+1.3
+0.3
+22
+0.8
+0.5
+0.3
+3.5
+0.3
+13
+0.5
+0.3
+2.1
+0.3
+0.3
+0.9
+1
+0.5
+5.4
+1.8
+0.2
+19
+0.6
+0.4
+10
+12
+0.4
+0.4
+13
+0.4
+6
+1.2
+0.9
+19
+12
+2.4
+72
+4.7
+0.2
+0.2
+0.4
+67
+4.7
+1.1
+1.4
+0.4
+0.2
+42
+2.7
+0.2
+0.4
+1
+0.2
+8.7
+0.5
+0.2
+4.7
+0.6
+0.2
+0.2
+0.9
+0.1
+2.3
+0.4
+0.2
+0.6
+0.2
+0.2
+0.6
+0.3
+0.2
+0.9
+0.3
+0.2
+3.4
+0.3
+0.3
+1.7
+1.7
+0.2
+0.2
+2.5
+0.2
+1.1
+0.4
+0.3
+2.2
+2.1
+0.6
+32
+1.2
+0.2
+0.2
+0.3
+18
+0.6
+0.4
+0.7
+0.2
+0.2
+8.4
+0.3
+0.2
+0.3
+0.3
+0.1
+1
+0.2
+0.2
+0.4
+0.2
+0.2
+0.1
+0.3
+0.2
+0.7
+0.2
+0.1
+0.2
+0.2
+0.2
+0.1
+0.2
+0.2
+0.4
+0.3
+0.3
+0.7
+0.2
+0.2
+0.6
+0.6
+0.3
+0.2
+0.7
+0.2
+0.2
+0.3
+0.2
+0.7
+0.5
+0.3
+1.3
+0.3
+0.2
+0.2
+0.1
+11
+0.4
+0.3
+0.2
+0.2
+0.2
+0.6
+0.3
+0.3
+0.1
+0.2
+0.1
+0.5
+0.2
+0.1
+0.3
+0.1
+0.1
+0.1
+0.2
+0.2
+0.2
+0.2
+0.2
+0.2
+0.1
+0.2
+0.1
+0.2
+0.2
+0.2
+0.2
+0.2
+0.3
+0.2
+0.2
+0.2
+0.3
+0.1
+0.2
+0.5
+0.2
+0.2
+0.2
+0.2
+0.3
+0.3
+0.2
+0.3
+0.2
+0.2
+0.2
+(d) MobileNetV2-1.0
+1
+2
+3
+4
+5
+Degredation
+conv1
+dw1
+conv2
+conv3
+dw2
+conv4
+conv5
+dw3
+conv6
+conv7
+dw4
+conv8
+conv9
+dw5
+conv10
+conv11
+dw6
+conv12
+conv13
+dw7
+conv14
+conv15
+dw8
+conv16
+conv17
+dw9
+conv18
+conv19
+dw10
+conv20
+conv21
+dw11
+conv22
+conv23
+dw12
+conv24
+conv25
+dw13
+conv26
+conv27
+dw14
+conv28
+conv29
+dw15
+conv30
+conv31
+dw16
+conv32
+conv33
+dw17
+conv34
+conv35fc1
+3
+4
+5
+6
+7
+8
+#Bits
+62
+74
+73
+72
+74
+70
+3.6
+73
+68
+52
+73
+73
+18
+69
+43
+1.3
+70
+37
+19
+74
+63
+1.2
+74
+8.2
+1.5
+60
+7
+1.5
+24
+4.5
+22
+72
+46
+3.8
+73
+11
+2.6
+73
+68
+23
+34
+74
+5.1
+74
+30
+8.7
+74
+72
+72
+74
+57
+1.2
+2
+22
+66
+34
+14
+73
+39
+1.1
+72
+50
+5.5
+5.1
+9.1
+1.2
+69
+9.7
+0.3
+28
+6.4
+2.6
+72
+11
+0.4
+72
+2.9
+0.4
+8.8
+1.5
+0.4
+2.1
+2.2
+2.9
+30
+3.5
+1.2
+70
+1.7
+0.7
+66
+26
+2.3
+0.9
+67
+1.9
+38
+5.9
+4.3
+64
+48
+26
+74
+8.6
+0.4
+0.4
+14
+43
+6
+1.8
+58
+17
+0.2
+20
+9.8
+1.2
+2.2
+2.9
+0.4
+73
+1.4
+0.2
+1.5
+1.7
+0.6
+2.3
+2.3
+0.1
+28
+0.5
+0
+0.7
+0.5
+0.1
+1.1
+0.4
+0.6
+3
+1.3
+0.3
+16
+0.7
+0.3
+12
+7
+0.7
+0.1
+33
+0.6
+7.1
+1.2
+1.2
+15
+11
+4.4
+74
+1.6
+0.1
+0.1
+1.5
+30
+0.9
+0.5
+30
+5.4
+0.2
+3.8
+0.8
+0.4
+0.4
+0.9
+0.1
+49
+0.2
+0.1
+0.4
+0.5
+0.2
+0.5
+0.4
+0.2
+6.9
+0.2
+0.1
+0.5
+0.1
+0.2
+0.2
+0.2
+0.1
+0.5
+0.1
+0.2
+2.9
+0.3
+0.1
+2.9
+1.3
+0.2
+0.2
+4.2
+0.2
+1.7
+0.3
+0.4
+4.6
+2.6
+1.1
+72
+0.5
+0.1
+0.1
+0.4
+12
+0.4
+0.2
+2.6
+0.8
+0.1
+0.4
+0.3
+0.1
+0.2
+0
+0.1
+20
+0.2
+0.1
+0.1
+0.2
+0.1
+0.3
+0.3
+0.1
+0.9
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.4
+0.1
+0.1
+0.5
+0.1
+0.1
+0.6
+0.1
+0.1
+0.1
+1.2
+0.1
+0.3
+0.2
+0.1
+0.9
+0.6
+0.4
+1.7
+0.2
+0.1
+0.2
+0.1
+0.7
+0.1
+0.2
+0.6
+0.1
+0
+0.5
+0
+0.1
+0
+0.1
+0
+1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.1
+0.2
+0.1
+0.1
+0.1
+0.1
+0
+0.1
+0.1
+0.1
+0.1
+0.1
+0
+0.2
+0.1
+0.1
+0.1
+0.2
+0.1
+0.1
+0.3
+0.1
+0.1
+0.1
+0.1
+0.3
+0.2
+0.1
+0.1
+0.1
+0.1
+0.1
+(e) MobileNetV2-1.4
+0
+1
+2
+3
+4
+5
+Degredation
+Figure 3. Layer-wise analysis of common networks. Each row is a single run of the tool with a different bit-width selected for the
+weights. Each column represents a layer of the network. The layers are topologically sorted. The annotation in each cell is the absolute
+top-1 degradation of the network when only that layer is quantized to a speciﬁc bit width. The color bar is saturated at degradation of
+5% for better visibility.
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv9
+conv10
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+fc1
+layer
+−0.05
+0.00
+0.05
+0.10
+0.15
+0.20
+degradation
+Degradation per layer - Resnet 18 (8 bit)
+baseline
+equalization
+Figure 4. ResNet18 (ImageNet-1K) layer-wise degradation under
+equalization. The network architecture and full precision output
+is identical to the baseline model. The results however differ.
+methods are inherently heuristic, the standard practice of
+evaluating them only on the merit of global application is
+bad practice; moreover, compound quantization methods
+which apply a larger-range of heuristics locally can give
+much better results.
+4.3. Quantization-Aware Training
+Our method was designed to be used in a post-
+training quantization setting.
+Networks which undergo
+quantization-aware ﬁne-tuning (Jacob et al., 2017) via
+straight-through estimation can’t be used with our method
+due to the fact that the full-precision network is no longer
+the appropriate reference. It is, however, still of interest to
+examine the results. We continue with the same network as
+in the previous section. The optimization target of the ﬁne-
+tune process is the quantized network and so it doesn’t act
+to reduce the noise in the full-precision network but rather
+to compensate for it in the quantized network. This is il-
+lustrated in Figure 7 where we see that the ﬁne-tuned net-
+work has almost the same noise proﬁle as the original net-
+
+
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv10
+conv9
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+fc1
+layer
+0.0
+0.2
+0.4
+0.6
+0.8
+degradation
+Degradation per layer - Resnext 26 (8 bit)
+Figure 5. Layer-wise analysis of ResNext26 on ImageNet-1K val-
+idation set. Most of the degradation is caused by conv4
+−0.6
+−0.4
+−0.2
+0.0
+0.2
+0.4
+0.6
+0
+200
+400
+600
+800
+1000
+1200
+−7σ−6σ−5σ−4σ−3σ−2σ−1σ
+1σ 2σ 3σ 4σ 5σ 6σ 7σ
+ResNext26 - conv4 weight histogram
+Figure 6. The weight distribution of conv4 in ResNext26. The
+quantization range is decided by the minimum and maximum val-
+ues denoted by the dash-dot lines in the ﬁgure. We see there are
+outliers which drastically increase the dynamic range.
+work, however, since the network was trained in the pres-
+ence of noise, the performance of the ﬁne-tuned network is
+improved when noise is introduced to the network by quan-
+tization.
+The problem stems from the fact that the full-precision net-
+work and the optimization target of the training process are
+no longer one and the same. Our type of analysis only
+works well when the reference against which we compare
+the quantized network is the optimization target. Another
+way of expressing the above is that when the network is
+trained in the presence of a speciﬁc noise proﬁle then the
+assumption of noise independence no longer holds. Thus,
+it is still possible to use our method to analyze ﬁne-tuned
+models, but we must use quantization noise that is inde-
+Table 1. Top-1 Accuracy for ResNext26 on
+ImageNet-1K validation set under differ-
+ent post-training methods for 8-bit quanti-
+zation. The standard approaches still show
+high degradation. By using our layer-wise
+analysis we identify the problem and man-
+age to get better results.
+Method
+Top-1 Accuracy
+Full Precision
+76.08
+Naive Quantization
+74.28
+Equalization + IBC
+75.00
+SAWB globally
+71.88
+SAWB conv4ψ
+75.91
+ψ Methods using our layer-wise break-
+down
+pendent of the network training.
+This is shown in Fig-
+ure 8 when we take the full-precision model ﬁne-tuned to
+8-bit quantization and use 7-bits quantization instead. This
+above doesn’t mean that layer-wise analysis is of no use
+when using quantization-aware training. The fact that the
+ﬁne-tuning only compensates but does not reduce the noise,
+means that performing an analysis prior to lengthy training
+is still beneﬁcial - problematic layers can be recognized and
+dealt with prior to training for improved performance.
+4.4. Bias Shift
+One of our underlying assumptions for noise additiv-
+ity is that quantization noise has zero mean.
+Previous
+works (Finkelstein et al., 2019; Nagel et al., 2019) have
+shown that layers with small kernels (e.g. depthwise lay-
+ers) receive a mean activation shift (Finkelstein et al., 2019)
+due to quantization.
+For these networks there is strong
+interaction between noises from adjacent layers, skewing
+the result of layer-wise analysis. For example, using layer-
+wise analysis on MobileNets (Howard et al., 2017; Sandler
+et al., 2018a) (Figure 3) which have many depthwise lay-
+ers, shows that the linear additivity of quantization noise
+no longer holds. We note that we can still apply layer-
+wise analysis on MobileNets (section 4.1) for ﬁnding the
+individual degradation of layers, however, the sum of these
+individual contributions will under-estimate the overall net-
+work degradation.
+5. Discussion and Future Directions
+In this work, we presented a method for layer-wise anal-
+ysis of post-training quantization methods. The use-case
+we presented in section 4.2 illustrates a general issue with
+advanced post-training quantization methods – they often
+
+
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv10
+conv9
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+fc1
+layer
+10
+20
+30
+40
+50
+60
+70
+80
+90
+noise energy
+Noise Energy in Logits per layer - resnext26_32x4d (8 bit)
+resnext26_32x4d
+resnext26_32x4d finetuned
+(a)
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv10
+conv9
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+fc1
+layer
+−0.8
+−0.6
+−0.4
+−0.2
+0.0
+0.2
+0.4
+0.6
+0.8
+degradation
+Degradation per layer - resnext26_32x4d finetuned (8 bit)
+resnext26_32x4d
+resnext26_32x4d finetuned
+(b)
+Figure 7. Layer-wise analysis of ResNext-26 on ImageNet-1K
+validation set before and after ﬁne-tuning. The usual correlation
+between noise and degradation breaks down. (a) Noise energy
+has decreased in conv4 after ﬁne-tuning, but is still high. The
+rest of the noise proﬁle is similar. (b) The Fine-tuned network is
+showing improved accuracy when a layer is quantized. Using the
+full-precision network after ﬁne-tuning as the reference network
+is no longer appropriate.
+have some hyperparameter (e.g. clipping value) which is
+selected based on greedy optimization. Values that are op-
+timal for certain layers can be detrimental to others to the
+point where overall network performance is degraded. Our
+tool directly measures the contribution of the layer to the
+overall degradation, taking into account both the layer lo-
+cation in the network as well as the whole network archi-
+tecture. Once problematic layers have been identiﬁed it is
+easy to apply existing methods in a more precise fashion.
+We further claim that the difference between global and lo-
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv10
+conv9
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+fc1
+layer
+0
+100
+200
+300
+400
+noise energy
+Noise Energy in Logits per layer - resnext26_32x4d (7 bit)
+resnext26_32x4d
+resnext26_32x4d finetuned
+(a) Layer-wise analysis of noise
+conv1
+conv2
+conv3
+conv4
+conv5
+conv6
+conv7
+conv8
+conv10
+conv9
+conv11
+conv12
+conv13
+conv14
+conv15
+conv16
+conv17
+conv18
+conv19
+conv20
+conv21
+conv22
+conv23
+conv24
+conv25
+conv26
+conv27
+conv28
+conv29
+fc1
+layer
+0
+1
+2
+3
+4
+5
+6
+7
+degradation
+Degradation per layer - resnext26_32x4d finetuned (7 bit)
+resnext26_32x4d
+resnext26_32x4d finetuned
+(b) Layer-wise analysis of degradation
+Figure 8. layer-wise analysis of ResNext-26 before and after ﬁne-
+tuning to 8-bit quantization. The network is quantized 7 bits when
+performing the analysis to make the quantization noise indepen-
+dent of the 8-bit noise used for ﬁne-tuning. We see that the corre-
+lation between noise and degradation is restored.
+cal application of quantization methods is symptomatic of
+a larger issue which is the one-dimensional evaluation of
+quantization methods. As shown in section 4.1 using layer-
+wise analysis gives a more nuanced evaluation of the per-
+formance of quantization methods, allowing disambigua-
+tion between architecture-speciﬁc effects and general qual-
+ities of the quantization method. We believe that it is im-
+portant for future works to give a layer-wise breakdown of
+their method that will show exactly from which layers the
+improvement in performance is achieved. This will allow
+both better understanding and create a richer design space
+for compound quantization methods. Our method is a ﬁrst
+step in the direction of establishing better analysis tools for
+quantization which we hope will serve as a framework for
+
+
+10
+20
+30
+40
+50
+60
+70
+Expected Accuracy
+0
+10
+20
+30
+40
+50
+60
+Measured Accuracy
+mobilenet_v1 quantization
+measurements
+fitted linear curve r2=0.943
+10
+20
+30
+40
+50
+60
+Expected Accuracy
+10
+20
+30
+40
+50
+60
+Measured Accuracy
+mobilenet_v2_1_4 quantization
+measurements
+fitted linear curve r2=0.813
+Figure 9. MobileNets expected degradation vs. measured. Cor-
+relation is lower due to bias shift. Measurements were done on
+ImageNet-1K validation set and were taken similarly to Figure 2
+future works.
+References
+Anonymous. {BRECQ}: Pushing the limit of post-training
+quantization by block reconstruction.
+In Submitted to
+International Conference on Learning Representations,
+2021. URL https://openreview.net/forum?
+id=POWv6hDd9XH. under review. 3
+Banner, R., Nahshan, Y., Hoffer, E., and Soudry, D. ACIQ:
+analytical clipping for integer quantization of neural net-
+works.
+CoRR, abs/1810.05723, 2018.
+URL http:
+//arxiv.org/abs/1810.05723. 1, 2, 4
+Baskin, C., Liss, N., Chai, Y., Zheltonozhskii, E.,
+Schwartz, E., Giryes, R., Mendelson, A., and Bron-
+stein, A. M.
+NICE: noise injection and clamping
+estimation for neural network quantization.
+CoRR,
+abs/1810.00162, 2018. URL http://arxiv.org/
+abs/1810.00162. 2, 4
+Cai, Y., Yao, Z., Dong, Z., Gholami, A., Mahoney,
+M. W., and Keutzer, K.
+Zeroq:
+A novel zero
+shot quantization framework.
+2020 IEEE/CVF Con-
+ference on Computer Vision and Pattern Recognition
+(CVPR), Jun 2020.
+doi:
+10.1109/cvpr42600.2020.
+01318.
+URL http://dx.doi.org/10.1109/
+cvpr42600.2020.01318. 2
+Choi, J., Chuang, P. I., Wang, Z., Venkataramani, S., Srini-
+vasan, V., and Gopalakrishnan, K. Bridging the accuracy
+gap for 2-bit quantized neural networks (QNN). CoRR,
+abs/1807.06964, 2018. URL http://arxiv.org/
+abs/1807.06964. 4
+Choukroun, Y., Kravchik, E., Yang, F., and Kisilev, P.
+Low-bit quantization of neural networks for efﬁcient in-
+ference. 2019 IEEE/CVF International Conference on
+Computer Vision Workshop (ICCVW), Oct 2019.
+doi:
+10.1109/iccvw.2019.00363. URL http://dx.doi.
+org/10.1109/ICCVW.2019.00363. 1
+Dong, Z., Yao, Z., Cai, Y., Arfeen, D., Gholami, A., Ma-
+honey, M. W., and Keutzer, K. Hawq-v2: Hessian aware
+trace-weighted quantization of neural networks. 2019a.
+1
+Dong, Z., Yao, Z., Gholami, A., Mahoney, M. W.,
+and Keutzer, K.
+HAWQ: hessian aware quantiza-
+tion of neural networks with mixed-precision.
+CoRR,
+abs/1905.03696, 2019b. URL http://arxiv.org/
+abs/1905.03696. 2, 4
+Elthakeb, A. T., Pilligundla, P., Yazdanbakhsh, A., Kinzer,
+S., and Esmaeilzadeh, H. Releq: A reinforcement learn-
+ing approach for deep quantization of neural networks.
+CoRR, abs/1811.01704, 2018. URL http://arxiv.
+org/abs/1811.01704. 2
+Esser, S. K., McKinstry, J. L., Bablani, D., Appuswamy,
+R., and Modha, D. S. Learned step size quantization.
+CoRR, abs/1902.08153, 2019. URL http://arxiv.
+org/abs/1902.08153. 2, 4
+Fang, J., Shaﬁee, A., Abdel-Aziz, H., Thorsley, D., Geor-
+giadis, G., and Hassoun, J. Near-lossless post-training
+quantization of deep neural networks via a piecewise lin-
+ear approximation. 2020. 1
+Finkelstein, A., Almog, U., and Grobman, M.
+Fighting
+quantization bias with bias.
+CoRR, abs/1906.03193,
+2019.
+URL http://arxiv.org/abs/1906.
+03193. 2, 4, 6
+Haroush, M., Hubara, I., Hoffer, E., and Soudry, D. The
+knowledge within: Methods for data-free model com-
+pression. 2019. 2, 4
+
+
+He, K., Zhang, X., Ren, S., and Sun, J. Deep residual learn-
+ing for image recognition. CoRR, abs/1512.03385, 2015.
+URL http://arxiv.org/abs/1512.03385. 4
+Howard, A. G., Zhu, M., Chen, B., Kalenichenko, D.,
+Wang, W., Weyand, T., Andreetto, M., and Adam, H.
+Mobilenets: Efﬁcient convolutional neural networks for
+mobile vision applications.
+CoRR, abs/1704.04861,
+2017.
+URL http://arxiv.org/abs/1704.
+04861. 4, 6
+Hubara, I., Nahshan, Y., Hanani, Y., Banner, R., and
+Soudry, D. Improving post training neural quantization:
+Layer-wise calibration and integer programming. 2020.
+2, 3
+Ioffe, S. and Szegedy, C. Batch normalization: Accelerat-
+ing deep network training by reducing internal covariate
+shift. 2015. 3
+Jacob,
+B.,
+Kligys,
+S.,
+Chen,
+B.,
+Zhu,
+M.,
+Tang,
+M., Howard, A. G., Adam, H., and Kalenichenko,
+D.
+Quantization and training of neural networks
+for efﬁcient integer-arithmetic-only inference.
+CoRR,
+abs/1712.05877, 2017. URL http://arxiv.org/
+abs/1712.05877. 1, 3, 5
+Jain, S. R., Gural, A., Wu, M., and Dick, C. H. Trained
+quantization thresholds for accurate and efﬁcient ﬁxed-
+point inference of deep neural networks. 2019. 1
+Liu, X., Ye, M., Zhou, D., and Liu, Q. Post-training quan-
+tization with multiple points: Mixed precision without
+mixed precision. 2020. 2, 4
+Meller, E., Finkelstein, A., Almog, U., and Grobman, M.
+Same, same but different - recovering neural network
+quantization error through weight factorization. CoRR,
+abs/1902.01917, 2019. URL http://arxiv.org/
+abs/1902.01917. 2, 4
+Nagel, M., van Baalen, M., Blankevoort, T., and Welling,
+M. Data-free quantization through weight equalization
+and bias correction. CoRR, abs/1906.04721, 2019. URL
+http://arxiv.org/abs/1906.04721. 2, 6
+Nagel, M., Amjad, R. A., van Baalen, M., Louizos, C., and
+Blankevoort, T. Up or down? adaptive rounding for post-
+training quantization. 2020. 2, 3
+Nahshan, Y., Chmiel, B., Baskin, C., Zheltonozhskii, E.,
+Banner, R., Bronstein, A. M., and Mendelson, A. Loss
+aware post-training quantization. 2019. 2, 4
+Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S.,
+Ma, S., Huang, Z., Karpathy, A., Khosla, A., Bernstein,
+M., Berg, A. C., and Fei-Fei, L. ImageNet Large Scale
+Visual Recognition Challenge. International Journal of
+Computer Vision (IJCV), 115(3):211–252, 2015. doi: 10.
+1007/s11263-015-0816-y. 3
+Sandler, M., Howard, A. G., Zhu, M., Zhmoginov, A., and
+Chen, L. Inverted residuals and linear bottlenecks: Mo-
+bile networks for classiﬁcation, detection and segmenta-
+tion. CoRR, abs/1801.04381, 2018a. 6
+Sandler, M., Howard, A. G., Zhu, M., Zhmoginov, A., and
+Chen, L. Inverted residuals and linear bottlenecks: Mo-
+bile networks for classiﬁcation, detection and segmen-
+tation.
+CoRR, abs/1801.04381, 2018b.
+URL http:
+//arxiv.org/abs/1801.04381. 4
+Stock, P., Joulin, A., Gribonval, R., Graham, B., and J´egou,
+H. And the bit goes down: Revisiting the quantization
+of neural networks. CoRR, abs/1907.05686, 2019. URL
+http://arxiv.org/abs/1907.05686. 1
+Szegedy, C., Liu, W., Jia, Y., Sermanet, P., Reed, S. E.,
+Anguelov, D., Erhan, D., Vanhoucke, V., and Rabi-
+novich, A.
+Going deeper with convolutions.
+CoRR,
+abs/1409.4842, 2014.
+URL http://arxiv.org/
+abs/1409.4842. 4
+Uhlich, S., Mauch, L., Yoshiyama, K., Cardinaux, F.,
+Garc´ıa, J. A., Tiedemann, S., Kemp, T., and Nakamura,
+A. Differentiable quantization of deep neural networks.
+CoRR, abs/1905.11452, 2019. URL http://arxiv.
+org/abs/1905.11452. 1, 2
+Wang, K., Liu, Z., Lin, Y., Lin, J., and Han, S.
+HAQ: hardware-aware automated quantization. CoRR,
+abs/1811.08886, 2018. URL http://arxiv.org/
+abs/1811.08886. 1, 2
+Wang, P., Chen, Q., He, X., and Cheng, J. Towards accu-
+rate post-training network quantization via bit-split and
+stitching. In Proceedings of the 37nd International Con-
+ference on Machine Learning (ICML), pp. 243–252, July
+2020. 3
+Wu, H., Judd, P., Zhang, X., Isaev, M., and Micikevicius, P.
+Integer quantization for deep learning inference: Princi-
+ples and empirical evaluation, 2020. 3
+Xie, S., Girshick, R., Doll´ar, P., Tu, Z., and He, K. Ag-
+gregated Residual Transformations for Deep Neural Net-
+works. arXiv e-prints, art. arXiv:1611.05431, November
+2016. 4
+Yang, J., Shen, X., Xing, J., Tian, X., Li, H., Deng, B.,
+Huang, J., and Hua, X. Quantization networks. 2019. 2,
+4
+Zhao, R., Hu, Y., Dotzel, J., Sa, C. D., and Zhang,
+Z.
+Improving neural network quantization with-
+out retraining using outlier channel splitting.
+CoRR,
+
+
+abs/1901.09504, 2019. URL http://arxiv.org/
+abs/1901.09504. 2
+Zhou, Y., Moosavi-Dezfooli, S.-M., Cheung, N.-M., and
+Frossard, P. Adaptive Quantization for Deep Neural Net-
+work. arXiv e-prints, art. arXiv:1712.01048, December
+2017. 2, 3

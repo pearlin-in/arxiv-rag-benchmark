@@ -1,0 +1,1260 @@
+Preprint
+SEMANTIC-GUIDED LORA PARAMETERS GENERATION
+Miaoge Li1, Yang Chen1, Zhijie Rao1, Can Jiang2, Jingcai Guo 1∗
+1Department of Computing/LSGI, The Hong Kong Polytechnic University, Hong Kong SAR
+2School of Artificial Intelligence, Xidian University, China
+jc-jingcai.guo@polyu.edu.hk
+ABSTRACT
+Low-Rank Adaptation (LoRA) has demonstrated strong generalization capabili-
+ties across a variety of tasks for efficiently fine-tuning AI models, especially on
+resource-constrained edges. However, in real-world applications, edge users often
+exhibit task-specific preferences that are difficult to handle with a unified model
+trained under a closed-world assumption, and the challenge may further increase
+when there are significant domain shifts between training and deployment. Mean-
+while, retraining/fine-tuning models for each user is also impractical due to its
+cost-intensive nature and privacy concerns over raw data utilization from edges. To
+address these challenges, we propose Semantic-guided LoRA Parameter Genera-
+tion (SG-LoRA), the first of its kind framework to efficiently produce user-specific
+LoRA parameters without any additional training on user tasks or access to user-
+specific data. Concretely, SG-LoRA uses task descriptions as the semantic bridge,
+measuring their proximity to a set of known expert tasks in a shared embedding
+space. Based on this semantic guidance, it models the target task’s LoRA parameter
+distribution to generate high-performing parameters for novel tasks. SG-LoRA
+enables the real-time construction of LoRA models aligned with individual intents
+by distilling knowledge from prominent LoRA experts and, meanwhile, offering a
+privacy-preserving solution for personalized model adaptation in a novel zero-shot
+open-world setting proposed in this work. Extensive experiments on multiple
+challenging tasks confirm the superior performance and remarkable adaptability of
+SG-LoRA. Code is available at https://github.com/keepgoingjkg/SG-LoRA.
+1
+INTRODUCTION
+In recent years, deep learning has seen remarkable progress, largely driven by the advent of large-scale
+pre-trained models (LPMs) Chung et al. (2024); Li et al. (2022); Liu et al. (2023); Rombach et al.
+(2022); Touvron et al. (2023). Trained on massive and diverse datasets, these models demonstrate
+exceptional performance across a wide range of downstream tasks Shenaj et al. (2024); Alayrac et al.
+(2022); Touvron et al. (2023). However, as both model and data scales continue to grow, retraining
+the entire model becomes increasingly computationally expensive and often infeasible in practice. To
+mitigate this challenge, parameter-efficient fine-tuning (PEFT) methods have garnered considerable
+attention Zhang et al. (2023c;b); Ding et al. (2023). Among them, Low-Rank Adaptation (LoRA) Hu
+et al. (2022) has emerged as a prominent approach. LoRA adapts pre-trained models by introducing
+a small number of trainable low-rank matrices into existing layers, achieving strong task-specific
+performance while leaving the original model weights unchanged.
+While an increasing number of pre-trained LoRA modules are becoming publicly available, effectively
+leveraging them in real-world scenarios remains a significant challenge. The abundance of LoRA
+resources does not inherently guarantee robust generalization—particularly when the target domain
+diverges substantially from those seen during training Qorbani et al. (2025). Simultaneously, user-side
+demands are becoming increasingly dynamic and personalized, particularly in edge environments
+where data privacy constraints and limited computational resources make large-scale retraining
+infeasible. These trends raise two critical questions: (1) How can LoRA-enhanced models be rapidly
+and efficiently adapted for on-device deployment? (2) How can such adaptations accurately reflect
+individual user intent without requiring extensive retraining?
+∗Jingcai Guo is the corresponding author.
+1
+arXiv:2509.10535v1  [cs.LG]  5 Sep 2025
+
+
+Preprint
+…
+car
+badminton
+cat
+Zero-Shot Open-world Adaptation
+(ZSOA)
+Unseen Tasks
+dog
+flower
+…
+Seen Tasks
+bus
+…
+Parameter diversity 
+✓
+Open-world generation 
+Fine-tune with LoRA
+Parameter diversity 
+
+Open-world generation ✓
+deterministic 
+fusion
+(a) Merging-based
+…
+Router
+…
+?
+?
+?
+Parameter diversity 
+✓
+Open-world generation ✓
+(c) SG-LoRA
+…
+expert 1
+expert k
+expert 2
+dog
+…
+Generation Model
+Semantic
+Guided
+(b) Generation-based
+Generation Model
+seen task
+enhancement
+…
+…
+• without unseen task data
+• Open-world task coverage
+: Task description  
+: LoRA parameter
+Figure 1: Motivation of our SG-LoRA. We consider a challenging scenario termed Zero-Shot Open-World
+Adaptation (ZSOA), where a model is provided rich LoRA resources for seen tasks but lacks access to data
+for unseen tasks during inference, with an unconstrained task space. Conventional LoRA adaptation methods
+are not suitable for ZSOA: merging-based approaches struggle to explore the diversity of LoRA parameters,
+while generation-based methods primarily focus on LoRA enhancement for seen task. Our SG-LoRA uses task
+descriptions as semantic guidance to enable conditional LoRA generation for unseen tasks in a data-free and
+open-world manner. (Each color family represents a set of LoRA parameters for the same task, for example,
+brown represents LoRAs for the ’Dog’ task, and yellow represents LoRAs for the ’Car’ task.)
+To tackle these challenges, as shown in Figure.1, prior research has explored two main directions
+in the broader application of LoRA, each targeting one of the issues. The first line of work focuses
+on fusion-based methods, which aim to rapidly construct task-specific models by directly merging
+existing LoRA modules at hand Shenaj et al. (2024). This approach eliminates the need for additional
+fine-tuning, enabling fast adaptation. However, such deterministic fusion is inherently limited in
+flexibility and generalizability: once the merged weights are determined, the resulting model is fixed
+to a specific task, restricting its ability to adapt to diverse or evolving requirements. Moreover, the
+merging process must be carefully designed, as conflicts may arise when integrating LoRA modules
+trained on different tasks Zou et al. (2025); Zhao et al. (2024). In parallel, another direction explores
+generation-based methods, which leverage generative models—such as variational autoencoders
+(VAEs) Kingma & Welling (2013) or diffusion models Ho et al. (2020)—to synthesize new LoRA
+parameters. By introducing stochasticity, these approaches enable greater diversity in parameter
+generation and bypass traditional fine-tuning pipelines. However, their success often relies on a
+closed-world assumption, where training and test tasks are drawn from similar distributions Soro et al.
+(2024). As a result, these methods are susceptible to task (or domain) shifts—scenarios in which the
+data distribution at test time differs from that observed during training—often resulting in significant
+performance degradation.
+To address both challenges simultaneously, we introduce Zero-Shot Open-world Adaptation (ZSOA),
+a novel evaluation setting that assesses a model’s ability to generalize to previously unseen hetero-
+geneous tasks, which share the same structural format(e.g., classification or retrieval) but differ in
+data distributions, without requiring access to labeled data from the target task. ZSOA emphasizes
+two key aspects: (1) Open-world task coverage, where user-defined tasks emerge from a broad and
+unconstrained task space, maintaining structural consistency while varying in content, domain, or
+distribution. (2) Adaptability to evolving user intents, reflecting real-world scenarios in which user
+needs change dynamically.
+In this work, we draw inspiration from the human ability to intuitively infer semantic relationships
+between prior knowledge and new tasks Lake et al. (2017), enabling effective generalization in
+2
+
+
+Preprint
+unfamiliar situations. For example, after learning to recognize cat breeds such as Birman and Egyptian
+Mau, a person can identify British Shorthair based solely on its textual description by relating it to
+previously acquired concepts. Motivated by this analogy-driven reasoning process, we propose a
+Semantic-Guided LoRA Parameter generation framework (SG-LoRA) that adapt LPMs to the ZSOA
+setting. Specifically, we begin by aggregating LoRA modules fine-tuned on known task-specific
+datasets to establish a repository of task experts. Rather than fine-tuning new LoRA parameters for
+each novel task, our method exploits task relationships embedded in their textual descriptions. These
+descriptions, typically concise, yet semantically rich, are processed by a frozen CLIP text encoder
+to capture task-level correlations without exposing user-specific data. More importantly, simply
+scaling the number of expert LoRAs does not guarantee performance gains, as they may provide
+contradictory or irrelevant task knowledge. To resolve this, we design a sparse router that selectively
+combines the most semantically relevant expert LoRAs for a target task, thereby integrating rational
+prior knowledge for generating new task-adaptive LoRA parameters. We then train a generative
+model that leverages this acquired prior LoRA knowledge as conditional input to synthesize high-
+performing task-specific parameters. During inference, the system directly generates target LoRA
+modules aligned with user requirements using only prior knowledge. Crucially, the stochastic nature
+of our trained generator transforms deterministic LoRA construction into probabilistic parameter
+sampling—enhancing coverage diversity to dynamically adapt to evolving user intents. In summary,
+the main contributions of this work include :
+• We introduce Semantic-Guided LoRA Generation, a versatile framework that harnesses
+semantic task relationships to enable zero-shot open-world adaptation. SG-LoRA conditions
+on prior task knowledge to synthesize high-performance LoRA parameters for arbitrary
+unseen tasks without retraining.
+• By seamlessly integrating efficiently generated LoRA modules into off-the-shelf LPMs,
+our method enables fast personalization at inference time. It supports flexible updates to
+the expert database and enables exploration of diverse LoRA configurations for broad task
+coverage. Additionally, the framework is inherently transparent and controllable, providing
+a scalable solution for personalized and adaptable model behavior.
+• Comprehensive experiments on multiple image-text retrieval benchmarks demonstrate that
+the proposed method can rapidly generate LoRA parameters with performance comparable
+to that of traditional LoRA fine-tuning.
+2
+RELATED WORK
+2.1
+LOW-RANK ADAPTATION
+Low-Rank Adaptation (LoRA) is a parameter-efficient fine-tuning method to adapt large models to
+novel tasks and shows superior performance Huang et al. (2023); Zhang et al. (2023a); Sung et al.
+(2022). By optimizing new sets of low-rank matrices to approximate the weight changes during fine-
+tuning, LoRA dramatically reduces trainable parameters—maintaining knowledge from pre-training
+while minimizing computational overhead. Specifically, LoRA observes that a pre-trained model’s
+weight matrix often has a low intrinsic rank. Given a pre-trained weight W0 in the network, with x
+as the input and h as the hidden state, LoRA decomposes the weight update ∆W ∈Rm×n into two
+low-dimensional matrics B ∈Rm×r and A ∈Rr×n:
+h = W0x + ∆W x = W0x + αBAx,
+(1)
+where the rank r ≪min(n, m). The scalar α is a constant scaling hyperparameter that controls the
+contribution of the LoRA update in subsequent layers. Recently, a growing number of high-quality,
+pre-trained LoRA modules have become publicly available for various architectures Civitai (2024);
+HuggingFace (2024), including transformers and vision–language models, providing rich resources
+to accelerate adaptation and deployment on specific downstream tasks.
+2.2
+MODEL MERGING
+Model merging integrates parameter-level knowledge from multiple independently trained neural
+networks into a unified model, achieving enhanced capabilities Li et al. (2023); Ilharco et al. (2022);
+3
+
+
+Preprint
+Jang et al. (2024); Wortsman et al. (2022b). The pioneer work Model Soups Wortsman et al. (2022a)
+establishes weight averaging as a foundational paradigm, demonstrating that averaging fine-tuned
+models from identical pre-trained bases with varied hyperparameters consistently outperforms individ-
+ual models. Its efficacy arises from geometric alignment within shared loss landscape basins, where
+fine-tuned parameters converge to flat minima, coupled with the near-orthogonality of task-specific
+adjustments (task vectors) that minimizes interference during fusion. AdapterSoup Chronopoulou
+et al. (2023) generalizes the Model Soups paradigm to cross-domain adaptation by dynamically aver-
+aging domain-specific adapters at test time. This approach preserves the base model’s integrity while
+enhancing out-of-distribution generalization through selective weight-space interpolation of relevant
+domain knowledge. Recent advances have extended this paradigm to LoRA-based module fusion.
+For instance, LoraHub Huang et al. (2023) dynamically composes pre-trained LoRA modules by
+optimizing their weights through few-shot examples from new tasks, leveraging black-box optimiza-
+tion techniques (e.g., CMA-ES) to achieve efficient adaptation without backpropagation. Meanwhile,
+SemLA Qorbani et al. (2025) introduces a training-free approach by directly comparing test images’
+visual features with known domain prototypes, using this similarity measure as an efficient domain
+navigator for both adapter retrieval and fusion. However, both methods are limited—either needing
+unknown-task data or employing inflexible deterministic fusion for new tasks.
+2.3
+NEURAL NETWORK PARAMETERS GENERATION
+Despite significant advancements in generative modeling, recent work has only begun to address
+the direct generation of network weights for pre-trained models Knyazev et al. (2021); Zhmoginov
+et al. (2022); Knyazev et al. (2023). Approaches such as generative hyper-representation learning
+Ha et al. (2016), neural network diffusion Peebles et al. (2022); Hu et al. (2021); Jin et al. (2024),
+and kernel density estimation–based methods Soro et al. (2024) have shown promise but remain
+fundamentally limited to small architectures and unconditional weight generation within fixed
+distributions. Consequently, these methods are hampered in their ability to generalize to unknown
+tasks, constraining their broader applicability. While meta-learning frameworks Nava et al. (2022);
+Zhang et al. (2024) have enabled powerful joint model generation for visual recognition and few-shot
+learning, they typically neglect the personalization and diversity of the generated parameters and
+restrict the generator’s output to classifier heads rather than more flexible and expressive parameter
+sets, such as LoRA. Shao et al. (2025) ICM-LoRA innovatively explores the parameter relationships
+among tasks through task vectors, but focuses on closed-world, task-specific enhancements of LoRA
+parameters. As a result, the question of whether one can rapidly generate efficient, user-intent–focused
+LoRA parameters in open-world settings remains unexplored.
+3
+THE PROPOSED MODEL
+In this section, we begin with an overview of essential concepts for understanding semantic-guided
+LoRA parameter generation, followed by detailed descriptions of our proposed methods.
+3.1
+PROBLEM DEFINATION AND PRELIMINARY
+We define Zero-Shot Open-world Adaptation (ZSOA) as a novel and challenging task setting that
+requires models to generalize across semantically diverse tasks in open-world scenarios. Unlike
+conventional zero-shot learning or task transfer—often confined to fixed label spaces or narrow
+domains—ZSOA focuses on tasks that share a common structural format (e.g., image-to-text retrieval)
+but differ substantially in domain, content, or distribution. It emphasizes that queried tasks during
+inference time are drawn from an undefined and unbounded set, requiring rapid adaptation to novel
+tasks without access to labeled data. This setting reflects realistic deployment scenarios, where
+task-level generalization must rely solely on prior experience.
+In this work, we instantiate ZSOA in the context of fine-grained image-text retrieval, where each task
+corresponds to a retrieval problem defined by a specific semantic category (e.g., bird species, flower
+type). Formally, given a set of fine-tuned LoRA module W trained on known tasks T , our goal is
+to adapt the model to unknown task T ∗without accessing any labeled image-text pairs. Let f(T )
+denote the textual description of task T , we learn a generator G that predicts LoRA parameters for
+4
+
+
+Preprint
+T ∗based on semantic descriptions and W:
+W∗= G (f(T ∗), W, f(T ))
+(2)
+The synthesized LoRA parameter W∗is then used to modulate a frozen vision-language backbone,
+enabling it to perform the image-text retrieval task defined by T ∗. ZSOA thus extends traditional zero-
+shot learning by enabling parameter-level generalization , accommodating diverse user-instructed
+tasks with open-world queries.
+3.2
+LORA PARAMETER DATASET CONSTRUCTION
+3.2.1
+TASK-SPECIFIC LORA TRAINING
+The first stage involves constructing a dataset of LoRA parameters. Consider a collection of N
+distinct tasks T = {T1, . . . , TN}, where each Ti corresponds to a specific image-to-text retrieval task.
+In this context, the task is dataset-agnostic—that is, it may originate from the same dataset or from a
+different one. Given a pre-trained vision-language model (VLM), we train a task-specific LoRA for
+each Ti using corresponding image-caption pairs, applying LoRA modules at consistent positions
+within the VLM. To ensure comparability and reduce variance, all LoRA modules are trained using
+identical network configurations by default. After training stabilizes, we extract and store the LoRA
+parameters from the final M epochs, yielding task-specific parameter data:
+∆Wi = {∆Wj
+i }M
+j=1,
+di = f(Ti),
+(3)
+where ∆Wj
+i is the j-th epoch LoRA parameter for task Ti. di denotes the textual description
+associated with Ti, generated using the template ’a photo of a <class name>’, and encoded by the
+frozen CLIP text encoder f(·) to serve as a global semantic representation. Collectively, these form
+the LoRA parameter dataset:
+W = {∆W1, . . . , ∆WN},
+(4)
+where element is optimized for image-text alignment within its respective task.
+3.2.2
+LORA EXPERT REPOSITORY FORMATION
+To construct a reliable expert LoRA space, we first curate a representative subset of tasks from the
+full corpus, where each task is associated with its corresponding LoRA parameters and semantic
+embedding. For each selected task, we compute the mean LoRA parameters µi across all available
+adaptations, forming a distilled representation of the task-specific adaptation pattern. These mean
+parameters, along with their associated semantic embeddings, constitute our expert repository:
+Wexpert = {(µi, di) | i ∈I},
+µi = 1
+M ∆Wi,
+(5)
+where I represents the selected expert index and Wexpert serves as a compact yet expressive basis
+for capturing the essential characteristics of each knowledge domain. The remaining LoRA data are
+then partitioned into training and evaluation sets to facilitate subsequent model development and
+evaluation.
+3.3
+SEMANTIC-GUIDED LORA PARAMETER GENERATION
+Our SG-LoRA framework generates conditional LoRA parameters under semantic guidance. We
+first construct a semantic prior by selecting and combining the most relevant expert LoRAs from the
+repository using a sparse router. A conditional variational autoencoder (CVAE)Sohn et al. (2015)
+is then trained to generate target LoRA parameters aligned with the task description intent. Once
+trained, the model can generalize to new tasks in an open-world query setting without requiring
+further training.
+3.3.1
+CONSTRUCTION OF SEMANTIC PRIOR
+Intuitively, not all experts contribute equally to an unknown task. Therefore, it is essential to identify
+and prioritize the most beneficial experts. Fortunately, the CLIP textual encoder is well-suited for this
+purpose, as it effectively captures rich semantic relationships across diverse tasks. As established in
+5
+
+
+Preprint
+Eq. 3, we use the textual embedding of each task as a global semantic descriptor for its corresponding
+LoRA parameters. For an unseen task T ∗with textual embedding d∗, we calculate the cosine
+similarity between d∗and the textual embedding di of each expert task. We then select the top-k
+experts with the highest similarity scores to form a semantically tailored expert set, indexed by Itop-k.
+The LoRA parameters associated with these experts are fused to construct a prior for the unseen
+task T ∗. Then, we normalize their similarity scores using the softmax function to obtain the fusion
+coefficients:
+αi =
+exp (sim(d∗, di)/τ)
+P
+j∈Itop-k exp (sim(d∗, dj)/τ),
+i ∈Itop-k,
+(6)
+where τ > 0 is a temperature parameter. The semantic LoRA prior for task T ∗is computed as a
+weighted sum:
+µ∗=
+X
+i∈Itop-k
+αi · µi,
+(7)
+To better fit the prior distribution at the distributional level, we also consider estimating the variance
+for the unseen task as a function of expert parameters and their contribution weights:
+σ2∗= F
+ µ∗, {µi, σ2
+i }K
+i=1
+
+,
+(8)
+where F(·) denotes an aggregation function that combines expert-level uncertainties and deviations
+to capture the overall task variance. This flexible formulation enables the model to better reflect the
+statistical properties of new tasks, which is crucial for generative modeling. Leveraging semantic
+similarities, the model adapts more efficiently to novel tasks. The estimated mean and variance guide
+the generative process, resulting in more accurate and context-aware outputs, thereby improving
+generalization and robustness. To simplify, we will use c to represent the semantic prior in the
+following descriptions.
+3.3.2
+CONDITIONAL LORA PARAMETER GENERATION
+We adopt a conditional variational autoencoder framework to generate target LoRA parameters based
+on task-aware prior information. Given a batch of training LoRA tensor X ∈RB×m×n, the encoder
+approximates the posterior distribution q(z|X, c) using a multi-layer perceptron (MLP) that takes
+the to be reconstructed X and the semantic prior c as input. A latent code z ∼q(z|X, c) is sampled
+and passed to the decoder along with c as condition to reconstruct the original input X. To model the
+task-conditional prior p(z|c), we use a separate MLP, referred to as the prior mapper. This allows the
+model to flexibly represent a task-specific prior distribution based on domain-level statistics.
+The model is trained to maximize the evidence lower bound (ELBO), which consists of two terms:
+the reconstruction and the regularization term :
+LCVAE = Eq(z|X,c)
+h
+∥X −ˆ
+X∥2i
++ λ · KL(q(z|X, c)∥p(z|c)),
+(9)
+where ˆ
+X denotes the reconstructed LoRA parameters, KL(· ∥·) is the Kullback-Leibler divergence,
+and λ controls the relative weight of the KL term. The first term encourages the decoder to reconstruct
+accurate LoRA parameters, while the second term regularizes the latent space to match the task-
+specific prior. During inference, a sample z is drawn from the prior distribution p(z|c), and the
+decoder generates the corresponding custom LoRA parameter.
+4
+EXPERIMENTS
+4.1
+EXPERIMENTAL SETTINGS
+We conducted experiments on both image-text retrieval and cross-dataset generalization tasks. Specif-
+ically, we use the widely adopted MS-COCO dataset Lin et al. (2014), a standard benchmark for
+image-caption retrieval, known for its diverse scenes and rich linguistic annotations. To evaluate
+the model’s generalization ability across visual domains, we further include the OxfordPets dataset
+Parkhi et al. (2012) and the Flowers102 dataset Nilsback & Zisserman (2008), both of which are
+originally designed for fine-grained image classification. Moreover, given the inherent ambiguity and
+limited informativeness of MS-COCO captions and the absence of captions in the other two datasets,
+6
+
+
+Preprint
+we construct synthetic textual descriptions using Qwen2-VL Wang et al. (2024). For MS-COCO,
+we use the original training split but regenerate captions for each image, effectively creating a new
+image–caption dataset, and then divide it into training, validation, and test sets. These datasets enable
+us to assess the model’s robustness both in in-domain retrieval and in generalizing to novel domains
+and compositional scenarios. The evaluation metric used is Recall@K (R@K), which quantifies the
+proportion of correct matches appearing in the top-K retrieved candidates. We report R@1, R@5,
+and R@10 for both image-to-text and text-to-image retrieval scenarios.
+4.2
+IMPLEMENTATION DETAILS
+We adopt CLIP ViT-B/16 as our backbone, injecting rank-2 LoRA adapters into the Wq, Wk, and Wv
+projection matrices of every Transformer block in the visual encoder. Training is carried out with the
+Adam optimizer. The CVAE’s encoder and prior network each consist of two-layer MLPs with ReLU
+activations, whereas the decoder is realized as a three-layer MLP with ReLU activations. We set the
+default values of M and k in the model to 100 and 4, respectively. All experiments were performed
+on a single NVIDIA A6000 GPU.
+4.3
+COMPARATIVE METHODS
+To evaluate the effectiveness of the proposed method, we compare it with following methods: (1)
+Zero-Shot CLIP: The original CLIP model without any adaptation of LoRA modules. (2) Model
+Soups: Consistent with Wortsman et al. (2022a) all LoRA experts in Wexpert are uniformly averaged
+without considering their relevance to the target task. (3) Top-k LoRA Merging (Ours): The top-k
+experts from the expert repository are selected based on the semantic similarity vector and with equal
+weight, assigning each a coefficient of 1/k. (4) Top-k LoRA Weighted (Ours): The top-k experts
+are selected based on the semantic similarity vector, and their weights are computed by applying a
+softmax function over the similarity scores for adaptive merging. (5) SG-LoRA (Ours) Our proposed
+method, which generates task-specific LoRAs based on semantic proximity. (6) Oracle: For each
+task, LoRA parameters are trained individually using the respective image-caption pair dataset.
+4.4
+MAIN RESULTS AND DISCUSSION
+4.5
+IMAGE-TEXT RETRIEVAL WITHIN A SINGLE DATASET
+We conducted image-text retrieval evaluations on both the MS-COCO and OxfordPets datasets, with
+results shown in Table.1 -2. Several key observations are as follows: 1). Compared to the Zero-shot
+CLIP baseline and consistent with previous findings Qorbani et al. (2025), directly merging all
+experts in the expert repository leads to performance improvements. 2). Selecting semantically
+relevant experts—those most related to the current query task—from the repository can further
+enhance performance. However, naively treating all selected experts equally may result in degraded
+performance. For instance, in Table 2, uniform Top-k LoRA Merging underperforms compared to
+Top-k LoRA Weighted. This may be because different experts contribute unevenly to the target task.
+Therefore, assigning equal weight ignores the varying degrees of semantic alignment, potentially
+amplifying noise from less relevant experts. Conversely, incorporating semantic weighting coefficients
+allows for more effective integration of expert knowledge during fusion, thereby improving retrieval
+performance. 3). While merging-based approaches still fall short of the performance achieved
+by directly fine-tuning LoRA on the unseen task, SG-LoRA fully recovers the performance of
+oracle adapters. Notably, SG-LoRA even outperforms task-specific fine-tuned LoRAs in certain
+cases—for example, R@1 and R@5 for bidirectional retrieval in Table.1 and R@1 in for image-to-text
+retrieval in Table.2. This improvement gains from the efficient compression of expert LoRAs: our
+trained CVAE effectively integrates the target LoRA distribution using compact yet semantically
+rich task representations, enabling the generation of target-aligned LoRA parameters by modeling
+their distribution in the parameter space. Moreover, the oracle LoRA fine-tuned on unseen tasks
+sometimes suffers from overfitting, especially when trained on a small set of image-caption pairs.
+Our SG-LoRA helps mitigate this performance drop, likely due to its ability to generalize without
+relying on target-task data.
+7
+
+
+Preprint
+Table 1: Model Performance of image-text retrieval on MS-COCO. The best results are highlighted
+in bold, and the second-best results are underlined.
+Method
+I2T Metrics
+T2I Metrics
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Zero-shot CLIP
+66.43
+84.31
+89.14
+41.66
+64.63
+73.01
+Oracle
+72.45
+88.91
+93.41
+53.10
+76.47
+83.97
+Model Soups
+69.37
+85.96
+90.95
+47.38
+69.54
+77.97
+Top-k LoRA Merging
+70.70
+86.57
+91.09
+48.64
+70.51
+78.79
+Top-k LoRA Weighted
+71.55
+87.54
+91.69
+49.85
+71.79
+79.66
+SG-LoRA
+74.31
+88.78
+92.50
+54.42
+75.45
+82.18
+Table 2: Model Performance of image-text retrieval on OxfordPets. The best results are highlighted
+in bold, and the second-best results are underlined.
+Method
+I2T Metrics
+T2I Metrics
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Zero-shot CLIP
+40.45
+66.27
+77.53
+26.03
+50.66
+62.98
+Oracle
+55.84
+81.84
+89.13
+40.99
+70.41
+80.39
+Model Soups
+52.54
+77.80
+85.59
+33.51
+61.77
+72.93
+Top-k LoRA Merging
+52.59
+78.52
+86.09
+34.05
+62.70
+73.93
+Top-k LoRA Weighted
+53.96
+79.41
+86.53
+35.42
+64.08
+74.99
+SG-LoRA
+57.15
+80.40
+88.04
+37.62
+67.16
+77.44
+4.6
+CROSS-DATASET IMAGE-TEXT RETRIEVAL
+Moreover, given the flexibility of SG-LoRA, we conducted a more challenging cross-dataset evalua-
+tion. As shown in Table.3-5, SG-LoRA consistently outperforms merging-based approaches in these
+settings. Interestingly, we also observed that models trained on MS-COCO were able to generate
+LoRA parameters that, in some cases, outperformed those trained directly on the OxfordPets dataset.
+This may be attributed to the richer expert knowledge available in MS-COCO, which, due to its
+broader data diversity, enables more extensive exploration of the parameter space during genera-
+tion—something not achievable when generating within the narrower scope of OxfordPets. Another
+possible reason is that the uniform LoRA training configuration used across datasets (as described
+in Section 3.2.1) may not be optimal for OxfordPets. Conversely, comparing Table.4 with Table.1,
+we find that when the generation model is trained on OxfordPets and applied to MS-COCO, its
+performance is generally worse than that of models trained on MS-COCO. This is likely due to the
+limited expert diversity in OxfordPets, which focuses primarily on fine-grained distinctions within
+just two broad categories—cats and dogs—thus making it less effective at generating LoRAs for
+more diverse tasks found in MS-COCO.
+4.7
+GENERALIZATION IN STANDARD IMAGE-TEXT RETRIEVAL
+Considering another complex scenario where the test task may contain image-caption pairs of multiple
+categories, we evaluated the retrieval performance on the test set of the Flickr30K dataset Plummer
+et al. (2015). Since this dataset has no clear category distinction during retrieval, we randomly selected
+one caption from the test set, fed it into the CLIP textual encoder to obtain the textual embedding, and
+then calculated the mean value as the task description for retrieval. The experimental results are shown
+in Figure.2, where SG-LoRA outperforms Zero-shot CLIP. Additionally, SG-LoRA trained on MS-
+COCO achieves better results than that trained on OxfordPets. This is because MS-COCO provides
+more comprehensive expert knowledge, covering a wider range of categories, while OxfordPets
+primarily focuses on fine-grained knowledge of cat and dog categories. This also indicates that when
+semantic guidance is more powerful and comprehensive, or more relevant to the downstream task,
+the generated LoRA parameters are also superior.
+8
+
+
+Preprint
+Table 3: Cross-dataset evaluation with the model trained on MS-COCO and tested on OxfordPets.
+The best results are highlighted in bold, and the second-best results are underlined.
+Method
+I2T Metrics
+T2I Metrics
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Zero-shot CLIP
+40.45
+66.27
+77.53
+26.03
+50.66
+62.98
+Oracle
+55.84
+81.84
+89.13
+40.99
+70.41
+80.39
+Model Soups
+44.67
+70.91
+80.78
+30.45
+56.77
+68.52
+Top-k LoRA Merging
+45.96
+71.83
+81.42
+30.88
+57.32
+69.08
+Top-k LoRA Weighted
+48.13
+73.43
+82.73
+33.34
+59.53
+70.89
+SG-LoRA
+55.41
+80.73
+87.33
+38.84
+66.77
+76.69
+Table 4: Cross-dataset evaluation with the model trained on OxfordPets and tested on MS-COCO.
+The best results are highlighted in bold, and the second-best results are underlined.
+Method
+I2T Metrics
+T2I Metrics
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Zero-shot CLIP
+66.43
+84.31
+89.14
+41.66
+64.63
+73.01
+Oracle
+72.45
+88.91
+93.41
+53.10
+76.47
+83.97
+Model Soups
+68.58
+85.67
+90.62
+44.09
+66.55
+75.08
+Top-k LoRA Merging
+68.74
+85.83
+90.63
+44.19
+66.58
+75.31
+Top-k LoRA Weighted
+68.75
+85.77
+90.67
+44.60
+66.76
+75.25
+SG-LoRA
+70.81
+86.83
+91.41
+46.50
+68.73
+77.19
+Figure 2: Simulation of task-agnostic evaluation on a general image-text retrieval dataset. We train models on
+MS-COCO and OxfordPets respectively, and evaluate them on the Flickr30K test set. To mimic the scenario
+where the task description is not explicitly given, we randomly sample one caption per image from Flickr30K
+and use the CLIP textual encoder to obtain embeddings for all captions, which are then averaged to construct the
+task description.
+4.8
+ABLATION STDUY
+Impact of expert repository configuration.
+In Table 3, we observed that the Cat expert from the
+MS-COCO dataset were frequently selected as semantic conditions. To further evaluate the impact
+of semantically salient experts, we assessed how the inclusion of the Cat expert from MS-COCO
+influences retrieval performance on two unseen cat classes in the OxfordPets dataset. As shown in
+Table. 6, incorporating the Cat expert into the expert repository improves performance in most cases,
+particularly for text-to-image retrieval. This highlights the effectiveness of semantically guided expert
+selection. This finding also demonstrates the flexibility of our method in constructing task-adaptive
+expert repositories—particularly when a richer pool of LoRA resources is available.
+Given that our model supports open-world expert repository construction, we further conducted a
+case study in which experts were selected from the OxfordPets and MS-COCO and Flowers102
+datasets to form a mixed-source expert repository. We also combined training data from both datasets
+9
+
+
+Preprint
+Table 5: Cross-dataset evaluation with the model trained on MS-COCO and tested on Flowers102.
+The best results are highlighted in bold, and the second-best results are underlined.
+Method
+I2T Metrics
+T2I Metrics
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Zero-shot CLIP
+22.30
+53.57
+69.41
+16.33
+46.79
+68.49
+Oracle
+26.23
+59.17
+77.55
+21.57
+57.56
+80.13
+Model Soups
+23.50
+54.84
+73.85
+17.23
+50.96
+73.48
+Top-k LoRA Merging
+24.21
+54.26
+72.83
+17.76
+50.93
+73.83
+Top-k LoRA Weighted
+23.98
+52.83
+71.91
+17.63
+50.69
+73.74
+SG-LoRA
+26.83
+56.63
+74.16
+20.52
+53.71
+76.69
+Table 6: Ablation study on expert repository strategy for cross-dataset evaluation. We assess the
+impact of the Cat expert from MS-COCO dataset on the retrieval performance in two unseen cat
+tasks from OxfordPets dataset.
+Expert
+I2T Metrics
+T2I Metrics
+strategy
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Egyptian Mau
+w/o Cat expert
+36.08
+62.89
+71.13
+15.21
+31.70
+44.07
+w Cat expert
+37.11
+63.92
+72.16
+15.21
+35.05
+46.91
+Persian
+w/o Cat expert
+44.00
+80.00
+87.00
+34.00
+62.25
+72.75
+w Cat expert
+47.00
+79.65
+86.00
+36.75
+64.25
+73.75
+to train the SG-LoRA model accordingly. Figure.3 presents a comparison between single-source
+and mixed-source expert configurations. Additionally, we present the top-4 experts selected by
+SG-LoRA under the mixed-source setup for the unseen Yorkshire Terrier category, along with their
+corresponding weights. As shown, the mixed-source experts yield slightly better performance for
+the Yorkshire Terrier category. The performance even surpasses that of the oracle LoRA model in
+text-to-image retrieval. These demonstrates the potential of our method in more realistic, real-time
+application scenarios, where expert repositories are constructed dynamically from heterogeneous
+data sources.
+Impact of the number of expert.
+We conduct ablation studies on the number of experts k used
+in semantic prior construction. As shown in Figure.4, using too few experts leads to insufficient
+knowledge for generalizing to unknown tasks, while increasing k incorporates more semantic
+information but may also introduce irrelevant context. Overall, k = 4 shows a good balance between
+expert diversity and relevance, delivering good performance on both datasets.
+5
+CONCLUSION
+In this work, we introduce a novel and challenging task setting—Zero-Shot Open-world Adaptation
+(ZSOA)—which requires models to generalize across isomorphic yet semantically diverse tasks in
+Table 7: Top-4 expert for Yorkshire Terrier category selected by semantic similarity under mixed-
+source experts configurations
+Expert Task
+Source Dataset
+Contribution
+Scottish Terrier
+OxfordPets
+0.9221
+Dog
+MS-COCO
+0.0692
+Cat
+MS-COCO
+0.0082
+American Bulldog
+OxfordPets
+0.0005
+10
+
+
+Preprint
+Figure 3: Comparison on expert repository configuration: single-source experts(OxfordPets) vs. mixed-source
+experts.
+Figure 4: Ablaton study on the number of expert.
+open-world scenarios. To tackle this, we propose a flexible and efficient approach that dynamically
+generates task-specific LoRA parameters guided by available task semantics. By identifying the
+most relevant expert knowledge based on semantic similarity and leveraging weighted combinations
+in a conditional generative framework, our SG-LoRA models the distribution of target parameters
+without the need for traditional fine-tuning. The inherent stochasticity of our generation process
+further introduces diversity, enhancing adaptability to previously unseen tasks. SG-LoRA is scalable
+and naturally privacy-preserving, making it well-suited for deployment in sensitive and dynamic
+real-world environments.
+REFERENCES
+Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel
+Lenc, Arthur Mensch, Katherine Millican, Malcolm Reynolds, et al. Flamingo: a visual language
+model for few-shot learning. Advances in neural information processing systems, 35:23716–23736,
+2022.
+Alexandra Chronopoulou, Matthew E Peters, Alexander Fraser, and Jesse Dodge. Adaptersoup:
+Weight averaging to improve generalization of pretrained language models.
+arXiv preprint
+arXiv:2302.07027, 2023.
+Hyung Won Chung, Le Hou, Shayne Longpre, Barret Zoph, Yi Tay, William Fedus, Yunxuan Li,
+Xuezhi Wang, Mostafa Dehghani, Siddhartha Brahma, et al. Scaling instruction-finetuned language
+models. Journal of Machine Learning Research, 25(70):1–53, 2024.
+Civitai. Civitai: The Home of Open-Source Generative AI. https://civitai.com/, 2024.
+Accessed: November 2024.
+Ning Ding, Yujia Qin, Guang Yang, Fuchao Wei, Zonghan Yang, Yusheng Su, Shengding Hu, Yulin
+Chen, Chi-Min Chan, Weize Chen, et al. Parameter-efficient fine-tuning of large-scale pre-trained
+language models. Nature machine intelligence, 5(3):220–235, 2023.
+David Ha, Andrew Dai, and Quoc V Le. Hypernetworks. arXiv preprint arXiv:1609.09106, 2016.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in
+neural information processing systems, 33:6840–6851, 2020.
+11
+
+
+Preprint
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR, 1(2):3, 2022.
+Wei Hu, QiHao Zhao, Yangyu Huang, and Fan Zhang. P-diff: Learning classifier with noisy labels
+based on probability difference distributions. In 2020 25th International Conference on Pattern
+Recognition (ICPR), pp. 1882–1889. IEEE, 2021.
+Chengsong Huang, Qian Liu, Bill Yuchen Lin, Tianyu Pang, Chao Du, and Min Lin. Lorahub:
+Efficient cross-task generalization via dynamic lora composition. arXiv preprint arXiv:2307.13269,
+2023.
+HuggingFace. Hugging Face – The AI community building the future. https://huggingface.
+co/, 2024. Accessed: November 2024.
+Gabriel Ilharco, Mitchell Wortsman, Samir Yitzhak Gadre, Shuran Song, Hannaneh Hajishirzi, Simon
+Kornblith, Ali Farhadi, and Ludwig Schmidt. Patching open-vocabulary models by interpolating
+weights. Advances in Neural Information Processing Systems, 35:29262–29277, 2022.
+Dong-Hwan Jang, Sangdoo Yun, and Dongyoon Han. Model stock: All we need is just a few
+fine-tuned models. In European Conference on Computer Vision, pp. 207–223. Springer, 2024.
+Xiaolong Jin, Kai Wang, Dongwen Tang, Wangbo Zhao, Yukun Zhou, Junshu Tang, and Yang You.
+Conditional lora parameter generation. arXiv preprint arXiv:2408.01415, 2024.
+Diederik P Kingma and Max Welling.
+Auto-encoding variational bayes.
+arXiv preprint
+arXiv:1312.6114, 2013.
+Boris Knyazev, Michal Drozdzal, Graham W Taylor, and Adriana Romero Soriano. Parameter
+prediction for unseen deep architectures. Advances in Neural Information Processing Systems, 34:
+29433–29448, 2021.
+Boris Knyazev, Doha Hwang, and Simon Lacoste-Julien. Can we scale transformers to predict
+parameters of diverse imagenet models? In International Conference on Machine Learning, pp.
+17243–17259. PMLR, 2023.
+Brenden M Lake, Tomer D Ullman, Joshua B Tenenbaum, and Samuel J Gershman. Building
+machines that learn and think like people. Behavioral and brain sciences, 40:e253, 2017.
+Junnan Li, Dongxu Li, Caiming Xiong, and Steven Hoi. Blip: Bootstrapping language-image pre-
+training for unified vision-language understanding and generation. In International conference on
+machine learning, pp. 12888–12900. PMLR, 2022.
+Weishi Li, Yong Peng, Miao Zhang, Liang Ding, Han Hu, and Li Shen. Deep model fusion: A survey.
+arXiv preprint arXiv:2309.15698, 2023.
+Tsung-Yi Lin, Michael Maire, Serge Belongie, James Hays, Pietro Perona, Deva Ramanan, Piotr
+Dollár, and C Lawrence Zitnick. Microsoft coco: Common objects in context. In Computer vision–
+ECCV 2014: 13th European conference, zurich, Switzerland, September 6-12, 2014, proceedings,
+part v 13, pp. 740–755. Springer, 2014.
+Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. Visual instruction tuning. Advances in
+neural information processing systems, 36:34892–34916, 2023.
+Elvis Nava, Seijin Kobayashi, Yifei Yin, Robert K Katzschmann, and Benjamin F Grewe. Meta-
+learning via classifier (-free) diffusion guidance. arXiv preprint arXiv:2210.08942, 2022.
+Maria-Elena Nilsback and Andrew Zisserman. Automated flower classification over a large number
+of classes. In 2008 Sixth Indian Conference on Computer Vision, Graphics & Image Processing,
+pp. 722–729. IEEE, 2008.
+Omkar M Parkhi, Andrea Vedaldi, Andrew Zisserman, and CV Jawahar. Cats and dogs. In 2012
+IEEE conference on computer vision and pattern recognition, pp. 3498–3505. IEEE, 2012.
+12
+
+
+Preprint
+William Peebles, Ilija Radosavovic, Tim Brooks, Alexei A Efros, and Jitendra Malik. Learning to
+learn with generative models of neural network checkpoints. arXiv preprint arXiv:2209.12892,
+2022.
+Bryan A Plummer, Liwei Wang, Chris M Cervantes, Juan C Caicedo, Julia Hockenmaier, and
+Svetlana Lazebnik. Flickr30k entities: Collecting region-to-phrase correspondences for richer
+image-to-sentence models. In Proceedings of the IEEE international conference on computer
+vision, pp. 2641–2649, 2015.
+Reza Qorbani, Gianluca Villani, Theodoros Panagiotakopoulos, Marc Botet Colomer, Linus
+Härenstam-Nielsen, Mattia Segu, Pier Luigi Dovesi, Jussi Karlgren, Daniel Cremers, Federico
+Tombari, et al. Semantic library adaptation: Lora retrieval and fusion for open-vocabulary semantic
+segmentation. In Proceedings of the Computer Vision and Pattern Recognition Conference, pp.
+9804–9815, 2025.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-
+resolution image synthesis with latent diffusion models. In Proceedings of the IEEE/CVF confer-
+ence on computer vision and pattern recognition, pp. 10684–10695, 2022.
+Yihua Shao, Minxi Yan, Yang Liu, Siyu Chen, Wenjie Chen, Xinwei Long, Ziyang Yan, Lei Li,
+Chenyu Zhang, Nicu Sebe, et al. In-context meta lora generation. arXiv preprint arXiv:2501.17635,
+2025.
+Donald Shenaj, Ondrej Bohdal, Mete Ozay, Pietro Zanuttigh, and Umberto Michieli. Lora. rar:
+Learning to merge loras via hypernetworks for subject-style conditioned image generation. arXiv
+preprint arXiv:2412.05148, 2024.
+Kihyuk Sohn, Honglak Lee, and Xinchen Yan. Learning structured output representation using deep
+conditional generative models. Advances in neural information processing systems, 28, 2015.
+Bedionita Soro, Bruno Andreis, Hayeon Lee, Wonyong Jeong, Song Chong, Frank Hutter, and Sung Ju
+Hwang. Diffusion-based neural network weights generation. arXiv preprint arXiv:2402.18153,
+2024.
+Yi-Lin Sung, Jaemin Cho, and Mohit Bansal. Vl-adapter: Parameter-efficient transfer learning for
+vision-and-language tasks. In Proceedings of the IEEE/CVF conference on computer vision and
+pattern recognition, pp. 5227–5237, 2022.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+Peng Wang, Shuai Bai, Sinan Tan, Shijie Wang, Zhihao Fan, Jinze Bai, Keqin Chen, Xuejing Liu,
+Jialin Wang, Wenbin Ge, et al. Qwen2-vl: Enhancing vision-language model’s perception of the
+world at any resolution. arXiv preprint arXiv:2409.12191, 2024.
+Mitchell Wortsman, Gabriel Ilharco, Samir Ya Gadre, Rebecca Roelofs, Raphael Gontijo-Lopes,
+Ari S Morcos, Hongseok Namkoong, Ali Farhadi, Yair Carmon, Simon Kornblith, et al. Model
+soups: averaging weights of multiple fine-tuned models improves accuracy without increasing
+inference time. In International conference on machine learning, pp. 23965–23998. PMLR, 2022a.
+Mitchell Wortsman, Gabriel Ilharco, Jong Wook Kim, Mike Li, Simon Kornblith, Rebecca Roelofs,
+Raphael Gontijo Lopes, Hannaneh Hajishirzi, Ali Farhadi, Hongseok Namkoong, et al. Robust
+fine-tuning of zero-shot models. In Proceedings of the IEEE/CVF conference on computer vision
+and pattern recognition, pp. 7959–7971, 2022b.
+Baoquan Zhang, Chuyao Luo, Demin Yu, Xutao Li, Huiwei Lin, Yunming Ye, and Bowen Zhang.
+Metadiff: Meta-learning with conditional diffusion for few-shot learning. In Proceedings of the
+AAAI conference on artificial intelligence, volume 38, pp. 16687–16695, 2024.
+Jinghan Zhang, Junteng Liu, Junxian He, et al.
+Composing parameter-efficient modules with
+arithmetic operation. Advances in Neural Information Processing Systems, 36:12589–12610,
+2023a.
+13
+
+
+Preprint
+Qingru Zhang, Minshuo Chen, Alexander Bukharin, Nikos Karampatziakis, Pengcheng He, Yu Cheng,
+Weizhu Chen, and Tuo Zhao. Adalora: Adaptive budget allocation for parameter-efficient fine-
+tuning. arXiv preprint arXiv:2303.10512, 2023b.
+Renrui Zhang, Jiaming Han, Chris Liu, Peng Gao, Aojun Zhou, Xiangfei Hu, Shilin Yan, Pan Lu,
+Hongsheng Li, and Yu Qiao. Llama-adapter: Efficient fine-tuning of language models with zero-init
+attention. arXiv preprint arXiv:2303.16199, 2023c.
+Ziyu Zhao, Tao Shen, Didi Zhu, Zexi Li, Jing Su, Xuwu Wang, Kun Kuang, and Fei Wu. Merging
+loras like playing lego: Pushing the modularity of lora to extremes through rank-wise clustering.
+arXiv preprint arXiv:2409.16167, 2024.
+Andrey Zhmoginov, Mark Sandler, and Maksym Vladymyrov. Hypertransformer: Model generation
+for supervised and semi-supervised few-shot learning. In International Conference on Machine
+Learning, pp. 27075–27098. PMLR, 2022.
+Xiandong Zou, Mingzhu Shen, Christos-Savvas Bouganis, and Yiren Zhao. Cached multi-lora
+composition for multi-concept image generation. arXiv preprint arXiv:2502.04923, 2025.
+14
+
+
+Preprint
+A
+APPENDIX
+A.1
+EXPERIMENTAL DETAILS
+In this work, we generate fine-grained captions for the image-text retrieval task using Qwen2-VL. As
+illustrated in Figure.5, our in-context learning approach provides the Multimodal Large Language
+Model (MLLM) with a small number of demonstration examples, enabling it to generate detailed and
+accurate captions for target images. Using this method, we have produced diverse and highly relevant
+captions for the entire OxfordPets dataset and the Flowers102 dataset, a subset of the MS-COCO
+dataset. These fine-grained descriptions serve as a valuable resource for downstream tasks such as
+fine-grained image-text retrieval and facilitate further research in ZSOA.
+[Instruction]
+You are an image description assistant. Please analyze the given image carefully and provide a detailed
+description of its contents.
+[Demonstration 1]
+Image: <image_path1>
+Input: A photo of pug.
+Output: The pug has a fawn coat, black mask, and wrinkled face with a short-muzzled expression. It wears a green
+collar with a tag, sits on a rock, and has a solemn gaze.
+[Demonstration 2]
+Image: <image_path2>
+Input: A photo of birman.
+Output: The Birman cat has a sleek cream and brown coat, striking blue eyes, and a dark brown nose. It wears a
+blue collar and is perched on a scratching post.
+[Target Query]
+Image: <image_path>
+Input: A photo of {class name}.
+Output: fine-grained caption for the target image
+Figure 5: Examples of caption generation using Qwen2-VL.
+Generated caption: The image shows an Air France
+Airbus A380 in mid-flight, captured from a side angle.
+The plane is flying through a cloudy sky, with the tail
+and engines visible. The fuselage is predominantly white,
+and the airline's logo and colors are clearly displayed.
+Original caption: A big airplane flying in the big blue sky.
+Generated caption : A person is doing a trick on a
+skateboard in the air above a cement ramp in a skate
+park.
+Original caption : A kid doing a kickflip over a ramp.
+Generated caption 1: The image features a Yorkie dog with long,
+curly hair, black fur on its back, and a light brown face. The dog
+is lying down in a field of tall green grass, with its mouth open,
+tongue out, and a pink ball nearby.
+Generated caption 2: A small dog is sitting in a grassy area with
+a red ball next to it. The dog has a long, wavy coat and is
+wearing a collar with a tag. The surroundings include grass and
+flowers.
+Generated caption 1: The Maine Coon cat has a long coat,
+striking yellow eyes, and a fluffy tail. It is perched on a
+scratching post, with its paws hanging over the edge.
+Generated caption 2: The cat has a brown coat with white and
+black markings, and it is perched on a scratching post.
+Generated caption 1: The image is of a single morning
+glory flower, which is blue in color and has the center is
+yellow. The flower is surrounded by green leaves.
+Generated caption 2: The is a blue morning glory with a
+yellow center. The petals are thin and slightly curled.
+The plant is surrounded by green leaves.
+Generated caption 1: The image shows a cluster of pink
+azalea flowers buds in various stages of bloom, with some
+fully open and others still tightly closed. The background
+features green leaves and additional flowers.
+.
+Generated caption 2: The is a photo of pink azalea with
+some water drops on the petals. The background is blurry
+and the azalea is in the center
+Figure 6: Illustration of generated captions: results on the MS-COCO (top), OxfordPets (middle), and
+Flowers102 (bottom) datasets.
+As shown in Figure.6, we present examples of image-caption pairs from three datasets. Compared to
+the original captions in the COCO dataset (labeled as Original Caption in the top), our generated
+captions more accurately reflect the content of the corresponding images.
+A.2
+ADDITIONAL RESULTS ON CLASSIFICATION TASK
+In addition to the image-text retrieval task, we also explored the performance of SG-LoRA on
+classification tasks. Specifically, we selected 20 superclasses from CIFAR-100 as 20 distinct tasks,
+15
+
+
+Preprint
+with each task corresponding to a 5-class classification. We selected 8 of these tasks as expert LoRAs
+and performed inference on 6 unseen tasks, with the results presented in Table.8. We observed that,
+compared to Zero-shot CLIP, both Model Soups and the selection of expert parameters to construct
+LoRA improved classification performance on unseen tasks. Furthermore, SG-LoRA achieved best
+performance, indicating that our method is also applicable to classification tasks. However, we
+found that SG-LoRA still has a significant performance gap compared to fine-tuning LoRA directly
+on unseen tasks using training data. We hypothesize that this is because, for classification tasks,
+the independence (or orthogonality, where decision boundaries between tasks may be orthogonal)
+between tasks is much more pronounced. In contrast, for image-text retrieval tasks, which operate
+at a finer granularity, there exist stronger inter-task correlations—this inherent property facilitates
+feasible LoRA parameter transfer. As shown in Figure.8, we visualized the average LoRA parameters
+for the 20 tasks and found that, although semantically similar tasks are closer in parameter space,
+their distances remain relatively sparse compared to image-text retrieval tasks in Figure.7.We plan to
+conduct further exploration on this issue in the future.
+Additionally, we conducted an ablation study on textual description for the classification task,
+as shown in Table.9. It can be observed that, for the current task setting, more detailed textual
+descriptions, which account for the specific categories within each task, can better capture the
+semantic relationships between tasks, thus leading to improved performance.
+Table 8: Model Performance of image classification on CIFAR-100 superclass.
+Method
+Accuracy
+Zero-shot CLIP
+72.30
+Oracle
+91.43
+Model Soups
+75.63
+Top-k LoRA Merging
+72.60
+Top-k LoRA Weighted
+72.70
+SG-LoRA
+77.50
+Table 9: Ablation study of textual description on CIFAR-100 superclass Classification
+Description
+Accuracy (%)
+A photo of a <superclass name>
+75.77
+This is a classification task for recognizing <superclass name>,
+which includes class_1, ..., class_5
+77.50
+A.3
+MORE ABLATIONS AND ANALYSIS
+Table 10: Ablation study on modalities of semantic prior condition
+Condition
+Metrics
+Dataset
+I2T R@1
+T2I R@1
+Visual
+73.16
+52.70
+MS-COCO
+Textual
+74.31
+54.42
+Visual
+86.30
+70.12
+Flickr30K
+Textual
+86.90
+70.66
+Condition
+Metrics
+Dataset
+Accuracy
+Visual
+73.83
+CIFAR-100
+Textual
+77.50
+16
+
+
+Preprint
+Ablation on modalities of semantic prior condition.
+The construction of semantic priors serves as
+the foundation for our SG-LoRA. In Table.10, we compare the performance results of prior conditions
+across different modalities. The visual condition is obtained by averaging the visual embeddings of
+training set images within each task dataset using a frozen CLIP visual encoder. Experimental results
+show that the textual condition better captures the semantic relationships between tasks. This could
+be attributed to two factors. Firstly, the high degree of condensation in textual semantics might play a
+role. Secondly, the disparities between training and test set images (or the presence of noisy images)
+within a task could result in inaccuracies in the visual prior condition.
+Impact of expert repository configuration.
+Consistent with Table 6, we further evaluated the
+impact of incorporating the Dog expert from the MS-COCO dataset on retrieval performance for two
+unseen dog tasks in the OxfordPets dataset. As demonstrated in Table 11, including the Dog expert in
+the expert repository consistently improves the performance.
+Visulization of LoRA parameters.
+To further investigate the parameter diversity of SG-LoRA, we
+conducted evaluations on the unseen ’Zebra’ task from the MS-COCO dataset at different training
+stages and visualized the generated LoRAs using t-SNE. As shown in Figure 9, we observe that the
+distribution of LoRAs generated by SG-LoRA gradually aligns with that of Oracle LoRAs (directly
+trained in image-caption pairs), while still preserving diversity rather than extensively overlapping
+with the Oracle. This indicate that, by injected stochasticity, our method effectively explores the
+high-performance LoRAs in the parameter space.
+Figure 7: t-SNE visualization of the averaged LoRA parameters on MS-COCO dataset for image-text retrieval
+task. Triangular markers indicate expert LoRAs. Semantically similar LoRA parameters tend to cluster closely
+together.
+17
+
+
+Preprint
+Figure 8: t-SNE visualization of the averaged LoRA parameters on CIFAR-100 for classification task. Triangular
+markers indicate expert LoRAs. Although semantically similar LoRA parameters tend to cluster closely together,
+the distribution appears sparser compared to the MS-COCO dataset due to stronger task independence.
+Additionally, by comparing the bottom subfigure, we can see that compared to Model Soup, which
+treats all experts equally, both Tok-k LoRA Merging and Tok-k LoRA Weighted leverage semantic
+guidance to customize LoRA parameters better suired for the current unseen task. Thus, in parameter
+space, they lie closer to the mean value of the Oracle LoRA.
+Table 11: Ablation study on expert repository strategy for cross-dataset evaluation. We assess the
+impact of the Dog expert from MS-COCO dataset on the retrieval performance in two unseen dog
+tasks from OxfordPets dataset.
+Expert
+I2T Metrics
+T2I Metrics
+strategy
+R@1
+R@5
+R@10
+R@1
+R@5
+R@10
+Pug
+w/o Dog expert
+45.00
+66.00
+78.00
+32.00
+51.00
+61.25
+w Dog expert
+46.00
+67.00
+78.00
+32.00
+51.75
+62.75
+Chihuahua
+w/o Dog expert
+64.00
+89.00
+93.00
+52.50
+81.00
+88.25
+w Dog expert
+66.00
+90.00
+95.00
+55.25
+81.25
+89.75
+18
+
+
+Preprint
+Figure 9: t-SNE visualization of LoRA parameters using different comparative methods, tested on the unseen
+’Zebra’ category at different training stages. For SG-LoRA and Oracle LoRA, we randomly sampled 50 samples
+each. The subfigures from top to bottom represent increasing CVAE training epochs.
+19

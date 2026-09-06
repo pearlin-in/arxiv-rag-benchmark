@@ -1,0 +1,1008 @@
+arXiv:2505.07411v2  [cs.LG]  15 Jun 2025
+ICE-Pruning: An Iterative Cost-Efficient Pruning
+Pipeline for Deep Neural Networks
+Wenhao Hu, Paul Henderson, Jos´e Cano
+School of Computing Science, University of Glasgow, Scotland, UK
+Abstract—Pruning is a widely used method for compressing
+Deep Neural Networks (DNNs), where less relevant parameters
+are removed from a DNN model to reduce its size. However,
+removing parameters reduces model accuracy, so pruning is
+typically combined with fine-tuning, and sometimes other op-
+erations such as rewinding weights, to recover accuracy. A
+common approach is to repeatedly prune and then fine-tune,
+with increasing amounts of model parameters being removed in
+each step. While straightforward to implement, pruning pipelines
+that follow this approach are computationally expensive due to
+the need for repeated fine-tuning.
+In this paper we propose ICE-Pruning, an iterative pruning
+pipeline for DNNs that significantly decreases the time required
+for pruning by reducing the overall cost of fine-tuning, while
+maintaining a similar accuracy to existing pruning pipelines.
+ICE-Pruning is based on three main components: i) an automatic
+mechanism to determine after which pruning steps fine-tuning
+should be performed; ii) a freezing strategy for faster fine-tuning
+in each pruning step; and iii) a custom pruning-aware learning
+rate scheduler to further improve the accuracy of each pruning
+step and reduce the overall time consumption. We also propose an
+efficient auto-tuning stage for the hyperparameters (e.g., freezing
+percentage) introduced by the three components. We evaluate
+ICE-Pruning on several DNN models and datasets, showing that
+it can accelerate pruning by up to 9.61×. Code is available at
+https://github.com/gicLAB/ICE-Pruning
+Index Terms—Artificial Intelligence, Deep Neural Networks,
+Pruning, Hyperparameter Search.
+I. INTRODUCTION
+Pruning is a widely used method for compressing Deep
+Neural Network (DNN) models, reducing their size and mak-
+ing them more suitable for deployment in resource-constrained
+edge devices such as mobile phones, drones, etc [1], [2]. It
+typically involves removing less important parameters from a
+pre-trained DNN model, followed by fine-tuning the remaining
+parameters on the training dataset to compensate for any
+potential loss in accuracy [3]–[5]. The pruning process of a
+DNN is often formulated as a pruning-fine-tuning pipeline,
+where inputs are a pre-trained DNN model, a dataset, and a
+pruning ratio; and the output is a pruned model that ideally
+achieves similar accuracy to the original model.
+One popular design for the pruning-fine-tuning pipeline is
+iterative pruning-fine-tuning. Here the DNN model is repeat-
+edly pruned, with fine-tuning performed after each pruning
+step; this process continues until a target compression ratio
+is reached [3], [4], [6]. However, the repeated fine-tuning
+operations in such pipelines are prohibitively time-consuming
+when the dataset and/or DNN model are large. More sophis-
+ticated methods adapt this basic pipeline in different ways.
+For example, AAP [7] sometimes rewinds the weights of
+the pruned model to an earlier state and resumes pruning
+from there. Unfortunately, this further increases the time
+consumption of the pruning process.
+To address the slowness of existing iterative pruning
+pipelines, we propose ICE-Pruning, a novel and automatically
+configured Iterative Cost-Efficient pruning pipeline that sig-
+nificantly reduces the pruning time while providing similar
+accuracy to existing pipelines, especially for high-redundancy
+DNN models. ICE-Pruning is based on the idea that, due to
+the high parameter redundancy present in most DNN models,
+not all the pruning steps need to be followed by fine-tuning
+to recover accuracy, so that fine-tuning can be completely
+avoided for some pruning steps.
+To implement this idea, ICE-Pruning makes three key
+changes to the standard pruning-fine-tuning pipeline. First,
+instead of fine-tuning the full DNN model after every pruning
+step, ICE-Pruning measures the accuracy drop immediately
+after a pruning step; it then skips fine-tuning if the accuracy
+drop is less than a certain threshold. Second, we introduce a
+novel layer freezing strategy to reduce fine-tuning overheads in
+each pruning step; this automatically determines which layers
+have minimal effect during fine-tuning, and can therefore
+keep their retained weights fixed during fine-tuning. Third,
+we introduce a custom pruning-aware learning rate scheduler
+that dynamically adjusts the learning rate based on the current
+pruning level; this improves the accuracy after each fine-
+tuning stage and thus reduces the number of times fine-
+tuning is triggered overall. Since these three changes introduce
+new hyperparameters, we also design an efficient auto-tuning
+stage with a custom objective function that simultaneously
+minimizes the accuracy loss and the time consumption, thus
+avoiding the need for manual tuning.
+Note that ICE-Pruning does not introduce any new pruning
+criteria. Instead, it supports widely-used existing criteria (e.g.,
+L1 norm [6], random, entropy-based [4] and mean activa-
+tion [8] filter pruning), thus providing a plug-and-play solution
+to improve pruning time on existing pipelines.
+The contributions of the paper include the following:
+• ICE-Pruning, a novel pipeline for accelerating DNN
+pruning that is based on three key components: i) a mech-
+anism to determine when fine-tuning should be performed
+based on an accuracy drop threshold; ii) a novel layer
+freezing strategy to reduce fine-tuning overheads in each
+pruning step; iii) a pruning-aware learning rate scheduler
+
+
+to further improve the accuracy of each pruning step and
+reduce the possibility of triggering fine-tuning.
+• An efficient auto-tuning stage to avoid the need to man-
+ually tune pruning hyperparameters.
+• An evaluation of ICE-Pruning with different pruning
+criteria, demonstrating that it works with all of them and
+also identifying the criterion that yields the best results.
+• An ablation study to show how the different components
+of the ICE-Pruning pipeline impact both accuracy and
+overall pruning time.
+• A comparison of ICE-Pruning against i) a baseline iter-
+ative pruning pipeline and ii) the state-of-the-art method
+AAP, using three different combinations of DNN model
+and dataset. Overall our results demonstrate that ICE-
+Pruning can accelerate pruning by up to 9.61× while
+maintaining similar (and sometimes better) final accuracy
+than existing solutions.
+The rest of the paper is organized as follows: In Section II,
+we provide the required background and discuss related works;
+Section III shows the detailed design of ICE-Pruning; in
+Section IV, we evaluate ICE-Pruning and provide an ablation
+study of its components and a comparison with the state-
+of-the-art; finally, Section V provides some conclusions and
+briefly discusses potential future work.
+II. BACKGROUND AND RELATED WORK
+A. Deep Neural Network pruning
+DNN pruning methods can be characterized with four key
+dimensions [9]: Structure, Scoring, Scheduling, and Fine-
+tuning.
+• Structure refers to the level of granularity of pruning,
+and is generally divided into two classes: unstructured
+and structured. In unstructured pruning individual weights
+are removed, whereas structured pruning removes groups
+of parameters such as whole filters/channels or atten-
+tion heads. With the increasing attention on pruning re-
+search [10], several approaches have been developed [9],
+[11]. Our ICE-Pruning pipeline focuses on structured
+pruning.
+• Scoring refers to which parameters to prune. For example,
+a popular approach is to use the L1 norm [6], where
+we prune parameters with absolute values closer to zero.
+The L2 norm is an alternative solution to determine
+which structures should be pruned [12]. The similarity
+of the structures within the same layers can also be used
+to make the pruning decisions [13]. For Transformers,
+previous research [14] shows that attention heads can also
+be pruned guided by the Taylor Expansion [15] of the
+difference between before and after pruning the heads.
+ICE-Pruning supports various scoring approaches such as
+L1 norm.
+• Scheduling refers to how much we prune in each step. For
+example, we might perform all the pruning in a single
+step, one-shot pruning [6]; or gradually increase the
+amount of pruning in iterative steps, iterative pruning [3].
+ICE-Pruning is based on the iterative pruning.
+• Finally, fine-tuning refers to how we recover lost accuracy
+by training the model for a small number of epochs. The
+typical method is to use the training dataset to do the
+training [3], and ICE-Pruning does this.
+B. Fine-tuning
+As compared to one-shot pruning, iterative pruning can
+yield better accuracy if we fine-tune after every pruning
+step [6]. However, the larger the DNN model is, the more
+expensive fine-tuning becomes. Therefore, many methods only
+fine-tune for 1 or 2 epochs with some accuracy penalty,
+sometimes training more epochs for the final pruning step [3]–
+[5]. Note that even with a low number of epochs, the fine-
+tuning process can still be prohibitively time-consuming due
+to the large dataset sizes, the model sizes or the limited
+computing capacity available.
+To avoid the high cost of fine-tuning, ICE-Pick [16] tries
+to reduce the overall time consumption while other solutions
+entirely eliminate fine-tuning from the pruning process. For
+example, NFP [17] compensates the pruned layers with their
+Batch Normalization beta factors instead of fine-tuning the
+model. Roy et al. [18] proposes moving pruning to training
+to avoid fine-tuning during pruning. However, such solutions
+require specialized training operations (e.g., NFP uses a cus-
+tomized loss function), which has limited applicability to prac-
+tical DNN model deployment where users already have a pre-
+trained model (common in modern artificial intelligence tasks
+such as natural language processing and computer vision).
+It is important to note that fine-tuning is not exclusive
+to pruning. In transfer learning [19], fine-tuning is used
+to adapt models to domains with limited data. Similar to
+pruning, fine-tuning in transfer learning can also be very time-
+consuming [20]. To address this problem, some methods use
+layer freezing to accelerate the fine-tuning process [19]–[22],
+where the parameters of some layers of the model are ‘frozen’
+such that they cannot be changed during fine-tuning. We also
+apply this idea to model pruning, due to the similar role of fine-
+tuning in both tasks. Note also that in both tasks, fine-tuning
+tries to adapt the models into new states; for transfer learning,
+fine-tuning adapts the models to new datasets; for pruning,
+fine-tuning adapts the models to new sparsity structures.
+C. Automatic pruning pipeline
+Some pruning pipelines such as AAP [7] aim to automati-
+cally prune DNN models [7], but do not focus on efficiency.
+AAP is based on LTH [23], which shows a model that includes
+sub-models that are easier to train. As a result, AAP tries to
+find the best state (the ideal sub-model for training) of the
+DNN models to prune and fine-tune. To do that, AAP rewinds
+the weights of the pruned model to previous states if the
+current state cannot satisfy, for example, the target accuracy.
+This makes the running time even longer. Also, for models that
+have high parameter redundancies, rewinding to the previous
+state is not necessarily better than direct fine-tuning on the
+current state, as the high number of remaining parameters can
+still have enough expressivity [24].
+
+
+(a) Overview
+(b) Fine-Tuning Cases
+Fig. 1: ICE-Pruning pipeline: (a) Using subsampled datasets, we automatically search for the best hyperparameters by running
+the whole pruning pipeline with the current hyperparameters (Stage 1). Then, we re-run the pruning pipeline with the full
+dataset and the best hyperparameters found (Stage 2). In each step, we prune the model (note that the dotted lines are the edges
+of the pruned parts) and then we move to the next pruning step or fine-tune the model by applying the freezing strategy; (b)
+Fine-tuning has four cases depending on the accuracy loss and pruned model width. The learning rate is adjusted dynamically,
+and fine-tuning for a given step is halted if the accuracy loss is lower than the threshold.
+III. ICE-PRUNING
+A. Overview
+The main idea behind ICE-Pruning is that instead of fine-
+tuning a full DNN model in every pruning step, we freeze less
+sensitive layers and skip fine-tuning when the accuracy loss is
+lower than a user-defined threshold. Figure 1 gives an overview
+of our ICE-Pruning pipeline, with Algorithm 1 describing the
+steps in more detail.
+As we can see in Figure 1a, ICE-Pruning has two main
+stages. In Stage 1, we automatically search for the best
+hyperparameters using subsampled datasets. Using the current
+candidate hyperparameters, we iteratively prune the DNN
+model. After applying each pruning step, we move to the next
+pruning step or fine-tune the non-frozen layers of the model
+by applying the freezing strategy. If fine-tuning happens, we
+adjust the learning rate dynamically. In Stage 2, we redo the
+iterative pruning of the previous stage but using the full dataset
+and applying the best hyperparameters found. During both
+stages of fine-tuning (Figure 1b), cases 1 , 2 , and 3 show
+how we gradually reduce the learning rate as the level of
+pruning increases. In case 4 we stop fine-tuning when the
+accuracy loss is below a threshold.
+In Algorithm 1, Stage 1 (lines 4-12) iterates the candi-
+date hyperparameters and selects the ones that minimize the
+errors (line 9), which involves both accuracy loss and time
+consumption during the pruning-fine-tuning (PFT) operations.
+This process (lines 6-12) corresponds to Equation 2. Then in
+Stage 2 (line 14), the pruning-fine-tuning is applied again but
+with the best hyperparameters found. Note that PFT is defined
+in Algorithm 2, where the model is first frozen (line 5) by our
+novel freezing strategy (discussed in Section III-B). Then, for
+each pruning step, the algorithm measures the accuracy drop
+value (line 8). If the value is larger or equal than the pre-
+defined threshold (line 8), it fine-tunes the model by adjusting
+the learning rate (lines 9-11). The details of lines 6-11 will be
+discussed in Section III-C. The following subsections discuss
+the key design aspects of the algorithm and further motivate
+our design choices.
+B. Layer Freezing
+We adopt layer freezing, a class of techniques commonly
+used in transfer learning [19]–[21]. This is motivated by the
+fact that some DNN layers (typically initial layers in the
+model) see smaller weight shifts than others during fine-tuning,
+and the ranks of the weight shifts are generally maintained
+(we provide evidence of this in Section IV-B). Therefore, we
+can skip training these layers and reduce the fine-tuning time.
+Also, since the ranks of the shifts are generally maintained,
+we can get information of which layers are less sensitive to
+pruning from a single pruning step. Based on those insights,
+we design the following freezing strategy: We run a pruning
+step followed by fine-tuning while tracking the weight changes
+of different layers. After fine-tuning, and based on the input
+
+
+Algorithm 1 ICE-Pruning Pipeline
+1: Input:
+(1) Pruning-Fine-Tuning operator PFT(...),
+(2) Pruning steps σ,
+(3) Model M,
+(4) Hyperparameters Search Space Λ,
+(5) Accuracy testing operator Test(., .),
+(6) DataSet D,
+(7) DataSet sampler Sp(.),
+(8) Layer-wise Pruning operator P(.),
+2: Output: Pruned Model M∗
+3: Stage 1: Auto-Tuning the Hyperparameters
+4: accorig ←Test(M, Sp(D))
+5: ebest ←MAX VALUE
+6: for λ ∈Λ do
+7:
+time, acc ←PFT(σ, M, λ, Sp(D), P)
+8:
+∆A ←accorig −acc
+▷eq. 3
+9:
+e ←
+time+∆A
+max(time,∆A)
+10:
+if e < ebest then
+11:
+λbest ←λ
+12:
+ebest ←e
+13: Stage 2: Apply the Searched Hyperparameters
+14: M∗←PFT(σ, M, λbest, D, P);
+15: return M∗
+freezing percentage (i.e., the proportion of frozen layers), the
+layers with smaller weight changes are frozen. To eliminate
+the impact of weight magnitudes and have fair comparisons,
+weight changes of each layer are normalized by the norm of
+the layer weights. This is a novel freezing strategy in our work,
+and we conduct an ablation study to show the effectiveness
+of this component in Section IV-D. In Figure 1, we use a
+snowflake to represent the layer freezing.
+C. Pruning and Fine-tuning
+The main goal of ICE-Pruning is to iteratively prune DNN
+models but to trigger fine-tuning as few times as possible, thus
+reducing the overall pruning time. Lines 7-11 of Algorithm 2
+show a pruning and fine-tuning step. For each layer in the
+model, including the frozen ones, we apply structured pruning
+and then we evaluate the model on the test dataset. If we
+observe an accuracy drop higher than or equal to our threshold
+(line 8 of Algorithm 2), then we trigger fine-tuning; otherwise,
+we skip it. This accuracy threshold is searched automatically or
+set manually, with its value varying depending on the learning
+task and the application’s tolerance to accuracy loss.
+Note that, since our method acts as a meta-algorithm that
+wraps existing pruning criteria, we do not design a new
+pruning criterion. However, to select the pruning criterion that
+works best with ICE-Pruning, we compare four popular criteria
+in Section IV-C.
+If we trigger fine-tuning, we want to minimize the training
+time while converging to a higher accuracy more quickly.
+Dynamic learning rates are widely used to adapt to changing
+learning conditions [25], [26]. It has been shown that narrower
+Algorithm 2 Pruning-Fine-Tuning Operator (PFT)
+1: Input:
+(1) Layer-wise Pruning operator P(.),
+(2) Pruning steps σ,
+(3) Freezing operator Freeze(.),
+(4) Accuracy testing operator Test(., .),
+(5) Parameter calculating operator Pr(.),
+(6) Fine-tuning operator FT(., .),
+(7) Model M,
+(8) Dataset D,
+(9) Original accuracy accorig,
+(10) Searched Hyperparameters λ
+(10.1) Accuracy drop threshold θ,
+(10.2) Frozen layers percentage η,
+(10.3) Initial learning rate (LR) LRbase,
+(10.4) Maximum LR change ∆,
+(10.5) Pruning level p that ∆midpoint is reached,
+(10.6) The shape control β
+2: Output: Pruned Model M∗
+3: Morig ←M
+4: accorig ←Test(M, D)
+5: Mfrozen ←Freeze(M, η)
+6: for step ∈{1 . . . σ} do
+7:
+Mfrozen ←P(Mfrozen, step)
+8:
+if accorig −Test(Mfrozen, D) ⩾θ then
+9:
+α ←Pr(Mfrozen)
+Pr(Morig)
+10:
+LRmax ←LRbase −
+∆
+1+(
+α
+2×(1−p)−α))
+β
+▷eq. 1
+11:
+FT(Mfrozen, LRmax, D)
+12: M∗←Mfrozen
+13: return M∗
+models (i.e., smaller average width, where we define ‘width’
+as the number of non-pruned structures in a given layer) have a
+narrower loss landscape [27], and thus can benefit from lower
+maximum learning rates. When we prune, we similarly shrink
+the loss landscape. That means that we benefit from controlling
+the upper bound of whatever learning rate scheduler is being
+used for fine-tuning, to match the current loss landscape.
+Therefore, inspired by S-Cyc [28], we design a pruning-aware
+scheduler to choose the maximum learning rate, based on the
+current level of pruning, measured according to the average
+width. Our maximum learning rate is defined by:
+LRmax = LRbase −
+∆
+1 +
+
+α
+2×(1−p)−α)
+β
+(1)
+where LRmax is the upper bound of the existing scheduler
+used for fine-tuning (e.g., cosine decay or constant), and α is
+the proportion of unpruned parameters. The hyperparameters
+are: LRbase, the maximum learning rate to be used for the
+unpruned model; ∆, the maximum change in the learning rate
+during pruning, with range (0, LRbase); p, the level of pruning
+where the midpoint of ∆is reached, with range (0, 50%]; and
+β, which controls the shape of the curve, with range (0, +∞).
+
+
+By tuning these hyperparameters, we can flexibly formulate
+different types of decreasing learning schedules for different
+situations. We conduct an ablation study to show the impact
+of this component in Section IV-D.
+D. Automatic Selection of hyperparameters
+The behavior of ICE-Pruning is determined by several
+hyperparameters. To avoid the need for manually tuning these
+hyperparameters, we add an auto-tuning stage. We empirically
+design the following optimization cost function:
+λ = arg min
+λ
+PT + ∆A
+max(PT, ∆A)
+(2)
+where
+∆A = Accoriginal −Accpruned
+(3)
+and λ is the set of hyperparameters; PT is the pruning time,
+which is the overall time (in seconds) required by the whole
+pruning-fine-tuning from the first layer to the last; Accoriginal
+is the accuracy of the full model; and Accpruned is the final
+accuracy of the pruned model. We normalize the sum of PT
+and ∆A by the larger value of them to avoid the domination of
+larger values. Empirically, since accuracy PT is always larger
+than ∆A, minimizing this function is equivalent to minimizing
+the accuracy loss per time-unit (e.g., seconds) during pruning.
+We use a search algorithm to find the optimal λ instead of
+gradient-based methods. In this way, the pruning time does
+not need to be differentiable, which is required by gradient-
+based methods.
+We compared several popular hyperparameter search al-
+gorithms (i.e., Grid Search, Tree-structured Parzen Estima-
+tor [29], Random Sampling, Gaussian process-based Bayesian
+Optimization [30]) and found that grid search performs best,
+since our search space is low-dimensional. To save time in
+the auto-tuning stage, we only use a randomly sampled subset
+of the data. The sampled data has a similar distribution as
+the whole dataset, thus if the hyperparameters optimize the
+objective (2) with respect to the sampled dataset, they should
+also optimize it with respect to the full dataset, assuming the
+same DNN models and pruning methods. As a result, the
+optimal hyperparameters can be transferred to the later stage.
+Our experimental results in SectionIV show that this design
+works.
+IV. EVALUATION
+In this section, we validate ICE-Pruning and demonstrate its
+ability to reduce the overall pruning time while maintaining
+accuracy. First, we show how some DNN layers change much
+less than others during fine-tuning, justifying the use of layer
+freezing (Section IV-B). We then compare ICE-Pruning when
+using four different pruning criteria (L1 norm filter pruning,
+Random filter pruning, Entropy-based filter pruning and Mean
+activation filter pruning) and justify which one works best with
+ICE-Pruning (Section IV-C). After that, we conduct an ablation
+study to explore the impact of different components such as
+the accuracy drop threshold mechanism, layer freezing, and the
+pruning-aware learning rate scheduler (Section IV-D). Finally,
+TABLE I: Fine-tuning details for different model and dataset.
+BS is batch size, LR is base learning rate, MO is Momentum,
+WD is weight decay. Note that the TinyImageNet experiments
+use batch size 256 for AAP and 128 for the rest pipelines.
+Model
+Dataset
+BS
+LR
+MO
+WD
+ResNet-152
+CIFAR-10
+128
+0.001
+0.9
+0.0001
+DenseNet-121
+TinyImageNet
+128/256
+0.001
+0.9
+0.0001
+WRN-101
+ImageNet
+256
+0.001
+0.9
+0.0001
+we compare ICE-Pruning with a baseline iterative pruning
+pipeline and the state-of-the-art pipeline AAP [7] for different
+datasets and DNN models (Section IV-E).
+A. Experimental setup
+We conduct experiments with the following datasets: i)
+CIFAR-10 [31] (using the full dataset when doing the fine-
+tuning, except for the hyperparameter search phase) and ii)
+TinyImageNet [32] and ImageNet [33] (using subsampled
+datasets when performing the fine-tuning). Note that for all the
+experiments we adopt the common practice of performing only
+one fine-tuning epoch in each pruning step [3]–[5], except the
+non-AAP experiments for TinyImageNet, in which after fine-
+tuning in the last pruning step, we applied four more epochs
+with full datasets. For CIFAR-10, all pipelines use knowledge
+distillation [34], [35], following the practice of Joo et al. [3].
+We use L1 norm filter pruning [6] in each non-AAP
+experiment (including Section III-B), except Section IV-C
+where we compare different heuristics. All the models are
+pruned layer by layer with consistent specified pruning ratios
+for each layer in each experiment. The pruned layers in our
+DNN models are the basic blocks in ResNets [36], the dense
+blocks in DenseNet [37], and the bottleneck block in Wide
+ResNet (WRN) [38]. For fine-tuning, all experiments use the
+SGD [39] optimizer, with batch size of 128 or 256, base
+learning rate of 0.001 (except the experiments that need to
+search for it), momentum of 0.9 and weight decay of 0.0001.
+The details of the fine-tuning are shown in Table I.
+We use PyTorch [40] as our main machine learning frame-
+work, with Optuna [30] for automated hyperparameter search.
+The experiments were run on a single NVIDIA GeForce RTX
+3090 GPU, except for ImageNet which run on two of them.
+B. Justification of Layer Freezing
+We first study how the L1 norm of model weights changes
+during iterative fine-tuning, to justify the novel layer freezing
+strategies introduced in Section III-B. Specifically, we consider
+ResNet-152 [36] and MobileNetV2 [41] trained on CIFAR-
+10 [31]. To eliminate the possibility that larger magnitude
+weights may have higher L1 norm changes, we normalize
+the results by the L2 norms of initial layer weights. Each
+experiment applies a pruning ratio (the proportion of filters
+removed) of 30%. Figure 2 shows how the weights of different
+layers change as the amount of fine-tuning increases. We
+observe that across our DNN models, some layers tend to see
+smaller changes in weights during fine-tuning. This implies
+
+
+(a) ResNet-152
+(b) MobileNetV2
+Fig. 2: Normalized weight changes (∆W / ∥W0∥2) per layer
+for each pruning step in DNN iterative pruning; ∆W is the
+weight changes, ∥W0∥2 is the L2 norm of the initial weights.
+The learning rate is 0.001 and the pruning ratio is 30%.
+that those layers are insensitive to fine-tuning, or at least it
+is not worth spending time on them for fine-tuning because
+of the small changes. We also observe that the ranks of the
+weight changes of the layers are generally maintained, so the
+sensitivity ranking of layers can be determined after the very
+first pruning step. This is a powerful insight, since determining
+which layers are less sensitive based on only one pruning step
+is cheap, and hence makes ICE-Pruning faster. In summary,
+this experiment justifies both freezing the less sensitive layers
+(determined by observing weight changes from one pruning
+step) and applying the freezing step only once.
+C. Comparisons of different pruning criteria
+To know which pruning criterion works best with ICE-
+Pruning, we now compare four different pruning criteria:
+• L1 norm filter pruning: For each layer, the filters that
+have a smaller L1 norm will be pruned.
+• Random filter pruning: For each layer, the filters are
+randomly pruned.
+• Entropy-based filter pruning [4]: For each layer, the
+filters that correspond to lower feature map entropy values
+are removed.
+• Mean activation filter pruning [8]: For each layer,
+the filters that correspond to the lowest mean activation
+values are removed.
+For each pruning criterion, we conducted an experiment
+with ResNet-152 on CIFAR-10 and DenseNet-121 [37] on
+Fig. 3: Pruning time vs. accuracy of ICE-Pruning with four
+different pruning criteria for two different models, Resnet-152
+on CIFAR-10, and DenseNet-121 on TinyImageNet.
+TinyImageNet [32]. Each experiment applies pruning ratios
+of 60%, 70% and 80%.
+In Figure 3, we observe that for different DNN models,
+datasets and pruning ratios, L1 norm filter pruning provides
+the best trade-off between accuracy and time consumption.
+As a result, we use L1 norm as the pruning criterion for
+ICE-Pruning in the remaining experiments. Interestingly, we
+observe that random pruning performs well too. This is
+because of the low overhead of using this pruning criterion,
+and because the models have enough redundancies for these
+datasets. Therefore, we suggest users to use random pruning
+as well.
+D. Ablation study of key components
+We explore the impact of the three key components of ICE-
+Pruning (accuracy drop threshold, freezing percentage, and
+learning rate scheduler) in order to provide deeper insights
+into our method. We select ResNet-152 on CIFAR-10 and
+DenseNet-121 on TinyImageNet. For each model, we apply
+ICE-Pruning but without one component and compare the
+accuracy and time consumption with the full pipeline. The
+pruning ratio is 60%.
+From Table II, we observe that for both DNN models, using
+all ICE-Pruning components provides the best accuracy and
+pruning time trade-off. We also observe that the mechanism
+based on accuracy drop threshold provides the greatest time
+reduction. Specifically, the accuracy drop threshold mechanism
+provides up to 56.43% time reduction, layer freezing provides
+up to 10.75% time reduction and pruning-aware learning rate
+scheduler provides up to 11.68% time reduction.
+E. Comparison against existing pruning pipelines
+We now compare ICE-Pruning with a baseline and the state-
+of-the-art method AAP [7] in terms of final accuracy and time
+consumption. The baseline is the naive way of iterative pruning
+in which DNN models are pruned component by component,
+and at each pruning step an epoch of fine-tuning is applied [3],
+[4], [6]. We conduct the experiments with three pruning ratios
+
+
+TABLE II: Ablation study of ICE-Pruning key components.
+Threshold is the accuracy drop threshold mechanism, Freezing
+is layer freezing and Scheduler is pruning-aware scheduler.
+Time is the time consumption.
+(a) Ablation study with Resnet-152 on CIFAR-10
+Threshold
+Freezing
+Scheduler
+Accuracy(%)
+Time(s)
+✓
+✓
+✓
+92.23
+1943
+✗
+✓
+✓
+92.81
+4459
+✓
+✗
+✓
+92.30
+2177
+✓
+✓
+✗
+91.42
+2200
+(b) Ablation study with DenseNet-121 on TinyImageNet
+Threshold
+Freezing
+Scheduler
+Accuracy(%)
+Time(s)
+✓
+✓
+✓
+62.33
+409
+✗
+✓
+✓
+62.17
+426
+✓
+✗
+✓
+58.67
+429
+✓
+✓
+✗
+61.83
+408
+(60%, 70% and 80%), with three DNN models (ResNet-152,
+DenseNet-121, and Wide ResNet-101-2 [WRN-101-2]) and
+three datasets (CIFAR-10, TinyImageNet and ImageNet). Note
+that AAP prunes the models globally, which means that it
+considers all the model components that are to be pruned
+(target components) as an integrated target. Therefore, while
+AAP aims to prune the model to a certain level, the pruning
+ratio may not be consistent for each target component.
+In Table III, we observe that ICE-Pruning has better ac-
+curacy and time consumption in most cases. Specifically, at
+60% pruning, ICE-Pruning has up to 7.8% higher accuracy
+and is up to 2.96× faster; at 70% pruning, ICE-Pruning has
+up to 1.35% higher accuracy and is up to 4.12× faster; at 80%
+pruning, ICE-Pruning has up to 3.16% higher accuracy and is
+up to 9.61× faster. Even in cases where the accuracies are
+similar, such as at 80% pruning with ResNet-152 and CIFAR-
+10, ICE-Pruning is still up to 2.67× faster. This is because i)
+the models are so over-parameterized that they are robust to
+pruning and ii) we skip many fine-tuning operations, which
+are applied unnecessarily often in other pipelines.
+Note that, for ICE-Pruning, the magnitude of time con-
+sumption varies significantly between the different models
+and datasets. For example, for ResNet-152, DenseNet-121 and
+WRN-101-2 with 60% pruning, ICE-Pruning takes 1,943, 409,
+and 6,530 seconds respectively. This is due to the different
+sizes of models and datasets. Generally, the larger the sizes
+are, the slower ICE-Pruning will be.
+V. CONCLUSION
+We have proposed ICE-Pruning, a simple yet effective
+threshold-guided automatic pruning pipeline based on iterative
+pruning. ICE-Pruning is based on three key components:
+a mechanism to determine when fine-tuning is necessary
+based on an accuracy drop threshold, a novel layer freezing
+strategy, and a pruning-aware learning rate scheduler. This
+design enables ICE-Pruning to be a plug-and-play solution
+TABLE III: Comparisons of ICE-Pruning with AAP and
+Baseline. Acc is accuracy, Time is time consumption.
+(a) 60% pruning accuracy and time consumption
+Pipeline
+Model
+Dataset
+Acc(%)
+Time(s)
+Baseline
+ResNet-152
+CIFAR-10
+92.15
+3793
+AAP
+ResNet-152
+CIFAR-10
+91.91
+4909
+ICE-Pruning
+ResNet-152
+CIFAR-10
+92.23
+1943
+Baseline
+DenseNet-121
+TinyImageNet
+59.50
+1212
+AAP
+DenseNet-121
+TinyImageNet
+54.53
+898
+ICE-Pruning
+DenseNet-121
+TinyImageNet
+62.33
+409
+Baseline
+WRN-101-2
+ImageNet
+62.77
+10105
+AAP
+WRN-101-2
+ImageNet
+59.3
+6935
+ICE-Pruning
+WRN-101-2
+ImageNet
+61.81
+6530
+(b) 70% pruning accuracy and time consumption
+Pipeline
+Model
+Dataset
+Acc(%)
+Time(s)
+Baseline
+ResNet-152
+CIFAR-10
+91.29
+3829
+AAP
+ResNet-152
+CIFAR-10
+91.63
+5301
+ICE-Pruning
+ResNet-152
+CIFAR-10
+91.97
+3144
+Baseline
+DenseNet-121
+TinyImageNet
+57.00
+1237
+AAP
+DenseNet-121
+TinyImageNet
+53.15
+1744
+ICE-Pruning
+DenseNet-121
+TinyImageNet
+54.50
+423
+Baseline
+WRN-101-2
+ImageNet
+55.65
+9764
+AAP
+WRN-101-2
+ImageNet
+55.05
+15250
+ICE-Pruning
+WRN-101-2
+ImageNet
+54.97
+7393
+(c) 80% pruning accuracy and time consumption
+Pipeline
+Model
+Dataset
+Acc(%)
+Time(s)
+Baseline
+ResNet-152
+CIFAR-10
+91.11
+3811
+AAP
+ResNet-152
+CIFAR-10
+91.20
+8719
+ICE-Pruning
+ResNet-152
+CIFAR-10
+91.10
+3266
+Baseline
+DenseNet-121
+TinyImageNet
+50.50
+1209
+AAP
+DenseNet-121
+TinyImageNet
+49.84
+4151
+ICE-Pruning
+DenseNet-121
+TinyImageNet
+53.00
+432
+Baseline
+WRN-101-2
+ImageNet
+45.62
+9344
+AAP
+WRN-101-2
+ImageNet
+44.01
+14979
+ICE-Pruning
+WRN-101-2
+ImageNet
+46.85
+8897
+that supports widely-used pruning criteria. Additionally, ICE-
+Pruning automatically determines the best hyperparameters,
+which saves the user from the effort of manual tuning. In our
+experiments, we show how different pruning criteria work with
+ICE-Pruning, and we have explored the impact of different
+components. Finally, we show that ICE-Pruning can maintain
+accuracy while reducing pruning time significantly, up to
+9.61× compared with existing pruning pipelines.
+As future work, we plan to use ICE-Pruning with a broader
+range of real industrial development environment, models,
+datasets, and pruning methods to explore its benefits in real-
+world scenarios. For example, we could use ICE-Pruning to
+prune large language models (LLMs) [42] for efficient de-
+ployment. As another example, we could deploy ICE-Pruning
+on different types of machine learning servers with diverse
+hardware configurations to evaluate the impact of hardware
+platforms on its efficiency.
+
+
+REFERENCES
+[1] L. Deng, G. Li, S. Han, L. Shi, and Y. Xie, “Model compression and
+hardware acceleration for neural networks: A comprehensive survey,”
+Proceedings of the IEEE, vol. 108, no. 4, pp. 485–532, 2020.
+[2] P. Gibson, J. Cano, E. Crowley, A. Storkey, and M. O’boyle, “DLAS: A
+Conceptual Model for Across-Stack Deep Learning Acceleration,” ACM
+Transactions on Architecture and Code Optimization, vol. 22, no. 1, Mar.
+2025.
+[3] D. Joo, E. Yi, S. Baek, and J. Kim, “Linearly Replaceable Filters for
+Deep Network Channel Pruning,” Proceedings of the AAAI Conference
+on Artificial Intelligence, vol. 35, no. 9, pp. 8021–8029, May 2021.
+[4] J.-H. Luo and J. Wu, “An entropy-based pruning method for cnn
+compression,” ArXiv, vol. abs/1706.05791, 2017.
+[5] J.-H. Luo, J. Wu, and W. Lin, “Thinet: A filter level pruning method
+for deep neural network compression,” in Proceedings of the IEEE
+international conference on computer vision, 2017, pp. 5058–5066.
+[6] H. Li, A. Kadav, I. Durdanovic, H. Samet, and H. P. Graf, “Pruning
+filters for efficient convnets,” in International Conference on Learning
+Representations, 2017.
+[7] K. Zhao, A. Jain, and M. Zhao, “Automatic attention pruning: Improv-
+ing and automating model pruning using attentions,” in International
+Conference on Artificial Intelligence and Statistics, 2023, pp. 10 470–
+10 486.
+[8] P. Molchanov, S. Tyree, T. Karras, T. Aila, and J. Kautz, “Pruning
+convolutional neural networks for resource efficient inference,” in In-
+ternational Conference on Learning Representations, 2017.
+[9] D. Blalock, J. J. Gonzalez Ortiz, J. Frankle, and J. Guttag, “What is the
+State of Neural Network Pruning?” in Proceedings of Machine Learning
+and Systems, vol. 2, 2020, pp. 129–146.
+[10] T. Hoefler, D. Alistarh, T. Ben-Nun, N. Dryden, and A. Peste, “Sparsity
+in deep learning: Pruning and growth for efficient inference and training
+in neural networks,” The Journal of Machine Learning Research, vol. 22,
+no. 1, pp. 10 882–11 005, 2021.
+[11] L. Deng, G. Li, S. Han, L. Shi, and Y. Xie, “Model compression and
+hardware acceleration for neural networks: A comprehensive survey,”
+Proceedings of the IEEE, vol. 108, no. 4, pp. 485–532, 2020.
+[12] Y. He, G. Kang, X. Dong, Y. Fu, and Y. Yang, “Soft filter pruning for
+accelerating deep convolutional neural networks,” in Proceedings of the
+27th International Joint Conference on Artificial Intelligence, 2018, p.
+2234–2240.
+[13] K. Song, W. Yao, and X. Zhu, “Filter Pruning via Similarity Clustering
+for Deep Convolutional Neural Networks,” in International Conference
+on Neural Information Processing, 2022, pp. 88–99.
+[14] P. Michel, O. Levy, and G. Neubig, “Are Sixteen Heads Really Better
+than One?” in Advances in Neural Information Processing Systems,
+H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alch´e-Buc, E. Fox,
+and R. Garnett, Eds., 2019.
+[15] P. Molchanov, S. Tyree, T. Karras, T. Aila, and J. Kautz, “Pruning
+Convolutional Neural Networks for Resource Efficient Inference,” in
+International Conference on Learning Representations, 2017.
+[16] W. Hu, P. Gibson, and J. Cano, “ICE-pick: Iterative cost-efficient
+pruning for DNNs,” in ICML 2023 Workshop Neural Compression: From
+Information Theory to Applications, 2023.
+[17] R. Liu, J. Cao, P. Li, W. Sun, Y. Zhang, and Y. Wang, “Nfp: A no fine-
+tuning pruning approach for convolutional neural network compression,”
+in 2020 3rd International Conference on Artificial Intelligence and Big
+Data (ICAIBD), 2020, pp. 74–77.
+[18] S. Roy, P. Panda, G. Srinivasan, and A. Raghunathan, “Pruning filters
+while training for efficiently optimizing deep learning networks,” in
+International Joint Conference on Neural Networks, 2020, pp. 1–7.
+[19] A. Brock, T. Lim, J. M. Ritchie, and N. Weston, “FreezeOut: Accelerate
+Training by Progressively Freezing Layers,” in 10th NIPS Workshop on
+Optimization for Machine Learning, 2017.
+[20] Y. Liu, S. Agarwal, and S. Venkataraman, “AutoFreeze: Automatically
+Freezing Model Blocks to Accelerate Fine-tuning,” arXiv preprint
+arXiv:2102.01386, 2021.
+[21] J. Lee, R. Tang, and J. Lin, “What would elsa do? freezing layers during
+transformer fine-tuning,” arXiv preprint arXiv:1911.03090, 2019.
+[22] U. M. Topc¸uo˘glu and E. Akag¨und¨uz, “Local Masking Meets Progressive
+Freezing: Crafting Efficient Vision Transformers for Self-Supervised
+Learning,” in Seventeenth International Conference on Machine Vision
+(ICMV), 2024.
+[23] J. Frankle and M. Carbin, “The Lottery Ticket Hypothesis: Finding
+Sparse, Trainable Neural Networks,” in International Conference on
+Learning Representations, 2019.
+[24] S. Liu, L. Yin, D. C. Mocanu, and M. Pechenizkiy, “Do we actually need
+dense over-parameterization? in-time over-parameterization in sparse
+training,” in 38th International Conference on Machine Learning, vol.
+139, 18–24 Jul 2021, pp. 6989–7000.
+[25] Y. Li, C. Wei, and T. Ma, “Towards explaining the regularization effect
+of initial large learning rate in training neural networks,” Advances in
+Neural Information Processing Systems, vol. 32, 2019.
+[26] L. Liu, H. Jiang, P. He, W. Chen, X. Liu, J. Gao, and J. Han, “On the
+Variance of the Adaptive Learning Rate and Beyond,” in International
+Conference on Learning Representations, 2020.
+[27] H. Li, Z. Xu, G. Taylor, C. Studer, and T. Goldstein, “Visualizing the loss
+landscape of neural nets,” Advances in neural information processing
+systems, vol. 31, 2018.
+[28] S. Liu, C. M. J. Tan, and M. Motani, “S-Cyc: A Learning Rate
+Schedule for Iterative Pruning of ReLU-based Networks,” arXiv preprint
+arXiv:2110.08764, 2021.
+[29] J. Bergstra, R. Bardenet, Y. Bengio, and B. K´egl, “Algorithms for hyper-
+parameter optimization,” in Advances in Neural Information Processing
+Systems, vol. 24, 2011.
+[30] T. Akiba, S. Sano, T. Yanase, T. Ohta, and M. Koyama, “Optuna:
+A Next-generation Hyperparameter Optimization Framework,” in 25th
+ACM SIGKDD International Conference on Knowledge Discovery and
+Data Mining, 2019.
+[31] A. Krizhevsky, “Learning Multiple Layers of Features from Tiny Im-
+ages,” University of Toronto, Tech. Rep., 2009.
+[32] Y. Le and X. Yang, “Tiny ImageNet Visual Recognition Challenge,”
+Stanford University, Tech. Rep., 2015.
+[33] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei, “Imagenet:
+A large-scale hierarchical image database,” in 2009 IEEE Conference on
+Computer Vision and Pattern Recognition, 2009, pp. 248–255.
+[34] G. Hinton, O. Vinyals, and J. Dean, “Distilling the Knowledge in a
+Neural Network,” arXiv preprint arXiv:1503.02531, 2015.
+[35] J. Turner, E. J. Crowley, V. Radu, J. Cano, A. Storkey, and M. O’Boyle,
+“Distilling with Performance Enhanced Students,” arXiv preprint
+arXiv:1810.10460, 2019.
+[36] K. He, X. Zhang, S. Ren, and J. Sun, “Deep Residual Learning for
+Image Recognition,” IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 770–778, 2016.
+[37] G. Huang, Z. Liu, L. Van Der Maaten, and K. Q. Weinberger, “Densely
+connected convolutional networks,” in IEEE conference on computer
+vision and pattern recognition, 2017, pp. 4700–4708.
+[38] S. Zagoruyko and N. Komodakis, “Wide Residual Networks,” arXiv
+preprint arXiv:1605.07146, 2017.
+[39] S. Ruder, “An Overview of Gradient Descent Optimization Algorithms,”
+arXiv preprint arXiv:1609.04747, 2016.
+[40] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga et al., “Pytorch: An
+imperative style, high-performance deep learning library,” Advances in
+neural information processing systems, vol. 32, 2019.
+[41] A. G. Howard, M. Zhu, B. Chen, D. Kalenichenko, W. Wang, T. Weyand,
+M. Andreetto, and H. Adam, “MobileNets: Efficient Convolutional
+Neural Networks for Mobile Vision Applications,” arXiv:1704.04861,
+2017.
+[42] J. Ye, X. Chen, N. Xu, C. Zu, Z. Shao, S. Liu, Y. Cui, Z. Zhou,
+C. Gong, Y. Shen, J. Zhou, S. Chen, T. Gui, Q. Zhang, and X. Huang,
+“A Comprehensive Capability Analysis of GPT-3 and GPT-3.5 Series
+Models,” arXiv preprint arXiv:2303.10420, 2023.

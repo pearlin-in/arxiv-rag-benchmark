@@ -1,0 +1,1320 @@
+Sparse Attention across Multiple-context KV Cache
+Ziyi Cao1,*,†, Qingyi Si2,†, Jingbin Zhang2,†, Bingquan Liu1
+1Harbin Institute of Technology
+2Huawei Technologies Co., Ltd.
+zyc@stu.hit.edu.cn, siqingyi@huawei.com, zhangjingbin@pku.edu.cn, liubq@hit.edu.cn
+Abstract
+Large language models face significant cost challenges in
+long-sequence inference. To address this, reusing historical
+Key-Value (KV) Cache for improved inference efficiency
+has become a mainstream approach. Recent advances further
+enhance throughput by sparse attention mechanisms to se-
+lect the most relevant KV Cache, thereby reducing sequence
+length. However, such techniques are limited to single-
+context scenarios, where historical KV Cache is computed
+sequentially with causal-attention dependencies. In retrieval-
+augmented generation (RAG) scenarios, where retrieved doc-
+uments as context are unknown beforehand, each document’s
+KV Cache is computed and stored independently (termed
+multiple-context KV Cache), lacking cross-attention between
+contexts. This renders existing methods ineffective. Although
+prior work partially recomputes multiple-context KV Cache
+to mitigate accuracy loss from missing cross-attention, it re-
+quires retaining all KV Cache throughout, failing to reduce
+memory overhead. This paper presents SamKV, the first ex-
+ploration of attention sparsification for multiple-context KV
+Cache. Specifically, SamKV takes into account the comple-
+mentary information of other contexts when sparsifying one
+context, and then locally recomputes the sparsified informa-
+tion. Experiments demonstrate that our method compresses
+sequence length to 15% without accuracy degradation com-
+pared with full-recompuation baselines, significantly boost-
+ing throughput in multi-context RAG scenarios.
+1
+Introduction
+Large language models (LLMs) (Vaswani et al. 2017; De-
+vlin et al. 2019) have demonstrated remarkable capabili-
+ties across a multitude of domains, including question an-
+swering, chatbots, education, and healthcare. They process
+text-like token sequences submitted by users to provide re-
+sponses. However, as requests (user query) become more
+intricate, the challenge of serving LLMs effectively grows
+more pronounced. This is particularly evident in complex
+tasks such as multi-context question answering and few-shot
+learning within retrieval-augmented generation (RAG) sce-
+narios (Lewis et al. 2020). These tasks often involve im-
+mutable token chunks (e.g., system messages, examples, and
+*Work done during the internship at Huawei.
+†These authors contributed equally.
+Copyright © 2026, Association for the Advancement of Artificial
+Intelligence (www.aaai.org). All rights reserved.
+TTFT (%)
+100
+0
+F1
+Recompute
+Reuse
+CacheBlend
+EPIC
+SamKV 
+(Ours)
+Figure 1: KV Cache methods across multiple contexts. The
+x-axis shows time to first token (TTFT) as a percentage of
+full recomputation. The y-axis represents F1 scores, with
+circle sizes indicating GPU memory usage during inference.
+Multi-context methods
+CacheBlend
+EPIC
+Ours
+Sequence ratio
+100%
+100%
+14.9%
+Recomputation ratio
+15.0%
+14.1%
+14.3%
+Table 1: Sequence ratio indicates the proportion of KV
+Cache that requires loading in the GPU, and recomputation
+ratio indicates the ratio of tokens to be recomputed.
+contexts) that remain unchanged and are repeatedly used
+across different requests. The key challenge lies in how to
+effectively leverage these recurring text chunks to enhance
+the efficiency of LLM services.
+To address the challenges of LLM serving, context
+caching has emerged as a key strategy to enhance effi-
+ciency by reusing precomputed Key-Value (KV) Caches
+(Pope et al. 2023) for repeated tokens. Context caching
+methods can be broadly categorized into two types: single-
+context and multi-context approaches. Single-context meth-
+ods often concentrate on sparsifying the KV Cache, aim-
+ing to reduce the computational cost and memory footprint
+associated with LLM inference (Li et al. 2024; Liu et al.
+2024; Xiao et al. 2024a). However, these single-context ap-
+proaches are not designed to address the absence of cross-
+attention that occurs when multiple contexts are prefilled
+separately. In contrast, multi-context techniques typically
+focus on recomputing specific tokens’ KV Caches (Yao et al.
+2024; Hu et al. 2024). This approach can somewhat allevi-
+ate the lack of cross-attention between different text chunks.
+Yet, it comes at a cost. These methods generally require the
+arXiv:2508.11661v1  [cs.LG]  6 Aug 2025
+
+
+entire KV Cache to be loaded into memory, even if only
+a fraction of the tokens’ KV Caches are recomputed. This
+means that while they improve the accuracy of the gener-
+ated responses by addressing cross-attention issues, they do
+not sparsify the KV Cache. As a result, the GPU memory
+usage remains high, posing a challenge for efficient LLM
+serving, especially when dealing with extensive contextual
+information.
+To break through these limitations, we introduce SamKV,
+a novel method that combines sparsification and selective
+recomputation to efficiently handle multiple contexts. Our
+approach consists of two main steps. First, we perform spar-
+sification by filtering out irrelevant content from the current
+document based on the user query and other documents’ in-
+formation. This step ensures that only the most useful con-
+tent is retained, significantly reducing the amount of data
+to be processed. Second, we selectively recompute the KV
+Caches for a subset of tokens within the sparsified content.
+This selective recomputation focuses on updating the KV
+Caches for tokens that are crucial for maintaining cross-
+attention and generating high-quality responses. By inte-
+grating sparsification and selective recomputation, SamKV
+achieves both acceleration and reduced memory usage, mak-
+ing it more efficient to handle multiple contexts without the
+need to load the entire KV Cache into memory.
+Specifically, during the sparsification process, SamKV
+exclusively utilizes the KV Cache from initial and local po-
+sitions in the sequence to generate query vectors. To enhance
+cross-document information extraction, we further enrich
+each context’s query vector by incorporating query-relevant
+signals from other contexts. For instance, when answering
+a crime-related question, SamKV fetches the KV Cache of
+semantically linked documents (e.g., legal statutes and ju-
+risprudential analyses). By augmenting the query vector for
+jurisprudential analysis with features from legal statutes, the
+system more effectively captures their inter-document cor-
+relations, enabling personalized query embeddings per con-
+text. Moreover, during token recomputation, SamKV selec-
+tively processes only the sparsified KV Cache, prioritizing
+tokens from initial/local positions and those with high atten-
+tion scores. This dual strategy reduces computational over-
+head while preserving model accuracy.
+In this paper, we introduce SamKV, a novel approach
+that achieves significant compression of multi-context
+KV Caches without compromising accuracy. Specifically,
+SamKV reduces the KV Cache size to only 15% of the
+original while maintaining the same level of precision. Fur-
+thermore, we find that incorporating information from other
+contexts into the user query during the sparsification process
+yields more critical sparse information. Additionally, we ob-
+serve that integrating the newly recomputed KV values for
+the sparse tokens back into the original KV Cache can some-
+times enhance the overall performance.
+Our contributions are primarily as follows:
+• We present the first approach to achieve KV Cache spar-
+sification in multi-context scenarios, which significantly
+reduces GPU memory usage.
+• We propose an innovative multi-context sparsification
+approach and a novel token recomputation method, both
+of which achieve promising results.
+• Our method, validated on the LongBench’s Question-
+Answering (QA) datasets (Bai et al. 2024), demonstrates
+the ability to reduce computational load and accelerate
+processing while maintaining accuracy.
+2
+Related work
+2.1
+Single-context sparsification
+Optimizing LLMs for long-context processing has focused
+on single-context sparsification techniques. For example, In-
+fLLM (Xiao et al. 2024a) uses sliding window attention
+with an efficient context memory, while SnapKV (Li et al.
+2024) compresses the KV Cache by identifying critical at-
+tention features. However, these methods are designed for
+single contexts and do not address cross-attention issues
+in multi-context settings. In contrast, SamKV leverages the
+correlations between multiple contexts, incorporating cross-
+attention mechanisms to capture dependencies between con-
+texts. When processing a single context, SamKV degrades
+gracefully to traditional single-context methods, making it a
+generalization of existing approaches.
+2.2
+Multi-context recomputation
+Multi-context methods represent an extension of single-
+context approaches, further enhancing the efficiency and
+scalability
+of
+LLM
+serving.
+Recent
+works
+such
+as
+CacheBlend (Yao et al. 2024) and EPIC (Hu et al. 2024)
+have made significant strides in this area. CacheBlend se-
+lectively recomputes tokens based on the absence of cross-
+attention in the first layer, with the scope of updates de-
+creasing progressively across layers. EPIC focuses on up-
+dating only the initial and local positions within the context
+to minimize computational load. In contrast, our proposed
+method, SamKV, leverages the inherent importance of cer-
+tain tokens within the context, identified through the con-
+centration of attention weights (as observed in the RaaS (Hu
+et al. 2025)). By selectively recomputing these critical to-
+kens, in addition to initial and local positions, SamKV re-
+duces both the amount of KV Cache needed and the overall
+computational requirements, offering a more efficient and
+targeted approach to LLM serving.
+2.3
+Attention sink
+In the quest to optimize LLMs, recent studies have un-
+covered distinct attention patterns. StreamingLLM (Xiao
+et al. 2024b) first identifies attention concentration at initial
+positions. Longformer (Beltagy, Peters, and Cohan 2020)
+emphasizes local contexts, highlighting the importance of
+nearby tokens. RaaS (Hu et al. 2025) further reveals atten-
+tion clustering at intermediate positions during reasoning
+tasks. In contrast, SamKV extends these findings by consid-
+ering both initial and local tokens and refining the threshold-
+based selection from RaaS. Using power-law distribution
+fitting and comparison, SamKV more effectively identifies
+critical tokens, offering a more rational and comprehensive
+approach to token selection for enhanced efficiency and per-
+formance.
+
+
+Notation
+Description
+N
+total number of layers
+N ∗
+stable attention layers (Appendix A.2)
+D
+total number of documents
+KV doc-i
+document i’s KV Cache (also for Q and K Caches)
+doc-iold
+KVdoc-iold represents the KVdoc-i before recomputa-
+tion (also for new), defaulting to old
+doc-iini
+initial position of document i’s absolute position
+(also for middle, local, or attention degree posi-
+tions anchor, max, and min) (attention analysis
+is in Appendix A.1)
+Qque
+generic query vector
+ˆQdoc-i
+query vector for document i only
+Pdoc-i
+select Top P in document i
+⟨·, ·⟩
+inner product
+KV (n)
+n-th layer of KV (also for percentages)
+s(n)
+doc-ianc
+D
+Q(n)
+doc-i, K(n)
+doc-ianc
+E
+(also for max and min)
+Table 2: Summary of terminology.
+3
+Our proposed SamKV
+When handling multiple contextual scenarios, two critical
+challenges emerge: efficiently sparsifying the KV Caches
+across contexts, and addressing the cross-attention defi-
+ciency caused by independent prefilling of each context. To
+resolve these issues, we propose SamKV, a novel method
+designed to jointly optimize sparse KV Cache manage-
+ment and cross-context attention recovery. SamKV com-
+prises three core components: (i) Personalized Query Em-
+bedding Module, (ii) KV Selection Module, and (iii) Re-
+computation Module. To elucidate the interplay between
+these modules, Figure 2 presents a running example with
+three distinct contexts. The remainder of this section details
+each component’s design and its role in SamKV’s pipeline.
+3.1
+Generation of personalized query vectors
+Existing approaches for multi-context KV Cache necessi-
+tate full cache loading (Yao et al. 2024; Hu et al. 2024),
+which incurs substantial GPU memory overhead. The devel-
+opment of sparse KV Cache techniques provides an effec-
+tive alternative, where constructing appropriate query vec-
+tors represents the crucial initial phase in implementing
+such sparse solutions. Unlike traditional approaches that em-
+ploy incremental prefill for user queries, our method in-
+troduces document-specific query vector customization, en-
+abling more efficient context-aware processing.
+Specifically, multiple contexts and their corresponding
+KV Caches can be firstly retrieved using the user query in
+the RAG scenario. Since these contexts are all relevant to
+the query, they often overlap with each other to some ex-
+tend. We refer to this overlap as inter-document consensus.
+The consensus, due to its repeated appearance across mul-
+tiple documents, indicates its particular significance. How-
+ever, merely using the user query for sparsifying a context
+is not sufficient to effectively identify the consensus. There-
+fore, when sparsifying a context, we also need to consider
+other contexts as query information to recognize the consen-
+KVdoc-1
+KVdoc-2
+KVdoc-3
+doc-1
+Q
+doc-2
+Q
+doc-3
+Q
+Personalized Query 
+Embedding Module
+Layers
+Context length
+Compressed KV cache
+Recomputation Module
+KV Selection Module
+User 
+Query
+^
+^
+^
+Figure 2: Overview of SamKV: input user query text; gener-
+ate exclusive personalized query vector for each context; get
+compressed KV Cache; recompute partial tokens.
+sus. This results in varying query vectors for each context.
+To this end, we propose the Personalized Query Embedding
+Module, which first generates a generic query vector based
+on the user query information and then appends consensus
+information specific to the current context. The details are as
+follows:
+Generate generic query vector. Inspired by the observa-
+tion that KV Caches at both initial and local positions play
+a critical role in attention computation (Xiao et al. 2024b;
+Beltagy, Peters, and Cohan 2020), we propose a novel cache
+compress strategy. Specifically, we extract and concatenate
+the KV pairs from these two pivotal positions across all
+contexts to form a composite Cache unit. This compressed
+Cache is then employed to incrementally prefill the Q Matrix
+of user queries through attention computation. Here, the Q
+Matrix encapsulates the current contextual query representa-
+tion, which is subsequently transformed into a spares query
+vector Qque via mean pooling. As illustrated in Figure 3, the
+Q(n)
+que denotes the Qque of the n-th layer.
+Add personalized bias. Although Qque is generated from
+context, its primary role is to express the user query, which
+limits its ability to capture targeted consensus. To address
+this limitation, we propose augmentaing Qque with a con-
+textual Q Cache. As before, we focus on Q Caches at the
+initial and local positions. The initial Q Cache is designed
+to interact with initial-position K, while the local Q Cache
+multiplies with all K to complete the information extraction.
+Consequently, the local Q Cache exhibits the strongest re-
+trieval capability, and we denote document i’s local Q Cache
+as Qdoc-iloc. The next step is determining the proportion and
+method of integrating Qdoc-iloc into Qque. To avoid over-
+shadowing the user’s original query, the bias introduced by
+Qdoc-iloc must be weighted lightly. Empirical analysis reveals
+that the cosine similarity between Qque and Qdoc-iloc typically
+ranges from -0.3 to 0.3. Critically, only when Qdoc-iloc is in-
+corporated into Qque with positive weighting does the inner
+
+
+KVdoc-1
+Qque
+Mean
+Incremental 
+prefill
+Qque Matrix
+Layer n
+Layer n for doc-1
+User 
+Query
+(n)
+KVdoc-2
+(n)
+KVdoc-3
+(n)
+(n)
+(n)
+|cos(   ,   )| x    + |cos(   ,   )| x
+x
+Mean
+1
+2
+⊕
+Personalized bias
+Qdoc-2
+(n)
+Qdoc-3
+(n)
+Qdoc-1
+(n)
+^
+Figure 3: Detail of Personalized Query Embedding Mod-
+ule. The upper half depicts incremental prefill generating the
+generic query vector Qque, while the lower half visualizes the
+integration of personalized bias (derived from Qdoc-2loc and
+Qdoc-3loc) into Qque to form the document-specific ˆQdoc-1.
+product of Qque and any K vector effectively retain the mul-
+tiplicative interaction between Qdoc-iloc and K. We therefore
+adopt the absolute cosine value | cos | as weight constraint.
+To further safeguard against query information dilution from
+excessive context, we normalize the integration by the num-
+ber of contextual documents. The equation composition is
+expressed as:
+ˆQdoc-i = Qque +
+1
+D −1×
+D
+X
+j(j̸=i)
+| cos(Qque, Qdoc-jloc)| × Qdoc-jloc
+(1)
+This equation fundamentally ensures that when sparsifying
+a document, its query vector assimilates relevant query in-
+formation from other contexts to facilitate consensus recog-
+nition. As illustrated in Figure 3, ˆQdoc-1 for context 1 is
+synthesized through Equation 1 by combining Qque with
+both Qdoc-2loc and Qdoc-3loc according to the specified fusion
+scheme. The vectors ˆQdoc-2 and ˆQdoc-3 are derived analo-
+gously, following the same augmentation process.
+3.2
+Selection of important KV Caches
+Current multi-context methods require loading the entire KV
+Caches during inference, leading to excessive GPU mem-
+ory consumption. To sparsify the multi-context KV Caches,
+beyond the query vector generation in Section 3.1, another
+critical challenge is determining how many KV Caches to
+select. In our proposed SamKV, we address this by intro-
+ducing a dynamic Top-P sampling strategy based on anchor
+points: the proportion P scales adaptively with the number
+of K Caches more important than the anchor.
+Specifically, since KV Caches at initial and local posi-
+tions are widely recognized as critical for inference (Xiao
+et al. 2024b; Beltagy, Peters, and Cohan 2020), we retain
+them in full resolution without sparsification. The primary
+Mean
+Block static 
+attention 
+analysis 
+(Appendix A.1)
+Qdoc-1
+(n)
+Pdoc-1
+(n)
+Kdoc-1max
+(n)
+Kdoc-1min
+(n)
+Kdoc-1anc
+Equation 2
+(n)
+Kdoc-1
+Kdoc-1mid
+(n)
+(n)
+Layer n for doc-1
+^
+Figure 4: Calculate the Top P to be taken for context 1 in
+layer n.
+target of sparsification is instead the middle segments of the
+KV Caches. Given the importance of initial and local KV
+Caches, we leverage their corresponding K Caches as an-
+chor points Kdoc-ianc for attention pattern analysis. For the
+middle blocks, we identify the blocks with maximum and
+minimum attention scores, denoted as Kdoc-imax and Kdoc-imin
+respectively (see Appendix A.1). It is important to note that
+some tokens (e.g., punctuation marks) may yield high at-
+tention scores while being semantically insignificant. To ad-
+dress this issue, we implement block-level KV management
+and retrieval, where each block is represented by the mean
+vector of its constituent token caches.
+Furthermore, we compute Kdoc-ianc, Kdoc-imax, and Kdoc-imin
+inner products with ˆQdoc-i to obtain sdoc-ianc, sdoc-imax, and
+sdoc-imin, respectively. Under the assumption that sdoc-ianc and
+sdoc-imin remain stable, a larger sdoc-imax (i.e., a higher upper
+bound of attention scores) implies more K Caches surpass-
+ing the anchor’s importance, thus Pdoc-i should increase pro-
+portionally with sdoc-imax. By similar reasoning, Pdoc-i is in-
+versely proportional to both sdoc-imin and sdoc-ianc. This princi-
+pled analysis leads to our formulation in Equation 2, i.e.,
+P (n)
+doc-i =
+
+
+
+
+
+
+
+
+
+
+
+s(n)
+doc-imax −s(n)
+doc-ianc
+s(n)
+doc-imax −s(n)
+doc-imin
+,
+if s(n)
+doc-ianc ∈
+
+s(n)
+doc-imin, s(n)
+doc-imax
+i
+,
+0,
+otherwise.
+(2)
+As formulated in Equation 2, only those K Caches that
+surpass the anchor point in importance are selected as sig-
+nificant features. While Equation 2 determines the selection
+ratio P (n)
+doc-i specifically for layer n, the final ratio Pdoc-i is
+obtained by consolidating layer-wise ratios through Equa-
+tion 3, i.e.,
+Pdoc-i =
+1
+N ∗
+N ∗
+X
+n
+P (n)
+doc-i.
+(3)
+In Equation 3, we selectively employ attention layers that
+exhibit stable token-wise attention scores, denoted as N ∗.
+
+
+Layer 1
+Layer 2
+Selected important KV Caches
+Pad to unify layers
+Layer 1
+Layer 2
+Merge & Mark recomputation target with red
+Remove padding
+Layer 1
+Layer 2
+Layer 1
+Layer 2
+Recompute
+Layer 
+2
+Layer
+1
+➀  ➁➂➃
+Figure 5: Case of the recomputation for layers 1 and 2. Four
+token recomputation examples are labels: ①lower layer re-
+computed but upper layer not, ②neither layer recomputed,
+③upper layer recomputed but lower layer not, and ④both
+layers recomputed.
+The derivation process and criteria for identifying N ∗are
+elaborated in Appendix A.2.
+After selecting the Top Pdoc-i KV Cache blocks for doc-
+ument i, we normalize the inner products of all retrieved
+blocks across contexts before concatenating and comparing
+them. From this combined set, we retain only the most crit-
+ical blocks, with the number of selected blocks equal to the
+total block count divided by the number of contexts. This en-
+sures cross-contextual filtering of the most important blocks.
+3.3
+Recomputation
+Despite obtaining the sparse KV Cache in Section 3.2, the
+lack of cross-attention between KV Caches from different
+contexts, which are prefilled separately rather than jointly,
+leads to performance degradation (Yao et al. 2024). To mit-
+igate this, we need to recompute some tokens in the sparse
+KV Caches. In addition to tokens with high attention scores
+from the initial and local positions, we further incorpo-
+rate tokens that exhibited significant attention weights in
+the original context for recomputation (see Appendix A.1
+for implementation details). However, sparse KV Caches
+from multiple contexts cannot be aligned across layers,
+posing a significant challenge and explaining why other
+works avoid sparse KV Caches for multi-context settings.
+As shown in Figure 5, there are many misaligned blocks be-
+tween layer 1 and layer 2 in the selected KV Caches.
+To address the challenge of cross-layer block alignment,
+we first align mismatched positions using blank blocks, then
+apply the following recomputation rules:
+1. For any token requiring recomputation at layer n, com-
+pute outputs from all preceding n −1 layers.
+2. At layer n, recompute tokens when necessary while
+reusing existing Cache entries otherwise.
+Following recomputation, remove all padding blocks. Fig-
+ure 5 illustrates this complete workflow: padding, merging,
+recomputing, and finally removing padding elements.
+Examining the four examples in Figure 5 demonstrates
+strict adherence to the two rules. Example ①involves recom-
+puting only layer-1 tokens’ KV pairs without output com-
+putation since layer-2 remains unchanged. Example ②re-
+quires no computation under the rule 1. In ③and ④, layer-2
+tokens require recomputation, necessitating computation of
+corresponding layer-1 token outputs. Rule 2 employs an op-
+timization strategy to maximize reuse of existing KV Cache
+entries, for instance, in example ③, while layer-2 requires re-
+computation, layer-1 padding blocks utilize the token’s pre-
+filled KV Cache for output computation. This approach ef-
+fectively reduces computational overhead while compensat-
+ing for missing cross-document attention.
+After recomputing new KV values, conventional ap-
+proaches directly overwrite the old KV Cache with the new
+values. In our work, we propose two update strategies:
+• Overwrite: follow the traditional update mechanism by
+replacing the old Cache with new KV values;
+• Fusion: combine new KV values with the old Cache.
+While the overwrite mechanism is straightforward and re-
+quires no further elaboration, the fusion strategy warrants
+detailed discussion.
+The key to KV fusion lies in determining the appropri-
+ate blending ratio between new KV values (KVdoc-inew) and
+the old Cache (KVdoc-iold), with their weights summing to
+1. We employ a simple yet effective approach using the co-
+sine similarity θ = cos(KVdoc-inew, KVdoc-iold). Experimental
+observations reveal that this similarity measure θ typically
+yields high values around 0.9. To balance cache updates with
+preservation of historical information, we formulate the up-
+date rule as:
+KVdoc-inew = θ × KVdoc-inew + (1 −θ) × KVdoc-iold.
+(4)
+This equation guarantees both the update of inter-document
+relationships and the retention of intra-document informa-
+tion, achieving effective knowledge fusion.
+After concatenating all KVdoc-inew yields KVdocsnew, answer
+inference can proceed. However, both Qque and ˆQdoc-i are
+generated or extended based solely on the initial and local
+parts of the KV Caches, lacking information from the mid-
+dle section. Thus, neither is suitable for answer generation.
+In contrast, KVdocsnew encompasses information from initial,
+middle, and local sections. Therefore, we re-perform an in-
+cremental prefill of the user query based on KVdocsnew and
+then infer the answer.
+
+
+Recompute no token, use all to inference
+Recompute no tokens, use initial + Top 15% + local to inference
+Recompute 15% tokens, use all to inference
+Recompute initial + local tokens, use all to inference
+CacheBlend
+EPIC
+Reuse
+User 
+Query
+User 
+Query
+User 
+Query
+Multi-context
+InfLLM
+(Multi-InfLLM)
+User 
+Query
+User 
+Query
+Recompute initial + few + local tokens, use them to inference
+SamKV
+(Ours)
+User 
+Query
+Recompute all tokens, use all to inference
+Recompute
+(Baseline)
+Accuracy    Memory
+User 
+Query
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+KVdoc-1
+KVdoc-2
+KVdoc-3
+Figure 6: Comparison among multi-context methods. Darker
+colors indicate KV Caches obtained through sparsification.
+Red markings denote recomputed positions.
+4
+Evaluation
+4.1
+Setup
+Our proposed SamKV is fundamentally designed as a sparse
+processing strategy for multi-context scenarios. Given this
+intrinsic characteristic, our experimental setup including
+the dataset selection, base LLM configuration, and base-
+line comparison aligns with established practices in multi-
+context research. Specifically, we adopt the evaluation
+framework used by existing multi-context methods such as
+CacheBlend (Yao et al. 2024) and EPIC (Hu et al. 2024) to
+ensure fair and meaningful comparisons.
+Implementation. We implement SamKV by modifying
+the original Transformers library’s model code (Wolf et al.
+2020). Compared to vLLM-based implementations, our ap-
+proach requires fewer code modifications and demonstrates
+better compatibility with framework upgrades. For inference
+hyperparameters, we employ greedy decoding with temper-
+ature set to 0. Regarding KV Cache management at the block
+level, we configure SamKV with a block size of 64, allocat-
+ing 1 block for the initial position KV Cache and 2 blocks
+for the local position KV Cache during sparsification.
+Datasets. For fair comparison with existing methods, we
+evaluate performance on three multi-context QA datasets
+from LongBench (Bai et al. 2024): 2WikiMQA, MuSiQue,
+and HotpotQA. In addition to these datasets, we conduct fur-
+ther ablation experiments on DuReader. Each dataset con-
+tains 200 test samples, with each sample comprising a long
+context, user query, and corresponding answer. All answers
+are uniformly evaluated using F1 scores.
+Models. In our experiments, we select several representa-
+tive models including Mistral 7B Instruct (Jiang et al. 2023)
+and Llama3.1 8B Instruct (Dubey et al. 2024) based on
+current hardware compatibility. To provide comprehensive
+evaluation, we incorporate the Qwen2.5 3B Instruct (Team
+Method
+2WikiMQA
+MuSiQue
+HotpotQA
+Mistral 7B Instruct
+Recompute
+25.06
+19.94
+37.70
+Reuse
+6.33-18.73
+1.92-18.02
+2.32-35.38
+Multi-InfLLM
+23.47-1.59
+15.77-4.17
+38.61+0.91
+CacheBlend
+20.42-4.64
+17.44-2.5
+33.98-3.75
+EPIC
+19.40-5.66
+17.22-2.72
+32.23-5.47
+SamKV-overwrite
+27.04+1.98
+17.20-2.74
+39.10+1.4
+SamKV-fusion
+27.88+2.82
+18.54-1.4
+37.66-0.04
+Llama 3.1 8B Instruct
+Recompute
+21.48
+14.56
+24.12
+Reuse
+3.66-17.82
+2.23-12.33
+2.80-21.32
+Multi-InfLLM
+16.20-5.28
+12.70-1.86
+29.04+4.92
+CacheBlend
+19.12-2.36
+12.33-2.23
+22.18-1.94
+EPIC
+17.36-4.12
+13.01-1.55
+23.04-1.08
+SamKV-overwrite
+23.13+1.65
+13.04-1.52
+35.27+11.15
+SamKV-fusion
+22.41+0.93
+12.47-2.09
+30.52+6.4
+Table 3: F1 scores of cross-context KV Cache methods.
+2024) to examine performance across different model scales.
+Methods. We compare our SamKV with five alterna-
+tive approaches: Recompute, Reuse, Multi-context InfLLM
+(Multi-InfLLM), CacheBlend (Yao et al. 2024), and EPIC
+(Hu et al. 2024). Among these, Recompute serves as our
+baseline by performing complete recalculation of the KV
+Caches. Multi-InfLLM concatenates KV Caches from all
+contexts into a single context Cache and applies InfLLM’s
+single-context sparsification method (Xiao et al. 2024a).
+Ablation studies. The ablation study examines three key
+aspects: selection of KV Caches, personalized bias, and re-
+computation. For the selection component, the sparse KV
+Caches with selection incorporate the initial-position KV
+Cache, selected important KV Caches, and local-position
+KV Caches. In contrast, the no-selection variant only uti-
+lizes the initial and local KV Caches without selection.
+Environment. We conduct experiments on a server
+equipped with a 64GB NPU and a 256-core Kunpeng 920
+CPU@2.60GHz (hyperthreading disabled), supported by
+2TB DRAM. The system runs EulerOS 2.0 with kernel ver-
+sion 5.10.0. To ensure fair comparison across different hard-
+ware platforms, we maintain F1 score comparisons when
+evaluating against CacheBlend and EPIC.
+4.2
+Overall improvement
+From Table 3, it is evident that SamKV outperforms all
+other multi-context methods and even surpasses Recompute,
+the baseline, on both 2WikiMQA and HotpotQA. Even bet-
+ter, when based on Llama, SamKV-overwrite achieves an
+F1 score of 35.27 on HotpotQA, significantly surpassing
+Recompute’s 24.12, which we attribute to the inclusion of
+excessive irrelevant information in full recomputation that
+interferes with result generation. Furthermore, the perfor-
+mance of overwrite and fusion strategies varies depending
+on the model and dataset, with each showing different ad-
+vantages. Overall, both recomputation methods contribute to
+improved effectiveness.
+
+
+#
+Method
+Condition
+Dataset
+Avg.
+Selection
+PersBias.
+Recompute
+2WikiMQA
+MuSiQue
+HotpotQA
+DuReader
+Qwen2.5 3B Instruct
+1
+Recompute
+-
+-
+-
+33.34
+20.96
+40.11
+16.49
+27.73
+2
+SamKV
+-
+21.86
+13.18
+31.73
+16.30
+20.77
+3
+-
+34.01
+16.94
+36.51
+17.70
+26.29
+4
+22.29
+10.75
+26.22
+15.00
+18.57
+5
+23.64
+12.76
+28.52
+14.90
+19.96
+6
+33.10
+13.18
+38.57
+17.82
+25.67
+7
+35.00+1.66
+17.03-3.93
+39.09-1.02
+18.08+1.59
+27.30-0.43
+Llama 3.1 8B Instruct
+8
+Recompute
+-
+-
+-
+21.48
+14.56
+24.12
+27.60
+21.94
+9
+SamKV
+-
+10.54
+9.49
+21.68
+16.99
+14.68
+10
+-
+22.12
+12.44
+26.67
+25.00
+21.56
+11
+10.63
+9.59
+23.62
+16.14
+15.00
+12
+10.91
+9.36
+23.60
+17.74
+15.40
+13
+20.90
+13.21-1.35
+29.26
+25.48
+22.21
+14
+22.41+0.93
+12.47
+30.52+6.4
+25.58-2.02
+22.75+0.81
+Table 4: Using full recomputation as the baseline, ablations are conducted on three aspects: selecting the KV Cache in the
+middle section, adding personalized bias (PersBias.), and whether to recompute (with fusion as default). The evaluation metric
+is the F1 score, with Avg. denoting the average F1 score across datasets.
+4.3
+Ablation studies
+We conduct comprehensive ablation experiments to evalu-
+ate three key design choices: (i) whether to apply selection
+to the middle segment’s KV Cache, (ii) the inclusion of per-
+sonalized bias, and (iii) the use of recomputation. Following
+the comparative analysis of overwrite versus fusion recom-
+putation strategies in Section 4.2, we fix the recomputation
+method to fusion for all ablation trials to isolate variable ef-
+fects. The detailed analysis is presented as follows.
+Selection of middle KV Caches. The key consideration
+in adopting selection lies in whether to extract crucial KV
+from the middle part of the KV Cache. Here,
+denotes
+selection, while
+indicates no selection, meaning only the
+initial and local parts of the KV Caches are used. Compar-
+ing the average results (Avg.) in Table 4, specifically rows
+2 and 4 as well as rows 9 and 11, it can be observed that
+when recomputation is disabled, the absence of the middle
+KV Cache yields slightly better performance than its inclu-
+sion. This suggests that relying solely on the initial and local
+parts of the KV Cache can achieve reasonably good results.
+However, this performance improvement precisely becomes
+the factor that limits its further enhancement. Only when ex-
+tending to incorporate the middle part can additional person-
+alized bias be introduced. For instance, when recomputation
+is enabled, comparing the cases without selection (rows 3
+and 10) and those with personalized bias (rows 7 and 14) re-
+veals that selection with personalized bias delivers superior
+performance. Evidently, adopting selection is a prerequisite
+for further enhancement. The computational overhead asso-
+ciated with selection is discussed in detail later.
+Personalized bias. Comparing rows 4 and 5, rows 6 and
+7, rows 11 and 12, and rows 13 and 14 in Table 4 reveals that
+while both cases involve selection, the inclusion of personal-
+ized bias in the query vectors yields better performance. The
+results show that introducing a small amount of Q Cache
+into the query vector may help identify consensus for better
+performance.
+Recomputation. Comparing rows 2 and 3, rows 4 and 6,
+rows 5 and 7, rows 9 and 10, rows 11 and 13, and rows 12
+and 14 in Table 4, it can be observed that recomputing only
+a portion of the sparsified KV Cache consistently improves
+the F1 score by 6% to 7%, regardless of whether selection is
+applied or personalized bias is incorporated. This indicates
+that recomputing only the sparse subset of tokens can sig-
+nificantly alleviate the missing cross-attention between doc-
+uments without requiring the full KV Cache to be carried
+throughout the entire inference process.
+In terms of time consumption, compared to methods like
+CacheBlend and EPIC that utilize full KV Caches, our ap-
+proach introduces an additional sparsification process which
+incurs extra time overhead. However, these methods require
+carrying the complete KV Caches during recomputation, for
+example, when recomputing the KV of the local position in
+n-th layer, the output of the local position in the (n −1)-th
+layer relies on the KV of all tokens for computation, result-
+ing in high time complexity. In contrast, our method only
+recomputes a small subset of tokens from the sparsified KV
+Caches, and the sparsification process is accelerated by vec-
+tor databases and GPUs, leading to lower overall time con-
+sumption.
+5
+Conclusion
+In this paper, we present SamKV, the first method designed
+for KV Cache sparsification across diverse contexts. Ex-
+perimental results demonstrate that SamKV achieves com-
+parable accuracy to full recomputation while reducing the
+required KV Cache during inference to only 15% of its
+original length. Further investigations reveal that incorpo-
+rating inter-document consensus during sparsification along
+with localized recomputation after sparsification not only re-
+duces computational overhead and the amount of KV Cache
+needed for inference but also significantly mitigates cross-
+
+
+attention deficiencies between documents. These findings
+provide valuable insights for optimizing ultra-long multiple
+contexts processing and establish an important reference for
+future research in this domain.
+A
+Static attention analysis of KV Cache
+A.1
+Attention for blocks within a layer
+When managing KV Cache at the block level for long con-
+texts, a block’s attention scores inherently depend on the
+relative attention weights of its internal tokens within the
+full sequence. Conventional analysis interprets these scores
+unidirectionally: higher scores indicate greater importance,
+while lower scores suggest lesser importance. In contrast
+to this single-score representation, we propose a dual-score
+characterization for each block, explicitly decoupling and
+quantifying both its importance and unimportance attributes.
+Importance attribute. Since a block contains numer-
+ous tokens, computing relative attention between all tokens
+would introduce excessive complexity. Instead, we select
+the most representative token from each block to deter-
+mine its importance attribute, then compare attributes across
+blocks. Specifically, for each block, we identify the token
+that receives consistently high attention from subsequent to-
+kens, visualized as distinct bright lines in Figure 7 (left).
+Extracting these lines yields Figure 7 (middle), and plot-
+ting their values produces the dashed curves in Figure 7
+(right). These curves closely follow a power-law distribution
+(y ∝x−α, α > 0), approximated by the solid lines in Fig-
+ure 7 (right). The fitted curves reveal two key observations:
+a smaller exponent α corresponds to higher overall atten-
+tion (e.g., ①-fit), while a larger α indicates lower attention
+(e.g., ②-fit). Thus, block importance is derived by sorting
+their respective α values. Moreover, since attention reflects
+token significance, we apply the PauTa Criterion to detect
+outliers in αs, identifying tokens requiring recomputation in
+the middle KV Cache section.
+Unimportance attribute. Unlike important tokens that
+exhibit distinct bright lines in attention patterns, unimpor-
+tant blocks or tokens consistently show uniformly low at-
+tention values, appearing as large purple regions in Figure 7
+(left). To quantify this, we select the token with the highest
+sustained attention within each block and compute its mean
+attention score. A lower mean indicates weaker attention al-
+location. When even the most prominent token in a block
+receives low attention, the block itself is deemed less im-
+portant, e.g., its unimportance is more pronounced. Based
+on this measure, we derive an unimportance ranking for all
+blocks within a layer.
+By extracting the block with the highest importance at-
+tribute and the block with the highest unimportance attribute
+from the KV Cache of document i, we obtain KV (n)
+doc-imax and
+KV (n)
+doc-imin, which are used to compute P (n)
+doc-i.
+A.2
+Block importance cross layers
+Through manual inspection of attention score maps from
+the layers, we observe that tokens with high attention scores
+(e.g., those exhibiting distinct bright lines in Figure 7) con-
+sistently maintain high attention across multiple layers. For
+instance, in Qwen2.5 3B Instruct, the last five layers all
+highlight tokens at nearly identical positions. This indicates
+strong consistency in high-attention token selection across
+some layers.
+To better observe which layers maintain stable attention
+distributions, we transform and visualize this process. For
+efficient analysis and management, we examine attention
+patterns at the block level. Appendix A.1 provides the at-
+tention ranking for all blocks in each layer. For any given
+block, we average its rankings across all layers to determine
+its overall attention ranking in the model. Our key insight
+is that when a block achieves the highest attention in the
+full model and certain layers consistently rank it high-
+est, these layers demonstrate consensus regarding the
+block’s attention stability. We identify such layers as hav-
+ing stable attention patterns.
+We implement this insight through a two-step pipeline.
+First, we identify the block β with maximum attention using
+the method described in Appendix A.1. Second, if β’s rank-
+ing in layer n is statistically significant as determined by the
+PauTa Criterion (indicating an outlier), we classify this layer
+as attention-stable and increment its score by 1. Figure 8 vi-
+sualizes the resulting scores across all layers as a line chart.
+The figure reveals performance variations across mod-
+els and datasets, demonstrating that this attention stabiliza-
+tion phenomenon is model dependent. Observations of at-
+tention stability distributions across different models reveal
+that higher stability is consistently exhibited in the final few
+layers. Therefore, we focus on selecting from these latter
+layers. Specifically, the phenomenon occurs in:
+• Qwen2.5-3B-Instruct layers 32 to 36;
+• Mistral-7B-Instruct layers 28 to 32;
+• Llama-3.1-8B-Instruct layers 29 to 32.
+We identify these layers as N ∗due to their stable attention
+distributions and high consistency. From these layers, we ex-
+tract three key components: the anchor block, the maximum-
+attention block, and the minimum-attention block. These
+components are used to compute P (n)
+doc-i, which yields both
+stable and reasonable sparsity ratios.
+References
+Bai, Y.; Lv, X.; Zhang, J.; Lyu, H.; Tang, J.; Huang, Z.; Du,
+Z.; Liu, X.; Zeng, A.; Hou, L.; Dong, Y.; Tang, J.; and Li,
+J. 2024. LongBench: A Bilingual, Multitask Benchmark for
+Long Context Understanding. In Ku, L.; Martins, A.; and
+Srikumar, V., eds., Proceedings of the 62nd Annual Meeting
+of the Association for Computational Linguistics (Volume 1:
+Long Papers), ACL 2024, Bangkok, Thailand, August 11-16,
+2024, 3119–3137. Association for Computational Linguis-
+tics.
+Beltagy, I.; Peters, M. E.; and Cohan, A. 2020. Longformer:
+The Long-Document Transformer. CoRR, abs/2004.05150.
+Devlin, J.; Chang, M.; Lee, K.; and Toutanova, K. 2019.
+BERT: Pre-training of Deep Bidirectional Transformers for
+Language Understanding. In Burstein, J.; Doran, C.; and
+Solorio, T., eds., Proceedings of the 2019 Conference of the
+
+
+②
+①
+②
+①
+-ﬁt
+-ﬁt
+Figure 7: Attention sink (left) in the middle of the context (Hu et al. 2025) evaluated on the MATH 500 (Hendrycks et al. 2021)
+using the Qwen2.5 Math 7B Instruct (Yang et al. 2024). Extract representative tokens within the block (middle), and plot them
+as a dashed figure (right). Fit the dashed line with a power law to get the solid line.
+0
+10
+20
+30
+0
+20
+40
+60
+Qwen2.5 3B Instruct
+2WikiMQA
+MuSiQue
+HotpotQA
+DuReader
+0
+10
+20
+30
+0
+10
+20
+Mistral 7B Instruct
+2WikiMQA
+MuSiQue
+HotpotQA
+DuReader
+0
+10
+20
+30
+0
+10
+20
+30
+Llama 3.1 8B Instruct
+2WikiMQA
+MuSiQue
+HotpotQA
+DuReader
+Layers
+Figure 8: After analyzing block importance across datasets, SamKV evaluates the stability of attention distributions in each
+layer. The vertical axis measures the stability of each layer’s attention allocation to the most important block. Higher stability
+values indicate more consistent attention distributions in the corresponding layer.
+North American Chapter of the Association for Computa-
+tional Linguistics: Human Language Technologies, NAACL-
+HLT 2019, Minneapolis, MN, USA, June 2-7, 2019, Vol-
+ume 1 (Long and Short Papers), 4171–4186. Association for
+Computational Linguistics.
+Dubey, A.; Jauhri, A.; Pandey, A.; Kadian, A.; Al-Dahle,
+A.; Letman, A.; Mathur, A.; Schelten, A.; Yang, A.; Fan,
+A.; Goyal, A.; Hartshorn, A.; Yang, A.; Mitra, A.; Sra-
+vankumar, A.; Korenev, A.; Hinsvark, A.; Rao, A.; Zhang,
+A.; Rodriguez, A.; Gregerson, A.; Spataru, A.; Rozi`ere, B.;
+Biron, B.; Tang, B.; Chern, B.; Caucheteux, C.; Nayak, C.;
+Bi, C.; Marra, C.; McConnell, C.; Keller, C.; Touret, C.;
+Wu, C.; Wong, C.; Ferrer, C. C.; Nikolaidis, C.; Allonsius,
+D.; Song, D.; Pintz, D.; Livshits, D.; Esiobu, D.; Choud-
+hary, D.; Mahajan, D.; Garcia-Olano, D.; Perino, D.; Hup-
+kes, D.; Lakomkin, E.; AlBadawy, E.; Lobanova, E.; Dinan,
+E.; Smith, E. M.; Radenovic, F.; Zhang, F.; Synnaeve, G.;
+Lee, G.; Anderson, G. L.; Nail, G.; Mialon, G.; Pang, G.; Cu-
+curell, G.; Nguyen, H.; Korevaar, H.; Xu, H.; Touvron, H.;
+Zarov, I.; Ibarra, I. A.; Kloumann, I. M.; Misra, I.; Evtimov,
+I.; Copet, J.; Lee, J.; Geffert, J.; Vranes, J.; Park, J.; Ma-
+hadeokar, J.; Shah, J.; van der Linde, J.; Billock, J.; Hong,
+J.; Lee, J.; Fu, J.; Chi, J.; Huang, J.; Liu, J.; Wang, J.; Yu, J.;
+Bitton, J.; Spisak, J.; Park, J.; Rocca, J.; Johnstun, J.; Saxe,
+J.; Jia, J.; Alwala, K. V.; Upasani, K.; Plawiak, K.; Li, K.;
+Heafield, K.; Stone, K.; and et al. 2024. The Llama 3 Herd
+of Models. CoRR, abs/2407.21783.
+Hendrycks, D.; Burns, C.; Kadavath, S.; Arora, A.; Basart,
+S.; Tang, E.; Song, D.; and Steinhardt, J. 2021. Measuring
+Mathematical Problem Solving With the MATH Dataset. In
+Vanschoren, J.; and Yeung, S., eds., Proceedings of the Neu-
+ral Information Processing Systems Track on Datasets and
+Benchmarks 1, NeurIPS Datasets and Benchmarks 2021,
+December 2021, virtual.
+Hu, J.; Huang, W.; Wang, H.; Wang, W.; Hu, T.; Zhang,
+Q.; Feng, H.; Chen, X.; Shan, Y.; and Xie, T. 2024. EPIC:
+Efficient Position-Independent Context Caching for Serving
+Large Language Models. CoRR, abs/2410.15332.
+Hu, J.; Huang, W.; Wang, W.; Li, Z.; Hu, T.; Liu, Z.; Chen,
+X.; Xie, T.; and Shan, Y. 2025.
+RaaS: Reasoning-Aware
+Attention Sparsity for Efficient LLM Reasoning.
+arXiv
+preprint arXiv:2502.11147.
+Jiang, A. Q.; Sablayrolles, A.; Mensch, A.; Bamford, C.;
+Chaplot, D. S.; de Las Casas, D.; Bressand, F.; Lengyel, G.;
+
+
+Lample, G.; Saulnier, L.; Lavaud, L. R.; Lachaux, M.; Stock,
+P.; Scao, T. L.; Lavril, T.; Wang, T.; Lacroix, T.; and Sayed,
+W. E. 2023. Mistral 7B. CoRR, abs/2310.06825.
+Lewis, P.; Perez, E.; Piktus, A.; Petroni, F.; Karpukhin, V.;
+Goyal, N.; K¨uttler, H.; Lewis, M.; Yih, W.; Rockt¨aschel, T.;
+Riedel, S.; and Kiela, D. 2020. Retrieval-Augmented Gen-
+eration for Knowledge-Intensive NLP Tasks. In Larochelle,
+H.; Ranzato, M.; Hadsell, R.; Balcan, M.; and Lin, H., eds.,
+Advances in Neural Information Processing Systems 33: An-
+nual Conference on Neural Information Processing Systems
+2020, NeurIPS 2020, December 6-12, 2020, virtual.
+Li, Y.; Huang, Y.; Yang, B.; Venkitesh, B.; Locatelli, A.; Ye,
+H.; Cai, T.; Lewis, P.; and Chen, D. 2024. SnapKV: LLM
+Knows What You are Looking for Before Generation. In
+Globersons, A.; Mackey, L.; Belgrave, D.; Fan, A.; Paquet,
+U.; Tomczak, J. M.; and Zhang, C., eds., Advances in Neu-
+ral Information Processing Systems 38: Annual Conference
+on Neural Information Processing Systems 2024, NeurIPS
+2024, Vancouver, BC, Canada, December 10 - 15, 2024.
+Liu, D.; Chen, M.; Lu, B.; Jiang, H.; Han, Z.; Zhang, Q.;
+Chen, Q.; Zhang, C.; Ding, B.; Zhang, K.; Chen, C.; Yang,
+F.; Yang, Y.; and Qiu, L. 2024. RetrievalAttention: Accel-
+erating Long-Context LLM Inference via Vector Retrieval.
+CoRR, abs/2409.10516.
+Pope, R.; Douglas, S.; Chowdhery, A.; Devlin, J.; Bradbury,
+J.; Heek, J.; Xiao, K.; Agrawal, S.; and Dean, J. 2023. Effi-
+ciently Scaling Transformer Inference. In Song, D.; Carbin,
+M.; and Chen, T., eds., Proceedings of the Sixth Conference
+on Machine Learning and Systems, MLSys 2023, Miami, FL,
+USA, June 4-8, 2023. mlsys.org.
+Team, Q. 2024. Qwen2.5: A Party of Foundation Models.
+Vaswani, A.; Shazeer, N.; Parmar, N.; Uszkoreit, J.; Jones,
+L.; Gomez, A. N.; Kaiser, L.; and Polosukhin, I. 2017. At-
+tention is All you Need.
+In Guyon, I.; von Luxburg, U.;
+Bengio, S.; Wallach, H. M.; Fergus, R.; Vishwanathan, S.
+V. N.; and Garnett, R., eds., Advances in Neural Informa-
+tion Processing Systems 30: Annual Conference on Neural
+Information Processing Systems 2017, December 4-9, 2017,
+Long Beach, CA, USA, 5998–6008.
+Wolf, T.; Debut, L.; Sanh, V.; Chaumond, J.; Delangue, C.;
+Moi, A.; Cistac, P.; Rault, T.; Louf, R.; Funtowicz, M.; Davi-
+son, J.; Shleifer, S.; von Platen, P.; Ma, C.; Jernite, Y.; Plu, J.;
+Xu, C.; Scao, T. L.; Gugger, S.; Drame, M.; Lhoest, Q.; and
+Rush, A. M. 2020. Transformers: State-of-the-Art Natural
+Language Processing. In Liu, Q.; and Schlangen, D., eds.,
+Proceedings of the 2020 Conference on Empirical Methods
+in Natural Language Processing: System Demonstrations,
+EMNLP 2020 - Demos, Online, November 16-20, 2020, 38–
+45. Association for Computational Linguistics.
+Xiao, C.; Zhang, P.; Han, X.; Xiao, G.; Lin, Y.; Zhang, Z.;
+Liu, Z.; and Sun, M. 2024a. InfLLM: Training-Free Long-
+Context Extrapolation for LLMs with an Efficient Context
+Memory. In Globersons, A.; Mackey, L.; Belgrave, D.; Fan,
+A.; Paquet, U.; Tomczak, J. M.; and Zhang, C., eds., Ad-
+vances in Neural Information Processing Systems 38: An-
+nual Conference on Neural Information Processing Systems
+2024, NeurIPS 2024, Vancouver, BC, Canada, December 10
+- 15, 2024.
+Xiao, G.; Tian, Y.; Chen, B.; Han, S.; and Lewis, M. 2024b.
+Efficient Streaming Language Models with Attention Sinks.
+In The Twelfth International Conference on Learning Rep-
+resentations, ICLR 2024, Vienna, Austria, May 7-11, 2024.
+OpenReview.net.
+Yang, A.; Zhang, B.; Hui, B.; Gao, B.; Yu, B.; Li, C.; Liu,
+D.; Tu, J.; Zhou, J.; Lin, J.; Lu, K.; Xue, M.; Lin, R.; Liu,
+T.; Ren, X.; and Zhang, Z. 2024. Qwen2.5-Math Techni-
+cal Report: Toward Mathematical Expert Model via Self-
+Improvement. CoRR, abs/2409.12122.
+Yao, J.; Li, H.; Liu, Y.; Ray, S.; Cheng, Y.; Zhang, Q.; Du,
+K.; Lu, S.; and Jiang, J. 2024. CacheBlend: Fast Large Lan-
+guage Model Serving for RAG with Cached Knowledge Fu-
+sion. CoRR, abs/2405.16444.

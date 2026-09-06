@@ -1,0 +1,1176 @@
+arXiv:2201.09881v1  [cs.LG]  22 Jan 2022
+Iterative Activation-based Structured Pruning
+Kaiqi Zhao*, Arizona State University (AWS Intern 2020)
+Animesh Jain, AWS
+Ming Zhao, Arizona State University
+Abstract
+Deploying complex deep learning models on edge devices
+is challenging because they have substantial compute and
+memory resource requirements, whereas edge devices’ re-
+source budget is limited. To solve this problem, extensive
+pruning techniques have been proposed for compressing net-
+works. Recent advances based on the Lottery Ticket Hypoth-
+esis (LTH) show that iterative model pruning tends to pro-
+duce smaller and more accurate models. However, LTH re-
+search focuses on unstructured pruning, which is hardware-
+inefﬁcient and difﬁcult to accelerate on hardware platforms.
+In this paper, we investigate iterative pruning in the context of
+structured pruning because structurally pruned models map
+well on commodity hardware. We ﬁnd that directly applying a
+structured weight-based pruning technique iteratively, called
+iterative L1-norm based pruning (ILP), does not produce ac-
+curate pruned models. To solve this problem, we propose two
+activation-based pruning methods, Iterative Activation-based
+Pruning (IAP) and Adaptive Iterative Activation-based Prun-
+ing (AIAP). We observe that, with only 1% accuracy loss,
+IAP and AIAP achieve 7.75ˆ and 15.88ˆ compression on
+LeNet-5, and 1.25ˆ and 1.71ˆ compression on ResNet-50,
+whereas ILP achieves 4.77ˆ and 1.13ˆ, respectively.
+Introduction
+Deep neural networks (DNNs) have substantial com-
+pute
+and
+memory
+requirements.
+As
+deep
+learning
+becomes pervasive and moves towards edge devices,
+DNN deployment becomes harder because of the mist-
+match between resource-hungry DNNs and resource-
+constrained
+edge
+devices
+(Li, Zhou, and Chen
+2018;
+Li et al. 2019). Deep learning researchers and practi-
+tioners have proposed many techniques to alleviate this
+resource pressure (Chu, Funderlic, and Plemmons 2003;
+Han, Mao, and Dally 2015; Polino, Pascanu, and Alistarh
+2018; Yim et al. 2017; Pham et al. 2018). Among these
+efforts, DNN pruning is a promising approach (Li et al.
+2016; Han, Mao, and Dally 2015; Molchanov et al. 2016;
+Theis et al. 2018; Renda, Frankle, and Carbin 2020), which
+identiﬁes the parameters (or weight elements) that do not
+contribute signiﬁcantly to the accuracy, and prunes them
+from the network.
+*This work is conduct during Kaiqi’s internship at Amazon.com
+Inc.
+Unstructured vs. Structured Pruning
+Like
+other
+compression
+techniques,
+pruning
+has
+a
+performance-accuracy
+tradeoff,
+i.e,
+as
+we
+compress
+the model more aggressively, we achieve better hardware
+performance (higher reductions in computation and mem-
+ory requirements) but suffer higher accuracy losses. In this
+paper, we measure performance across two dimensions.
+First, memory footprint, i.e., memory space used to store
+parameters, and second, inference latency, i.e., time to run
+one inference. Pruning can be broadly categorized into
+two classes, namely, unstructured pruning and structured
+pruning. The two techniques take different approaches on
+memory footprint reduction, and impact inference latency
+and accuracy differently.
+Unstructured pruning is a ﬁne-grained approach that
+prunes individual unimportant elements in weight tensors.
+It allows better accuracy with higher memory footprint re-
+duction, compared to structured pruning, as it selectively
+prunes unimportant elements from a weight ﬁlter while re-
+taining the important elements. However, unstructured prun-
+ing is hardware-inefﬁcient because it is difﬁcult to map ran-
+dom/indirect memory in the pruned weight representation on
+general-purpose hardware platforms like Intel/ARM CPU
+vector units or NVDIA GPU CUDA cores (He et al. 2018),
+e.g, (Hill et al. 2017) shows directly applying NVDIA cuS-
+PARSE on unstructured pruned models can lead to 60ˆ
+slowdown on GPU compared to dense kernels.
+On the other hand, structured pruning is a coarse-grained
+approach that prunes entire regular regions of weight ten-
+sors (e.g., ﬁlters or output channels) (Han, Mao, and Dally
+2015). It tends to cause higher drop in accuracy than un-
+structured pruning because by removing entire regions, it
+might remove weight elements that are important to the ﬁ-
+nal accuracy (Li et al. 2016). However, structurally pruned
+models can be mapped easily to general-purpose hardware
+and accelerated directly with off-the-shelf hardware and li-
+braries (He et al. 2018).
+Iterative Pruning
+Another choice in DNN pruning is between one-shot prun-
+ing and iterative pruning. One-shot pruning prunes a pre-
+trained model and then retrains it once to make up for the
+accuracy loss. Iterative pruning, on the other hand, prunes
+and retrains the model in multiple rounds. Both techniques
+
+
+can choose either structured or unstructured pruning tech-
+niques. Recent research, particularly the Lottery Ticket Hy-
+pothesis (LTH) (Frankle and Carbin 2018), shows that iter-
+ative pruning leads to smaller and more accurate models,
+when weights or/and learning rate are rewound to an early
+training iteration after each pruning round (discussed more
+in Background and Related Works). However, majority of
+LTH and the follow-up research has been done with un-
+structured pruning which is hardware-inefﬁcient. In this pa-
+per, we investigate hardware-friendly iterative structured
+pruning with rewinding.
+Prior iterative unstructured pruning with rewinding re-
+search (LTH and follow-up papers) uses widely adopted iter-
+ative magnitude pruning (IMP) technique (Han et al. 2015).
+To understand the state of iterative structured pruning, we
+experiment with IMP’s structured pruning counterpart—L1-
+norm structured pruning (ILP) (Li et al. 2016). ILP removes
+entire ﬁlters depending on their L1-norm value. However,
+we observe that ILP leads to severe accuracy losses with
+small reduction in memory size, e.g., ILP could compress
+ResNet-50 by only 1.13ˆ when the maximum accuracy loss
+is limited to 1% (higher accuracy losses tend to be unsuitable
+for industrial deployments). Therefore, directly applying it-
+erative pruning to existing structured pruning methods does
+not produce accurate pruned models.
+Our Solution
+Our results from ILP show that just using weights values to
+identify and prune unimportant ﬁlters is not effective. Some-
+times, ﬁlters that have small weight values can also produce
+useful non-zero activation patterns that are important for
+learning features during backpropagation. Instead, we pro-
+pose to use activation values, i.e., the intermediate output
+tensors after the non-linear activation, to identify unimpor-
+tant ﬁlters. This tends to be more effective because activa-
+tion values not only capture features of training dataset, but
+also contain the information of convolution layers that act as
+feature detectors for prediction tasks.
+Based on this insight, we propose two activation-
+based structured pruning methods—Iterative Activation-
+based pruning (IAP) and Adaptive Iterative Activation-
+based pruning (AIAP). IAP prunes a ﬁxed percentage of
+unimportant ﬁlters every round depending on the mean of
+the activation values. AIAP prunes ﬁlters if the mean acti-
+vation value is below an adaptive threshold that increases as
+the model gets smaller every round.
+In this paper, we seek to answer following questions in
+the context of iterative structured pruning with rewinding:
+• Q1: Can iterative structured pruning with rewinding
+ﬁnd lottery tickets, i.e., generate pruned models that are
+smaller but also at least as accurate as the original model?
+Answer: Yes, we observe winning lottery tickets for both
+shallow and deep networks. IAP and AIAP compress
+LeNet-5 by 2.55ˆ and 3.95ˆ and ResNet-50 by 1.11ˆ
+and 1.17ˆ, respectively, with no accuracy loss.
+• Q2: What is the accuracy and memory footprint tradeoff
+for iterative structured pruning?
+Answer: We observe that IAP and AIAP compress the
+models with graceful accuracy degradation, e.g., for an
+acceptable accuracy loss of 1%, IAP and AIAP achieve
+1.25ˆ and 1.71ˆ compression, respectively, compared to
+just 1.13ˆ for ILP.
+• Q3: What is the accuracy and inference latency tradeoff
+for iterative structured pruning?
+Answer: We observe that IAP and AIAP reduce the com-
+pute ﬂops by 1.5ˆ and 1.6ˆ for LeNet-300-100 and
+1.05ˆ and 1.33ˆ for ResNet-50 compared to ILP, when
+accuracy loss is 1%. As our pruning techniques are regular
+and remove ﬁlters, we can employ off-the-shelf libraries
+to speedup the model inference.
+To the best of our knowledge, the paper is the ﬁrst to in-
+vestigate iterative structured pruning with weight and learn-
+ing rate rewinding. We introduce two activation-based struc-
+tured pruning techniques to prune the models. The models
+pruned by the proposed techniques produce a new baseline
+for the future work on structurally pruned models.
+Background and Related Works
+Deep learning researchers and practitioners have pro-
+posed many techniques to reduce the resource-hungry
+requirements of deep neural networks, such as low-
+rank
+approximation
+(Chu, Funderlic, and Plemmons
+2003;
+Clarkson and Woodruff
+2017),
+quan-
+tization
+(Lan, Studer, and Baraniuk
+2014;
+Polino, Pascanu, and Alistarh
+2018),
+weight
+shar-
+ing (Han, Mao, and Dally 2015; Kadetotad et al. 2016),
+knowledge distillation (Polino, Pascanu, and Alistarh 2018;
+Yim et al. 2017), neural architecture search (Zoph and Le
+2016; Pham et al. 2018) and pruning (Li et al. 2016;
+Han, Mao, and Dally
+2015;
+Srinivas and Babu
+2015;
+Molchanov et al. 2016). There has also been substantial
+work in manually designing new model topology, like Mo-
+bileNet (Howard et al. 2017) and EfﬁcientNet (Tan and Le
+2019), that are suitable for edge device deployment but
+are less accurate compared to traditional models like
+ResNet (He et al. 2016). Model pruning is gaining popular-
+ity because researchers are gradually building an automatic
+ﬂow of pruning the models, reducing the need of manual
+rules or signiﬁcant domain expertise.
+Unstructured Pruning. One of the earliest works in
+unstructured pruning is Optimal Brain Damage, which
+prunes weights based on Hessian of the loss func-
+tion (LeCun, Denker, and Solla 1990). Recently, Han pro-
+posed to prune weights with smallest magnitude val-
+ues (Li et al. 2016), which has been widely adopted.
+Research has shown that traditional sparse computation
+libraries, like cuSPARSE or MKLDNN, observe substan-
+tial slowdown on unstructured pruned models because the
+libraries are designed for extremely high sparsity (ą99%),
+while unstructured sparsity leads to much lower 75%-90%
+sparsity (Hill et al. 2017). To solve this, there are initial
+efforts to manually write kernels suitable for this spar-
+sity (Elsen et al. 2019). But overall, unstructured pruned
+models are still hard to accelerate on commodity hardware.
+Structured Pruning. Earlier pruning research focused
+on manually ﬁnding heuristics on how to prune, such
+2
+
+
+Rewind To Epoch k
+Are
+Requirements 
+Met?
+No
+Yes
+Pruned 
+Model
+Retrain T-k Epochs
+Prune
+Train T epochs
+Original 
+Model
+Figure 1: Iterative pruning ﬂow with rewinding
+as
+L1-norm
+(Li et al.
+2016),
+average
+percentage
+of
+zero
+(Molchanov et al.
+2016),
+and
+other
+information
+considering the relationship between neighboring lay-
+ers (Theis et al. 2018; Lee, Ajanthan, and Torr 2018). Re-
+cently, the focus has shifted to ﬁnding the marginal ﬁlters
+automotically. Network slimming prunes ﬁlters with lower
+scaling factors, producing automatically discovered target
+architectures (Yu et al. 2018). AutoML uses reinforcement
+learning to iteratively prune the convolution layers (He et al.
+2018). Though time consuming, automatic pruning has pro-
+duced smaller models than manual techniques for similar ac-
+curacy.
+Structured pruned models are easier to accelerate as they
+remove entire regions of the weight tensor. For example, L1-
+norm ﬁlter pruning prunes ﬁlters, thus reducing the number
+of elements in the ﬁlter dimension of weight tensors. Essen-
+tially, this results in convolving two smaller tensors, which
+can be accelerated easily using off-the-shelf libraries. This
+is much harder to do in unstructured pruning.
+Iterative Pruning with Rewinding. Lottery Ticket Hypoth-
+esis (LTH) is a recent work on iterative pruning, which intro-
+duces rewinding with iterative pruning to generate smaller
+and accurate models (Frankle and Carbin 2018). LTH posits
+that a dense randomly initialized network has a subnetwork,
+termed as a winning ticket, which can be trained in isolation
+to achieve better or at least similar accuracy than the origi-
+nal network (Frankle and Carbin 2018; Frankle et al. 2019).
+While pruning the model iteratively, it rewinds the weights
+and learning rate to some early epoch in the training phase.
+There are two types of rewinding—weight rewinding and
+learning rate rewinding (Renda, Frankle, and Carbin 2020).
+In weight rewinding, both weights and learning rate are re-
+wound to some early training epoch. In learning rate rewind-
+ing, only the learning rate is rewound. However, rewinding
+has only been validated in the context of unstructured prun-
+ing, which as mentioned above is hardware-inefﬁcient.
+In this paper, we focus on iterative structured pruning with
+rewinding. We aim to generate pruned models that are not
+only smaller and accurate, but also faster.
+Methodology
+We ﬁrst present an overview of iterative pruning ﬂow, and
+then detail the design of activation-based structured pruning.
+original image
+input image
+filer_1
+filer_2
+filer_3
+filer_4
+filer_5
+filer_6
+filer_7
+filer_8
+filer_9
+filer_10
+filer_11
+filer_12
+filer_13
+filer_14
+filer_15
+filer_16
+Figure 2: Activation output of 16 ﬁlters of a conv2d layer.
+On the left, the ﬁrst image is the original and the second is
+after data augmentation; right portion shows ﬁlter activation
+outputs.
+Flow of Iterative Pruning
+We present the high-level ﬂow of iterative pruning in Fig-
+ure 1. First, train the model, say for T epochs to create the
+original model. Next step is to ﬁgure out what to prune.
+Either structured or unstructured pruning technique can be
+used to identify unimportant weight elements/regions and
+remove them from the network. By this time, we have a
+pruned model but its accuracy is likely to be bad.
+Next, rewind weights and learning rate or just learning
+rate to their original values at epoch k (Frankle and Carbin
+2018). Then retrain the rewound pruned model for T ´ k
+epochs to make up for the accuracy losses introduced by
+pruning. Check if the retrained pruned model has met our
+requirement (desired accuracy or memory footprint). If not,
+repeat the pruning round—prune, rewind and retrain—until
+the requirements are met.
+We present a more formal and complete algorithm in Al-
+gorithm 1. To represent pruning of weights, we use a mask
+M rǫ t0, 1ud for each weight tensor W r
+t ǫRd, where r is prun-
+ing round number and t is the training epoch. Therefore, the
+pruned network at the end of training epoch T is represented
+by the element-wise product M r dW r
+T. The ﬁrst three steps
+are to train the original model to completion, while saving
+the weights at epoch k. Steps 4–7 represent a pruning round.
+Step 4 prunes the model. Step 5 (optional) and 6 perform
+rewinding. Step 7 retrains the pruned model for the remain-
+ing T ´ k epochs.
+Iterative Structured Pruning—Motivation
+In this subsection, we present the motivation behind the de-
+sign of our pruning techniques. We focus on weight- and
+activation-based structural pruning techniques to prune ﬁl-
+ters. Such pruning techniques are simple to implement and
+work well with iterative pruning, e.g., LTH uses simple un-
+structured iterative weight-based magnitude pruning (IMP)
+and successfully ﬁnds lottery tickets.
+To evaluate the state-of-the-art for iterative structured
+pruning, we choose simple and widely used L1-norm based
+3
+
+
+Algorithm 1 Iterative Structured Pruning Algorithm
+1: [Initialize] Randomly initialize a neural network fpx; M 0 d W 0
+0 q with initial pruning mask M 0 “ t0, 1u|W 0
+0 |.
+2: [Save weights at epoch k] Train the network for k epochs, producing network fpx; M 0 d W 0
+k q, and save weights W 0
+k .
+3: [Train to Completion] Train the network for T-k further epochs to converge, producing network fpx; M 0 d W 0
+T q.
+For each pruning round r (r>=1):
+4: [Prune] Prune ﬁlters from W r´1
+T
+, producing a new mask M r, and a network fpx; M r d W r´1
+T
+q.
+5: [Rewind Weights] Reset the remaining ﬁlters to their values in W 0
+k at epoch k, producing network fpx; M r d W r´1
+k
+q.
+6: [Rewind Learning Rate] Reset the learning rate schedule to its state from epoch k.
+7: [Retrain] Retrain the unpruned ﬁlters for T-k epoch to converge, producing a network fpx; M r d W r
+T q.
+structured pruning method. We refer to it as Iterative L1-
+norm Pruning (ILP). ILP is a weight-based pruning approach
+that removes ﬁlters with lowest L1-norm values. However,
+we observe that ILP does not produce accurate pruned mod-
+els. For example, the largest achievable compression ratio
+of ResNet-50 pruned by ILP is only 1.13ˆ with 1% top-1
+accuracy loss. Some ﬁlters, even though their L1-norm is
+small, can produce useful non-zero activation values that are
+important for learning features during backpropagation.
+Instead, we observe that activation values are more effec-
+tive in ﬁnding unimportant ﬁlters. We present the visual mo-
+tivation in Figure 2. The ﬁgure shows the activation output of
+16 ﬁlters of a convolution layer on one input image. The ﬁrst
+image on the left is the original image, and the second im-
+age is the input features after data augmentation. We observe
+that some ﬁlters extract image features with high activation
+patterns, e.g., 6th and 12th ﬁlters. In comparison, the acti-
+vation outputs of some ﬁlters are close to zero, such as the
+2nd, 14th, and 16th. Therefore, from visual inspection, re-
+moving ﬁlters with weak activation patterns is likely to have
+minimal impact on the ﬁnal accuracy of the pruned model.
+Overall, we ﬁnd that activation-based pruning leads to
+more accurate pruned models. Activations induce the spar-
+sity, and enable convolutional layers acting as feature de-
+tectors. If an activation value is small, then its correspond-
+ing feature detector is not important for prediction tasks. So
+activation values, i.e., the intermediate output tensors after
+the non-linear activation, not only detect features of train-
+ing dataset, but also contain the information of convolution
+layers that act as feature detectors for prediction tasks.
+Activation-based Structured Pruning
+To solve the aforementioned problem, we introduce two sim-
+ple activation-based structured pruning methods—Iterative
+Activation-based Pruning (IAP) and Adaptive Iterative
+Activation-based Pruning (AIAP). Note that these are struc-
+tured pruning techniques, and therefore hardware-efﬁcient
+and easy to accelerate with off-the-shelf libraries.
+Iterative Activation-based Filter Pruning (IAP).
+Fig-
+ure 3 shows the inputs and outputs of a 2D convolution
+layer (referred to as conv2d), followed by an activation layer.
+For the ith conv2d layer, let XiǫRbˆni´1ˆhi´1ˆwi´1 de-
+note one batch of the input features, and F i
+j ǫRni´1ˆkiˆki
+be the jth ﬁlter, where b denotes batch size, hi´1{wi´1 is
+the height/width of the input features, ni´1 is the number
+of input channels, and ni is the number of output channels.
+Inputs
+ni Filters
+Outputs
+ReLu
+Conv2d
+F0
+i
+ki
+ki
+ni-1
+F1
+i
+ki
+ki
+ni-1
+Fn
+i
+ki
+ki
+ni-1
+Xi
+wi-1
+hi-1
+ni-1
+Ai
+wi
+hi
+ni
+Figure 3: Input and output tensors of a convolution layer.
+Convolution layer is typically followed by an activation
+layer like ReLu.
+The output of the ﬁlter F i
+j after ReLu mapping is therefore
+denoted by Ai
+jǫRbˆhiˆwi, where hi{wi is the height/width
+of the output features.
+For pruning, we introduce a mask M i
+jǫ t0, 1uni´1ˆkiˆki
+for each ﬁlter F i
+j. The effective weights of the conv2d layer
+after pruning is the elementwise product of the ﬁlter and
+mask—F i
+j dM i
+j. For a ﬁlter, all values of this mask is either
+0 or 1, thus either keeping or pruning the entire ﬁlter.
+Our structured pruning technique is applied iteratively
+with rewinding. For each pruning round r, we prune p% ﬁl-
+ters from each conv2d layer. We present the steps in each
+pruning round for the ith conv2d layer below:
+1. Select unpruned ﬁlters with a non-zero mask: F i
+“
+␣
+F i
+j |M i
+j ‰ 0
+(
+, and let mi denote the number of unpruned
+ﬁlters in F i: mi “
+ˇˇF iˇˇ.
+2. For each ﬁlter F i
+j in F i, calculate the mean of its acti-
+vation Ai
+j: ¯
+Ai
+j “ 1
+b
+řhi
+k“1
+řwi
+l“1 ak,l, where ak,l denotes
+every value of Ai
+j.
+3. Sort ﬁlters by ¯
+Ai
+j.
+4. Prune p% ˆ mi ﬁlters with the smallest activation mean
+values, i.e., let M i
+j “ 0 if F i
+j is pruned.
+Adaptive Iterative Activation-based Pruning (AIAP).
+Weight-based pruning techniques like ILP and the above
+proposed IAP prune a ﬁxed percentage of ﬁlters in each
+pruning round. This approach can be too aggressive in some
+4
+
+
+pruning rounds and remove useful ﬁlters, making it hard to
+recover accuracy loss.
+In order to avoid removing useful ﬁlters, we propose to
+prune different numbers of ﬁlters in each pruning round
+based on the reduced number of parameters. We introduce an
+Adaptive Iterative Activation-based pruning (AIAP) method
+which adapts the aggressiveness of pruning automatically. In
+contrast to IAP that removes a ﬁxed percentage (p%) of ﬁl-
+ters with lowest mean activation values, AIAP removes the
+ﬁlters that are below the adaptive threshold (T). The pruning
+starts conservatively, with T initialized to 0, and gradually
+increases its aggressiveness: T increases only if the amount
+of parameters removed in the previous round is insufﬁcient.
+We show the procedure for AIAP in a pruning round r for
+the ith conv2d layer as follows:
+1. Calculate the fraction of parameters of conv2d lay-
+ers pruned in the last round, denoted as d: d
+“
+P rr´2s´P rr´1s
+P r0s
+, where Prr ´ 1s and Prr ´ 2s are the re-
+maining number of parameters of conv2d layers in prun-
+ing round r ´ 1 and r ´ 2, respectively, and Pr0s denotes
+the total number of parameters of conv2d layers of the
+original network.
+2. Calculate threshold, denoted as T rrs, which is set to 0.0
+initially, and then increases gradually (λ denotes the in-
+crement) if the remaining number of ﬁlters does not de-
+crease continuously with pruning:
+T rrs “
+#
+0.0
+if
+r ď 3
+T rr ´ 1s ` λ
+if
+r ą 3
+and
+d ă 1%
+T rr ´ 1s
+if
+r ą 3
+and
+d ě 1%
+3. Select unpruned ﬁlters that have a non-zero mask: F i “
+␣
+F i
+j|M i
+j ‰ 0
+(
+.
+4. For each ﬁlter F i
+j in F i, calculate the mean of its activa-
+tion: ¯
+Ai
+j “ 1
+b
+řhi
+k“1
+řwi
+l“1 ak,l, where ak,l denotes every
+value of Ai
+j.
+5. Prune the ﬁlter if its activation mean value is not larger
+than threshold T rrs, i.e., set M i
+j “ 0 if ¯
+Ai
+j ď T rrs; Oth-
+erwise, set M i
+j “ 1.
+Note that both IAP and AIAP are applied iteratively, and
+stop when the accuracy or memory footprint requirement
+is met. As shown in Figure 1, IAP and AIAP are the im-
+plementation of the “Prune” box. Either weight rewinding
+and/or learning rate rewinding can be used to implement the
+“Rewind” box in the ﬂow.
+Evaluation
+Experimental Setup
+Deep Neural Networks and Datasets. We evaluate our
+proposed techniques on a variety of image classiﬁcation
+DNNs: LeNet-300-100 on MNIST (Deng 2012), LeNet-5 on
+CIFAR-10 (Krizhevsky, Hinton et al. 2009), and ResNet-50
+on ImageNet (Deng et al. 2009). We present the relevant de-
+tails in Table 1. We implement all the iterative techniques on
+PyTorch version 1.6.0.
+Evaluation Metrics. We evaluate a pruned network on the
+following three criteria:
+• Accuracy: We use Top-1 accuracy to measure the accu-
+racy of original and pruned models.
+• Memory Footprint: We measure the total memory con-
+sumed by the model weights. For pruned models, we con-
+sider only the unmasked weights.
+• Compute Flops: We measure the total number of ﬂoating
+point operations (ﬂops) required to perform model infer-
+ence. For pruned models, we consider only the computa-
+tion of the unmasked weights.
+While comparing accuracy-memory footprint or accuracy-
+compute ﬂops tradeoff, we also put emphasis on no accuracy
+loss and 1% accuracy loss. We observe that higher accuracy
+losses tend to be unsuitable for industrial applications (like
+object detection in autonomous driving).
+Baseline.
+Our
+baseline
+is
+iterative
+L1-norm
+weight-based
+pruning
+technique
+(Li et al.
+2016;
+Renda, Frankle, and Carbin
+2020)
+applied
+iteratively
+with rewinding. We refer to it as Iterative L1-norm based
+pruning (ILP).
+Accuracy and Memory Footprint Tradeoff
+In this subsection, we present the tradeoff between accuracy
+and memory footprint. We run experiments to seek answers
+to the ﬁrst two questions we listed in the Introduction sec-
+tion, 1) Can we ﬁnd lottery tickets? and 2) What is the accu-
+racy loss with different types of weight- and activation-based
+pruning techniques?
+Referring to Figure 1, we structurally prune using IAP,
+AIAP and our baseline ILP. For IAP and AIAP, we use one
+batch of images (60 for LeNet models and 128 for ResNet-
+50) on one GPU to calculate activation mean values. For IAP
+and ILP, in each pruning round, on LeNet models, we prune
+20% for dense layer and 10% for conv2d layer; On ResNet-
+50, we prune 5% for conv2d layer in the ﬁrst four pruning
+rounds, and 20% in later pruning rounds. For AIAP, λ is set
+to 0.01 for LeNet models, and 0.2 for ResNet-50. After prun-
+ing, we rewind to roughly 90% of the total training duration,
+i.e., rewind to epoch 5 for LeNet-300-100, 22 for LeNet-5
+and 80 for ResNet-50 (total training epochs are 6, 24 and 90,
+respectively). We choose weight rewinding for LeNet mod-
+els and learning rate rewinding for ResNet-50. For LeNet
+models, weight rewinding is better than learning rate rewind-
+ing (e.g., within 1% accuracy loss, the pruned model has
+12.9% parameters remaining with weight rewinding and
+23.8% parameters remaining with learning rate rewinding);
+but their results are similar for ResNet-50. After rewinding,
+we retrain the models for remaining 10% of total training
+epochs. We repeat the cycle for many pruning rounds, and
+measure the Top-1 test accuracy and the remaining number
+of unpruned weights at the end of each pruning round.
+The results in Figure 4 show that IAP and AIAP out-
+perform ILP signiﬁcantly in all scenarios. On shallow net-
+works, like LeNet-300-100 and LeNet-5, when the number
+of remaining parameters is large, there is little difference
+5
+
+
+Table 1: Networks, datasets, and hyperparameters.
+Dataset
+Network
+#Params
+Optimizer
+Learning Rate
+(t
+=
+training
+epoch)
+Test Accuracy
+(Top-1)
+MNIST
+LeNet-300-100
+0.27M
+Nesterov Adam
+Weight decay: 0.0001
+batch size: 60
+0.0012
+tǫr0, 6q
+97.34% ˘ 0.20%
+CIFAR-10
+LeNet-5
+4.30M
+Nesterov Adam
+Weight decay: 0.0001
+batch size: 60
+0.0002
+tǫr0, 24q
+69.57% ˘ 0.61%
+ImageNet
+ResNet-50
+25.5M
+Nesterov SGD
+Weight decay: 0.0001
+batch size: 1024
+α “
+$
+’
+’
+’
+&
+’
+’
+’
+%
+0.4 ¨ t
+8
+tǫr0, 8q
+0.4
+tǫr8, 30q
+0.04
+tǫr30, 60q
+0.004
+tǫr60, 80q
+0.0004
+tǫr80, 90q
+75.54% ˘ 0.01%
+100.0
+32.77
+10.77
+3.81
+1.52
+Percent of Weights Remaining
+40
+50
+60
+70
+80
+90
+100
+Top-1 Test Accuracy
+IAP (Our)
+AIAP (Our)
+ILP (ICLR'20)
+(a) LeNet-300-100 (MNIST)
+100.0
+41.26
+24.84
+9.62
+5.05
+Percent of Weights Remaining
+40
+45
+50
+55
+60
+65
+70
+75
+Top-1 Test Accuracy
+ILP (ICLR'20)
+IAP (Our)
+AIAP (Our)
+(b) LeNet-5 (CIFAR-10)
+99.9
+85.42
+58.53
+52.33
+45.27
+Percent of Weights Remaining
+40
+45
+50
+55
+60
+65
+70
+75
+80
+Top-1 Test Accuracy
+ILP (ICLR'20)
+IAP (Our)
+AIAP (Our)
+(c) ResNet-50 (ImageNet)
+Figure 4: Top-1 test accuracy as the model is pruned iteratively with many pruning rounds. Each pruning round (x-axis) results
+in a different percentage of remaining number of parameters.
+between the pruning methods, and they all match the ac-
+curacy of the original network. As the model gets smaller,
+IAP and AIAP deliver a higher compression at the same ac-
+curacy compared to ILP. On LeNet-300-100 with MNIST,
+with 1.23% of parameters remaining, the Top-1 accuracy of
+ILP, IAP, and AIAP is 44.59%, 68.05%, and 66.97%, respec-
+tively; On LeNet-5 with CIFAR-10, with 5.05% remaining
+parameters, the Top-1 accuracy of ILP, IAP, and AIAP is
+42.04%, 63.66%, and 58.27%, respectively.
+On deeper models like ResNet-50 with ImageNet, we ob-
+serve major differences in resulting accuracy of pruned mod-
+els in early pruning rounds where the compression ratio is
+not high. IAP and AIAP show a graceful accuracy degrada-
+tion as the model is pruned iteratively. In comparison, ILP
+shows steep accuracy losses when the remaining number
+of weights is below 85.42%. For example, IAP and AIAP
+achieve a Top-1 accuracy of 70.33% and 71.9%, respec-
+tively, with 45.37% of the parameters remaining, whereas
+ILP’s accuracy drops severely to just 41.17%.
+Further, we present the compression ratio for the same ex-
+periment at 0% (no accuracy drop) and 1% accuracy drop in
+Table 2. IAP and AIAP achieve signiﬁcantly higher com-
+pression ratio consistently. For example, with no accuracy
+loss, on LeNet-5 with CIFAR-10, AIAP can achieve a 3.95ˆ
+compression ratio, which is higher than ILP’s 2.42ˆ com-
+pression ratio, and so are the results within 1% accuracy loss
+(15.88ˆ vs 4.77ˆ).
+With these results, we can answer our research questions:
+1. Lottery tickets: Yes, Table 2 shows that we can get smaller
+models with no accuracy loss, i.e, lottery tickets, but the
+compression ratio is small. With an acceptable drop of
+1%, the compression ratio improves signiﬁcantly, e.g.,
+1.17ˆ to 1.71ˆ for ResNet-50, using AIAP.
+2. Accuracy loss: We show that IAP and AIAP produce new
+state-of-the-art results showing graceful accuracy degra-
+dation while iteratively pruning the models.
+Accuracy and Compute Flops Tradeoff
+Compression ratio alone is not enough to indicate the reduc-
+tion in inference time. Inference time depends on height and
+width of the input feature map, in addition to weight ten-
+sor sizes. Therefore, we measure the total number of com-
+pute ﬂops to estimate the reduction in inference time. Un-
+like unstructured pruning, compute ﬂops is an acceptable
+indicator of inference latency for structured pruning because
+the pruned model has regular patterns and reduces compute
+ﬂops in a hardware-friendly manner.
+In this experiment, we measure the compute ﬂops for the
+pruned models in our previous experiment across four Top-
+1 test accuracy drops: 0%, 1%, 3% and 5%. Figure 5 shows
+the total ﬂops for IAP and AIAP normalized to our baseline
+ILP. We observe that IAP achieves better results in all cases.
+For example, with no accuracy loss on LeNet-300-100, IAP
+produces a model that is 1.95ˆ faster than ILP.
+AIAP, however, is not always faster than ILP. It is fa-
+vorable for LeNet-300-100 and ResNet-50 (0.66ˆ speedup,
+with no accuracy loss), but it is worse for LenNet-5 (1.5ˆ
+slown down). This is in contrast to the results in Table 2,
+6
+
+
+Table 2: Largest achievable compression ratio with 0% and 1% accuracy drop
+No accuracy drop
+1% accuracy drop
+Model
+IAP (Our)
+AIAP (Our)
+ILP (ICLR’20)
+IAP (Our)
+AIAP (Our)
+ILP (ICLR’20)
+LeNet-300-100 (MNIST)
+3.80ˆ
+3.80ˆ
+1.95ˆ
+8.94ˆ
+9.94ˆ
+7.42ˆ
+LeNet-5 (CIFAR-10)
+2.55ˆ
+3.95ˆ
+2.42ˆ
+7.75ˆ
+15.88ˆ
+4.77ˆ
+ResNet-50 (ImageNet)
+1.11ˆ
+1.17ˆ
+1.09ˆ
+1.25ˆ
+1.71ˆ
+1.13ˆ
+ILP(ICLR'20)
+IAP(Our)
+AIAP(Our)
+Speedup
+0
+0.5
+1.0
+1.5
+2.0
+Accuracy Loss
+0%
+1%
+3%
+5%
+(a) LeNet-300-100 (MNIST)
+ILP(ICLR'20)
+IAP(Our)
+AIAP(Our)
+Speedup
+0
+0.5
+1.0
+1.5
+Accuracy Loss
+0%
+1%
+3%
+5%
+(b) LeNet-5 (CIFAR-10)
+ILP(ICLR'20)
+IAP(Our)
+AIAP(Our)
+Speedup
+0
+0.5
+1.0
+1.5
+2.0
+Accuracy Loss
+0%
+1%
+3%
+5%
+(c) ResNet-50 (ImageNet)
+Figure 5: The highest achievable FLOPs speedup for IAP and AIAP normalized to the baseline (ILP), on LeNet-300-100
+(MNIST), LeNet-5 (CIFAR-10), and ResNet-50 (ImageNet) with different levels of accuracy loss.
+where AIAP always achieves higher memory footprint re-
+duction compared to ILP. Upon further investigation, we ﬁnd
+that this discrepancy is because AIAP tends to prune more
+neurons from fully connected layers than conv2d layers. In
+LeNet-5, conv2d layers are more expensive in terms of com-
+pute ﬂops. Therefore for the same compression ratio, ILP
+(and also IAP) achieve better compute ﬂop reduction.
+AIAP achieves a slightly higher speedup than IAP on
+ResNet-50. This is consistent with our ﬁndings in Table 2,
+where AIAP achieves higher compression than IAP for the
+same accuracy loss, e.,g., with 1% accuracy loss, AIAP
+achieves higher compression (1.71ˆ vs 1.25ˆ) and better
+compute ﬂop reduction (1.33ˆ vs 1.05ˆ).
+These experiments answer our third research question of
+accuracy and performance tradeoff. We observe that our it-
+erative activation-based pruning techniques are effective in
+generating pruned models that are not just smaller and accu-
+rate, but also readily faster.
+Which Epoch to Rewind?
+In order to understand how rewinding impacts accuracy of
+the pruned models, we analyze stability to pruning as pro-
+posed by (Frankle et al. 2019), which is deﬁned as the L2
+distance between the masked weights of the pruned network
+and the original network at the end of training.
+Figure 6(a) shows the Top-1 test accuracy of the pruned
+ResNet-50 with 83.74% remaning parameters when learning
+rate is rewound to different epochs, and Figure 6(b) shows
+the stability values at the corresponding rewinding epochs.
+We observe that there is a region, 65 to 80 epochs, where
+the resulting accuracy is high. Below this range, the pruned
+model accuracy is sub-optimal. We ﬁnd that L2 distance
+closely follows this pattern, showing high distance for early
+training epochs and small distance for later training epochs.
+We also observe that when rewinding epoch is very close to
+the end of training time (85 and 88 epochs), the resulting
+25
+55
+65
+70
+80
+85
+88
+Rewinding Epoch
+69
+70
+71
+72
+73
+74
+75
+Top-1 Test Accuracy
+IAP
+(a) Top-1 Test Accuracy
+25
+55
+65
+70
+80
+85
+88
+Rewinding Epoch
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+L2 Distance
+IAP
+(b) Stability to Pruning
+Figure 6: The effect of the rewinding epoch (x-axis) on Top-
+1 test accuracy (left) and pruning stability (right) for pruned
+ResNet-50, when 83.74% of parameters are remaining.
+accuracy is bad.
+We
+therefore
+validate
+the
+observations
+proposed
+by (Frankle et al. 2019) that for deep networks, rewinding
+to very early stages is sub-optimal as the network has not
+learned considerably by then. On the other hand, rewinding
+to very late training stages is also sub-optimal because
+there is not enough time to retrain. Our ﬁndings show
+that rewinding to 75%-90% of training time leads to good
+accuracy.
+Conclusion
+In this paper, we investigate iterative structured pruning with
+rewinding. Structural pruning removes entire ﬁlters from
+weight tensors, resulting in pruned models that can be easily
+accelerated using off-the-shelf libraries. We introduce two
+activation-based iteration structured pruning techniques—
+Iterative Activation-based Pruning (IAP) and Adaptive Itera-
+tive Activation-based Pruning (AIAP) to aggressively prune
+the models. We observe that IAP and AIAP can ﬁnd win-
+ning lottery tickets, i.e., models that are smaller and more
+accurate than the original model. Our methods also sub-
+stantially outperform weight-based Iterative L1-norm Prun-
+7
+
+
+ing (ILP) on a variety of architectures, e.g., LeNet-300-
+100 (MNIST), LeNet-5 (CIFAR-10), and ResNet-50 (Im-
+ageNet). For the same memory footprint, IAP and AIAP
+achieve much higher accuracy (e.g., 30% higher Top-1 accu-
+racy for pruned ResNet-50 models with 45.27% remaining
+parameters); for the same accuracy loss, they achieve much
+higher compression and faster inference speed (e.g., 1.95ˆ
+higher compression and 1.95ˆ speedup for pruned LeNet-
+300-100 models with no accuracy loss).
+References
+Chu, M. T.; Funderlic, R. E.; and Plemmons, R. J. 2003.
+Structured low rank approximation. Linear algebra and its
+applications 366: 157–172.
+Clarkson, K. L.; and Woodruff, D. P. 2017. Low-rank ap-
+proximation and regression in input sparsity time. Journal
+of the ACM (JACM) 63(6): 1–45.
+Deng, J.; Dong, W.; Socher, R.; Li, L.-J.; Li, K.; and Fei-
+Fei, L. 2009. Imagenet: A large-scale hierarchical image
+database. In 2009 IEEE conference on computer vision and
+pattern recognition, 248–255. Ieee.
+Deng, L. 2012. The mnist database of handwritten digit im-
+ages for machine learning research [best of the web]. IEEE
+Signal Processing Magazine 29(6): 141–142.
+Elsen, E.; Dukhan, M.; Gale, T.; and Simonyan, K. 2019.
+Fast Sparse ConvNets.
+Frankle, J.; and Carbin, M. 2018. The lottery ticket hypothe-
+sis: Finding sparse, trainable neural networks. arXiv preprint
+arXiv:1803.03635 .
+Frankle, J.; Dziugaite, G. K.; Roy, D. M.; and Carbin, M.
+2019.
+Stabilizing the lottery ticket hypothesis.
+arXiv
+preprint arXiv:1903.01611 .
+Han, S.; Mao, H.; and Dally, W. J. 2015.
+Deep com-
+pression: Compressing deep neural networks with pruning,
+trained quantization and huffman coding.
+arXiv preprint
+arXiv:1510.00149 .
+Han, S.; Pool, J.; Tran, J.; and Dally, W. 2015. Learning
+both weights and connections for efﬁcient neural network. In
+Advances in neural information processing systems, 1135–
+1143.
+He, K.; Zhang, X.; Ren, S.; and Sun, J. 2016. Deep resid-
+ual learning for image recognition. In Proceedings of the
+IEEE conference on computer vision and pattern recogni-
+tion, 770–778.
+He, Y.; Lin, J.; Liu, Z.; Wang, H.; Li, L.-J.; and Han, S. 2018.
+Amc: Automl for model compression and acceleration on
+mobile devices. In Proceedings of the European Conference
+on Computer Vision (ECCV), 784–800.
+Hill, P.; Jain, A.; Hill, M.; Zamirai, B.; Hsu, C.; Laurenzano,
+M. A.; Mahlke, S.; Tang, L.; and Mars, J. 2017. DeftNN:
+Addressing Bottlenecks for DNN Execution on GPUs via
+Synapse Vector Elimination and Near-compute Data Fis-
+sion. In 2017 50th Annual IEEE/ACM International Sym-
+posium on Microarchitecture (MICRO), 786–799.
+Howard, A. G.; Zhu, M.; Chen, B.; Kalenichenko, D.; Wang,
+W.; Weyand, T.; Andreetto, M.; and Adam, H. 2017. Mo-
+bilenets: Efﬁcient convolutional neural networks for mobile
+vision applications. arXiv preprint arXiv:1704.04861 .
+Kadetotad, D.; Arunachalam, S.; Chakrabarti, C.; and Seo,
+J.-s. 2016. Efﬁcient memory compression in deep neural
+networks using coarse-grain sparsiﬁcation for speech appli-
+cations. In Proceedings of the 35th International Conference
+on Computer-Aided Design, 78. ACM.
+Krizhevsky, A.; Hinton, G.; et al. 2009. Learning multiple
+layers of features from tiny images. Technical report, Cite-
+seer.
+Lan, A. S.; Studer, C.; and Baraniuk, R. G. 2014. Matrix
+recovery from quantized and corrupted measurements. In
+2014 IEEE International Conference on Acoustics, Speech
+and Signal Processing (ICASSP), 4973–4977. IEEE.
+LeCun, Y.; Denker, J. S.; and Solla, S. A. 1990. Optimal
+brain damage. In Advances in neural information processing
+systems, 598–605.
+Lee, N.; Ajanthan, T.; and Torr, P. H. 2018. Snip: Single-
+shot network pruning based on connection sensitivity. arXiv
+preprint arXiv:1810.02340 .
+Li, E.; Zeng, L.; Zhou, Z.; and Chen, X. 2019. Edge AI:
+On-demand accelerating deep neural network inference via
+edge computing. IEEE Transactions on Wireless Communi-
+cations 19(1): 447–457.
+Li, E.; Zhou, Z.; and Chen, X. 2018. Edge intelligence: On-
+demand deep learning model co-inference with device-edge
+synergy. In Proceedings of the 2018 Workshop on Mobile
+Edge Communications, 31–36.
+Li, H.; Kadav, A.; Durdanovic, I.; Samet, H.; and Graf, H. P.
+2016. Pruning ﬁlters for efﬁcient convnets. ICLR .
+Molchanov, P.; Tyree, S.; Karras, T.; Aila, T.; and Kautz, J.
+2016. Pruning convolutional neural networks for resource
+efﬁcient inference. arXiv preprint arXiv:1611.06440 .
+Pham, H.; Guan, M. Y.; Zoph, B.; Le, Q. V.; and Dean,
+J. 2018. Efﬁcient neural architecture search via parameter
+sharing. arXiv preprint arXiv:1802.03268 .
+Polino, A.; Pascanu, R.; and Alistarh, D. 2018. Model com-
+pression via distillation and quantization.
+arXiv preprint
+arXiv:1802.05668 .
+Renda, A.; Frankle, J.; and Carbin, M. 2020. Comparing
+rewinding and ﬁne-tuning in neural network pruning. arXiv
+preprint arXiv:2003.02389 .
+Srinivas, S.; and Babu, R. V. 2015.
+Data-free param-
+eter pruning for deep neural networks.
+arXiv preprint
+arXiv:1507.06149 .
+Tan, M.; and Le, Q. V. 2019. Efﬁcientnet: Rethinking model
+scaling for convolutional neural networks. arXiv preprint
+arXiv:1905.11946 .
+Theis, L.; Korshunova, I.; Tejani, A.; and Husz´ar, F. 2018.
+Faster gaze prediction with dense networks and ﬁsher prun-
+ing. arXiv preprint arXiv:1801.05787 .
+8
+
+
+Yim, J.; Joo, D.; Bae, J.; and Kim, J. 2017. A gift from
+knowledge distillation: Fast optimization, network mini-
+mization and transfer learning. In Proceedings of the IEEE
+Conference on Computer Vision and Pattern Recognition,
+4133–4141.
+Yu, J.; Yang, L.; Xu, N.; Yang, J.; and Huang, T.
+2018.
+Slimmable neural networks.
+arXiv preprint
+arXiv:1812.08928 .
+Zoph, B.; and Le, Q. V. 2016.
+Neural architec-
+ture search with reinforcement learning.
+arXiv preprint
+arXiv:1611.01578 .
+9

@@ -1,0 +1,1941 @@
+STUN: Structured-Then-Unstructured Pruning
+for Scalable MoE Pruning
+Jaeseong Lee*, Seung-won Hwang*, Aurick Qiao,
+Daniel Campos, Zhewei Yao, Yuxiong He
+Snowflake AI Research, Seoul National University*
+Abstract
+Mixture-of-experts (MoEs) have been adopted
+to reduce inference costs by sparsely activating
+experts in large language models (LLMs). De-
+spite these reductions, the massive number of
+parameters in MoEs still makes them expensive
+to serve. Conventionally, unstructured or struc-
+tured pruning has been considered to reduce the
+number of parameters. Our key contribution is
+exploring the interpolation between structured
+and unstructured pruning, to propose a novel
+structured-then-unstructured (STUN) approach
+outperforming both structured and unstructured
+pruning, especially for MoEs. In the first stage,
+we show a scalable expert pruning with O(1)
+forward pass, unlike existing work requiring
+O( kn
+√n) forward passes for n experts that can-
+not scale for recent MoEs with hundreds of ex-
+perts. We then show our expert-pruned MoEs
+are robust to unstructured pruning to follow.
+Experiments on Snowflake Arctic and Mixtral
+show that our proposal is highly effective– For
+Snowflake Arctic, a 480B-sized MoE with 128
+experts, our method needs only one H100 and
+two hours to achieve nearly no loss in perfor-
+mance with 40% sparsity, even in generative
+tasks such as GSM8K, where state-of-the-art
+structured or unstructured pruning methods fail.
+The code is publicly available.1
+1
+Introduction
+Large language models (LLMs) have become state-
+of-the-art for various tasks (OpenAI, 2023; Tou-
+vron et al., 2023; Jiang et al., 2023; Lieber et al.,
+2024). However, their prohibitive inference cost
+is becoming a bottleneck to deployment (Kad-
+dour et al., 2023), and detrimental to the environ-
+ment (Strubell et al., 2019; Zeng et al., 2023).
+Mixture-of-experts (MoE) presents a promising
+alternative, by sparsely activating a specific sub-
+set of parameters, named as experts, to reduce the
+*Work done while visiting Snowflake. Correspond to se-
+ungwonh@snu.ac.kr
+1https://github.com/thnkinbtfly/STUN
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0
+0.2
+0.4
+0.6
+0.8
+1
+GSM8K accuracy
+structured pruning ratio
+OWL
+Lu et al. (2024)
+Ours
+LLM-Pruner
+Figure 1: GSM8K 5-shot accuracy by pruning Mixtral-
+8x7B-Instruct by 50% of sparsity. We probe interpola-
+tion of structured and unstructured pruning, by varying
+the ratio of structured pruning.
+inference cost. This architecture has been empiri-
+cally proven effective, in training cost (Fedus et al.,
+2022), and inference cost (Du et al., 2022).
+Despite these reductions, the massive number of
+parameters remains unchanged, requiring signifi-
+cantly more GPU memory, which makes serving
+large MoE models challenging for many. Addi-
+tionally, recent MoEs tend to increase the number
+of experts n, resulting in even larger MoEs. For
+instance, accommodating 56B parameters of Mix-
+tral (Jiang et al., 2024) with 8 experts or 132B
+of DBRX (Databricks, 2024) with 16 experts, or
+480B of Snowflake Arctic (Snowflake, 2024) with
+128 experts, requires an ever-growing amount of
+memory and more GPUs to serve.
+To reduce the number of parameters, unstruc-
+tured (Frantar and Alistarh, 2023; Sun et al., 2024),
+or structured pruning (Ma et al., 2023) can be
+considered. Unstructured pruning allows weight
+tensors to be sparse anywhere, while structured
+pruning imposes patterns on sparsification, such
+as removing rows, entire weight tensors (Ma et al.,
+2023), or pruning experts in MoE (Lu et al., 2024a).
+In this paper, we propose the interpolation of two,
+arXiv:2409.06211v2  [cs.LG]  21 Jul 2025
+
+
+Inter-Expert Sparsity
+Intra-Expert Sparsity
+Figure 1
+✓
+✗
+Lu et al., 2024a (•)
+✗
+✓
+LLM-Pruner (•), Wanda, OWL (•)
+✓
+✓
+Ours (•)
+Table 1: Comparison of existing pruning methods for MoEs.
+Structured-Then-UNstructured pruning (STUN).
+Figure 1 motivates our interpolated method, where
+unstructured- or structured-only, x = 0 and x = 1,
+respectively, is outperformed by the peak, combin-
+ing both.
+Our first phase, expert pruning, by leveraging
+model-inherent expert for pruning, significantly
+outperforms row/column-level structured pruning
+(Figure 1 blue; Ma et al., 2023) However, existing
+expert-level pruning for MoE (Figure 1 grey; Lu
+et al., 2024a) often does not scale well over the
+solution space, requiring an exhaustive combina-
+tion of experts, leading to O( kn
+√n) GPU calls, with
+k =
+1
+ϕϕ(1−ϕ)1−ϕ , and ϕ < 1 is sparsity (Lu et al.,
+2024a). While this was acceptable in an early MoE
+work with few experts, it does not scale to recent
+trends in MoEs with large n (Bai et al., 2023; Dai
+et al., 2024; Snowflake, 2024), or even infinity (He,
+2024). Our distinction is drastically reducing the
+number of GPU calls to O(1), without compromis-
+ing the performance. The main intuition is lever-
+aging a latent structure between experts, based on
+behavior similarity, such that the greedy decision of
+whether to prune closely captures the joint pruning
+effect.
+The second contribution is allowing unstructured
+phase to follow, to consider both inter- and intra-
+expert sparsity (Table 1). STUN removes redun-
+dant experts by expert-level structured pruning first,
+then desires fine-grained sparsity within individual
+experts.2
+We support STUN with the findings of Mason-
+Williams and Dahlqvist (2024), which show that
+higher kurtosis in the weight distribution (indicat-
+ing many outliers) suggests more weights can be
+pruned while maintaining performance, highlight-
+ing the robustness of unstructured pruning. We
+argue that expert-level pruning does not reduce kur-
+tosis, thereby preserving the network’s resilience
+to unstructured pruning.
+Our contributions can be summarized as follows:
+2From now on, we will define sparsity as the number of
+pruned parameters divided by the total number of parameters
+in the original model.
+• We propose STUN, the first method to com-
+bine structured and unstructured pruning, out-
+performing both approaches.
+• Scalable first phase: We design an expert-
+level pruning method with O(1) GPU calls,
+outperforming the O( kn
+√n) solution (Lu et al.,
+2024a).
+• Justifying the second phase: We show the
+expert-pruned network remains robust to un-
+structured pruning to follow.
+• State-of-the-art efficiency and compression:
+For Snowflake Arctic (480B, 128 experts), it
+requires just 1 H100 and two hours, with no
+backpropagation or fine-tuning needed. Com-
+pression reaches up to 40% sparsity without
+compromising performance, even in genera-
+tive tasks like GSM8K, where unstructured
+pruning fails. We report consistent results for
+Mixtral models.
+2
+Related Work
+2.1
+LLM Pruning
+LLM pruning can be classified into unstructured
+and structured pruning (Behnke and Heafield,
+2021). Unstructured pruning involves finding mask
+tensors to sparsify weight tensors. Such masking
+leads to practical speedups in hardware such as
+CPU (NeuralMagic, 2021), and ongoing research
+is actively developing methods to achieve similar
+speedups on GPUs (Mishra et al., 2021; Zhao et al.,
+2024). SparseGPT (Frantar and Alistarh, 2023)
+uses the Hessian matrix for second-order Taylor
+approximation, while GBLM-Pruner (Das et al.,
+2024) and Pruner-Zero (Dong et al., 2024) leverage
+gradients to identify mask tensors. However, as
+these methods demand substantial GPU memory
+for LLMs, we focus on more memory-efficient ap-
+proaches, using two recent baselines: Wanda (Sun
+et al., 2024) evaluates the importance of neurons
+in each layer by its weight multiplied by the activa-
+tion value, removing those with low scores. While
+Wanda assumes a uniform sparsity across layers,
+
+
+OWL (Yin et al., 2024) probes the optimal sparsity
+per layer, given the pruning budget.
+Structured pruning, on the other hand, imposes
+constraints on the sparsification pattern, such as
+removing rows, columns, or even entire weight ten-
+sors. Early methods that involve pruning attention
+heads (Voita et al., 2019; Shim et al., 2021; Zhang
+et al., 2021), rows (Gong et al., 2022), entire dense
+layers (Liang et al., 2021), or whole transformer
+blocks (Fan et al., 2019; Li et al., 2020) fall under
+this category. Recent works have applied struc-
+tured pruning for LLMs (Ma et al., 2023; Cheng
+et al., 2024; Gao et al., 2024; Zhang et al., 2024a;
+Dery et al., 2024), but without fine-tuning, these
+methods generally underperform when compared
+to unstructured pruning.
+Our distinction is to introduce a new class
+of pruning– structured-then-unstructured pruning–
+and demonstrate its significant advantages for
+MoEs, surpassing the performance of either
+method alone. This approach differs from previous
+methods that combine structured and unstructured
+pruning (Kurtic et al., 2022), which failed to out-
+perform unstructured pruning.
+2.2
+Expert Pruning
+Early work on expert pruning was domain-
+specific (Kim et al., 2021; Koishekenov et al., 2023;
+Liu et al., 2024), such as in translation MoEs, by
+keeping most activated experts (Kim et al., 2021),
+or pruning based on gate statistics (Koishekenov
+et al., 2023). Lu et al. (2024a) introduced a domain-
+agnostic expert pruning, searching for the best com-
+bination of experts to reduce the reconstruction loss,
+and quantify their criticality in output prediction.
+Concurrently to our study, (Zhang et al., 2024b)
+proposed an efficient expert pruning method.
+Our distinction is two-fold. First, we interpolate
+expert pruning with unstructured pruning to out-
+perform either method alone. Second, for scalable
+expert-level structured pruning, we derive a scal-
+able expert-level structured pruning method with
+O(1) GPU calls, improving on the O( kn
+√n) solution
+enumerating combinatorial pruning.
+2.3
+Pruning Robustness
+Robustness in post-hoc pruning is quantified by
+whether performance is maintained after prun-
+ing. Kurtosis of weights (Mason-Williams and
+Dahlqvist, 2024) has been used as a proxy for ro-
+bustness, with networks showing higher weight
+kurtosis able to tolerate higher unstructured prun-
+ing ratios. Our contribution is demonstrating that
+an expert-pruned network remains robust to addi-
+tional unstructured pruning, which naturally sup-
+ports our design of unstructured pruning as the
+second phase.
+3
+Preliminaries: MoE
+As a promising alternative to large language mod-
+els, which incur prohibitive inference costs, MoE
+employs a multitude of specialized experts. In each
+forward pass, MoE selectively activates specific ex-
+perts conditioned on input tokens, thereby reducing
+the train and inference costs.
+We now formally describe the behavior of an
+MoE. An MoE layer M consists of experts Ei =
+E(x; θi), where θi represents the parameters of
+expert Ei, and a router layer r. Each expert E
+typically follows the same MLP architecture.
+First, the router layer selects which experts to
+sparsely activate based on the current input token,
+and provides the coefficients r(x) ∈Rn for linear
+combination of selected expert outputs. The coeffi-
+cients r(x) and the top-k indices of experts T are
+formulated as follows:
+r(x) = softmax(Wx)
+(1)
+T = topk(r(x))
+(2)
+where W is the learnable weight matrix for router
+r.
+Next, these coefficients are used for the linear
+combination of expert outputs:
+M(x; θ) =
+X
+i∈T
+ri(x)E(x; θi)
+(3)
+4
+Proposed Method
+4.1
+Overview: STUN
+Figure 2 overviews our two-phase approach, inter-
+polating structured and unstructured pruning as mo-
+tivated in Table 1. Section 4.2 describes ➀how we
+remove redundant experts with expert-level struc-
+tured pruning with high scalability, then Section 4.3
+describes ➁how we perform unstructured pruning
+inside individual experts.
+4.2
+Expert-level Structured Pruning with
+O(1) GPU calls
+Now, we describe our expert-level structured prun-
+ing with O(1) GPU calls.3 Previous solution (Lu
+3We focus on GPU cost, since it dominates the CPU cost–
+For example, the accumulated CPU cost (including the hy-
+
+
+①
+②
+: experts
+: pruned
+Figure 2: Overview of our proposed STUN. ➀We first
+remove redundant experts with expert-level structured
+pruning, then ➁perform unstructured pruning inside
+individual experts. Black box represents a layer in MoE,
+and different colors represent different behavioral simi-
+larities.
+et al., 2024a) minimizes reconstruction loss (Sec-
+tion 4.2.1), requiring GPU call per combination
+of experts, that is O( kn
+√n). Our key contribution is
+to approximate this combinatorial reconstruction
+loss to reduce the number of GPU calls to O(1), by
+leveraging latent cluster structure among experts,
+based on behavioral similarity.
+Specifically, we find clusters of similar experts
+layer by layer, yielding a total of ϕnl clusters in
+the whole MoE, where ϕ is the sparsity, n is the
+number of experts in each layer, and l is the number
+of layers in MoE. Then we greedily prune every
+expert but one representative per each cluster.
+Later sections show why our greedy pruning is
+as effective as its combinatorial counterpart.
+4.2.1
+O( kn
+√n): Combinatorial Reconstruction
+Loss
+We start from the conventional goal of pruning–
+minimizing the reconstruction loss. Reconstruction
+loss has been employed to assess how closely the
+pruned model θ −θS without expert set S mirrors
+the behavior of the unpruned θ (Lu et al., 2024a).
+Formally, this loss is quantified by the Frobenius
+norm of the difference between the original output
+M(x; θ) and the output of pruned layer M(x; θ −
+θS), denoted as ES.
+ES = ∥M(x; θ) −M(x; θ −θS)∥F
+(4)
+perparameter search to meet desired sparsity) required by our
+algorithm is less than 1 minute, even on 480B Snowflake
+Arctic.
+where x is the whole input we consider. The objec-
+tive of pruning is to explore all possible combina-
+tions of experts,
+  n
+|S|
+
+, to determine the expert set
+S that minimizes ES.
+While such an exhaustive search is feasible for
+smaller models like Mixtral (Jiang et al., 2024),
+which contains only 8 experts, it becomes pro-
+hibitive for recent MoEs featuring a massive num-
+ber of experts.
+To elaborate, deciding which experts to prune
+using Eq. 4 for |S| = ϕn requires
+  n
+|S|
+
+≈O( kn
+√n)
+forward passes according to Stirling’s approxima-
+tion, where k =
+1
+ϕϕ(1−ϕ)1−ϕ , and ϕ < 1 repre-
+sents the sparsity. Our distinction is to lower the
+computation to O(1), without compromising the
+performance– In fact, as we will elaborate later, we
+outperform the combinatorial objective.
+4.2.2
+Towards O(n): Probabilistic
+Interpretation
+As a stepping stone towards O(1), we propose to
+rephrase the goal of finding θS to minimize ES (Eq.
+4) as:
+argmaxS
+Y
+k
+P(Xk = sk|X1 = s1,
+· · · , Xk−1 = sk−1)
+(5)
+Our contribution is greedy optimization with-
+out compromise for Eq. 5– We decompose the
+multiplication of Eq. 5 at each step k, and obtain
+the distribution P(Xk|s1, · · · , sk−1), to select Xk
+that maximizes the probability. To achieve it, we
+estimate the rank between the probabilities. Such
+rank estimation can benefit from the latent structure
+among experts, specifically, a cluster of similar ex-
+perts in MoE. Given cluster mapping c which maps
+an expert to a set of similarly behaving experts, we
+assign the value P(Ei|Sk−1), as follows:
+P(Ei|Sk−1) =
+(
+P(Ei) −p
+c(Ei) ⊆Sk
+P(Ei)
+otherwise
+(6)
+This enables the calculation of all P(Ei|Sk−1) in
+Eq. 5 from P(Ei)s, which needs only n forwards
+in total.
+Clustering the Similar Experts
+Our remaining
+task is to obtain cluster information c: One sig-
+nal is pairwise behavioral similarity bi,j, from the
+pretrained router weights W at a minimal cost.
+Suppose two rows Wi ≈Wj are similar; then
+
+
+ri(x) ≈rj(x), meaning Ei, Ej tend to be selected
+by similar inputs, implying similar expertise. Thus,
+the behavioral similarity bi,j between two experts
+Ei, Ej can be obtained as follows:
+bi,j = −∥Wi −Wj∥F
+(7)
+which can be improved with coactivation statis-
+tics ai,j, if we allow some inference cost. As a
+result, we illustrate our clustering algorithm in Alg
+1, whose detailed derivation can be found in Ap-
+pendix A.1.
+Algorithm 1 Expert Clustering Algorithm
+Require: l ←Number of layers
+Require: n ←Number of experts per layer
+Require: {ai,j}i,j ←Coactivation statistics of
+Ei, Ej for every layer
+Require: λ1, λ2 ←Hyperparameter for behav-
+ioral similarity
+Require: t ←Threshold to determine sparsity
+Ensure: c ←The mapping from expert to cluster
+of the similar experts
+for m in [1..l] do
+W ←Router weight of layer m
+{ai,j}i,j ←Coactivation statistics of layer
+m
+for i in [1..n −1] do
+for j in [i + 1..n] do
+bi,j ←−λ1∥Wi −Wj∥F + λ2ai,j
+end for
+end for
+for i in [1..n] do
+c(Ei) ←{Ei}
+end for
+while mini,j bi,j < t do
+d, e ←argmini,jbi,j
+md ←maxi∈c(Ee) bd,i
+me ←maxi∈c(Ed) bi,e
+if c(Ed)̸ = c(Ee) ∧max(md, me) < t
+then
+c(Ed) = c(Ee) ←c(Ed) ∪c(Ee)
+end if
+bd,e ←∞
+▷Mark as visited
+end while
+end for
+return c
+4.2.3
+Towards O(1): Taylor Approximation
+and Selective Reconstruction
+While the previous section immensely reduces the
+cost to obtain the probability distribution to O(n)
+by requiring only P(Ei)s, we can further reduce
+the number of forward passes– We aim to remove
+the GPU calls for P(Ei), which is needed as in Eq.
+10.
+The key idea is approximating Ei’s reconstruc-
+tion loss value Ei = ∥M(x; θ) −M(x; θ −θi)∥F .
+To address this, with 1st order Taylor approxima-
+tion, we find the expert closest to ¯θi within each
+cluster has the highest priority to be retained. We
+assign ranks similarly, and the same greedy algo-
+rithm is applied to optimize Eq. 5. Additionally,
+we selectively reconstruct the expert. The final al-
+gorithm is summarized in Alg 2, which is described
+in detail in Appendix A.2.
+Algorithm 2 Our O(1) Expert Pruning
+Require: l ←Number of layers
+Require: n ←Number of experts per layer
+Require: c ←The mapping from expert to cluster
+of the similar experts
+Require: κ ←Threshold for selective reconstruc-
+tion
+for m in [1..l] do
+r(m) = [ ]
+A ←{c(E1), · · · , c(En)}
+for C in A do
+¯θi ←
+1
+|C|
+P
+i∈C θi
+if |A| < κ then
+θC ←¯θi
+▷Reconstruct
+else
+θC ←minθj∈C ∥θj −¯θi∥F
+end if
+r(m).append(θC)
+end for
+end for
+return r
+4.3
+Unstructured Pruning on Expert-pruned
+Model
+Our main conjecture for STUN is intra-expert spar-
+sity yet remains intact after the first phase. Specif-
+ically, we propose to pursue fine-grained sparsity
+within the remaining experts, by leveraging unstruc-
+tured pruning methods designed for general LLM
+, such as OWL (Yin et al., 2024) or Wanda (Sun
+et al., 2024).
+Now we theoretically verify our conjecture:
+intra-expert sparsity remains high, or, even higher,
+after the expert pruning phase. In other words, we
+explain why performing unstructured pruning after
+
+
+model
+sparsity method
+GSM8K Avg(→) ARC-c ARC-e HellaSwag MMLU
+Arctic
+0%
+unpruned
+70.74
+68.33
+56.91
+84.60
+66.94
+64.86
+40%
+STUN (w/ OWL)
+70.28
+67.66
+57.68
+83.29
+64.94
+64.75
+OWL
+63.76
+67.35
+56.74
+84.13
+65.08
+63.47
+STUN (w/ Wanda)
+69.60
+67.64
+57.25
+83.63
+64.86
+64.81
+Wanda
+64.59
+67.54
+57.00
+84.64
+65.19
+63.32
+65%
+STUN (w/ OWL)
+43.97
+62.67
+51.54
+80.01
+59.91
+59.24
+OWL
+13.42
+56.68
+44.37
+76.64
+53.69
+52.02
+Mixtral-8x7B
+(Instruct)
+65%
+STUN (w/ OWL)
+25.09
+60.34
+48.12
+78.79
+54.05
+60.39
+OWL
+1.29
+45.20
+24.15
+49.79
+49.27
+57.60
+LLM-Pruner
+1.29
+31.74
+22.78
+45.96
+35.09
+23.13
+Mixtral-8x22B
+(Instruct)
+70%
+STUN (w/ OWL)
+30.78
+60.20
+47.95
+77.86
+55.41
+59.56
+OWL
+19.64
+57.74
+45.48
+76.60
+52.47
+56.42
+Table 2: Comparison between STUN and the baselines across various models.
+expert pruning is better than continuously perform-
+ing unstructured pruning only.
+Intra-expert sparsity, formally speaking, robust-
+ness to unstructured pruning, can be estimated
+by the kurtosis of weights (Mason-Williams and
+Dahlqvist, 2024). Kurtosis is expressed as follows:
+K(θ) = E
+"θ −µ
+σ
+4#
+(8)
+Suppose the weight of experts θ follow a zero-
+meaned Gaussian distribution N. Unstructured
+pruning (Sun et al., 2024; Yin et al., 2024; Das
+et al., 2024; Dong et al., 2024), which tends to
+remove near-zero weights,4 would shift the distri-
+bution closer to a bimodal symmetric distribution,
+whose kurtosis is minimum (Darlington, 1970). As
+a result, unstructured pruning would lower the kur-
+tosis value, leaving less margin for further unstruc-
+tured pruning.
+In contrast, coarse structured pruning, such as ex-
+pert pruning, is less likely to decrease the kurtosis
+value, since the assumption θ ∼N still holds for
+remaining experts. This implies that expert pruning
+preserves the robustness of unstructured pruning,
+unlike applying unstructured pruning with a similar
+sparsity.5
+5
+Experiments
+5.1
+Experimental Settings
+We use Snowflake Arctic (Snowflake, 2024) as a
+representative large MoE, with a total of 480B pa-
+4The importance score of unstructured pruning typically
+increases as the absolute value of the weight increases.
+5In our experiments, the kurtosis increased from 14248 to
+15623 after expert pruning.
+rameters and 128 experts. To compare our method
+with previous works (Lu et al., 2024a), we also
+experiment with Mixtral (Jiang et al., 2024).
+Tasks and Datasets
+In contrast to previous un-
+structured pruning studies (Sun et al., 2024; Yin
+et al., 2024), we also evaluate the NLG task,
+GSM8K (Cobbe et al., 2021), where maintaining
+performance proves to be much more challenging
+(see Table 2; Appendix F). We further assess per-
+formance on four NLU tasks– ARC-challenge and
+ARC-easy (Clark et al., 2018), HellaSwag (Zellers
+et al., 2019), and MMLU (Hendrycks et al., 2021).
+When comparing with expert pruning methods, fol-
+lowing previous work (Lu et al., 2024a), we also
+conduct a zero-shot evaluation on BoolQ (Wang
+et al., 2019), OpenBookQA (Mihaylov et al., 2018),
+RTE (Wang et al., 2018), WinoGrande (Sakaguchi
+et al., 2021).
+To provide some data for inference, we employ
+the C4 dataset (Raffel et al., 2020), following the
+baselines (Yin et al., 2024; Sun et al., 2024; Lu
+et al., 2024a).
+Implementation Details
+We explore the values
+of (λ1, λ2) ∈{(0, 1), (1, 0), (1, 1)}, except for
+Snowflake Arctic, the largest MoE in our exper-
+iments, where we only consider (λ1, λ2) = (1, 0),
+meaning no GPU calls are required for expert prun-
+ing. The sparsity for expert-level structured prun-
+ing is set to 20%, 12.5%, and 10% for Snowflake
+Arctic, Mixtral-8x7B, and Mixtral-8x22B respec-
+tively. We use κ = 3 for selective reconstruction.
+More detailed implementation information and hy-
+perparameter decisions are provided in Appendix.
+
+
+model
+sparsity
+method
+cost
+Avg
+Mixtral-8x7B (Instruct)
+0%
+unpruned
+69.98
+25%
+Ours
+O(1)
+68.05
+Lu et al. (2024a)
+O( kn
+√n)
+67.45
+Mixtral-8x7B
+0%
+unpruned
+67.58
+25%
+Ours
+O(1)
+64.34
+Lu et al. (2024a)
+O( kn
+√n)
+64.22
+Table 3: Comparing the average performance of 8 tasks of the proposed expert pruning, with other baselines.
+sparsity ARC-C BoolQ HellaSwag MMLU RTE WinoGrande Avg
+Unpruned
+0%
+59.4
+84.2
+84.0
+67.9
+70.4
+75.6
+71.5
+Ours
+25%
+55.6
+83.1
+81.1
+63.3
+68.6
+72.7
+70.7
+SEER-MoE (Muzio et al., 2024)
+25%
+-
+-
+-
+56.7
+-
+-
+-
+Expert Drop (He et al., 2024)
+25%
+53.2
+77.7
+80.5
+52.2
+55.6
+76.8
+66.0
+Layer Drop (He et al., 2024)
+25%
+47.7
+85.3
+75.2
+67.3
+69.7
+74.6
+70.0
+Table 4: Comparison of efficient expert pruning methods on Mixtral-8x7B.
+sparsity
+cost
+GSM8K
+unpruned
+0%
+63.46
+Ours
+25%
+O(1)
+53.22
+Lu et al. (2024a)
+25%
+O( kn
+√n)
+48.52
+Table 5: GSM8K accuracy comparison with baseline on
+Mixtral-8x7B-Instruct.
+5.2
+Experimental Results
+5.2.1
+RQ1: STUN Outperforms Unstructured
+Pruning
+Table 2 describes that our proposed (STUN) signif-
+icantly outperforms the unstructured pruning meth-
+ods. We emphasize that we use the same unstruc-
+tured pruning approach for all for fair comparison.
+For example, with 40% of sparsity for the Arc-
+tic, STUN neatly retains the original GSM8K per-
+formance, while unstructured pruning results in a
+noticeable performance drop. This is consistent
+for different unstructured pruning methods, Wanda,
+as well. As the sparsity increases, the table shows
+that STUN can maintain the original performance
+much better than the baselines– For 65% sparsity,
+STUN’s GSM8K performance is nearly 30%p bet-
+ter than that of unstructured pruning. With differ-
+ent models, we observe different gaps but a simi-
+lar trend– For 65% of sparsity for Mixtral-8x7B-
+Instruct, STUN’s GSM8K performance is nearly
+20 times better than that of unstructured pruning. In
+the ARC-challenge, the unstructured pruning per-
+formance falls below the random-guess accuracy
+of 25.02 (Clark et al., 2018), whereas STUN main-
+sparsity
+O(n)
+O(1)
+25%
+63.97
+64.34
+50%
+59.90
+59.58
+Table 6: Comparing the average performance of 8 tasks
+of our O(n) and O(1) algorithms for expert pruning on
+Mixtral-8x7B.
+tains a significantly higher performance, achieving
+twice the score. Mixtral-8x22B shows a similar
+trend.
+5.2.2
+RQ2: Our O(1) Expert Pruning
+Outperforms Existing Methods
+Tables 3 and 5 show that our proposed O(1) expert
+pruning method is highly effective, outperforming
+the previous O( kn
+√n) solution. This is because we
+derive the latent structure from the pretrained MoE,
+while the previous work (Lu et al., 2024a) relies
+solely on the given calibration data. This validates
+our design of O(1) in section 4. The detailed re-
+sults are in Appendix E.
+Table 4 shows that our expert pruning outper-
+forms other efficient pruning methods. Compared
+to SEER-MoE, our pruning clearly outperforms the
+performance in MMLU, by a substantial margin.
+Moreover, ours achieves a higher average perfor-
+mance compared to the results reported by He et al.
+(2024).6
+Moreover, Table 6 shows that our O(1) expert
+6Note that SEER-MoE (Muzio et al., 2024) only reveals
+the performance of MMLU, and we used different metrics
+following He et al. (2024).
+
+
+0
+0.2
+0.4
+0.6
+0.8
+50
+60
+70
+80
+sparsity
+unstructured
+STUN
+(a) Arctic (128x3.66B)
+0
+0.2
+0.4
+0.6
+0.8
+50
+60
+70
+sparsity
+unstructured
+STUN
+(b) Mixtral-8x7B
+0
+0.2
+0.4
+0.6
+0.8
+50
+60
+70
+80
+sparsity
+unstructured
+STUN
+(c) Mixtral-8x22B
+0
+0.2
+0.4
+0.6
+0.8
+45
+50
+55
+60
+sparsity
+unstructured
+STUN
+(d) OLMoE-7B
+Figure 3: Comparing STUN and unstructured pruning for various MoEs.
+Train GPU cost GPUs #
+Lu et al. (2024a)
+0
+infeasible7
+> 8
+STUN (w/ OWL)
+0
+1.12h
+1
+OWL (Yin et al., 2024)
+0
+1.12h
+1
+STUN (w/ Wanda)
+0
+0.58h
+1
+Wanda (Sun et al., 2024)
+0
+0.58h
+1
+Table 7: Cost comparison of diverse pruning methods
+with Snowflake-Arctic. Train: training cost, GPU #:
+number of GPUs required for pruning.
+pruning method achieves similar performance to
+our O(n) method. This supports our choice to use
+the O(1) method, which is more efficient.
+5.2.3
+RQ3: STUN Adapts Large Number of
+Small Experts
+Figure 3 illustrates the trend of STUN in differ-
+ent MoEs. The performance gap between STUN
+and unstructured pruning increases as the MoE has
+more experts with small sizes (from (c) to (a)). This
+is because having more experts, rather than having
+fewer but larger ones, provides greater flexibility
+to our expert pruning. Notably, MoEs with a large
+7In detail, 23951146041928082866135587776380551750
+forward passes per layer at minimum.
+number of small experts are favored in recent mod-
+els (He, 2024).
+5.2.4
+RQ4: STUN Outperforms Unstructured
+Pruning in non-MoEs
+To investigate whether STUN is generalizable to
+non-MoE as well, we employ a state-of-the-art
+structured pruning algorithm for non-MoE mod-
+els, namely, LLM-surgeon (van der Ouderaa et al.,
+2024) with 5% sparsity before performing unstruc-
+tured pruning, which is OWL in our case. Figure 4
+illustrates that such STUN outperforms unstruc-
+tured pruning.
+6
+Cost Analysis
+Table 7 shows the cost comparison between di-
+verse pruning methods. While none of the pruning
+methods require training cost, Lu et al. (2024a)
+is infeasible due to its prohibitive number of for-
+ward passes in GPUs. Due to the efficiency of
+proposed expert pruning, STUN is as efficient as
+the unstructured pruning method it uses, making
+it a feasible pruning method even for large MoEs,
+such as Snowflake-Arctic.
+
+
+0.02
+0.07
+0.12
+0.17
+45
+50
+55
+60
+65
+unstructured
+STUN
+(a) Llama-2 7B
+0.02
+0.07
+0.12
+0.17
+45
+50
+55
+60
+65
+unstructured
+STUN
+(b) Llama-2 13B
+Figure 4: GSM8K 5-shot accuracy comparing STUN and unstructured pruning for various non-MoEs.
+7
+Conclusion
+In this paper, we proposed STUN– an interpola-
+tion between structured and unstructured pruning,
+leveraging both inter- and intra-expert sparsity.We
+provide both theoretical and empirical evidence
+demonstrating why designing expert pruning be-
+fore unstructured pruning is beneficial.
+Limitation
+Since our method utilizes unstructured pruning in
+the second stage, we share the same disadvantages
+with unstructured pruning, that is, on some hard-
+ware, the acceleration may not be trivial. How-
+ever, it is shown that some hardware, such as CPU,
+can successfully accelerate unstructure-pruned net-
+works (NeuralMagic, 2021), and ongoing research
+is actively developing methods to achieve similar
+speedups on GPUs (Mishra et al., 2021; Zhao et al.,
+2024). With a substantial body of work dedicated
+to unstructured pruning (Frantar and Alistarh, 2023;
+Das et al., 2024; Dong et al., 2024; Sun et al., 2024;
+Yin et al., 2024; Li et al., 2024; Hu et al., 2024;
+Lu et al., 2024b), we believe this approach remains
+highly relevant and leads to practical performance
+improvements with ongoing hardware support.
+We already have shown our method works in
+versatile extreme settings, such as non-MoE mod-
+els, or high sparsity, etc. We leave more extensive
+evaluations, such as performance under highly im-
+balanced or skewed data distributions, as future
+work.
+References
+Daniel Aloise, Amit Deshpande, Pierre Hansen, and
+Preyas Popat. 2009. NP-hardness of Euclidean sum-
+of-squares clustering. Machine Learning, 75(2):245–
+248.
+Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang,
+Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei
+Huang, Binyuan Hui, Luo Ji, Mei Li, Junyang Lin,
+Runji Lin, Dayiheng Liu, Gao Liu, Chengqiang Lu,
+Keming Lu, Jianxin Ma, Rui Men, Xingzhang Ren,
+Xuancheng Ren, Chuanqi Tan, Sinan Tan, Jianhong
+Tu, Peng Wang, Shijie Wang, Wei Wang, Sheng-
+guang Wu, Benfeng Xu, Jin Xu, An Yang, Hao Yang,
+Jian Yang, Shusheng Yang, Yang Yao, Bowen Yu,
+Hongyi Yuan, Zheng Yuan, Jianwei Zhang, Xingx-
+uan Zhang, Yichang Zhang, Zhenru Zhang, Chang
+Zhou, Jingren Zhou, Xiaohuan Zhou, and Tianhang
+Zhu. 2023.
+Qwen Technical Report.
+Preprint,
+arXiv:2309.16609.
+Maximiliana Behnke and Kenneth Heafield. 2021. Prun-
+ing Neural Machine Translation for Speed Using
+Group Lasso. In Proceedings of the Sixth Conference
+on Machine Translation, pages 1074–1086, Online.
+Association for Computational Linguistics.
+Daniel Brélaz. 1979. New methods to color the vertices
+of a graph. Communications of The Acm, 22(4):251–
+256.
+Hongrong Cheng, Miao Zhang, and Javen Qinfeng
+Shi. 2024.
+MINI-LLM: Memory-Efficient Struc-
+tured Pruning for Large Language Models. Preprint,
+arXiv:2407.11681.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. 2018. Think you have Solved Question An-
+swering? Try ARC, the AI2 Reasoning Challenge.
+Preprint, arXiv:1803.05457.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+Nakano, Christopher Hesse, and John Schulman.
+2021. Training Verifiers to Solve Math Word Prob-
+lems. Preprint, arXiv:2110.14168.
+Damai Dai, Chengqi Deng, Chenggang Zhao, R.x. Xu,
+Huazuo Gao, Deli Chen, Jiashi Li, Wangding Zeng,
+Xingkai Yu, Y. Wu, Zhenda Xie, Y.k. Li, Panpan
+Huang, Fuli Luo, Chong Ruan, Zhifang Sui, and
+Wenfeng Liang. 2024. DeepSeekMoE: Towards Ul-
+timate Expert Specialization in Mixture-of-Experts
+
+
+Language Models. In Proceedings of the 62nd An-
+nual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 1280–
+1297, Bangkok, Thailand. Association for Computa-
+tional Linguistics.
+Richard B. Darlington. 1970.
+Is Kurtosis Really
+"Peakedness?". The American Statistician, 24(2):19–
+22.
+Rocktim Jyoti Das, Mingjie Sun, Liqun Ma, and
+Zhiqiang Shen. 2024. Beyond Size: How Gradients
+Shape Pruning Decisions in Large Language Models.
+Preprint, arXiv:2311.04902.
+Sanjoy Dasgupta. 2008. The hardness of k-means clus-
+tering.
+Databricks. 2024. Databricks/dbrx. Databricks.
+Lucio Dery, Steven Kolawole, Jean-François Kagy, Vir-
+ginia Smith, Graham Neubig, and Ameet Talwalkar.
+2024.
+Everybody Prune Now: Structured Prun-
+ing of LLMs with only Forward Passes. Preprint,
+arXiv:2402.05406.
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and
+Luke Zettlemoyer. 2023. QLoRA: Efficient finetun-
+ing of quantized LLMs. In Thirty-Seventh Confer-
+ence on Neural Information Processing Systems.
+Peijie Dong, Lujun Li, Zhenheng Tang, Xiang Liu,
+Xinglin Pan, Qiang Wang, and Xiaowen Chu. 2024.
+Pruner-Zero: Evolving Symbolic Pruning Metric
+From Scratch for Large Language Models. In Forty-
+First International Conference on Machine Learning.
+Nan Du, Yanping Huang, Andrew M Dai, Simon Tong,
+Dmitry Lepikhin, Yuanzhong Xu, Maxim Krikun,
+Yanqi Zhou, Adams Wei Yu, Orhan Firat, Barret
+Zoph, Liam Fedus, Maarten P Bosma, Zongwei Zhou,
+Tao Wang, Emma Wang, Kellie Webster, Marie Pel-
+lat, Kevin Robinson, Kathleen Meier-Hellstern, Toju
+Duke, Lucas Dixon, Kun Zhang, Quoc Le, Yonghui
+Wu, Zhifeng Chen, and Claire Cui. 2022. GLaM:
+Efficient scaling of language models with mixture-
+of-experts. In Proceedings of the 39th International
+Conference on Machine Learning, volume 162 of
+Proceedings of Machine Learning Research, pages
+5547–5569. PMLR.
+Angela Fan, Edouard Grave, and Armand Joulin. 2019.
+Reducing Transformer Depth on Demand with Struc-
+tured Dropout. In International Conference on Learn-
+ing Representations.
+William Fedus, Barret Zoph, and Noam Shazeer. 2022.
+Switch transformers: Scaling to trillion parameter
+models with simple and efficient sparsity. Journal of
+Machine Learning Research, 23(120):1–39.
+Elias Frantar and Dan Alistarh. 2023. SparseGPT: Mas-
+sive language models can be accurately pruned in
+one-shot. In Proceedings of the 40th International
+Conference on Machine Learning, volume 202 of
+Proceedings of Machine Learning Research, pages
+10323–10337. PMLR.
+Leo Gao, Jonathan Tow, Stella Biderman, Sid Black,
+Anthony DiPofi, Charles Foster, Laurence Golding,
+Jeffrey Hsu, Kyle McDonell, Niklas Muennighoff,
+Jason Phang, Laria Reynolds, Eric Tang, Anish Thite,
+Ben Wang, Kevin Wang, and Andy Zou. 2021. A
+framework for few-shot language model evaluation.
+Zenodo.
+Yuan Gao, Zujing Liu, Weizhong Zhang, Bo Du, and
+Gui-Song Xia. 2024. Optimization-based Structural
+Pruning for Large Language Models without Back-
+Propagation. Preprint, arXiv:2406.10576.
+Hongyu Gong, Xian Li, and Dmitriy Genzel. 2022.
+Adaptive Sparse Transformer for Multilingual Trans-
+lation. arXiv:2104.07358 [cs].
+Babak Hassibi and David Stork. 1992. Second order
+derivatives for network pruning: Optimal Brain Sur-
+geon. In Advances in Neural Information Processing
+Systems, volume 5. Morgan-Kaufmann.
+Shwai He, Daize Dong, Liang Ding, and Ang Li.
+2024. Demystifying the Compression of Mixture-
+of-Experts Through a Unified Framework. Preprint,
+arXiv:2406.02500.
+Xu Owen He. 2024. Mixture of A Million Experts.
+Preprint, arXiv:2407.04153.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou,
+Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+2021. Measuring massive multitask language under-
+standing. In International Conference on Learning
+Representations.
+Yuezhou Hu, Jun Zhu, and Jianfei Chen. 2024. S-STE:
+Continuous Pruning Function for Efficient 2:4 Sparse
+Pre-training. In The Thirty-eighth Annual Confer-
+ence on Neural Information Processing Systems.
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+sch, Chris Bamford, Devendra Singh Chaplot, Diego
+de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+Thibaut Lavril, Thomas Wang, Timothée Lacroix,
+and William El Sayed. 2023. Mistral 7B. Preprint,
+arXiv:2310.06825.
+Albert Q. Jiang, Alexandre Sablayrolles, Antoine
+Roux, Arthur Mensch, Blanche Savary, Chris
+Bamford, Devendra Singh Chaplot, Diego de las
+Casas, Emma Bou Hanna, Florian Bressand, Gi-
+anna Lengyel, Guillaume Bour, Guillaume Lam-
+ple, Lélio Renard Lavaud, Lucile Saulnier, Marie-
+Anne Lachaux, Pierre Stock, Sandeep Subramanian,
+Sophia Yang, Szymon Antoniak, Teven Le Scao,
+Théophile Gervet, Thibaut Lavril, Thomas Wang,
+Timothée Lacroix, and William El Sayed. 2024. Mix-
+tral of Experts. Preprint, arXiv:2401.04088.
+Jean Kaddour, Joshua Harris, Maximilian Mozes, Her-
+bie Bradley, Roberta Raileanu, and Robert McHardy.
+2023. Challenges and Applications of Large Lan-
+guage Models. Preprint, arXiv:2307.10169.
+
+
+Young Jin Kim, Ammar Ahmad Awan, Alexandre
+Muzio, Andres Felipe Cruz Salinas, Liyang Lu,
+Amr Hendy, Samyam Rajbhandari, Yuxiong He, and
+Hany Hassan Awadalla. 2021. Scalable and Efficient
+MoE Training for Multitask Multilingual Models.
+Preprint, arXiv:2109.10465.
+Yeskendir Koishekenov, Alexandre Berard, and Vas-
+silina Nikoulina. 2023. Memory-efficient NLLB-
+200: Language-specific Expert Pruning of a Mas-
+sively Multilingual Machine Translation Model. In
+Proceedings of the 61st Annual Meeting of the As-
+sociation for Computational Linguistics (Volume 1:
+Long Papers), pages 3567–3585, Toronto, Canada.
+Association for Computational Linguistics.
+Eldar Kurtic, Daniel Campos, Tuan Nguyen, Elias Fran-
+tar, Mark Kurtz, Benjamin Fineran, Michael Goin,
+and Dan Alistarh. 2022. The Optimal BERT Sur-
+geon: Scalable and Accurate Second-Order Prun-
+ing for Large Language Models. In Proceedings of
+the 2022 Conference on Empirical Methods in Nat-
+ural Language Processing, pages 4163–4181, Abu
+Dhabi, United Arab Emirates. Association for Com-
+putational Linguistics.
+Lujun Li, Peijie Dong, Zhenheng Tang, Xiang Liu,
+Qiang Wang, Wenhan Luo, Wei Xue, Qifeng Liu,
+Xiaowen Chu, and Yike Guo. 2024. Discovering
+Sparsity Allocation for Layer-wise Pruning of Large
+Language Models. In The Thirty-eighth Annual Con-
+ference on Neural Information Processing Systems.
+Xian Li, Asa Cooper Stickland, Yuqing Tang, and Xiang
+Kong. 2020. Deep transformers with latent depth. In
+Advances in Neural Information Processing Systems,
+volume 33, pages 1736–1746. Curran Associates,
+Inc.
+Chen Liang, Simiao Zuo, Minshuo Chen, Haoming
+Jiang, Xiaodong Liu, Pengcheng He, Tuo Zhao, and
+Weizhu Chen. 2021. Super Tickets in Pre-Trained
+Language Models: From Model Compression to Im-
+proving Generalization. In Proceedings of the 59th
+Annual Meeting of the Association for Computational
+Linguistics and the 11th International Joint Confer-
+ence on Natural Language Processing (Volume 1:
+Long Papers), pages 6524–6538, Online. Association
+for Computational Linguistics.
+Opher Lieber, Barak Lenz, Hofit Bata, Gal Cohen,
+Jhonathan Osin, Itay Dalmedigos, Erez Safahi,
+Shaked Meirom, Yonatan Belinkov, Shai Shalev-
+Shwartz, Omri Abend, Raz Alon, Tomer Asida,
+Amir Bergman, Roman Glozman, Michael Gokhman,
+Avashalom Manevich, Nir Ratner, Noam Rozen, Erez
+Shwartz, Mor Zusman, and Yoav Shoham. 2024.
+Jamba: A Hybrid Transformer-Mamba Language
+Model. Preprint, arXiv:2403.19887.
+Enshu Liu, Junyi Zhu, Zinan Lin, Xuefei Ning,
+Matthew B. Blaschko, Shengen Yan, Guohao Dai,
+Huazhong Yang, and Yu Wang. 2024.
+Efficient
+Expert Pruning for Sparse Mixture-of-Experts Lan-
+guage Models: Enhancing Performance and Reduc-
+ing Inference Costs. Preprint, arXiv:2407.00945.
+Xudong Lu, Qi Liu, Yuhui Xu, Aojun Zhou, Siyuan
+Huang, Bo Zhang, Junchi Yan, and Hongsheng Li.
+2024a. Not All Experts are Equal: Efficient Expert
+Pruning and Skipping for Mixture-of-Experts Large
+Language Models. In Proceedings of the 62nd An-
+nual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 6159–
+6172.
+Xudong Lu, Aojun Zhou, Yuhui Xu, Renrui Zhang,
+Peng Gao, and Hongsheng Li. 2024b. SPP: Sparsity-
+Preserved Parameter-Efficient Fine-Tuning for Large
+Language Models. In Forty-First International Con-
+ference on Machine Learning.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023.
+LLM-Pruner: On the structural pruning of large lan-
+guage models. In Thirty-Seventh Conference on Neu-
+ral Information Processing Systems.
+Gabryel Mason-Williams and Fredrik Dahlqvist. 2024.
+What makes a good prune? Maximal unstructured
+pruning for maximal cosine similarity. In The Twelfth
+International Conference on Learning Representa-
+tions.
+Nimrod Megiddo and Kenneth J. Supowit. 1984. On the
+Complexity of Some Common Geometric Location
+Problems. SIAM Journal on Computing, 13(1):182–
+196.
+Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish
+Sabharwal. 2018. Can a Suit of Armor Conduct Elec-
+tricity? A New Dataset for Open Book Question An-
+swering. In Proceedings of the 2018 Conference on
+Empirical Methods in Natural Language Processing,
+pages 2381–2391, Brussels, Belgium. Association
+for Computational Linguistics.
+Asit Mishra, Jorge Albericio Latorre, Jeff Pool, Darko
+Stosic, Dusan Stosic, Ganesh Venkatesh, Chong Yu,
+and Paulius Micikevicius. 2021. Accelerating Sparse
+Deep Neural Networks. Preprint, arXiv:2104.08378.
+Alexandre Muzio, Alex Sun, and Churan He. 2024.
+SEER-MoE: Sparse Expert Efficiency through
+Regularization for Mixture-of-Experts.
+Preprint,
+arXiv:2404.05089.
+NeuralMagic. 2021. Neuralmagic/deepsparse: Sparsity-
+aware deep learning inference runtime for CPUs.
+https://github.com/neuralmagic/deepsparse.
+OpenAI. 2023.
+GPT-4 Technical Report.
+Preprint,
+arXiv:2303.08774.
+Colin Raffel, Noam Shazeer, Adam Roberts, Kather-
+ine Lee, Sharan Narang, Michael Matena, Yanqi
+Zhou, Wei Li, and Peter J. Liu. 2020. Exploring the
+limits of transfer learning with a unified text-to-text
+transformer. Journal of Machine Learning Research,
+21(140):1–67.
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+ula, and Yejin Choi. 2021. WinoGrande: An adver-
+sarial winograd schema challenge at scale. Commu-
+nications of The Acm, 64(9):99–106.
+
+
+Kyuhong Shim, Iksoo Choi, Wonyong Sung, and Jung-
+wook Choi. 2021.
+Layer-wise Pruning of Trans-
+former Attention Heads for Efficient Language Mod-
+eling. In 2021 18th International SoC Design Con-
+ference (ISOCC), pages 357–358.
+Peter H. A. Sneath and Robert R. Sokal. 1973. Nu-
+merical taxonomy. The principles and practice of
+numerical classification.
+Snowflake. 2024.
+Snowflake-Labs/snowflake-arctic.
+Snowflake Labs.
+Emma Strubell, Ananya Ganesh, and Andrew McCal-
+lum. 2019. Energy and Policy Considerations for
+Deep Learning in NLP. In Proceedings of the 57th
+Annual Meeting of the Association for Computational
+Linguistics, pages 3645–3650, Florence, Italy. Asso-
+ciation for Computational Linguistics.
+Mingjie Sun, Zhuang Liu, Anna Bair, and J Zico Kolter.
+2024. A simple and effective pruning approach for
+large language models. In The Twelfth International
+Conference on Learning Representations.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+bert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton
+Ferrer, Moya Chen, Guillem Cucurull, David Esiobu,
+Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller,
+Cynthia Gao, Vedanuj Goswami, Naman Goyal, An-
+thony Hartshorn, Saghar Hosseini, Rui Hou, Hakan
+Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa,
+Isabel Kloumann, Artem Korenev, Punit Singh Koura,
+Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Di-
+ana Liskovich, Yinghai Lu, Yuning Mao, Xavier Mar-
+tinet, Todor Mihaylov, Pushkar Mishra, Igor Moly-
+bog, Yixin Nie, Andrew Poulton, Jeremy Reizen-
+stein, Rashi Rungta, Kalyan Saladi, Alan Schelten,
+Ruan Silva, Eric Michael Smith, Ranjan Subrama-
+nian, Xiaoqing Ellen Tan, Binh Tang, Ross Tay-
+lor, Adina Williams, Jian Xiang Kuan, Puxin Xu,
+Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan,
+Melanie Kambadur, Sharan Narang, Aurelien Ro-
+driguez, Robert Stojnic, Sergey Edunov, and Thomas
+Scialom. 2023. Llama 2: Open Foundation and Fine-
+Tuned Chat Models. Preprint, arXiv:2307.09288.
+Tycho F. A. van der Ouderaa, Markus Nagel, Mart Van
+Baalen, and Tijmen Blankevoort. 2024. The LLM
+surgeon. In The Twelfth International Conference on
+Learning Representations.
+Elena Voita, David Talbot, Fedor Moiseev, Rico Sen-
+nrich, and Ivan Titov. 2019. Analyzing Multi-Head
+Self-Attention: Specialized Heads Do the Heavy Lift-
+ing, the Rest Can Be Pruned. In Proceedings of the
+57th Annual Meeting of the Association for Computa-
+tional Linguistics, pages 5797–5808, Florence, Italy.
+Association for Computational Linguistics.
+Alex Wang, Yada Pruksachatkun, Nikita Nangia, Aman-
+preet Singh, Julian Michael, Felix Hill, Omer Levy,
+and Samuel R. Bowman. 2019. SuperGLUE: A stick-
+ier benchmark for general-purpose language under-
+standing systems. In Proceedings of the 33rd Interna-
+tional Conference on Neural Information Processing
+Systems, 294, pages 3266–3280. Curran Associates
+Inc., Red Hook, NY, USA.
+Alex Wang, Amanpreet Singh, Julian Michael, Felix
+Hill, Omer Levy, and Samuel Bowman. 2018. GLUE:
+A Multi-Task Benchmark and Analysis Platform for
+Natural Language Understanding. In Proceedings
+of the 2018 EMNLP Workshop BlackboxNLP: An-
+alyzing and Interpreting Neural Networks for NLP,
+pages 353–355, Brussels, Belgium. Association for
+Computational Linguistics.
+Lu Yin, You Wu, Zhenyu Zhang, Cheng-Yu Hsieh,
+Yaqing Wang, Yiling Jia, Gen Li, Ajay Kumar
+Jaiswal, Mykola Pechenizkiy, Yi Liang, Michael Ben-
+dersky, Zhangyang Wang, and Shiwei Liu. 2024. Out-
+lier Weighed Layerwise Sparsity (OWL): A Missing
+Secret Sauce for Pruning LLMs to High Sparsity.
+In Forty-First International Conference on Machine
+Learning.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. 2019. HellaSwag: Can
+a Machine Really Finish Your Sentence? In Proceed-
+ings of the 57th Annual Meeting of the Association for
+Computational Linguistics, pages 4791–4800, Flo-
+rence, Italy. Association for Computational Linguis-
+tics.
+Qingcheng Zeng, Lucas Garay, Peilin Zhou, Dading
+Chong, Yining Hua, Jiageng Wu, Yikang Pan, Han
+Zhou, Rob Voigt, and Jie Yang. 2023. GreenPLM:
+Cross-Lingual Transfer of Monolingual Pre-Trained
+Language Models at Almost No Cost. In Proceed-
+ings of the Thirty-Second International Joint Con-
+ference on Artificial Intelligence, pages 6290–6298,
+Macau, SAR China. International Joint Conferences
+on Artificial Intelligence Organization.
+Honghe Zhang, XiaolongShi XiaolongShi, Jingwei Sun,
+and Guangzhong Sun. 2024a. Structured Pruning
+for Large Language Models Using Coupled Compo-
+nents Elimination and Minor Fine-tuning. In Find-
+ings of the Association for Computational Linguis-
+tics: NAACL 2024, pages 1–12, Mexico City, Mexico.
+Association for Computational Linguistics.
+Zeliang Zhang, Xiaodong Liu, Hao Cheng, Chenliang
+Xu, and Jianfeng Gao. 2024b. Diversifying the Ex-
+pert Knowledge for Task-Agnostic Pruning in Sparse
+Mixture-of-Experts.
+Zhengyan Zhang, Fanchao Qi, Zhiyuan Liu, Qun Liu,
+and Maosong Sun. 2021. Know what you don’t need:
+Single-Shot Meta-Pruning for attention heads. AI
+Open, 2:36–42.
+Kang Zhao, Tao Yuan, Han Bao, Zhenfeng Su, Chang
+Gao, Zhaofeng Sun, Zichen Liang, Liping Jing, and
+Jianfei Chen. 2024. Beyond 2:4: Exploring V:N:M
+sparsity for efficient transformer inference on GPUs.
+Preprint, arXiv:2410.16135.
+
+
+A
+Derivation From O( kn
+√n) to O(1)
+A.1
+Towards O(n): Probabilistic
+Interpretation
+As a stepping stone towards O(1), we propose to
+rephrase the goal of finding θS to minimize ES (Eq.
+4) as:
+argmaxSP(X1 = s1, · · · , X|S| = s|S|)
+(9)
+where sis are the experts included in the expert
+set S, and P(X1 = s1, · · · , X|S| = s|S|) is the
+joint probability of pruning S. One intuitive way
+to design P so that Eq. 9 yields the same S to
+minimize Eq. 4 is as follows:
+P(X1 = s1, · · · , X|S| = s|S|) = 1
+Z · 1
+ES
+(10)
+where Z is the normalization factor. Each joint
+probability needs O(1) GPU calls, since ES needs
+the output of M(x; θ −θS).
+Section 4.2.1 corresponds to enumerating joint
+probability from all combinations, requiring
+  n
+|S|
+
+different values, which is compute-intensive. When
+chain rule is applied, Eq. 9 can be reformulated as
+follows:
+argmaxS
+Y
+k
+P(Xk = sk|X1 = s1,
+· · · , Xk−1 = sk−1)
+(11)
+Our contribution is greedy optimization without
+compromise for Eq. 11– We decompose the mul-
+tiplication of Eq. 11 at each step k, and obtain the
+distribution P(Xk|s1, · · · , sk−1), to select Xk that
+maximizes the probability. For simplicity, we will
+omit Xks from this point on.
+As our goal is finding the argmax of the prob-
+abilities as in Eq.
+11, estimating the rank be-
+tween them is sufficient, rather than evaluating
+exact values. Such rank estimation can benefit
+from the latent structure among experts, specif-
+ically, a cluster of similar experts in MoE, en-
+abling P(Xk|s1, · · · , sk−1) calculation without
+chain-rule multiplications in Eq. 11.
+Assume we know oracle clusters, c(Ei), where
+c is the mapping from an expert to a set of sim-
+ilarly behaving experts identified from the latent
+clusters. When we have knowledge of similar ex-
+perts, for example, c(Ei) = c(Ej) = {Ei, Ej}
+indicating Ei and Ej are highly similar, we will de-
+cide not to prune Ei if Ej is already pruned. That
+is, if c(Ei) ⊆Sk then P(Xk = Ei|Sk−1) should
+be lowered by some value p, to guide the model
+against pruning. Moreover, P(Ei|Sk−1) should be
+larger, or rank higher, otherwise.
+To generalize, we will cluster similar experts.
+Once the cluster of similar experts is finalized, we
+assign the value P(Ei|Sk−1), as follows:
+P(Ei|Sk−1) =
+(
+P(Ei) −p
+c(Ei) ⊆Sk
+P(Ei)
+otherwise
+(12)
+We set p as a constant for simplicity. This enables
+the calculation of all P(Ei|Sk−1) in Eq. 11 from
+P(Ei)s, which needs only n forwards in total.
+Clustering the Similar Experts
+Our remaining
+task is to obtain cluster information c: One signal
+is pairwise behavioral similarity bi,j, from the pre-
+trained weights W at a minimal cost. Suppose two
+rows Wi ≈Wj are similar; then ri(x) ≈rj(x),
+meaning Ei, Ej tend to be selected by similar in-
+puts, implying similar expertise. Thus, the behav-
+ioral similarity bi,j between two experts Ei, Ej can
+be obtained as follows:
+bi,j = −∥Wi −Wj∥F
+(13)
+Next, we generalize pairwise similarity into clus-
+ters of experts, such that experts in each cluster Cl
+are highly similar to its representative µl. Formally,
+the objective of clustering is to minimize the sum
+of squared errors between µl and experts Ei in the
+cluster:
+X
+i∈Cl
+X
+l
+∥Wi −µl∥2
+(14)
+which is an NP-hard problem (Megiddo and
+Supowit, 1984; Dasgupta, 2008; Aloise et al.,
+2009).
+Practically, we found that the agglomerative clus-
+tering algorithm (Sneath and Sokal, 1973) performs
+well.8 Specifically, clusters are initialized as indi-
+vidual experts and then iteratively merged, with
+a termination condition that prevents the experts
+within each cluster from being too dissimilar. This
+condition is tuned based on the desired sparsity.
+Lastly, if we allow inference on some data, we
+can improve Eq. 13 with coactivation statistics ai,j,
+which measure the frequency with which Ei, Ej
+are selected simultaneously.9 However, these coac-
+tivation statistics depend on the given data, whose
+8We tried other clustering algorithms in the Appendix.
+9We normalize ai,j by dividing it with the total coactiva-
+tions in one layer.
+
+
+distribution may differ from the test data. There-
+fore, we combine the two as follows:
+bi,j = −λ1∥Wi −Wj∥F + λ2ai,j
+(15)
+We recap the algorithm in the Appendix (Alg 1).
+A.2
+Towards O(1): Taylor Approximation
+and Selective Reconstruction
+1st-order Taylor Approximation
+While previ-
+ous section immensely reduces the cost to obtain
+the probability distribution to O(n) by requiring
+only P(Ei)s, we can further reduce the number of
+forward passes– We aim to remove the GPU calls
+for P(Ei), which is needed as in Eq. 10.
+The key idea is approximating Ei’s reconstruc-
+tion loss value Ei = ∥M(x; θ) −M(x; θ −θi)∥F ,
+and assigning P(Ei) as some high value L if the re-
+construction loss Ei is lowest. This neatly estimates
+the rank between P(Ei)s.
+Though Ei can be approximated via conven-
+tional 2nd-order reconstruction methods (Hassibi
+and Stork, 1992; Frantar and Alistarh, 2023), the
+size of the hessian matrix increases quadratically
+with the number of experts, which often yields out-
+of-memory errors.
+To address this, we propose using a 1st order
+Taylor approximation. To rank the reconstruction
+loss values, we consider approximating the recon-
+struction loss when replacing the output from θi
+with some specific expert θC in C = c(Ei) as fol-
+lows:
+Ei = ∥E′(θi) · (θi −θC)∥2
+(16)
+As the convention of 2nd order Taylor approxima-
+tion (Hassibi and Stork, 1992; Frantar and Alis-
+tarh, 2023), we assume the parameters are near a
+local minimum. Thus, with a small constant γ,
+∥E′(θi)∥< γ, leading to:
+X
+i
+Ei <
+X
+i
+γ∥θi −θC∥2
+(17)
+whose upper bound in the right-hand side can be
+minimized when θC = θi, where ¯ denotes the
+average.
+Therefore, the expert closest to ¯θi within each
+cluster has the highest priority to be retained. We
+assign Ei a large number L > p if Ei is the closest
+to ¯θi from the corresponding cluster c(Ei), and set
+it to zero otherwise. The same greedy algorithm is
+applied to optimize Eq. 11.
+Selective Reconstruction of Experts
+While let-
+ting θC as the expert closest to ¯θi successfully mini-
+mizes P
+i Ei, sometimes we can minimize them fur-
+ther, by replacing the weight of the closest expert
+θC to ¯θi. However, blindly doing so is suboptimal,
+as there is another kind of error to consider. The de-
+cision boundaries of the next layer are accustomed
+to the output of {E(x; θi)}|C|
+i=1, but changing the
+output as E(x; θC) = E(x; ¯θi) could result in a
+distribution that the model is unfamiliar with. This
+potential error, which we denote as Ed, would be
+minimized if θC ∈{θi}|C|
+i=1.
+To balance these two types of errors, we selec-
+tively decide whether to reconstruct. We observe
+that P
+i Ei increases if the total number of clusters
+in a layer decreases, as this would introduce more
+∥E′(θi) · (θi −θC)∥2 terms. Therefore, if the total
+number of clusters is below a threshold κ, we use
+θC = θi to minimize P
+i Ei. Otherwise, we set
+θC as the expert within the cluster {θi}|C|
+i=1 clos-
+est to the θi, to minimize Ed. The router weight
+reconstruction is done similarly, following its cor-
+responding expert.
+B
+Implementation Details
+We probe (λ1, λ2) ∈{(0, 1), (1, 0), (1, 1)}, except
+for the Snowflake Arctic, which is the biggest MoE
+we deal with, where we only consider (λ1, λ2) =
+(1, 0), which means no GPU calls is needed for
+expert pruning. To get coactivation values ai,j, we
+utilize 1000 samples from the C4 dataset, each
+of which has 2048 sequence length. We evaluate
+on LM-EVALUATION-HARNESS (Gao et al., 2021)
+We use 4bit quantization (Dettmers et al., 2023)
+for experiments with Mixtral-8x22B and Arctic,
+due to their model size. We use 20%, 12.5%, and
+10% for Arctic, Mixtral-8x7B, and Mixtral-8x22B
+respectively, as the expert sparsity for STUN. These
+are the maximum values among 10, 12.5, 20, 25,
+and 35%, with minimum performance loss. We
+use κ = 3 for selective reconstruction. For Wanda
+and OWL, we use 128 C4 samples following the
+original papers (Yin et al., 2024; Sun et al., 2024),
+while we use 4096 for sequence length. For OWL,
+we use the default setting, M = 5, λ = 0.08.
+All experiments are conducted on H100 80GB
+GPUs, with a maximum of 4. Each evaluation is
+done within 4 hours, and each unstructured pruning
+requires less than 2 hours on one GPU. Evaluation
+is done only once, since we introduce no random-
+ness in our experiment.
+
+
+Cluster
+Reconstruct
+LM-eval Avg
+Ours
+Ours
+59.58
+DSatur
+Ours
+58.59
+Ours
+Always
+57.60
+Ours
+Never
+59.22
+Table 8: Ablation experiments for the first component
+of STUN, the proposed expert pruning.
+C
+Other Clustering Algorithms
+We also considered DSatur (Brélaz, 1979) as a clus-
+tering algorithm for Eq. 12, converting into clique-
+partitioning in a graph where edge ei,j connected
+if two experts are similar enough as follows,
+ei,j =
+(
+1
+bi,j >= tDSatur
+∞
+otherwise
+(18)
+where tDSatur is some threshold to control the spar-
+sity of MoE.
+D
+Ablation Studies
+To validate our design of expert pruning in sections
+A.1 and A.2, we evaluate alternative approaches to
+expert-prune Mixtral-8x7B at 50% sparsity. Table 8
+confirms that our design choices are valid. Our ag-
+glomerative clustering algorithm outperforms the
+DSatur algorithm, an alternative clustering algo-
+rithm we discuss in the Appendix. Additionally, se-
+lective reconstruction proves superior to always or
+never reconstructing, as shown in the last two rows.
+Detailed per-task performance of ablation studies
+are described in Tables 9, 10. Detailed hyperpa-
+rameter ablation studies are described in Tables 11,
+12. Results with applying expert-pruning only are
+provided in Table 14.
+E
+Detailed Results for RQ2
+Table 13 describes the per-task performance of
+RQ2.
+F
+Why GSM8K is Harder
+The nature of the GSM8K task, which is a genera-
+tion task, accounts for this discrepancy. A random
+generation baseline on GSM8K would achieve 0%
+accuracy, making it far more challenging to main-
+tain performance. In contrast, ARC, HellaSwag,
+and MMLU are multiple-choice tasks where ran-
+dom baselines can achieve reasonable accuracy by
+comparing the perplexity of different completion
+options. As a result, maintaining performance on
+GSM8K is considerably harder, a challenge often
+overlooked in previous works. This explains the
+more pronounced difference in performance be-
+tween STUN and the baselines on GSM8K.
+
+
+ARC-c ARC-e BoolQ HellaSwag MMLU OBQA RTE WinoGrande Avg
+DSatur 45.99
+75.38
+80.76
+54.62
+45.06
+29.00 66.79
+71.11
+58.59
+Ours
+45.73
+75.13
+83.46
+54.55
+53.29
+31.20 62.45
+70.80
+59.58
+Table 9: Our agglomerative clustering algorithm is better than the alternative.
+ARC-c ARC-e BoolQ HellaSwag MMLU OBQA RTE WinoGrande Avg
+Always reconstruct (κ = 8) 42.92
+74.20
+82.42
+54.66
+50.09
+28.40 55.96
+72.14
+57.60
+No reconstruct (κ = 0)
+45.22
+75.21
+82.45
+54.53
+52.31
+30.00 62.82
+71.19
+59.22
+Ours (κ = 3)
+45.73
+75.13
+83.46
+54.55
+53.29
+31.20 62.45
+70.80
+59.58
+Table 10: Selective reconstruction outperforms the baselines.
+λ1
+λ2
+GSM8K
+Mixtral-8x7B
+1
+0
+63.38
+0
+1
+58.53
+1
+1
+60.42
+Mixtral-8x22B
+1
+0
+81.50
+0
+1
+81.58
+1
+1
+80.52
+Table 11: Comparison of different λ1, λ2 configurations.
+For the Arctic, we only consider the cheapest, (λ1, λ2)
+= (1,0).
+sparsity
+GSM8K
+Arctic
+10%
+70.74
+20%
+69.90
+35%
+60.05
+Mixtral-8x7B
+12.50%
+63.38
+25%
+53.22
+Mixtral-22B
+10%
+81.58
+12.50%
+79.91
+25%
+74.07
+Table 12: Comparison of different sparsity of our pro-
+posed expert-level pruning. (λ1, λ2) is probed among
+(1,0),(0,1),(1,1), except for 10% and 20% of Arctic.
+
+
+model
+sparsity method
+cost
+ARC-c ARC-e BoolQ HellaSwag MMLU OBQA RTE WinoGrande Avg
+Mixtral-8x7B
+(Instruct)
+0%
+unpruned
+62.20 87.04 88.50
+67.59
+68.87
+36.60 72.20
+76.87
+69.98
+25%
+Ours
+O(1)
+59.30 85.44 88.13
+64.42
+64.52
+35.40 71.84
+75.37
+68.05
+Lu et al. (2024a) O( kn
+√n) 58.19 84.89 87.34
+65.24
+62.47
+35.60 70.04
+75.85
+67.45
+Mixtral-8x7B
+0%
+unpruned
+57.17 84.01 85.35
+64.88
+67.88
+35.00 70.40
+75.93
+67.58
+25%
+Ours
+O(1)
+52.73 81.82 83.09
+60.84
+63.34
+31.60 68.59
+72.69
+64.34
+Lu et al. (2024a) O( kn
+√n) 51.62 81.94 83.64
+61.60
+58.72
+33.00 67.87
+75.37
+64.22
+Table 13: Comparing the first component of STUN, the proposed expert pruning, with other baselines.
+sparsity
+GSM8K
+Avg (→)
+ARC-c
+ARC-e
+HellaSwag
+MMLU
+Arctic
+20%
+69.90
+67.95
+57.00
+83.71
+65.70
+65.39
+Mixtral-8x7B
+12.50%
+63.38
+70.65
+61.18
+86.66
+66.80
+67.97
+Mixtral-8x22B
+10%
+81.58
+71.78
+61.18
+85.82
+66.62
+73.52
+Table 14: Performance when applying only our expert pruning.

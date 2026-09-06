@@ -1,0 +1,328 @@
+arXiv:2404.05086v1  [cs.LG]  7 Apr 2024
+A Note on LoRA
+Vlad Fomenko∗
+Han Yu
+Jongho Lee
+Stanley Hsieh
+Weizhu Chen†
+Microsoft
+vlfomenk@gmail.com wzchen@microsoft.com
+Abstract
+LoRA (Low-Rank Adaptation) [HSW+21] has emerged as a preferred method for eﬃciently adapt-
+ing Large Language Models (LLMs) with remarkable simplicity and eﬃcacy. This note extends the
+original LoRA paper by oﬀering new perspectives that were not initially discussed and presents a
+series of insights for deploying LoRA at scale. Without introducing new experiments, we aim to
+improve the understanding and application of LoRA.
+1
+Additional Insights
+1.1
+On Comparison
+Although the original LoRA paper compared LoRA with a variety of alternative methods, it didn’t
+fully explain why we designed LoRA in such a way or how it tackles the challenges born in other
+approaches.
+Back in 2020, the predominant parameter-eﬃcient adaptation technique was Adapter [HGJ+19]. This
+method sequentially integrates two adaptation modules in each Transformer [VSP+17] layer, one after
+the attention and the other after the feed-forward modules. This not only leads to extra inference
+latency, particularly with smaller batch sizes as highlighted in the LoRA study, but it also causes a
+signiﬁcant increase in the network’s depth. Empirically, we observed that this increase often led to
+training instability. Speciﬁcally, for certain tasks or datasets, achieving training convergence became
+challenging, particularly when working with the 96-layer GPT-3 model [BMR+20]. The issue with
+increased depth partly inspired us to consider expanding the network in its width rather than its
+depth, which laid the foundation for LoRA’s design that extends weights in parallel, contrasting with
+the Adapter’s sequential approach.
+Around the same time, a separate project led by Yang and Hu et al [YHB+21] on hyper-parameter
+transfer (HPT), demonstrated the practicality of transferring hyperparameters across a model’s width.
+However, attempts to apply HPT along the model’s depth were less successful.
+This lent further
+credence to the rationale behind extending networks in parallel width, as LoRA does, rather than
+sequentially like the Adapter. Indeed, there was a lack of comprehensive evidence or theory explaining
+the diﬃculties in either model adaptation or hyper-parameters transfer in terms of depth. This gap in
+understanding is a reason why we initially refrained from discussing such perspectives in the original
+LoRA paper.
+During our exploration of LoRA, we concurrently examined Preﬁx Tuning [LL21] and Prompt Tuning
+[LARC21]. Although Preﬁx Tuning oﬀered a novel approach, its reduction of the model’s context
+length posed a signiﬁcant limitation. In contrast, Prompt Tuning, despite showing potential, delivered
+inconsistent outcomes across diﬀerent datasets in our tests. This underscored that input-level modiﬁ-
+cations may not suﬃce for ensuring stability and consistency in diverse applications and that changes
+in the model’s internal structure are crucial.
+LoRA distinguishes itself by implementing adaptations at the matrix level, a more streamlined ap-
+proach compared to the Adapter’s addition of extra layers. This granular level of adaptation allows
+∗work done while at Microsoft
+†Weizhu completed the majority of the manuscript, Vlad edited the manuscript and drafted section 2.1
+1
+
+
+LoRA to be versatile and applicable to various modules, including diﬀerent matrices within Trans-
+formers’ attention layers, the fully connected layers in the Feed-Forward Network (FFN) blocks, and
+even the embedding layers. This makes LoRA broadly applicable to any model relying on matrix
+computations.
+1.2
+On Motivation
+One of the main initial motivations for exploring eﬃcient ﬁne-tuning from an infrastructure standpoint
+was a considerable network burden due to the costs of transferring model weights and optimization
+states, especially over cross-regional networks. Such issues often arise during the saving and load-
+ing of checkpoints. While caching the weights of a static pretrained model can mitigate the need
+to re-download weights for ﬁne-tuning, supporting continual ﬁne-tuning or resuming a pre-existing
+paused experiment necessitates frequent re-fetching of model weights. Moreover, this challenge is ex-
+acerbated for large-scale models that require a distributed training setup across multiple nodes. This
+also increases the risk of network failure during weight transfer. Consider training a GPT-3 model
+equipped with 175 billion parameters and FP16 weights. Its snapshot occupies approximately 350GB,
+necessitating the use of multiple nodes to manage the weights and their optimizer states, either in
+RAM or via networked storage. Checkpointing the weights of such a distributed model can introduce
+a lot of overhead. Yet, transitioning to LoRA signiﬁcantly stabilizes checkpoint management during
+training, as it only requires saving and transferring the comparatively smaller LoRA matrices. For
+continual ﬁne-tuning, with LoRA employed, it is no longer required to download the entire model
+weights, but just the relevant LoRA matrices, assuming the base model weights were pre-existing or
+cached beforehand (e.g., from a previous run). While initially, we believed that enhancing the training
+stability was the primary beneﬁt, we soon discovered that deploying LoRA models at scale for online
+inference yielded even more signiﬁcant and relevant advantages. We will explain this in more detail in
+a subsequent section.
+1.3
+On FFN
+The original LoRA paper puts a primary focus on the attention layers, with a limited examination of
+its eﬀects on the Feed-forward Network (FFN) module in Transformers [VSP+17]. Initially, we encoun-
+tered inconsistencies in FFN performance using LoRA, leading to a reduced interest in further FFN
+investigations. However, several months after publishing the original paper, we identiﬁed and rectiﬁed
+a bug in our LoRA FFN implementation. Subsequent extensive experimentation revealed that applying
+LoRA to FFN can be eﬀective and often complements attention-based LoRA. Nonetheless, considering
+the additional memory demands of LoRA, attention-based LoRA typically oﬀers greater eﬃcacy within
+memory constraints. We provide more insights on the placement of LoRA in Transformers below.
+2
+Practical Improvements
+Below we discuss insights and practices learned over the past several years of extensive deployment of
+models trained with LoRA in production.
+2.1
+Placement
+LoRA’s versatility enables it to be applied across a variety of model architectures that perform matrix
+multiplication operations. Our insights primarily derive from applying LoRA within Transformers for
+NLP tasks, where the choice of placement can signiﬁcantly inﬂuence training outcomes.
+The optimal placement for LoRA is highly dependent on the dataset and model architecture, with the
+size of the model being a critical factor. While uniformly applying LoRA to all matrices yields the best
+training outcomes in most cases, we often achieved comparable performance by selectively applying
+LoRA to a subset of matrices. The optimal selection varied across tasks and architectures. For some
+datasets, especially those of a larger scale, the performance gap between LoRA and full ﬁne-tuning
+could not be fully bridged. This suggests the necessity for customized experiments tailored to each
+unique scenario.
+2
+
+
+In our experience, applying LoRA exclusively to attention layers provides the most stability and miti-
+gates the risk of divergence, albeit at the cost of requiring multiple training epochs for optimal perfor-
+mance. The next eﬀective target for LoRA application has been the embedding matrices, especially for
+smaller-scale models where these matrices constitute a larger proportion of parameters. When LoRA
+was applied to un-embedding matrix, the addition of LoRA to the embedding matrix often became
+redundant. Incorporating LoRA into the fully connected (MLP) layers can further enhance model
+performance. As for hyperparameters, we observed that the default values generally performed well
+for LoRA training, however, when LoRA was applied to a small subset of matrices, higher values for
+learning rate were required. Overall, adjustment of LoRA placement can maintain the balance between
+the model’s capacity, speed of adaptation, and the risk of overﬁtting.
+Investigating LoRA applied to MoE (Mixture of Experts) models, we found that applying LoRA to each
+expert individually boosted performance in many setups. Yet, this approach signiﬁcantly increased
+memory usage, making it less cost-eﬀective. We observed limited success with applying LoRA to the
+router matrix, which only beneﬁted certain setups.
+The eﬀectiveness of LoRA is also inﬂuenced by the base model’s size. As the model scale increases,
+the beneﬁts of using a larger LoRA rank saturate faster, and the performance gap between the most
+eﬀective LoRA setup and full ﬁne-tuning diminishes. This suggests a strategy of applying LoRA to as
+many matrix types as feasible before considering increasing LoRA rank, within memory constraints.
+Further memory optimization can be achieved by leveraging techniques such as sharing the same B
+matrix across diﬀerent A matrices in LoRA, e.g., for the attention matrices WQ, WK, and WV in
+Transformers.
+In summary, there is no one-size-ﬁts-all strategy for LoRA placement. Our experience advocates for
+a progressive approach: starting with attention matrices, then embedding matrices, followed by fully-
+connected (MLP) matrices, and ﬁnally applying LoRA across all matrices, while increasing its rank,
+until the desired performance is achieved. This approach balances the trade-oﬀs between model quality,
+training time, and memory consumption during inference.
+2.2
+Inference
+Previous studies often credit LoRA for its eﬃciency in enhancing the training process. However, as we
+applied LoRA in production at scale, we realized that a more signiﬁcant impact stems from LoRA’s
+cost-eﬀective online serving. Most notably, by serving LoRA models with non-merged weights, one
+can reduce the cost of serving an additional LoRA model to a minimal extent.
+In general, there are three main ways to serve trained LoRA models for inference. The ﬁrst is to merge
+the LoRA weights with the base weight to produce a checkpoint of the same format as the base model.
+This approach can oﬀer zero extra inference latency, compared to serving the base model, since no
+extra operations are needed during inference. However, we rarely adopt this approach in production,
+unless the use case is extremely sensitive to inference latency and the same model needs to be deployed
+on a large number of GPUs, so that the fungibility of sharing GPUs across diﬀerent LoRA models is
+not crucial. Otherwise, this approach has several disadvantages. First, it introduces a large network
+overhead when transferring the full model weights for deployment. Second, it creates a deployment-
+time architecture mismatch, as during training, the model employed a separate pathway for LoRA
+weights, prior to merging. It can also introduce numerical instability, especially when working with
+low-precision formats like 4-bit [DPHZ23], since merging of the weights is lossy and non-trivial, e.g.,
+often requiring re-quantization.
+A straightforward alternative is to serve the resultant LoRA model in a non-merged form, with the
+delta LoRA weights explicitly present in the inference graph. This approach enables a single base
+model to dynamically pair with multiple delta LoRA weights, i.e., multiple models.
+As the base
+model’s weights remain intact, the same GPUs can keep them in memory, only swapping the LoRA
+parts of the computational graph or loading multiple LoRA weights at once, and masking out all
+but the currently selected weights. For every new request that requires a diﬀerent LoRA model, this
+approach allows for a fast weights swap operation to serve the new LoRA model. Nevertheless, while
+the LoRA delta weights are small, swapping them can still introduce a noticeable overhead for online
+serving, impacting latency, throughput, and serving costs.
+3
+
+
+The third option is to serve multiple models, i.e., LoRA weights, on the same set of GPUs over a
+shared endpoint, routing incoming requests to the correct underlying delta LoRA weights. Such a
+design can enable production services to serve thousands or even hundreds of thousands of LoRA
+models, with the same base model, at once. Implementations of this design can also allow for a batch
+of requests to point to diﬀerent LoRA weights, which can be dynamically selected during the forward
+pass.
+Further optimization techniques, such as buﬀering and batching the incoming requests, can
+bring signiﬁcant speedups. Since most inference operations are still memory-bound, batching multiple
+requests together is the key to better utilizing the GPU resources, signiﬁcantly reducing the cost and
+increasing the overall throughput.
+Below we describe one approach to enable serving multiple LoRA models at once, which can support
+requests pointing to multiple LoRA models, without swapping the LoRA weights, while maintaining
+latency comparable to a request pointing to a single model.
+We ﬁrst combine LoRA weights for
+every shared base layer, from all LoRA models, into a series of stacked tensors, one per each base
+layer. When treating a batch request pointing to multiple LoRA models, we deﬁne a batched routing
+mask with weights of 1 assigned to the indices of the target LoRA models’ weights, from the stacked
+LoRA matrices, while nullifying the rest.
+We implemented a set of kernels that support batched
+multiplication of such masks with stacked LoRA weights, allowing for eﬃcient forward passes with
+little overhead. This approach is reminiscent of the routing and Mixture-of-Expert (MoE) for the FFN
+layers in Switch Transformer [FZS21] and can enable eﬃcient batch serving of requests targeting a
+large number of LoRA models at once. Such system helped us to serve LoRA at a production scale by
+reducing the additional latency and cost of a new LoRA model to a minimal extent. A recent work,
+S-LoRA [SCL+23], proposes a similarly eﬀective solution for this scenario with several optimizations.
+2.3
+Additional Explorations
+We have also investigated multiple methodologies beyond our primary focus, yet these explorations
+did not culminate in impactful outcomes.
+A notable investigation involved the implementation of an adaptive version of LoRA, where the rank
+dimension r is dynamically determined for each layer and matrix during training. While this approach
+often helped to enhance the model’s quality, it was constrained by increased training duration and
+infrastructure challenges during inference. Speciﬁcally, such an approach resulted in a higher levels
+of memory fragmentation, causing larger overheads during inference.
+Batching LoRA requests for
+models with varying LoRA dimensionality posed a further problem. The recent development of S-
+LoRA [SCL+23] may oﬀer a solution to these challenges, suggesting the potential for future adoption
+of Adaptive LoRA.
+We also explored augmenting the vanilla LoRA with various techniques, such as non-linearity [HZM+22],
+similar to the DenseNet [HLvdMW18], but for LoRA weights only, expanding LoRA into MoE LoRA
+[ZUA+23], or combining LoRA with other parameter-eﬃcient training techniques [MMH+22].
+While some approaches improved the results on certain datasets, their increased complexity hindered
+the ease of integrating LoRA with base models. When the model size was large enough, our observations
+indicated that non-linearity added to LoRA did not substantially beneﬁt performance, and MoE LoRA
+was not suﬃciently cost-eﬀective due to the additional memory requirements.
+As outlined in our original publication, attempts were made to combine LoRA with other techniques,
+like Preﬁx Tuning and Prompt Tuning, given their orthogonal nature in structural augmentation. How-
+ever, we ultimately favored the simplicity and maintainability of using LoRA exclusively, considering
+its ease of future extensions and exploring the application of LoRA to diﬀerent matrices at once, as
+detailed in section 2.1.
+3
+Looking Ahead
+Despite its popularity and various advantages, there are many opportunities to make LoRA and other
+parameter-eﬃcient ﬁne-tuning methods even more eﬀective for both research and production.
+4
+
+
+First, when a model, on which LoRA weights were based, is changed or updated, the current methodol-
+ogy would require re-training all the LoRA models, diminishing the method’s utility. Finding a viable
+solution for this issue remains elusive, complicating the upkeep of services that utilize numerous LoRA
+models, when base models need to be updated monthly or annually.
+Second, although LoRA often outperforms other methods during inference, it remains relatively slow
+and expensive in training, particularly for large-scale models. Preliminary attempts to create LoRA pa-
+rameters without backpropagation [PMHC22] show potential but are not eﬀective enough for practical
+use yet. Other studies [HLL+23] [SRC+23] explored developing new LoRA models from pre-existing
+LoRA weights, instead of starting from scratch. Further innovation in LoRA synthesis is necessary to
+enhance quality and adaptability for varied tasks in a production environment.
+The rise of quantization-aware training introduces new complexities. While low-precision training with
+LoRA [DPHZ23] represents a signiﬁcant advancement in enabling LoRA to run on low-memory GPUs,
+it also quantizes the model weights, which can degrade the performance. Recent studies [LYL+23]
+[GGXK23] attempt to bridge this gap by integrating the quantization discrepancy into LoRA’s initial
+weights. These results are preliminary, and further research is essential, especially as quantized training
+is poised to gain widespread popularity.
+Although LoRA originated from a study of language modeling tasks, it has been successfully applied
+to models and tasks for other modalities, especially for computer vision tasks, e.g., to diﬀusion models
+[RBL+22]. Further research on combining the simplicity and eﬀectiveness of LoRA with the distinct
+mechanisms inherent to such methods, e.g., the multi-step denoising in diﬀusion models, is likely to
+yield exciting advancements.
+Acknowledgments
+We would like to thank Edward Hu for proofreading the draft and providing edit suggestions.
+References
+[BMR+20]
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla
+Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini
+Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya
+Ramesh, Daniel M. Ziegler, Jeﬀrey Wu, Clemens Winter, Christopher Hesse, Mark
+Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher
+Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language
+models are few-shot learners, 2020.
+[DPHZ23]
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Eﬃcient
+ﬁnetuning of quantized llms, 2023.
+[FZS21]
+William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion
+parameter models with simple and eﬃcient sparsity, 2021.
+[GGXK23]
+Han Guo, Philip Greengard, Eric P. Xing, and Yoon Kim. Lq-lora: Low-rank plus
+quantized matrix decomposition for eﬃcient language model ﬁnetuning, 2023.
+[HGJ+19]
+Neil Houlsby,
+Andrei Giurgiu,
+Stanislaw Jastrzebski,
+Bruna Morrone,
+Quentin
+de Laroussilhe, Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-
+eﬃcient transfer learning for nlp, 2019.
+[HLL+23]
+Chengsong Huang, Qian Liu, Bill Yuchen Lin, Tianyu Pang, Chao Du, and Min Lin.
+Lorahub: Eﬃcient cross-task generalization via dynamic lora composition, 2023.
+[HLvdMW18] Gao Huang, Zhuang Liu, Laurens van der Maaten, and Kilian Q. Weinberger. Densely
+connected convolutional networks, 2018.
+[HSW+21]
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+Lu Wang, and Weizhu Chen. Lora: Low-rank adaptation of large language models, 2021.
+5
+
+
+[HZM+22]
+Junxian He, Chunting Zhou, Xuezhe Ma, Taylor Berg-Kirkpatrick, and Graham Neubig.
+Towards a uniﬁed view of parameter-eﬃcient transfer learning, 2022.
+[LARC21]
+Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-
+eﬃcient prompt tuning, 2021.
+[LL21]
+Xiang Lisa Li and Percy Liang.
+Preﬁx-tuning: Optimizing continuous prompts for
+generation, 2021.
+[LYL+23]
+Yixiao Li, Yifan Yu, Chen Liang, Pengcheng He, Nikos Karampatziakis, Weizhu Chen,
+and Tuo Zhao. Loftq: Lora-ﬁne-tuning-aware quantization for large language models,
+2023.
+[MMH+22]
+Yuning Mao, Lambert Mathias, Rui Hou, Amjad Almahairi, Hao Ma, Jiawei Han, Wen
+tau Yih, and Madian Khabsa. Unipelt: A uniﬁed framework for parameter-eﬃcient
+language model tuning, 2022.
+[PMHC22]
+Jason Phang, Yi Mao, Pengcheng He, and Weizhu Chen. Hypertuning: Toward adapting
+large language models without back-propagation, 2022.
+[RBL+22]
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bj¨orn Om-
+mer. High-resolution image synthesis with latent diﬀusion models, 2022.
+[SCL+23]
+Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christo-
+pher Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer, Joseph E. Gonzalez, and Ion
+Stoica. S-lora: Serving thousands of concurrent lora adapters, 2023.
+[SRC+23]
+Viraj Shah, Nataniel Ruiz, Forrester Cole, Erika Lu, Svetlana Lazebnik, Yuanzhen Li,
+and Varun Jampani. Ziplora: Any subject in any style by eﬀectively merging loras.
+2023.
+[VSP+17]
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N.
+Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need, 2017.
+[YHB+21]
+Ge Yang, Edward Hu, Igor Babuschkin, Szymon Sidor, Xiaodong Liu, David Farhi, Nick
+Ryder, Jakub Pachocki, Weizhu Chen, and Jianfeng Gao. Tuning large neural networks
+via zero-shot hyperparameter transfer. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S.
+Liang, and J. Wortman Vaughan, editors, Advances in Neural Information Processing
+Systems, volume 34, pages 17084–17097. Curran Associates, Inc., 2021.
+[ZUA+23]
+Ted Zadouri, Ahmet ¨Ust¨un, Arash Ahmadian, Beyza Ermi¸s, Acyr Locatelli, and Sara
+Hooker. Pushing mixture of experts to the limit: Extremely parameter eﬃcient moe
+for instruction tuning, 2023.
+6

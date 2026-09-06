@@ -1,0 +1,2383 @@
+ReasonCache: Accelerating Large Reasoning Model
+Serving through KV Cache Sharing
+Kaiwen Chen1, Xin Tan1, Minchen Yu2, Jingzong Li3, Hong Xu1
+1The Chinese University of Hong Kong
+2The Chinese University of Hong Kong, Shenzhen
+3The Hang Seng University of Hong Kong
+Abstract—Large Reasoning Models (LRMs) are becoming in-
+tegral to many AI inference systems, enhancing their capabilities
+with advanced reasoning. However, deploying these models in
+production environments presents a significant QoS challenge:
+the substantial memory overhead from their long, auto-regressive
+inference processes severely limits throughput and increases
+latency, thereby affecting the quality of service for concurrent
+users. We observe that LRMs frequently generate highly similar
+intermediate reasoning steps, which, in turn, correspond to
+highly similar KV cache states across layers. Building on this
+insight, we propose ReasonCache, a novel KV cache management
+approach designed to improve the QoS of AI inference systems.
+ReasonCache utilizes a Collaborative Filtering Algorithm to
+efficiently identify reusable KV cache blocks and enables zero-
+copy cache reuse. Experimental evaluation demonstrates that
+ReasonCache achieves a peak throughput improvement of 89.2%
+and an average gain of 40-60%, leading to more responsive and
+cost-effective AI inference services. Notably, this performance is
+achieved while maintaining higher accuracy compared to existing
+KV cache management techniques.
+Index Terms—Large language models, Inference algorithms,
+Quality of service
+I. INTRODUCTION
+The deployment of Large Reasoning Models (LRMs), such
+as OpenAI’s o1 [1], QwQ-32B [2] and DeepSeek-R1 [3], is
+becoming critical for AI inference systems. These models are
+increasingly powering core features in applications like search
+engines [4], recommender systems [5], and conversational AI
+agents [6], delivering sophisticated reasoning capabilities that
+enhance user satisfaction. To achieve this, LRMs perform
+extensive reasoning before producing a final answer, including
+long chain-of-thought (CoT) sequences, exploration of multi-
+ple strategies, fine-grained problem decomposition, and self-
+verification [7], [8].
+Meanwhile, Key-value (KV) caching accelerates autoregres-
+sive generation in LRMs by storing the attention states of
+preceding tokens. While reusing these states avoids redundant
+computation and enhances inference speed, it incurs significant
+memory overhead. This overhead is particularly pronounced in
+LRMs due to their extensive reasoning processes. For instance,
+recent research [8] shows that the current LRM, QwQ-32B,
+can generate up to 13 redundant solutions for a trivial query
+such as “What is 2 + 3?”, resulting in a 1,953% increase
+in token count compared to conventional models. On the
+AIME 24 [9] dataset, the model produces an average of 12,406
+Self Verification
+Infinite Self-Loop
+A curve is parameterized 
+by (x,y) = (t^3 + 7, -3t^2 - 
+6t - 5). Please find the 
+point the curve passes 
+through at t =2.
+Okay, so I need to find the 
+point that the curve passes 
+through when t equals 2
+…
+Hmm, let me plug in t = 2 
+here step by step.
+First, compute each term.
+First term: -3*(4) = -12
+Second term: -6*2 = -12
+Third term: -5
+…
+Wait, let me verify that 
+again because it’s easy to 
+make a sign error here.
+Let me write it out step by 
+step:
+First term: -3*(4) = -12
+Second term: -6*2 = -12
+Third term: -5
+…
+The point the curve passes 
+through at t = 2 is (15, -29).
+S0
+S1
+S0
+S1
+(Verify)
+Model: DeepSeek-R1-
+Distill-Qwen-32B
+State Revisitations
+Please use four 
+integers [12, 13, 2, 8] to 
+play the 24 game.
+I suspect we need to find 
+an expression that equals 
+24. Let's check 
+possibilities:
+…
+Maybe (13-12/2)/? Possibly 
+13-12/2 = 13-6 = 7, then 7 
++ 8? =15, not 24.
+…
+Maybe: 8/(12-13/2)? 
+Equals 8/(12 - 
+6.5)=8/5.5=1.4545, not 24.
+…
+Maybe: (13-12/2)=13-6=7, 
+then 7+8 = 15, not 24.
+…
+So the expression is: 8 * 
+((13+2)-12) = 8*(15-
+12)=8*3=24.
+Thus, the final answer is (13 + 2) 
+- 12) * 8.
+S0
+S1
+S0
+S2
+(Revisit)
+Model: Phi-4-reasoning-
+plus
+Please explain the function:
+global void 
+mat_transpose_diagonal2d_kernel
+( float *x, float *y, int row, int col) { 
+const int block_y=blockIdx.x; 
+const int block_x
+=(blockIdx.x+blockIdx.y)%gridDim.x;
+const int global_col
+=threadIdx.x+blockDim.x*block_x;
+const int global_row
+=threadIdx.y+blockDim.y*block_y;
+if (global_col < col && global_row < row) { 
+y[global_row * col + global_col] =
+ x[global_col * row + global_row]; 
+}
+S0
+S1
+S2
+(loop)
+Thinking
+Model: QwQ-32B
+Okay, let me try to figure out how this CUDA 
+kernel works.
+…
+Here's the step-by-step explanation:
+1.Grid and Block Indices ensure blocks are 
+mapped to cover both rows and columns 
+symmetrically when `row == col`.
+…
+Here's the step-by-step explanation:
+1.Grid and Block Indices ensure blocks are 
+mapped to cover both rows and columns 
+symmetrically when `row == col`.
+…
+(Author’s note: Repeating this loop for 90 
+times and exhausting all token budgets!) 
+Question
+Thinking
+Final Answer
+Final Answer
+Question
+Thinking
+Question
+Fig. 1: Examples of redundant thinking patterns in Large
+Reasoning Models (LRMs).
+tokens per problem 1. With each token occupying 1280 KB of
+memory2, the KV cache alone requires roughly 15 GB of GPU
+memory per request. Given the typical memory constraints of
+modern GPUs, such substantial consumption severely limits
+the system’s maximum concurrency.
+Recent advances in KV cache management primarily exploit
+attention sparsity [10] to reduce memory overhead. These
+methods can be categorized into three types: KV cache evic-
+tion [11]–[16], selective loading [17], and KV cache merg-
+ing [18], [19]. Their core idea is to estimate the importance of
+tokens based on attention sparsity and then selectively discard,
+load, or merge tokens accordingly. However, these methods
+suffer from inherent limitations: eviction is irreversible, risking
+the permanent loss of tokens that may become important later;
+selective loading fails to reduce the memory footprint; and
+merging can cause hallucinations due to inaccurate importance
+prediction. Furthermore, a critical limitation common to all
+1Tested
+with
+Qwen
+team’s
+recommended
+sampling
+parameters:
+Temperature = 0.6, TopP = 0.95, TopK = 20.
+2Calculated as 2 (key/value vectors) × 5120 (hidden dimensions) × 64
+(number of layers) × 2 (FP16 size).
+arXiv:2507.21433v3  [cs.LG]  14 May 2026
+
+
+these sparsity-based techniques is their fundamental incom-
+patibility with PagedAttention [20], [21]. Exploiting attention
+sparsity requires dynamic, fine-grained operations, as sparsity
+patterns vary across layers and the set of critical tokens is
+query-dependent [17], [18], [22]. Consequently, these methods
+resort to token- or layer-level manipulations, which disrupt
+the contiguous block-based memory management of modern
+serving systems [20], [21], and lead to memory fragmentation.
+Instead of focusing on attention sparsity, our work identifies
+a novel optimization opportunity. We observe that LRMs
+frequently engage in what we term redundant thinking: the
+generation of repetitive reasoning steps with highly similar
+content during problem-solving. This behavior manifests in
+distinct patterns such as self-verification, state revisitation, and
+infinite self-loops, as illustrated in Figure 1. More importantly,
+these similar steps exhibit highly similar KV cache states. Key
+and value vectors from similar reasoning steps remain closely
+aligned across transformer layers. This insight enables a clear
+optimization opportunity: by sharing similar KV cache blocks,
+we can reduce memory overhead and enhance inference effi-
+ciency without compromising accuracy.
+However, realizing this opportunity requires overcoming
+two significant technical challenges. First, reusable KV cache
+blocks must be identified accurately and efficiently. A naive
+pairwise comparison of all blocks is computationally infea-
+sible due to its quadratic complexity (O(n2)) with respect
+to sequence length. Second, the reuse mechanism itself must
+be seamlessly integrated into the decoding process without
+introducing additional GPU memory bandwidth overhead or
+disrupting its highly parallelized nature.
+To address these challenges, we introduce ReasonCache,
+a system that efficiently identifies reusable KV cache blocks
+using a two-stage, coarse-to-fine filtering approach. To identify
+similar blocks, ReasonCache first performs a lightweight, step-
+level comparison to prune the search space. It then employs a
+fine-grained, block-level similarity check, measuring the Eu-
+clidean distance between key and value vectors to accurately
+confirm reusability. For seamless integration, ReasonCache
+is designed at the block level, aligning with the memory
+management schemes of modern serving frameworks like
+vLLM [20] and SGLang [21].
+To validate the effectiveness of ReasonCache, we conduct
+comprehensive evaluations across a range of tasks to assess
+its impact on the QoS. Our experimental results demonstrate
+that ReasonCache delivers significant performance gains with
+minimal accuracy loss. It achieves an average throughput
+improvement of 40% to 60% compared to dense attention,
+while retaining over 98% of its accuracy. Under a com-
+parable affected KV cache ratios, our method consistently
+outperforms existing KV cache management strategies like
+StreamingLLM [12], SnapKV [13], and Quest [17] in terms
+of accuracy.
+We summarize our key contributions as follows:
+• We show that LRMs frequently generate highly similar
+intermediate reasoning steps (redundant thinking), sug-
+gesting that much of the KV cache content is similar.
+• We introduce ReasonCache, a novel KV cache manage-
+ment method that efficiently identifies and reuses similar
+KV cache blocks.
+• We comprehensively evaluate ReasonCache on a variety
+of tasks. The results show that ReasonCache achieves
+up to 89.2% throughput gains while maintaining model
+accuracy.
+II. BACKGROUND ON LLM INFERENCE
+The inference process of Large Language Models (LLMs)
+comprises two distinct stages: prefill and decoding [23], [24],
+which also apply to LRMs.
+Compute-Bound Prefill Stage: During the prefill stage, the
+model processes the entire input sequence in parallel, perform-
+ing computations such as matrix multiplications (GEMM) and
+attention calculations. The computational complexity of the
+attention mechanism scales quadratically with the sequence
+length, as it requires calculating interactions between all pairs
+of tokens [25].
+Memory-Bound Decoding Stage: During the decoding stage,
+the computation of attention weights and output vectors in-
+volves matrix-vector operations with low arithmetic intensity
+while requiring access to the entire historical KV cache. This
+creates a fundamental imbalance between the small amount of
+computation per step and the large memory required to store
+all KV cache.
+PagedAttention:
+Driven
+by
+the
+pioneering
+work
+of
+vLLM [20] and SGLang [21], PagedAttention has become the
+dominant technology for high performance LLM inference.
+In PagedAttention, the KV cache is partitioned into fixed size
+blocks. This shifts the granularity of KV cache management
+from the entire sequence to individual blocks, significantly
+improving memory efficiency. Importantly, while blocks can
+be stored non-contiguously in memory, the order of tokens
+within each block remains fixed, preserving the sequential
+structure required for attention computation.
+III. MOTIVATION
+In this section, we first show that redundant thinking is
+common in LRMs, then examine its impact on KV cache
+patterns. Our two key observations are as follows:
+Observation 1: Redundant thinking frequently occurs in the
+reasoning process of LRMs. During the reasoning process of
+LRMs, we observe the frequent emergence of highly similar or
+identical reasoning patterns, a phenomenon we term redundant
+thinking. Figure 1 provides empirical examples of redundant
+thinking across various LRMs. We summarize the patterns into
+three types: (1) self-verification, where the model examines
+its previously generated content; (2) state revisitation, where
+the model repeatedly explores the same reasoning steps, often
+due to a failure to track its exploratory history; and (3) infinite
+self-loop, where the model fixes on two or more competing
+solutions, oscillating between them until the token budget is
+exhausted.
+To quantitatively evaluate this phenomenon, we assess the
+redundancy in solutions generated by various models across
+
+
+Phi-4-reasoning-plus
+DeepSeek-R1-
+Distill-Qwen-32B
+QwQ 32B
+DeepSeek-R1-
+Distill-Llama-8B
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Similarity Ratio
+Dataset
+GPQA-Diamond
+HotpotQA
+AIME 24
+TREC
+MATH 500
+HumanEval
+Fig. 2: Redundant thinking across different reasoning models
+and datasets.
+multiple benchmarks. The reasoning process is typically or-
+ganized into discrete steps, often separated by delimiters such
+as \n\n. Our methodology represents each reasoning step as
+a bag-of-words vector, then computes the cosine similarity
+between each step and all preceding steps. To measure overall
+redundancy, we introduce the similarity ratio, defined as
+the proportion of reasoning steps with a cosine similarity
+exceeding 0.8 to any prior step, indicating substantial lexical
+overlap. As shown in Figure 2, our findings indicate that 15%
+to 40% of the generated content is redundant. This issue of
+redundant thinking appears to be consistent across different
+models and tasks, suggesting it is both model- and task-
+agnostic.
+Observation 2: Redundant thinking leads to similar KV
+cache patterns in LRMs. Inspired by prior studies on token
+similarity in attention mechanisms [19], [26], we hypothesize
+that the redundant thinking patterns in LRMs also manifest as
+similar KV cache states. To validate this, we analyze block-
+wise Euclidean distance between KV caches. Our findings
+reveal a clear pattern: as shown in Figure 3, the heatmaps of
+key and value cache distances for layers 0 and 63 consistently
+show that lexically similar tokens (marked with red stars) have
+smaller Euclidean distances (deep bluer regions). Out of 21
+blocks in total, 8 (approximately 38%) are found to have a
+corresponding block that is both lexically similar and has a
+low Euclidean distance, indicating their potential for reuse.
+The above observations naturally motivate the idea of
+reusing KV cache blocks for similar reasoning steps to reduce
+memory overhead during inference.
+IV. REASONCACHE
+In this section, we introduce ReasonCache, a simple yet
+effective method designed to alleviate memory-bound con-
+straints of LRM.
+As illustrated in Figure 4, ReasonCache integrates two core
+components: Collaborative Filtering Algorithm for efficiently
+and accurately identifying reusable KV cache blocks and Zero-
+Copy KV Sharing mechanism for seamless reuse. The Col-
+laborative Filtering Algorithm employs a two-stage process.
+It begins with a fast lexical and structural comparison of
+reasoning steps to identify potential candidates, followed by a
+precise Euclidean distance calculation on their corresponding
+KV cache blocks to confirm reusability (Section IV-A). To
+implement the reuse, the KV sharing mechanism enables zero-
+copy sharing by integrating with vLLM’s memory manager. It
+0 2 4 6 8 101214161820
+Block Index
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+Block Index
+Layer 0 - Key Cache Distance
+Blocks with
+Similiar Tokens
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Distance
+0 2 4 6 8 101214161820
+Block Index
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+Block Index
+Layer 0 - Value Cache Distance
+Blocks with
+Similiar Tokens
+0.2
+0.3
+0.4
+0.5
+0.6
+Distance
+0 2 4 6 8 101214161820
+Block Index
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+Block Index
+Layer 63 - Key Cache Distance
+Blocks with
+Similiar Tokens
+0.2
+0.4
+0.6
+0.8
+Distance
+0 2 4 6 8 101214161820
+Block Index
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18
+20
+Block Index
+Layer 63 - Value Cache Distance
+Blocks with
+Similiar Tokens
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+Distance
+Fig. 3: Block-wise Euclidean distance heatmaps for KV cache,
+generated using QwQ-32B on the MATH 500 dataset.
+uses reference counting to map multiple logical blocks to a
+single physical copy, thereby avoiding costly data transfers
+(Section IV-B). Together, these components enable mem-
+ory efficient decoding and accelerate LRM serving without
+compromising accuracy. We also theoretically prove that our
+design will preserve the accuracy (Section IV-C).
+A. Collaborative Filtering Algorithm
+To leverage redundancy within the KV cache, ReasonCache
+employs a two-stage filtering algorithm that efficiently and
+accurately identifies reusable blocks. This entire process is
+designed as an asynchronous, lightweight filter offloaded to
+the CPU, ensuring it does not hinder GPU computation.
+The first stage performs coarse-grained filtering based on the
+textual content of reasoning steps. It uses lexical and structural
+analysis to rapidly prune the vast number of preceding steps
+into a small set of promising candidates. The second stage
+then performs a fine-grained verification on this reduced set,
+operating directly on the KV cache blocks. It calculates the
+Euclidean distance between their tensor representations to
+precisely quantify similarity, ensuring that only genuinely
+similar blocks are reused.
+1) Stage 1: Step-Level Similarity Filtering: This stage
+implements a two-phase filtering process to identify candidate
+steps for KV cache reuse, starting with a lexical pre-filter and
+then in a rigorous structural analysis.
+Lexical Similarity Pre-filtering: In the first phase, the lexical
+pre-filter assesses the similarity between the current step, Sc,
+and each candidate step, Sk, from all the preceding steps.
+Specifically, each step is converted into a bag-of-words vector
+based on the frequency of its token IDs from the model’s
+tokenizer. For a vocabulary of size |V |, this process yields
+sparse vectors vc, vk ∈R|V |, where each dimension counts
+the occurrences of a corresponding token ID. The similarity
+score is then calculated as the cosine similarity between these
+vectors, adjusted by a length penalty:
+sim(Sc, Sk) =
+vc · vk
+∥vc∥∥vk∥× min(|Sc|, |Sk|)
+max(|Sc|, |Sk|)
+
+
+x+5=0    
+Reasoning 
+Steps
+…   
+x+5=0
+ReasonCache
+…
+Filter by 
+AST
+Collaborative Filtering Algorithm
+x
++ 
+5
+=
+0
+x
++ 
+5
+=
+0
+x
++ 
+5
+=
+0
+Block 0
+Logical KV Cache Blocks
+Physical
+Block
+No.
+Reference 
+Count
+0
+0
+2
+3
+4
+0
+Block Table
+Physical KV Cache Blocks
+Block 5
+x
++ 
+5
+=
+0
+x
++ 
+5
+=
+0
+x
++ 
+5
+=
+0
+Block 4
+Block 3
+Block 2
+Block 1
+Block 0
+Block 1
+Block 2
+Block 3
+Block 4
+Block 5
+Ready
+to Share
+Zero-Copy KV Sharing
+Streaming Result
+Divide by 
+Step Delimiter
+Okay, let’s 
+solve it step 
+by step. 
+…
+Reasoning Steps
+Collaborative 
+Filtering Algorithm
+Zero-Copy
+KV Sharing
+Filtered Blocks
+Scheduler
+Block Tables
+Waiting
+Swapped
+Running
+Queue
+Block 
+Manager
+Allocator
+Uncached
+Cached
+Evictor
+Scheduler
+Output
+LLM 
+Engine
+Evaluator
+Collaborative 
+Filtering 
+Algorithm
+…
+CPU Only
+Worker
+Worker
+…
+Model Executor
+GPU Cache
+CPU Cache
+Cache Engine
+Attention 
+Backend
+Model Runner
+llama
+qwen
+phi3
+…
+Distributed Processes with GPUs
+Streaming
+Result
+Tokenize & 
+Vectorize
+Filter by 
+Cosine
+Similarity
+x+5=0    
+x+5=0
+x-5=0
+x-5=0
+…   
+Filter by 
+Euclidean
+Distance
+=
+0
++
+x
+5
+x+5=0    
+x+5=0
+x+5=0
+x+5=0    
+Input
+(a)
+(b)
+Parallel 
+Analyze
+Zero-Copy
+KV Sharing
+Fig. 4: System architecture (a) and workflow (b) of ReasonCache. While the Language Reasoning Model (LRM) performs
+streaming token generation, ReasonCache executes Collaborative Filtering Algorithm and Zero-Copy KV Sharing in parallel.
+This non-blocking architecture reduces memory consumption and improves efficiency.
+where |S| represents the character length of the text in a
+step. This length penalty favors candidates of similar length
+to the current step, mitigating bias towards shorter sequences
+which might otherwise achieve high cosine similarity with
+fewer token overlaps.
+A candidate step Sk is retained for further analysis if
+its similarity score exceeds a dynamic threshold τ, i.e.,
+sim(Sc, Sk) > τ. The dynamic threshold τ is adapted based
+on the similarity scores between the current step Sc and
+all preceding steps {S1, . . . , Sc−1}. Specifically, let Hc =
+{sim(Sc, Si) | i = 1, . . . , c −1} be the set of historical
+similarity scores. The threshold τ is then defined as:
+τ = τstrict −(τstrict −τsoft) × µHc
+where µHc represent the mean of the similarity scores in
+Hc. τstrict is the highest, strictest threshold, while τsoft is the
+lowest, most lenient threshold.
+The purpose of this dynamic threshold is to adaptively
+adjust the reuse policy based on the model’s current reasoning
+pattern. When the model enters a highly repetitive state (e.g.,
+repeatedly verifying the same formula), the similarity scores
+with preceding steps are consistently high, which elevates the
+mean, µHc. Consequently, the threshold τ is lowered towards
+τsoft, making it more lenient. Conversely, when the model
+explores a novel reasoning path, similarity scores are generally
+low. This depresses µHc and raises τ towards its strictest
+value, τstrict. This strict criterion ensures that only exceptionally
+similar steps are reused.
+Structural Equivalence Verification: Candidates that suc-
+cessfully pass the lexical filter advance to the structural
+analysis phase. It is important to note that this verification
+is selectively applied based on the content type. It targets
+steps expressed in formal languages (e.g., code, math) where
+structural precision is critical to prevent semantic errors (e.g.,
+distinguishing 2x+5=10 from 2x-5=10). For unstructured
+content like open-domain dialogue, where ASTs are undefined,
+this step is bypassed.
+For formal content, steps are parsed into their corresponding
+Abstract Syntax Trees (ASTs) [27], denoted as T = P(S).
+An AST is a labeled tree T = (V, E, L), where the nodes V
+represent components of the expression, the edges E define
+operator-operand relationships, and L is a labeling function
+that assigns a symbol (e.g., operator, variable, constant) to
+each node.
+To compare the structural properties of the current step Sc
+and a candidate step Sk, their respective ASTs, Tc = P(Sc)
+and Tk = P(Sk), are generated. The structural divergence
+between these trees is quantified using the Tree Edit Distance
+(TED) [28], denoted as D(Tc, Tk). TED measures the mini-
+mum cost required to transform Tc into Tk through a sequence
+of three fundamental node operations: insertion, deletion, and
+substitution. Formally, let γ(u →v) be the cost of substituting
+node u with v, γ(u →λ) be the cost of deleting u, and
+γ(λ →v) be the cost of inserting v. The TED is then the
+minimum cumulative cost over all valid edit mappings between
+the nodes of Tc and Tk.
+D(Tc, Tk) = min
+M
+ 
+X
+(u,v)∈M
+γ(u →v)+
+X
+u∈Vc\dom(M)
+γ(u →λ)+
+X
+v∈Vk\ran(M)
+γ(λ →v)
+!
+where Vc and Vk are the node sets of Tc and Tk respectively,
+and the mapping M must preserve the ancestry relationships
+between nodes. A candidate is discarded if D(Tc, Tk) > 0,
+as this indicates a mismatch in their underlying structure for
+formal language.
+2) Stage 2: Block-Level Distance Filtering: For steps
+flagged as similar in Stage 1, this stage computes the Euclidean
+distance between their corresponding KV cache blocks. This
+process comprises two key components: an optimized distance
+computation method and an adaptive thresholding policy.
+Distance Computation: Let the KV cache blocks for the
+current step Sc and a candidate step Sk be denoted as Bc
+and Bk. The computation aggregates normalized layer-wise
+distances across all N layers of the model. For each layer
+i ∈{1, . . . , N}, the Euclidean distance between the key and
+value tensors of the two blocks is calculated:
+∆K,i = ∥Ki[Bc] −Ki[Bk]∥2,
+∆V,i = ∥Vi[Bc] −Vi[Bk]∥2
+
+
+where Ki[B] and Vi[B] extracts the key and value tensor for
+block B from the layer i cache, respectively, and ∥· ∥2 is the
+L2 norm of the flattened tensor.
+The final normalized distance ¯d is the average of these
+layer-wise distances. Each layer’s distance is computed as the
+sum of its key and value distances, normalized by the block’s
+dimensions:
+¯d(Bc, Bk) = 1
+N
+N
+X
+i=1
+∆K,i + ∆V,i
+2dh
+where d is the number of tokens in the blocks (i.e., block
+size), and h is the number of KV heads.
+To amortize the cost of distance computation and maximize
+reuse, we can expand the squared Euclidean distance:
+∥xc −xk∥2 = ∥xc∥2 + ∥xk∥2 −2 x⊤
+c xk.
+Here, xc and xk represent the flattened key or value tensors
+from the blocks being compared (e.g., xc = Ki[Bc] and
+xk = Ki[Bk]). The squared norms ∥xc∥2 and ∥xk∥2 can be
+computed once for each block and cached for long-term reuse.
+We employ lazy computation: when a block first becomes a
+reuse candidate, we perform a single reduction operation to
+compute its tensor norms, storing these values in an LRU
+cache attached to the block metadata. Subsequent distance
+measurements reuse the cached norms and only require com-
+puting the dot product x⊤
+c xk.
+Percentile-based Adaptive Thresholding: To assess the
+reusability of a KV cache block, we adopt Percentile-based
+Adaptive Thresholding (PAT). This method sets a dynamic
+threshold based on the quantile of the current distance dis-
+tribution, making it robust across different models and tasks
+without a fixed value. The system operates in two phases:
+(1) it collects distance measurements to establish a baseline
+distribution (KV cache reuse is disabled during this warm-up
+period). (2) it uses the dynamically computed pth percentile
+as the threshold for all sharing decisions.
+The choice of PAT is motivated by the model-dependent
+nature of KV cache similarity metrics. The distance between
+KV cache entries can vary with model architecture, training
+data, and scale. Consequently, a fixed distance threshold for
+determining reusability is suboptimal, as a value indicating
+high similarity in one model may represent only moderate
+similarity in another. ReasonCache addresses this challenge
+by setting the dynamic threshold at a specific percentile, p, of
+this observed distribution for all subsequent sharing decisions.
+This ensures that the criterion for reuse is always relative to
+the specific model’s behavior, making the approach robust and
+model-agnostic.
+Complexity Analysis: We analyze the time complexity of
+ReasonCache. Let n denote the total token length and m
+denote the total number of reasoning steps (m ≈n/|S|, where
+|S| is the average step length). For each step, the algorithm
+performs candidate filtering and similarity verification. The
+total computational cost is O(m·k ·(|S|+N ·d·h)), where k
+denotes the number of candidates after filtering (k ≪m), N is
+the number of layers, d is the block size, and h is the number
+of attention heads. Since N, d, and h are architecture-specific
+constants, the complexity depends primarily on m and k. The
+effective complexity scales as O(n log n) in practice. This
+is because the number of reasoning steps m grows linearly
+with n, while the number of candidates k typically grows
+logarithmically (k ∝log n) due to the high selectivity of
+the two-stage filtering process, which efficiently prunes the
+search space. Furthermore, ReasonCache is implemented in a
+non-blocking and asynchronous manner, running Collaborative
+Filtering Algorithm on the CPU in parallel with the GPU
+inference. This design effectively hides the overhead, ensuring
+that the additional computation does not block the critical path
+of token generation.
+B. Zero-Copy KV Sharing
+Figure 4 illustrates our KV cache sharing mechanism, which
+is designed to integrate seamlessly with PagedAttention by
+operating at the same block-level granularity. A physical block
+is marked as sealed and becomes immutable once fully filled
+with tokens, making it eligible for sharing. The evaluator
+identifies sharing opportunities using Collaborative Filtering
+Algorithm. Instead of performing costly data copies, sharing
+is achieved by incrementing the block’s reference count and
+updating the block table accordingly. A physical block is
+returned to the free pool by the evictor only when its reference
+count drops to zero. This sharing process is integrated into the
+standard decoding loop: during each decoding step, the sched-
+uler batches requests, organizes their block table information,
+and forwards them to the model executor for inference.
+A key advantage of this approach is its ability to leverage
+vLLM’s decoupled CPU-GPU architecture. The GPU model
+executor can immediately act on sharing decisions through
+simple updates to the CPU-managed block table, thereby
+reusing cache blocks without interrupting the autoregressive
+generation process or consuming additional GPU memory
+bandwidth.
+C. Theoretical Foundation
+The central premise of ReasonCache is that reusing KV
+cache blocks that are similar, but not identical, can yield
+substantial efficiency gains. This premise, however, raises a
+critical question: Does reusing similar but not identical KV
+cache blocks adversely affect model accuracy? To formally
+prove the validity of our approach, we present Theorem 1.
+Theorem 1. Let qt be a query vector at step t, and let Kt =
+[k1, k2, . . . , kt] and Vt = [v1, v2, . . . , vt] denote the key and
+value caches, respectively. Suppose kj is replaced by k′
+j such
+that ∥kj −k′
+j∥2 < ε, and vj is replaced by v′
+j such that
+∥vj −v′
+j∥2 < δ. Then:
+The change in the attention score for position j satisfies
+|qtk⊤
+j −qtk′
+j
+⊤| = |qt(k⊤
+j −k′
+j
+⊤)| ≤∥qt∥2·∥kj−k′
+j∥2 < ∥qt∥2ε.
+The first inequality follows the Cauchy-Schwarz inequal-
+ity. Consequently, the resulting attention weight At
+=
+softmax
+
+qtK⊤
+t
+√
+d
+
+is only minimally perturbed, as the softmax
+function is Lipschitz continuous [29], [30].
+
+
+The change in the output ot = Pt
+j=1 At
+jvj due to replacing
+vj with v′
+j is bounded by
+∥At
+jvj −At
+jv′
+j∥2 = ∥At
+j(vj −v′
+j)∥2 = At
+j∥vj −v′
+j∥2 < At
+jδ,
+and the total perturbation in ot is at most δ since 0 < At
+j < 1.
+Therefore, substituting a key or value vector with a suf-
+ficiently close alternative induces only minor changes in the
+attention output, thereby justifying the validity of KV cache
+sharing. Rigorous proofs are provided in the Appendix A, and
+empirical results are presented in the evaluation section.
+V. EVALUATION
+A. Settings
+Benchmarks: We evaluate ReasonCache on a diverse suite
+of benchmarks targeting distinct reasoning capabilities. For
+coding, we use HumanEval [31], comprising 164 program-
+ming problems with unit tests to assess functional correctness.
+For long-context understanding, we employ HotpotQA [32]
+and TREC [33] from LongBench [34] (200 samples each),
+which test multi-document reasoning and fine-grained classi-
+fication, respectively. Mathematical reasoning is evaluated on
+AIME [9] and MATH-500 [35], covering advanced algebra,
+geometry, and number theory. Finally, GPQA Diamond [36]
+assesses scientific reasoning with 198 graduate-level questions
+across biology, physics, and chemistry.
+Models: We employ three models with diverse sizes and ar-
+chitectures: DeepSeek-R1-Distill-Qwen-32B, QwQ-32B, and
+Phi-4-reasoning-plus to ensure a comprehensive evaluation.
+Baselines:
+We
+compare
+ReasonCache
+against
+a
+fully
+cached
+baseline
+(Dense)
+and
+other
+methods,
+including
+StreamingLLM [12], Quest [17] and SnapKV [13].
+Parameters: We use step-level similarity thresholds of τstrict =
+0.9 and τsoft = 0.7. For block-level selection, we employ
+Percentile-based Adaptive Thresholding (PAT), retaining the
+80% of candidate blocks with the lowest Euclidean distances
+for sharing.
+Metrics: We evaluate the performance of different methods
+using three key metrics: Accuracy, Throughput, and Average
+Memory Saving Ratio (AMSR). Throughput, measured in
+tokens per second (tokens/s), is a critical indicator of QoS
+in AI inference systems. It directly reflects the system’s
+processing capacity under high concurrency, where higher
+throughput translates to a greater ability to serve concurrent
+users. Average Memory Saving Ratio (AMSR) quantifies
+the memory efficiency of cache management strategies. For
+sharing, eviction and merging-based methods, it represents the
+physical reduction in KV cache memory usage. For selective
+loading methods like Quest [17], which retain the full KV
+cache, AMSR measures the fraction of KV cache blocks
+that are skipped and thus not loaded during the attention
+computation.
+Testing Environment: To simulate a realistic AI inference
+system under high load, all benchmark tasks are submitted as
+concurrent requests to a vLLM-based engine, which dynami-
+cally schedules and batches them. Experiments are conducted
+on NVIDIA A800 (80GB) GPUs with Ubuntu 22.04.3 and
+vLLM version 0.8.2. All reported results are averaged over 5
+independent runs.
+B. Main Results
+We compare ReasonCache against two baseline settings:
+Dense Attention, which reserves the full KV cache without
+sharing, and Random Sharing, which reuses KV cache blocks
+arbitrarily. For a fair comparison, we align the Average Mem-
+ory Saving Ratio (AMSR) of Random Sharing with that of
+ReasonCache. As shown in Table I, ReasonCache delivers
+significant throughput gains across all evaluated models and
+benchmarks. For example, it achieves average throughput
+improvements of 59.29% for QwQ-32B. Notably, these sig-
+nificant performance enhancements are realized with minimal
+impact on model accuracy. For instance, Phi-4-reasoning-plus
+achieves a 43.3% throughput boost while retaining 98.3% of
+the baseline accuracy of Dense Attention.
+Comparison with Other KV Cache Management Methods:
+Table II presents a comprehensive comparison of various
+KV cache management methods across different models and
+benchmarks. Under comparable Average Memory Saving Ra-
+tio, ReasonCache consistently outperforms other methods in
+terms of accuracy. SnapKV, which is optimized for long
+prompts, demonstrates lower accuracy in mathematical and
+scientific reasoning tasks since it is less effective in long de-
+coding scenarios. StreamingLLM achieves moderate accuracy
+but suffers from information loss outside its sliding window.
+C. Overhead Analysis
+We conduct a detailed overhead analysis to quantify the
+system cost of ReasonCache, specifically focusing on the
+CPU-intensive filtering components. Using the DeepSeek-R1-
+Distill-Qwen-32B model on the HumanEval dataset, we profile
+the average latency of each filtering stage, as reported in
+Figure 5a. The results show that ReasonCache introduces a
+modest average overhead of 13.5 ms per step. In contrast, the
+model’s average token generation time for a step is 186.9 ms.
+Given that ReasonCache operates asynchronously, this CPU-
+side computation is completely masked by the GPU inference
+latency, ensuring zero impact on the critical path of token
+generation.
+In addition to latency, we analyze the resource consumption
+to rule out potential bottlenecks. Figure 5b presents the CPU
+and GPU utilization profiles under the same workload. CPU
+utilization consistently fluctuates within the 35–45% range,
+demonstrating that the filtering algorithm is efficient and far
+from saturating the CPU. More importantly, GPU utilization
+is sustained at over 95% during the initial 30-minute peak
+phase. This high utilization confirms that our asynchronous
+offloading design effectively decouples CPU tasks from GPU
+inference, preventing pipeline stalls. The subsequent drop in
+GPU utilization is due to the gradual completion of tasks,
+leading to reduced concurrency and smaller batch sizes in the
+final stages of the experiment.
+
+
+TABLE I: Accuracy and throughput (tokens/s) evaluation. Bold values represent the throughput improvement relative to Dense.
+Code
+Multi-doc QA
+Summarization
+Math
+Science
+Model
+Method
+HumanEval
+HotpotQA
+TREC
+AIME 2024
+AIME 2025
+MATH 500
+GPQA Diamond
+Avg
+Acc
+Avg
+throughput
+Acc throughput Acc throughput Acc throughput Acc throughput Acc throughput Acc throughput Acc throughput
+DeepSeek R1
+Distill
+Qwen 32B
+ReasonCache 0.969 (+62.36%)
+246.01
+0.36 (+42.18%)
+542.43
+0.61 (+58.87%)
+416.84
+0.7
+(+72.38%)
+123.4
+0.5
+(+43.1%)
+82.34
+0.918 (+89.2%)
+194.5
+0.607 (+56.6%)
+176.21
+0.665 (+56.33%)
+254.53
+Random
+0.622 (+63.09%)
+247.11
+0.18 (+40.98%)
+537.85
+0.28 (+54.89%)
+406.40
+0.367 (+68.73%)
+120.8
+0.2
+(+42.2%)
+81.81
+0.6
+(+85.9%)
+191.2
+0.323 (+53.8%)
+172.91
+0.367 (+54.25%)
+251.15
+Dense
+0.982
+151.52
+0.375
+381.51
+0.62
+262.38
+0.733
+71.59
+0.533
+57.55
+0.927
+102.82
+0.631
+112.40
+0.686
+162.82
+QwQ 32B
+ReasonCache 0.972 (+72.31%)
+193.52
+0.41 (+42.34%)
+423.23
+0.652 (+61.23%)
+287.59
+0.733 (+78.27%)
+85.3
+0.633 (+68.9%)
+82.3
+0.872 (+81.6%)
+152.31
+0.581 (+59.0%)
+125.67
+0.693 (+59.29%)
+192.85
+Random
+0.598 (+70.67%)
+191.68
+0.22 (+41.89%)
+421.89
+0.333 (+60.89%)
+286.98
+0.3
+(+79.1%)
+85.7
+0.233 (+72.6%)
+84.1
+0.588 (+82.7%)
+153.23
+0.278 (+55.9%)
+123.24
+0.364 (+58.92%)
+192.40
+Dense
+0.968
+112.31
+0.45
+297.34
+0.648
+178.37
+0.766
+47.85
+0.633
+48.72
+0.894
+83.85
+0.611
+79.06
+0.71
+121.07
+Phi 4
+reasoning
+plus
+ReasonCache 0.945 (+51.23%)
+338.33
+0.4
+(+32.45%)
+695.88
+0.61 (+42.13%)
+556.84
+0.8
+(+45.85%)
+245.21
+0.633 (+44.7%)
+243.21
+0.903 (+65.5%)
+384.21
+0.508 (+39.0%)
+243.22
+0.686 (+43.3%)
+386.7
+Random
+0.482 (+50.97%)
+337.75
+0.21 (+33.21%)
+699.87
+0.315 (+40.89%)
+552.08
+0.333 (+40.77%)
+243.2
+0.133 (+42.4%)
+239.41
+0.492 (+64.2%)
+381.23
+0.203 (+38.1%)
+241.81
+0.324 (+42.69%)
+385.05
+Dense
+0.933
+223.72
+0.43
+525.39
+0.635
+391.85
+0.8
+172.77
+0.677
+168.12
+0.893
+232.14
+0.520
+175.04
+0.698
+269.86
+TABLE II: Evaluation of different KV cache management strategies. Average Memory Saving Ratio (AMSR) quantifies the
+memory efficiency of a strategy. For each benchmark, the highest and second-highest accuracies are highlighted in bold and
+underlined, respectively.
+Code
+Multi-doc QA
+Summarization
+Math
+Science
+Model
+Method
+HumanEval
+HotpotQA
+TREC
+AIME 2024
+AIME 2025
+MATH 500
+GPQA Diamond
+Avg
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+Acc
+AMSR
+DeepSeek R1
+Distill
+Qwen 32B
+StreamingLLM
+0.884
+20.1%
+0.235
+15.8%
+0.47
+15.5%
+0.567
+22.34%
+0.333
+20.7%
+0.764
+38.2%
+0.409
+16.5%
+0.523
+21.31%
+SnapKV
+0.872
+9.6%
+0.285
+16.22%
+0.51
+16%
+0.5
+1.79%
+0.2
+1.8%
+0.44
+2.79%
+0.293
+8.2%
+0.443
+8.06%
+Quest
+0.866
+20.4%
+0.24
+16.02%
+0.48
+15.8%
+0.6
+20.98%
+0.333
+25%
+0.5
+39.9%
+0.561
+13.8%
+0.511
+21.7%
+ReasonCache
+0.969
+21.5%
+0.36
+16.51%
+0.61
+15.9%
+0.7
+21.18%
+0.5
+23.2%
+0.918
+39.1%
+0.607
+15.54%
+0.665
+21.85%
+Dense
+0.982
+0%
+0.375
+0%
+0.62
+0%
+0.733
+0%
+0.533
+0%
+0.927
+0%
+0.631
+0%
+0.686
+0%
+QwQ 32B
+StreamingLLM
+0.799
+21.7%
+0.282
+16.51%
+0.49
+17.3%
+0.567
+20.3%
+0.367
+20.6%
+0.672
+29.7%
+0.530
+17.5%
+0.523
+20.52%
+SnapKV
+0.756
+6.2%
+0.32
+15.7%
+0.61
+15.5%
+0.1
+1%
+0.233
+1.43%
+0.176
+1.55%
+0.146
+4.27%
+0.334
+6.52%
+Quest
+0.915
+20.8%
+0.36
+15.82%
+0.56
+17.8%
+0.666
+25.1%
+0.533
+23.5%
+0.506
+28%
+0.535
+18.1%
+0.582
+21.30%
+ReasonCache
+0.972
+22.1%
+0.41
+16.12%
+0.652
+18.1%
+0.733
+23.41%
+0.633
+23.1%
+0.872
+26.89%
+0.581
+18.12%
+0.693
+21.12%
+Dense
+0.968
+0%
+0.45
+0%
+0.648
+0%
+0.766
+0%
+0.633
+0%
+0.894
+0%
+0.611
+0%
+0.71
+0%
+Phi 4
+reasoning
+plus
+StreamingLLM
+0.812
+14.8%
+0.278
+14.8%
+0.45
+13.4%
+0.567
+16.6%
+0.367
+17%
+0.522
+23%
+0.333
+18.9%
+0.476
+16.93%
+SnapKV
+0.793
+11.5%
+0.292
+15.5%
+0.47
+13.7%
+0.2
+2.56%
+0.166
+3%
+0.146
+4.76%
+0.253
+7.29%
+0.331
+8.33%
+Quest
+0.854
+15.3%
+0.29
+15.75%
+0.47
+13.6%
+0.567
+18.5%
+0.433
+17.7%
+0.518
+21%
+0.312
+17.8%
+0.478
+17.09%
+ReasonCache
+0.945
+16.8%
+0.4
+16.2%
+0.61
+14.2%
+0.8
+16.4%
+0.633
+17.2%
+0.903
+21.41%
+0.508
+17.6%
+0.686
+17.12%
+Dense
+0.933
+0%
+0.43
+0%
+0.635
+0%
+0.8
+0%
+0.677
+0%
+0.893
+0%
+0.520
+0%
+0.698
+0%
+180
+200
+Ref: GPU Step (186.9 ms)
+CPU Filter Step
+0
+5
+10
+15
+20
+Latency (ms)
+Sys. Overhead
+KV Dist. Computation
+AST Parsing & TED
+Lexical Computing
+(a) Overhead break-
+down.
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Time (minutes)
+0
+20
+40
+60
+80
+100
+Utilization (%)
+System Resource Utilization Over Time
+GPU Utilization
+CPU Utilization
+GPU Average: 83.7%
+CPU Average: 37.5%
+(b) CPU/GPU utilization.
+Fig. 5: Overhead breakdown per step and system utilization
+analysis.
+D. Ablation Study
+Algorithm Design: To evaluate the contribution of each
+component in our proposed algorithm, we conduct an ablation
+study to assess three distinct configurations: (1) Ours w/ only
+Cos, a version that utilizes only cosine similarity to measure
+the similarity between steps; (2) Ours w/ only Cos + AST,
+which incorporates Abstract Syntax Tree (AST) analysis on
+top of cosine similarity to compare the structure of formal
+languages; and (3) Ours, our full algorithm that combines
+cosine similarity, AST analysis, and Euclidean distance for
+a comprehensive similarity assessment. The results, presented
+in Table III, demonstrate that our full algorithm achieves the
+highest accuracy across all tasks. However, this improved
+accuracy is accompanied by a decrease in throughput, which
+we attribute to the more granular filtering leading to less
+content sharing.
+50
+100
+150
+200
+250
+Throughput (tokens/s)
+192.41
+194.5
+189.16
+193.87
+71.28
+78.99
+MATH500; DeepSeek-R1-Distill-Qwen-32B
+Tokenizer-based Encoding
+Sentence-BERT Encoding
+Embedding Layer Encoding
+Cosine Similarity
+Euclidean Distance
+Accuracy (%)
+80
+85
+90
+95
+100
+Accuracy (%)
+90%
+91.2%
+83%
+87.8%
+91.2%
+92%
+50
+100
+150
+200
+250
+Throughput (tokens/s)
+178.53
+176.21
+174.7
+175.2
+56.18
+57.89
+GPQA Diamond; DeepSeek-R1-Distill-Qwen-32B
+Tokenizer-based Encoding
+Sentence-BERT Encoding
+Embedding Layer Encoding
+Cosine Similarity
+Euclidean Distance
+Accuracy (%)
+51
+54
+57
+60
+63
+66
+69
+72
+Accuracy (%)
+59.1%
+60.7%
+55.6%
+57.6%
+62.1%
+63.1%
+Fig. 6: Performance comparison of similarity measurement
+algorithms. Algorithms are categorized in step-level (distin-
+guished by colors) and block-level (distinguished by line
+patterns).
+
+
+TABLE III: Ablation study on different configurations of ReasonCache, comparing their accuracy and throughput (tokens/s).
+Code
+Multi-doc QA
+Summarization
+Math
+Science
+Model
+Setting
+HumanEval
+HotpotQA
+TREC
+MATH 500
+GPQA Diamond Avg
+Acc
+Avg
+throughput
+Acc throughput Acc throughput Acc throughput Acc throughput Acc throughput
+DeepSeek R1
+Distill
+Qwen 32B
+Ours w/ only Cos
+0.902
+277.99
+0.31
+572.21
+0.535
+436.21
+0.78
+223.68
+0.505
+214.21
+0.606
+344.86
+Ours w/ only Cos+AST 0.933
+255.85
+0.31
+570.64
+0.53
+439.35
+0.822
+210.06
+0.556
+198.23
+0.63
+334.83
+Ours
+0.969
+246.01
+0.36
+542.43
+0.61
+416.84
+0.918
+194.5
+0.607
+176.21
+0.692
+315.198
+QwQ 32B
+Ours w/ only Cos
+0.915
+216.74
+0.375
+440.28
+0.585
+303.82
+0.752
+181.25
+0.48
+142.12
+0.621
+256.84
+Ours w/ only Cos+AST 0.939
+201.26
+0.375
+444.39
+0.59
+301.39
+0.8
+167.54
+0.532
+133.46
+0.647
+249.61
+Ours
+0.972
+193.52
+0.41
+423.23
+0.652
+287.59
+0.872
+152.31
+0.581
+125.67
+0.697
+236.464
+Phi 4
+reasoning
+plus
+Ours w/ only Cos
+0.884
+375.55
+0.365
+728.21
+0.54
+578.92
+0.792
+430.24
+0.404
+278.12
+0.597
+478.21
+Ours w/ only Cos+AST 0.939
+358.63
+0.37
+730.67
+0.54
+580.78
+0.85
+412.32
+0.449
+252.52
+0.63
+466.98
+Ours
+0.945
+338.33
+0.4
+695.88
+0.61
+556.84
+0.903
+384.21
+0.508
+243.22
+0.673
+443.696
+80
+100
+120
+140
+160
+Throughput (tokens/s)
+123.4
+88.64
+101.16
+132.87
+AIME24; DeepSeek-R1-Distill-Qwen-32B
+Ours
+Static- =0.9
+Static- =0.8
+Static- =0.7
+Accuracy (%)
+55
+60
+65
+70
+75
+80
+Accuracy (%)
+70.0%
+66.7%
+63.3%
+56.7%
+100
+125
+150
+175
+200
+225
+250
+275
+300
+Throughput (tokens/s)
+246.01
+171.19
+200.42
+238.23
+HumanEval; DeepSeek-R1-Distill-Qwen-32B
+Ours
+Static- =0.9
+Static- =0.8
+Static- =0.7
+Accuracy (%)
+85
+90
+95
+100
+105
+Accuracy (%)
+96.3%
+95.8%
+89.2%
+85.8%
+Fig. 7: Comparison of dynamic and fixed thresholding.
+Similarity Measurement Methods: Figure 6 evaluates the
+effectiveness of different similarity measurement strategies,
+addressing the potential concern that simple lexical matching
+might miss semantic differences. We specifically compare
+our lightweight tokenizer-based approach against semantic
+embedding models. We assess three encoding approaches
+for step-level filtering: (1) Tokenizer-based Encoding: Our
+default method, using sparse bag-of-words vectors from the
+model’s native tokenizer. (2) Sentence-BERT [37]: Using all-
+MiniLM-L6-v2 to generate 384-dimensional dense semantic
+embeddings. This introduces an explicit semantic validation
+step. (3) Embedding Layer: This approach uses the the
+model’s native embedding layer, which, while potentially more
+accurate, incurs higher computational costs.
+Our results demonstrate that Tokenizer-based Encoding
+combined with Block-Level Euclidean Distance yields the
+highest accuracy. We attribute this to two factors: First, the KV
+cache states already encode high-level semantic and contextual
+information specific to the model [38]. Calculating the Eu-
+clidean distance between these states (Stage 2) effectively acts
+as an intrinsic semantic verification, rendering external seman-
+tic checks redundant. Second, external models like Sentence-
+BERT do not perfectly align with the target LRM’s internal
+representation. Thus, our two-stage design efficiently balances
+precision and throughputs.
+Impact of threshold: This section evaluates the impact of
+different thresholding strategies. We first compare our dy-
+namic thresholding mechanism with several fixed threshold
+approaches. As shown in Figure 7, the dynamic threshold, τ,
+TABLE IV: Performance comparison of different percentile
+values (p) for Percentile-based Adaptive Thresholding (PAT).
+Model
+Threshold
+HumanEval
+TREC
+MATH 500
+Acc
+throughput
+Acc
+throughput
+Acc
+throughput
+DeepSeek R1
+Distill
+Qwen 32B
+PAT-p=20
+0.97
+192.12
+0.6
+322.2
+0.924
+121.89
+PAT-p=50 0.957
+212.34
+0.605
+352.13
+0.922
+149.21
+PAT-p=80 0.969
+246.01
+0.61
+416.84
+0.918
+194.5
+PAT-p=100 0.933
+255.85
+0.53
+439.35
+0.822
+210.06
+QwQ-32B
+PAT-p=20
+0.97
+132.89
+0.645
+215.27
+0.878
+101.23
+PAT-p=50 0.976
+158.35
+0.655
+248.28
+0.868
+123.37
+PAT-p=80 0.972
+193.52
+0.652
+287.59
+0.872
+152.31
+PAT-p=100 0.939
+201.26
+0.59
+301.39
+0.8
+167.54
+Phi 4
+reasoning
+plus
+PAT-p=20 0.951
+261.23
+0.635
+412.3
+0.893
+310.2
+PAT-p=50 0.948
+295.71
+0.62
+478.21
+0.896
+342.3
+PAT-p=80 0.945
+338.33
+0.61
+556.84
+0.903
+384.21
+PAT-p=100 0.939
+358.63
+0.54
+580.78
+0.85
+412.32
+consistently achieves better accuracy and satisfying throughput
+compared to all tested fixed thresholds. Next, we investigate
+the effect of varying the percentile parameter, P, within
+our Percentile-based Adaptive Thresholding (PAT) framework.
+The results in Table IV indicate that setting P to the 80th
+percentile yields an optimal balance between accuracy and
+throughput. This finding remains consistent across various
+models and datasets, demonstrating the robustness of this
+parameter choice for achieving high overall performance.
+VI. RELATED WORK
+Recent work in KV cache management leverages the in-
+herent sparsity of attention patterns to estimate the token
+importance. Eviction-based methods reduce memory foot-
+print by permanently discarding non-critical tokens. Strate-
+gies like H2O [11], SnapKV [13], and RaaS [15] rely
+on importance scoring metrics. Other approaches, such as
+StreamingLLM [12], maintain a fixed-size cache by prior-
+itizing attention sinks. Recent specialized methods for rea-
+soning tasks include Lethe [14], which introduces layer- and
+time-adaptive pruning and RLKV [16] which adapts rein-
+forcement learning for identifying reasoning-critical attention
+head. However, eviction-based methods face a fundamental
+limitation: discarded KV pairs cannot be recovered even if
+needed later [39]. Selective KV loading methods, in contrast,
+retain the full KV cache but skip non-critical tokens during
+
+
+attention computation. Methods such as Quest [17] exemplify
+this approach. These techniques reduce information loss but
+maintain the original memory footprint of the KV cache. KV
+cache merging methods combine less important tokens into
+more critical ones rather than discarding them entirely. Mini-
+Cache [18] proposes an intra layer merging algorithm with
+restoration mechanisms to reduce memory usage. D2O [19]
+leverages cosine similarity between key states to select merge
+candidates and determine dynamic weights. However, the
+difficulty in accurately predicting which tokens are important
+for future text generation can lead to information loss, causing
+hallucinations [40].
+VII. CONCLUSION
+We present ReasonCache, a novel KV cache management
+approach that efficiently identifies and reuses similar KV cache
+blocks. Comprehensive evaluations show that ReasonCache
+achieves a peak throughput improvement of 89.2% and an
+average gain of 40-60%, while reducing KV cache memory
+usage by 17-21%, all without compromising accuracy.
+REFERENCES
+[1] A. Jaech, A. Kalai, A. Lerer, A. Richardson, A. El-Kishky, A. Low,
+A. Helyar, A. Madry, A. Beutel, A. Carney et al., “Openai o1 system
+card,” arXiv preprint arXiv:2412.16720, 2024.
+[2] Qwen, “Qwq-32b: Embracing the power of reinforcement learning,”
+2025. [Online]. Available: https://qwen.ai/blog?id=qwq-32b
+[3] D. Guo, D. Yang, H. Zhang, J. Song, R. Zhang, R. Xu, Q. Zhu, S. Ma,
+P. Wang, X. Bi et al., “Deepseek-r1: Incentivizing reasoning capability
+in llms via reinforcement learning,” arXiv preprint arXiv:2501.12948,
+2025.
+[4] W. Liu, X. Ma, W. Sun, Y. Zhu, Y. Li, D. Yin, and Z. Dou, “Reasonrank:
+Empowering passage ranking with strong reasoning ability,” arXiv
+preprint arXiv:2508.07050, 2025.
+[5] K. Zhao, F. Xu, and Y. Li, “Reason-to-recommend: Using interaction-
+of-thought reasoning to enhance llm recommendation,” arXiv preprint
+arXiv:2506.05069, 2025.
+[6] X. Zhou, G. Tie, G. Zhang, W. Wang, Z. Zuo, D. Wu, D. Chu, P. Zhou,
+L. Sun, and N. Zhenqiang Gong, “Large reasoning models in agent
+scenarios: Exploring the necessity of reasoning capabilities,” arXiv e-
+prints, pp. arXiv–2503, 2025.
+[7] F. Xu, Q. Hao, Z. Zong, J. Wang, Y. Zhang, J. Wang, X. Lan, J. Gong,
+T. Ouyang, F. Meng et al., “Towards large reasoning models: A survey
+of reinforced reasoning with large language models,” arXiv preprint
+arXiv:2501.09686, 2025.
+[8] X. Chen, J. Xu, T. Liang, Z. He, J. Pang, D. Yu, L. Song, Q. Liu,
+M. Zhou, Z. Zhang et al., “Do not think that much for 2+ 3=? on the
+overthinking of o1-like llms,” arXiv preprint arXiv:2412.21187, 2024.
+[9] MAA,
+“American
+invitational
+mathematics
+examination
+-
+aime,”
+2025. [Online]. Available: https://huggingface.co/datasets/di-zhang-fdu/
+AIME 1983 2024
+[10] R. Child, S. Gray, A. Radford, and I. Sutskever, “Generating long
+sequences with sparse transformers,” arXiv preprint arXiv:1904.10509,
+2019.
+[11] Z. Zhang, Y. Sheng, T. Zhou, T. Chen, L. Zheng, R. Cai, Z. Song,
+Y. Tian, C. R´e, C. Barrett et al., “H2o: Heavy-hitter oracle for efficient
+generative inference of large language models,” Advances in Neural
+Information Processing Systems, vol. 36, pp. 34 661–34 710, 2023.
+[12] G. Xiao, Y. Tian, B. Chen, S. Han, and M. Lewis, “Efficient streaming
+language models with attention sinks,” arXiv preprint arXiv:2309.17453,
+2023.
+[13] Y. Li, Y. Huang, B. Yang, B. Venkitesh, A. Locatelli, H. Ye, T. Cai,
+P. Lewis, and D. Chen, “Snapkv: Llm knows what you are looking for
+before generation,” Advances in Neural Information Processing Systems,
+vol. 37, pp. 22 947–22 970, 2024.
+[14] H. Zeng, D. Zhao, P. Yang, W. Hou, T. Zheng, H. Li, W. Ji, and
+J. Zhai, “Lethe: Layer-and time-adaptive kv cache pruning for reasoning-
+intensive llm serving,” arXiv preprint arXiv:2511.06029, 2025.
+[15] J. Hu, W. Huang, W. Wang, Z. Li, T. Hu, Z. Liu, X. Chen, T. Xie,
+and Y. Shan, “Raas: Reasoning-aware attention sparsity for efficient llm
+reasoning,” arXiv preprint arXiv:2502.11147, 2025.
+[16] W. Du, L. Jiang, K. Tao, X. Liu, and H. Wang, “Which heads
+matter for reasoning? rl-guided kv cache compression,” arXiv preprint
+arXiv:2510.08525, 2025.
+[17] J. Tang, Y. Zhao, K. Zhu, G. Xiao, B. Kasikci, and S. Han, “Quest:
+Query-aware sparsity for efficient long-context llm inference,” in Forty-
+first International Conference on Machine Learning.
+[18] A. Liu, J. Liu, Z. Pan, Y. He, R. Haffari, and B. Zhuang, “Minicache: Kv
+cache compression in depth dimension for large language models,” Ad-
+vances in Neural Information Processing Systems, vol. 37, pp. 139 997–
+140 031, 2024.
+[19] Z. Wan, X. Wu, Y. Zhang, Y. Xin, C. Tao, Z. Zhu, X. Wang, S. Luo,
+J. Xiong, L. Wang et al., “D2o: Dynamic discriminative operations for
+efficient long-context inference of large language models,” in ICLR,
+2025.
+[20] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez,
+H. Zhang, and I. Stoica, “Efficient memory management for large
+language model serving with pagedattention,” in Proceedings of the 29th
+Symposium on Operating Systems Principles, 2023, pp. 611–626.
+[21] L. Zheng, L. Yin, Z. Xie, C. L. Sun, J. Huang, C. H. Yu, S. Cao,
+C. Kozyrakis, I. Stoica, J. E. Gonzalez et al., “Sglang: Efficient ex-
+ecution of structured language model programs,” Advances in Neural
+Information Processing Systems, vol. 37, pp. 62 557–62 583, 2024.
+[22] X. Tan, Y. Chen, Y. Jiang, X. Chen, K. Yan, N. Duan, Y. Zhu, D. Jiang,
+and H. Xu, “Dsv: Exploiting dynamic sparsity to accelerate large-scale
+video dit training,” arXiv preprint arXiv:2502.07590, 2025.
+[23] P. Patel, E. Choukse, C. Zhang, A. Shah, ´I. Goiri, S. Maleki, and
+R. Bianchini, “Splitwise: Efficient generative llm inference using phase
+splitting,” in 2024 ACM/IEEE 51st Annual International Symposium on
+Computer Architecture (ISCA).
+IEEE, 2024, pp. 118–132.
+[24] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and
+H. Zhang, “Distserve: Disaggregating prefill and decoding for goodput-
+optimized large language model serving,” in 18th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 24), 2024, pp.
+193–210.
+[25] Z. Shen, M. Zhang, H. Zhao, S. Yi, and H. Li, “Efficient attention:
+Attention with linear complexities,” in Proceedings of the IEEE/CVF
+winter conference on applications of computer vision, 2021, pp. 3531–
+3539.
+[26] Z. Wang, B. Jin, Z. Yu, and M. Zhang, “Model tells you where to
+merge: Adaptive kv cache merging for llms on long-context tasks,” arXiv
+preprint arXiv:2407.08454, 2024.
+[27] V. A. Alfred, S. L. Monica, and D. U. Jeffrey, Compilers Principles,
+Techniques & Tools.
+Pearson Education, 2007.
+[28] K. Zhang and D. Shasha, “Simple fast algorithms for the editing distance
+between trees and related problems,” SIAM Journal on Computing,
+vol. 18, no. 6, pp. 1245–1262, 1989.
+[29] A. Virmaux and K. Scaman, “Lipschitz regularity of deep neural
+networks: Analysis and efficient estimation,” Advances in Neural In-
+formation Processing Systems, vol. 31, 2018.
+[30] L. Collins, A. Parulekar, A. Mokhtari, S. Sanghavi, and S. Shakkottai,
+“In-context learning with transformers: Softmax attention adapts to
+function lipschitzness,” in Advances in Neural Information Processing
+Systems, A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet,
+J. Tomczak, and C. Zhang, Eds., vol. 37.
+Curran Associates, Inc.,
+2024, pp. 92 638–92 696.
+[31] M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. D. O. Pinto, J. Kaplan,
+H. Edwards, Y. Burda, N. Joseph, G. Brockman et al., “Evaluating large
+language models trained on code,” arXiv preprint arXiv:2107.03374,
+2021.
+[32] Z. Yang, P. Qi, S. Zhang, Y. Bengio, W. Cohen, R. Salakhutdinov, and
+C. D. Manning, “Hotpotqa: A dataset for diverse, explainable multi-
+hop question answering,” in Proceedings of the 2018 Conference on
+Empirical Methods in Natural Language Processing, 2018, pp. 2369–
+2380.
+[33] X. Li and D. Roth, “Learning question classifiers,” in The 19th Interna-
+tional Conference on Computational Linguistics, 2002.
+[34] Y. Bai, X. Lv, J. Zhang, H. Lyu, J. Tang, Z. Huang, Z. Du, X. Liu,
+A. Zeng, L. Hou et al., “Longbench: A bilingual, multitask benchmark
+for long context understanding,” in Proceedings of the 62nd Annual
+Meeting of the Association for Computational Linguistics, 2024, pp.
+3119–3137.
+
+
+[35] D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang,
+D. Song, and J. Steinhardt, “Measuring mathematical problem solving
+with the math dataset,” in Proceedings of the Neural Information
+Processing Systems Track on Datasets and Benchmarks, vol. 1, 2021.
+[36] D. Rein, B. L. Hou, A. C. Stickland, J. Petty, R. Y. Pang, J. Dirani,
+J. Michael, and S. R. Bowman, “Gpqa: A graduate level google-proof qa
+benchmark,” 2023. [Online]. Available: https://arxiv.org/abs/2311.12022
+[37] N. Reimers and I. Gurevych, “Sentence-BERT: Sentence embeddings
+using Siamese BERT-networks,” in Proceedings of the 2019 Conference
+on Empirical Methods in Natural Language Processing and the 9th In-
+ternational Joint Conference on Natural Language Processing (EMNLP-
+IJCNLP), Nov. 2019.
+[38] K. Meng, D. Bau, A. Andonian, and Y. Belinkov, “Locating and editing
+factual associations in gpt,” Advances in neural information processing
+systems, vol. 35, pp. 17 359–17 372, 2022.
+[39] Y. LI, H. Jiang, Q. Wu, X. Luo, S. Ahn, C. Zhang, A. H. Abdi,
+D. Li, J. Gao, Y. Yang et al., “Scbench: A kv cache-centric analysis
+of long-context methods,” in The Thirteenth International Conference
+on Learning Representations, 2025.
+[40] J. Y. Yang, B. Kim, J. Bae, B. Kwon, G. Park, E. Yang, S. J. Kwon,
+and D. Lee, “No token left behind: Reliable kv cache compression
+via importance-aware mixed precision quantization,” arXiv preprint
+arXiv:2402.18096, 2024.
+APPENDIX A
+PROOF OF THEOREM 1
+Let d ∈N denote the hidden state dimension. For a given
+decoding step t, let qt ∈Rd be the query vector. Let Kt =
+[k1, k2, . . . , kt]⊤∈Rt×d and Vt = [v1, v2, . . . , vt]⊤∈Rt×d
+be the key and value matrices, respectively, where kj, vj ∈Rd
+for j = 1, . . . , t. The unnormalized attention scores, denoted
+by St ∈Rt, are given by: St = qtK⊤
+t
+√
+d .
+The attention weights At ∈Rt are then computed by
+applying the softmax function to St: At = softmax
+
+qtK⊤
+t
+√
+d
+
+.
+The output vector ot ∈Rd at decoding step t is a weighted
+sum of the value vectors: ot = Pt
+j=1(At)jvj.
+Suppose for some j ∈{1, . . . , t}, we replace kj with k′
+j such
+that ∥kj −k′
+j∥2 < ε, and vj with v′
+j such that ∥vj −v′
+j∥2 < δ.
+We will analyze the effect of these substitutions on the attention
+weights and the output ot.
+1. Key Similarity =⇒Similar Attention Scores
+Let St be the vector of unnormalized attention scores with key
+matrix Kt, and let S′
+t be the vector of unnormalized attention
+scores when kj is replaced by k′
+j in Kt (forming K′
+t). The
+i-th component of St is (St)i =
+qtk⊤
+i
+√
+d . Similarly, the i-th
+component of S′
+t is: (S′
+t)i =
+
+
+
+qtk⊤
+i
+√
+d ,
+i̸ = j
+qt(k′
+j)⊤
+√
+d
+,
+i = j
+.
+The difference between St and S′
+t is non-zero only at the
+j-th position. The magnitude of this difference is:
+|(St)j −(S′
+t)j| =
+
+qtk⊤
+j
+√
+d
+−qt(k′
+j)⊤
+√
+d
+ = |qt(kj −k′
+j)⊤|
+√
+d
+By the Cauchy-Schwarz inequality, |qt(kj −k′
+j)⊤|
+≤
+∥qt∥2∥kj −k′
+j∥2. Given ∥kj −k′
+j∥2 < ε, we have:
+|(St)j −(S′
+t)j| < ∥qt∥2ε
+√
+d
+For i̸ = j, (St)i −(S′
+t)i = 0. Therefore, the ℓ∞norm of the
+difference between St and S′
+t is:
+∥St −S′
+t∥∞= max
+i
+|(St)i −(S′
+t)i| = |(St)j −(S′
+t)j| < ∥qt∥2ε
+√
+d
+Now, we analyze the effect on the attention weights At =
+softmax(St) and A′
+t = softmax(S′
+t). The softmax function
+σ : Rt →Rt is Lipschitz continuous [29], [30]. Specifically,
+for any x, y ∈Rt, the following inequality holds:
+∥σ(x) −σ(y)∥1 ≤∥x −y∥∞
+Applying this property to our case, we get:
+∥At −A′
+t∥1 = ∥softmax(St)−softmax(S′
+t)∥1 ≤∥St −S′
+t∥∞< ∥qt∥2ε
+√
+d
+This result demonstrates that a small perturbation in a key
+vector kj leads to a linearly bounded change in the ℓ1 norm
+of the attention weights, directly proportional to the magnitude
+of the perturbation ε and the norm of the query vector, and
+inversely proportional to
+√
+d.
+2. Value Similarity =⇒Small Output Perturbation
+Let ot be the original output and o′
+t be the output when only
+the value vector vj is replaced by v′
+j, while keeping the key
+matrix Kt (and thus At) unchanged. The expressions for ot
+and o′
+t are: ot = Pt
+i=1(At)ivi, o′
+t = P
+i̸=j(At)ivi +(At)jv′
+j The
+difference between the two outputs is:
+∥ot −o′
+t∥2 = ∥(At)jvj −(At)jv′
+j∥2 = ∥(At)j(vj −v′
+j)∥2
+Since (At)j is a scalar, we have:∥ot −o′
+t∥2 = |(At)j|∥vj −v′
+j∥2
+Given that At is a probability distribution, (At)j ≥0 and
+Pt
+i=1(At)i = 1, which implies (At)j ≤1. With ∥vj −v′
+j∥2 <
+δ, we can write: ∥ot −o′
+t∥2 < (At)jδ ≤δ
+This shows that if only a single value vector is perturbed, the
+change in the output ot is directly bounded by the magnitude
+of the perturbation δ.
+More generally, if a set of value vectors indexed by J ⊆
+{1, . . . , t} are perturbed, i.e., vj →v′
+j for all j ∈J such that
+∥vj −v′
+j∥2 < δ for all j ∈J, then by the triangle inequality:
+∥ot −o′
+t∥2 =
+
+X
+j∈J
+(At)j(vj −v′
+j)
+
+2
+≤
+X
+j∈J
+∥(At)j(vj −v′
+j)∥2
+=
+X
+j∈J
+(At)j∥vj −v′
+j∥2 <
+X
+j∈J
+(At)jδ = δ
+X
+j∈J
+(At)j
+Since P
+j∈J(At)j ≤Pt
+j=1(At)j = 1, it follows that: ∥ot −o′
+t∥2 < δ
+Thus, even with multiple value vector perturbations, the
+total change in the output is bounded by the maximum
+perturbation in any individual value vector.
+3. Combined Effect on Output
+If both kj and vj are replaced, the total change in ot can
+be decomposed as: ∥ot −o′′
+t ∥≤∥ot −o′
+t∥+ ∥o′
+t −o′′
+t ∥.
+where o′′
+t is the output with both kj →k′
+j and vj →v′
+j.
+The first term is bounded as above. The second term, due to
+the change in At from kj →k′
+j, is:
+∥o′
+t−o′′
+t ∥=
+
+t
+X
+i=1
+(At
+i −At′
+i )v′
+i
+ ≤
+t
+X
+i=1
+|At
+i−At′
+i |·∥v′
+i∥≤∥At−A′
+t∥1·max
+i
+∥v′
+i∥
+Assuming ∥v′
+i∥is bounded (as is typical in practice), this term
+is O(ε).
+Conclusion.
+The above analysis rigorously establishes that, for sufficiently
+small ε and δ, the perturbations in the attention weights and
+output are both tightly bounded.

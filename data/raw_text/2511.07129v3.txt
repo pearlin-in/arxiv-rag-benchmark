@@ -1,0 +1,3722 @@
+LoRA on the Go: Instance-level Dynamic LoRA Selection and Merging
+Seungeon Lee1, Soumi Das1, Manish Gupta2, Krishna P. Gummadi1
+1MPI-SWS
+2Microsoft, India
+Correspondence: selee@mpi-sws.org
+Abstract
+Low-Rank Adaptation (LoRA) has emerged as
+a parameter-efficient approach for fine-tuning
+large language models. However, conventional
+LoRA adapters are typically trained for a single
+task, limiting their applicability in real-world
+settings, where inputs may span multiple, di-
+verse task domains. At inference time, existing
+methods can combine multiple LoRAs to im-
+prove cross-task performance, but they require
+additional labeled data or task-specific training,
+which is expensive at scale.
+In this work, we introduce LoRA on the Go
+(LOGO), a training-free framework that dy-
+namically selects and merges adapters at the
+instance level without any additional require-
+ments. LOGO leverages signals extracted from
+a single forward pass through LoRA adapters,
+to identify the most relevant adapters and de-
+termine their contributions on-the-fly. Across 5
+NLP benchmarks, 27 datasets, and 3 model
+families, LOGO outperforms training-based
+baselines on some tasks up to a margin of 3.6%
+while remaining competitive on other tasks and
+maintaining inference throughput, highlighting
+its effectiveness and practicality.
+1
+Introduction
+Recent advances in large language models (LLMs)
+such as LLaMA (Dubey et al., 2024) and
+DeepSeek (Bi et al., 2024) have led to remarkable
+progress across diverse natural language process-
+ing (NLP) tasks. While these models demonstrate
+strong generalization capabilities, achieving state-
+of-the-art results in specialized domains often re-
+quires task-specific fine-tuning (Wei et al., 2022).
+However, the massive scale of modern LLMs
+makes full fine-tuning computationally prohibitive,
+motivating research on Parameter-Efficient Fine-
+Tuning (PEFT) methods that adapt models by up-
+dating only a small subset of parameters (Houlsby
+et al., 2019; Li and Liang, 2021; Liu et al., 2022).
+Among them, Low-Rank Adaptation (LoRA) (Hu
+Input
+Pretrained
+Model
+3.0
+0.1
+2.0
+…
+0.3
+…
+LoRA Selection
+Pool of LoRAs
+Single Forward-pass & 
+Signal Extraction
+Signal-based Selection
+LoRA Merging
+①
+Pretrained
+Model
+②
+Signal-based 
+Weighted Sum
+0.6 X
+0.4 X
+Projection of
+Pretrained Model
+Output
+…
+…
+…
+…
+Figure 1: Overall workflow of the proposed LoRA on
+the Go (LOGO) framework.
+et al., 2022) is particularly effective, introducing
+trainable low-rank matrices while freezing pre-
+trained weights, thus reducing trainable parameters
+without sacrificing performance.
+Although LoRA provides an efficient adapta-
+tion mechanism, the adaptors are typically opti-
+mized for a single task domain. In contrast, real-
+world applications increasingly demand general-
+ization to unseen tasks or tasks that require spe-
+cialization across multiple task domains. Recent
+works (Huang et al., 2024; Zhao et al., 2024) ex-
+plore the possibility of simultaneously leveraging
+multiple LoRAs trained on diverse tasks.
+Existing multi-LoRA approaches share a key
+limitation: when composing LoRAs together, they
+need to first select relevant LoRAs from a pool and
+then they need to merge them. For both steps, they
+assume well-defined mixed-tasks and rely on la-
+beled data. For instance, LoRAHub (Huang et al.,
+2024) learns fixed composition weights for each
+new mixed-task using labeled samples from the tar-
+get input distribution, while LoRARetriever (Zhao
+et al., 2024) trains a retrieval model to select rele-
+1
+arXiv:2511.07129v3  [cs.CL]  20 Apr 2026
+
+
+vant LoRAs, but the retrieval model still depends on
+labeled examples to compute retrieval embeddings.
+Such dependence on task homogeneity and labeled
+supervision restricts scalability in real-world sce-
+narios, where LoRAs may be continually added or
+updated and labeled data may be unavailable.
+In generic conversational systems such as AI
+copilots (Microsoft, 2023) or multi-domain assis-
+tants (OpenAI, 2023; Gemini, 2023), these assump-
+tions rarely hold. User queries are highly heteroge-
+neous, often privacy-sensitive, and may transition
+across unrelated tasks (e.g., summarization, trans-
+lation, coding) without explicit task boundaries.
+Meanwhile, LoRA pools evolve dynamically as
+new adapters are introduced or deprecated, making
+task-specific retraining or labeled data collection
+expensive and impractical. These challenges mo-
+tivate our central research question: How can we
+dynamically select suitable LoRAs for each input,
+given an evolving LoRA pool and heterogeneous
+tasks, without labeled data or retraining?
+In this work, we introduce LoRA on the Go
+(LOGO), a framework that operates without any
+pre-defined data or retraining assumptions, en-
+abling seamless integration with a dynamic LoRA
+pool. Fig. 1 illustrates the workflow of LOGO.
+LOGO adopts an instance-specific perspective-
+selecting and merging LoRAs on the fly for each
+input. Since selection and merging must occur over
+many candidates in real time, our method is entirely
+training-free. The core intuition is that LoRA acti-
+vations already encode signals of relevance: when
+a LoRA is well-suited to an input, its updates exert
+stronger influence on model outputs (e.g., inference
+for WNLI (Levesque et al., 2012) benefits from Lo-
+RAs trained on SNLI (Bowman et al., 2015) and
+MNLI (Williams et al., 2018)).
+Building on this, LOGO extracts simple yet in-
+formative signals—such as the norm or entropy
+of LoRA activations—from a single forward pass
+with all LoRAs attached. These signals are used to
+identify relevant adapters, which are then merged
+via a weighted sum of activations, where weights
+are determined by the extracted signals.
+We evaluate LOGO on a diverse set of NLP
+benchmarks spanning 27 datasets, including BIG-
+Bench Hard (BBH) (Suzgun et al., 2023), Trans-
+lation (Bojar et al., 2014, 2016),
+Struct-to-
+Text (Gehrmann et al., 2021; Lin et al., 2020;
+Nan et al., 2021; Novikova et al., 2017; Gardent
+et al., 2017), Closed-Book QA (Clark et al., 2018;
+Kwiatkowski et al., 2019; Joshi et al., 2017), and
+Natural Language Inference (Nie et al., 2020; Wang
+et al., 2018). In our experiments, we train Lo-
+RAs for three model families over 260 FLANv2
+tasks (Wei et al., 2022; Chung et al., 2024).
+Results show that LOGO, even without retrain-
+ing or data assumptions, often surpasses training-
+based baselines by up to 3.6% on tasks like Struct-
+to-Text, NLI, while maintaining competitive per-
+formance on the rest. LOGO also preserves com-
+parable throughput during selection, merging, and
+inference. Our analysis confirms that its overhead
+is amortized in long-output tasks such as summa-
+rization or chain-of-thought reasoning, making it
+highly practical. Across different settings, LOGO
+shows consistent performance.
+We release our
+code1 and trained LoRAs2 publicly.
+Our main contributions are summarized as follows:
+• We identify the limitations of existing multiple
+LoRA-based approaches, which rely on labelled
+data availability and additional training, making
+them expensive for real-world deployment.
+• We introduce LoRA on the Go (LOGO), a
+training-free, instance-specific framework that
+dynamically selects and merges suitable LoRAs
+for each input using activations extracted in a
+single forward pass.
+• We conduct extensive experiments on 5 standard
+benchmarks encompassing 27 datasets over 3
+model families, showing that LOGO not only
+outperforms training-based baselines but also has
+comparable throughput.
+2
+Related Work
+Several studies have explored dynamically combin-
+ing multiple LoRA adapters, each trained on differ-
+ent tasks, to handle new inputs. Mixture of LoRAs
+(MoA) trains a router to select a single LoRA (Feng
+et al., 2024), while LoRAHub merges multiple Lo-
+RAs via learning task-specific weights for param-
+eter summation (Huang et al., 2024). Mixture of
+LoRA Experts (MoLE) similarly learns weights,
+but applies them to adapter outputs rather than pa-
+rameters (Wu et al., 2024). All of these methods
+assume access to labeled samples from the target
+input distribution and rely on such data to train
+either the router or the merging weights in a task-
+specific manner. However, this assumption rarely
+1https://github.com/archon159/LoGo
+2https://huggingface.co/archon159/
+LoGo-loras-collection
+2
+
+
+holds in practice: inputs usually arrive from diverse
+and unpredictable domains.
+LoRARetriever (Zhao et al., 2024) moves to-
+ward instance-specific adaptation by retrieving rel-
+evant LoRAs using an auxiliary embedding model
+trained on mixed datasets. However, it requires
+training a large embedding model and maintaining
+dataset samples. Extending this framework to new
+LoRAs requires (a) samples from the correspond-
+ing datasets, and (b) re-computing an embedding
+point for the new LoRAs in the existing embedding
+space. This embedding might not be appropriate for
+out-of-domain (OOD) scenarios, e.g. non-English
+tasks. Additionally, it may also tamper with the in-
+domain performance due to entangled embedding
+points with the OOD LoRAs. Hence, the perfor-
+mance of the resulting model may decline when
+the inputs deviate significantly from the training
+distribution of the embedding model.
+Recent contemporaneous works have also con-
+sidered training-free or dynamic LoRA composi-
+tion. K-LoRA (Ouyang et al., 2025) fuses only
+two LoRAs with predefined roles, limiting scal-
+ability to large adapter pools. Decouple and Or-
+thogonalize (Zheng et al., 2025) is data-free but
+requires additional optimization and merges all Lo-
+RAs without selection. LoRAtorio (Foteinopoulou
+et al., 2025) computes patch-level similarity for dif-
+fusion models, incurring per-step overhead. LoRA-
+Flow (Wang et al., 2024) trains a router to compute
+per-token fusion weights, introducing training cost
+and scalability challenges.
+In contrast, LOGO supports instance-specific
+LoRA selection without training or additional data.
+By leveraging adapter activations, it identifies rel-
+evant LoRAs on the fly, eliminating reliance on
+auxiliary models or predefined samples.
+3
+The Proposed LOGO Methodology
+The goal of LOGO is to dynamically select and
+merge the most relevant LoRA adapters for each
+input, without relying on task-specific training. We
+begin by formalizing the problem setting, where
+a pretrained backbone LLM is equipped with a
+pool of LoRA adapters at the scale of hundreds,
+each providing low-rank updates to projection ma-
+trices (Section 3.1). Given a new input, LOGO
+performs a single forward pass with all adapters
+attached, extracts their projection outputs from
+a designated block, and computes signal scores
+(e.g., norms or inverse entropy) from these projec-
+tion outputs to measure adapter relevance. The
+top-scoring adapters are then selected as candi-
+dates (Section 3.2). Next, the selected adapters
+are merged efficiently through a weighted sum of
+their outputs, where the weights are directly deter-
+mined by the extracted signals (Section 3.3). This
+design allows LOGO to adaptively combine multi-
+ple LoRAs on the fly, while maintaining real-time
+efficiency and avoiding any additional training over-
+head. We provide an algorithm that summarizes
+overall procedure of LOGO in Appendix C.
+3.1
+Problem Formulation
+We consider a setting where a pretrained model
+fθ is paired with a set of N LoRA adapters L =
+{Li}N
+i=1, each of which is fine-tuned on a distinct
+task Ti. Given an input sequence x = (x1, ..., xP )
+of length P, the model generates an output se-
+quence y = (yP+1, ..., yP+t) of length t.
+The pretrained model fθ consists of M Trans-
+former blocks B = {Bj}M
+j=1, where each block
+Bj contains a self-attention mechanism with
+head-specific query, key, and value projections,
+and a feed-forward network.
+We denote the
+query and value projection matrices of block
+Bj (we omit head subscripts for sake of clar-
+ity) as W(Q)
+j
+and W(V )
+j
+, respectively. A LoRA
+adapter Li ∈L attaches to the projection matri-
+ces {(W(Q)
+j
+, W(V )
+j
+)}M
+j=1 and introduces low-rank
+updates. For example, for the query projection in
+block Bj, let hj denote the latent input. Then, the
+adapter Li produces an update via a low-rank pro-
+jection ∆W(Q)
+i,j hj, where ∆W(Q)
+i,j = αi,jAi,jBi,j.
+Here, Ai,j and Bi,j are the low-rank matrices of
+LoRA, and αi,j is a scaling factor.
+3.2
+Selection of Instance-specific LoRAs
+To identify the relevant LoRAs for a given input,
+LOGO relies on signals extracted during a single
+forward pass (probe pass) through the base model
+fθ equipped with all available adapters in L. Unlike
+prior approaches that require additional training,
+our method is training-free. The procedure incurs
+only the cost of one token generation, making it
+practical even under real-time constraints.
+Formally, we define the adapter-augmented
+model fθ,L as the base model fθ where every
+adapter Li ∈L is attached to its designated projec-
+tion matrices. Let BT ∈B denote the target block
+from which we extract signals, and let hT be the
+hidden representation entering block BT . For each
+3
+
+
+story
+piqa
+wnli
+mnli
+snli
+paws
+mrpc
+qqp
+sst2
+yelp
+imdb
+sentiment140
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+LoRA Adapter
+story
+piqa
+wnli
+mnli
+snli
+paws
+mrpc
+qqp
+sst2
+yelp
+imdb
+sentiment140
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+Dataset
+Signal Intensity by Norm
+0.0
+0.5
+1.0
+Figure 2: Heatmap illustrating signal patterns across
+LoRA adapters trained on top of the Qwen-2.5-7B back-
+bone. The x-axis represents LoRAs trained on different
+tasks, while the y-axis corresponds to datasets from
+those tasks. Each cell shows the ℓ2 norm of the projec-
+tion outputs. The norm values are min-max normalized
+to [0,1] across datasets for each LoRA. Related task
+clusters are highlighted in red boxes. More results on
+signal intensity are in Appendix A.
+adapter Li ∈L attached to query projection matrix
+W(Q)
+T
+of BT , we define projection output as
+oi,T = ∆W(Q)
+i,T hT ,
+(1)
+where ∆W(Q)
+i,T
+= αi,T Ai,T Bi,T is the low-rank
+update from Li as defined in Section 3.1. From
+each projection, we compute a scalar signal score
+si that quantifies the relevance of adapter Li to the
+given input. Typical examples include the ℓ2 norm,
+si = ∥oi,T ∥2,
+(2)
+or entropy-based measures,
+p(j)
+i,T =
+exp(o(j)
+i,T )
+P
+k exp(o(k)
+i,T )
+, si =
+
+−
+X
+j
+p(j)
+i,T log p(j)
+i,T
+−1
+(3)
+derived from the projection distribution, both of
+which capture how strongly a LoRA adapter re-
+sponds to the input. Intuitively, a larger projec-
+tion norm indicates stronger activation and thus
+greater influence on the model’s output, while
+lower-entropy projections imply more confident
+and focused responses. Hence, these metrics serve
+as natural indicators of adapter relevance. Here,
+we take the reciprocal of entropy so that scores
+are always positive and lower-entropy (i.e., more
+confident) adapters receive larger weights. See Ap-
+pendix B for the theoretical interpretation of norm
+and entropy as signals.
+To examine whether these projection-based sig-
+nals indeed capture task relevance, Fig. 2 demon-
+strates signal intensities across existing LoRA
+adapters (from the pool) and datasets. Each column
+represents a LoRA trained on a specific dataset,
+while each row represents the dataset used for in-
+ference. The heatmap values indicate the normal-
+ized signal (here, norm) when each LoRA is ap-
+plied to samples from different datasets. A clear
+block-diagonal pattern emerges, highlighted with
+red boxes, revealing that similar tasks activate Lo-
+RAs in similar ways. This observation provides
+empirical evidence that the extracted signals reflect
+meaningful semantic relationships among tasks and
+can effectively guide adapter selection without any
+additional training.
+Finally, based on the collection of signals
+{si}N
+i=1, we select the top-k adapter set
+S = TopK
+ {(Li, si)}N
+i=1, k
+
+,
+(4)
+which contains the k adapters with the highest
+scores. This set S serves as the candidate pool
+for merging in the next stage (Section 3.3).
+3.3
+Merging LoRAs
+After selecting the top-k adapters S as described
+in Section 3.2, the next step is to merge them into
+the base model. Following prior work (Zhao et al.,
+2024), we consider two types of merging strategies:
+• Output-based Merging (Mixture). The projec-
+tion outputs {pi,T }i∈S are combined directly at
+the output level. That is, given hidden input hT ,
+the merged projection is formed as a weighted
+sum of the selected adapters’ projections.
+• Parameter-based Merging (Fusion).
+The
+low-rank parameter updates {∆W(Q)
+i,T }i∈S are
+merged into a single fused update, which is then
+re-attached to the base model.
+While both strategies are possible, LOGO adopts
+mixture merging for efficiency. Parameter-based fu-
+sion requires explicit recomputation of the merged
+weight matrices and re-attaching into the model at
+every step, which introduces significant overhead
+in deployment scenarios with many adapters. In
+contrast, output-based merging avoids additional
+overhead of parameter-level operations, since it
+directly discards unselected LoRAs during token
+generation and combines only the projections of
+the selected ones.
+Formally, let si be the signal score of adapter
+Li ∈S extracted from the probe pass. We normal-
+4
+
+
+ize these scores into non-negative weights
+˜wi =
+si
+P
+j∈S sj ,
+i ∈S.
+(5)
+The merged projection is then given by
+omerge =
+X
+i∈S
+˜wi oi,T .
+(6)
+In practice, this weighted summation can be effi-
+ciently implemented by adjusting only the scaling
+factors of the selected adapters, without modifying
+or reloading their parameters. This design enables
+LOGO to adaptively merge multiple LoRAs with
+minimal runtime overhead, while maintaining flex-
+ibility to handle diverse inputs on the fly.
+4
+Experiments
+We conduct extensive experiments to evaluate
+the performance and computational efficiency of
+LOGO. Section 4.1 outlines the experimental setup,
+including the base models, datasets, and baselines.
+Section 4.2 reports the performance of LOGO
+across diverse datasets and in mixed-dataset scenar-
+ios, followed by Section 4.3, which analyzes the
+inference-time throughput of our method.
+4.1
+Evaluation Setup
+Base Models and LoRA Adapters.
+We use
+LLaMA-3.1-8B, Qwen-2.5-7B, and DeepSeek-
+LLM-7B-Base as the base pretrained models in
+our evaluation.
+For each model, we train 260
+LoRA adapters on distinct Flan-v2 tasks (Wei
+et al., 2022; Chung et al., 2024), a scale that covers
+a broad range of practical multi-task deployment
+settings while remaining memory-feasible for the
+probe pass. Then, we evaluate LOGO as well as
+other baseline methods using the corresponding
+pretrained model with these adapters. More details
+on LoRA training are in Appendix D.1. We plan
+to publicly release the adapters trained on all
+pretrained models.
+Datasets.
+We evaluate LOGO on a diverse set of
+benchmarks spanning multiple task categories. For
+BIG-Bench Hard (BBH) (Suzgun et al., 2023),
+we include Boolean Expressions, Causal Judge-
+ment, Formal Fallacies, Navigate, Object Counting,
+Sports Understanding, Web of Lies, and Word Sort-
+ing. For Machine Translation, we use datasets
+from the WMT benchmarks (Bojar et al., 2014,
+2016), including WMT’14 FR→EN, WMT’14
+EN→FR, WMT’16 DE→EN, WMT’16 EN→DE,
+WMT’16 RO→EN, and WMT’16 EN→RO. For
+Struct-to-Text Generation, we adopt datasets
+from the GEM benchmark (Gehrmann et al.,
+2021), including CommonGen (Lin et al., 2020),
+DART (Nan et al., 2021), E2ENLG (Novikova
+et al., 2017), and WebNLG (Gardent et al., 2017).
+For Closed Book Question Answering, we use
+ARC-c, ARC-e (Clark et al., 2018), Natural
+Questions (Kwiatkowski et al., 2019), and Triv-
+iaQA (Joshi et al., 2017). Finally, for Natural Lan-
+guage Inference, we evaluate on ANLI-R1, ANLI-
+R2, ANLI-R3 (Nie et al., 2020), and QNLI (Wang
+et al., 2018). This collection covers reasoning,
+translation, structured generation, question answer-
+ing, and inference tasks, providing a comprehen-
+sive evaluation of LOGO under diverse conditions.
+Baselines.
+We compare LOGO against four base-
+lines: Base, the base pretrained model without
+any LoRA adapters; AdapterSoup (Chronopoulou
+et al., 2023), which selects relevant LoRA adapters
+based on Sentence-BERT similarity between the
+input and the LoRA training datasets, and merges
+them via uniform averaging, LoRAHub (Huang
+et al., 2024), which learns weights to merge the
+parameters of LoRA adapters via weighted sum-
+mation; and LoRARetriever (Zhao et al., 2024),
+which trains an auxiliary language model to retrieve
+the most relevant adapters for a given input based
+on embedding similarity. For LoRARetriever, we
+report results with mixture merging. We use the
+implementation of all baseline methods following
+their guidelines.
+Implementation Details.
+For all baselines, we
+fix the number of selected and merged LoRA
+adapters to 20 as a balanced and computationally
+efficient default that provides sufficient coverage
+of heterogeneous adapter pools, while keeping all
+other hyperparameters consistent with the default
+settings of the respective pretrained models.
+We use the last Transformer block of each model
+as the target block for signal extraction, denoted
+as BT , as instruction-tuned LoRAs primarily mod-
+ify high-level behavioral representations in upper
+layers. Similarly, the signal is extracted from the
+last token of each input sequence, whose hidden
+state directly precedes the model’s predicted re-
+sponse and is thus most informative for capturing
+adapter-induced behavior shifts. Ablation studies
+on the number of selected adapters, the choice of
+Transformer block, the token used for signal ex-
+traction, and the merging method are presented in
+5
+
+
+LLaMA-3.1-8B
+Qwen-2.5-7B
+DeepSeek-LLM-7B-Base
+Task
+Metric
+Base
+Adpater-
+Soup
+LoRAHub
+LoRA-
+Retriever
+LOGO
+(Norm)
+LOGO
+(Entropy)
+Base
+Adapter-
+Soup
+LoRAHub
+LoRA-
+Retriever
+LOGO
+(Norm)
+LOGO
+(Entropy)
+Base
+Adapter-
+Soup
+LoRAHub
+LoRA-
+Retriever
+LOGO
+(Norm)
+LOGO
+(Entropy)
+BBH
+Boolean Expressions
+EM
+58.0
+72.7
+64.5
+76.7
+71.3
+76.7
+76.7
+77.3
+76.7
+77.3
+74.0
+74.7
+66.0
+68.0
+55.9
+66.7
+68.0
+66.0
+Causal Judgement
+EM
+41.4
+48.3
+54.0
+54.0
+48.3
+47.1
+59.8
+59.8
+51.5
+59.8
+62.1
+59.8
+27.6
+49.4
+43.4
+48.3
+48.3
+14.9
+Formal Fallacies
+EM
+25.3
+52.7
+42.7
+49.3
+52.0
+50.0
+53.3
+55.3
+53.2
+56.7
+54.7
+53.3
+0.7
+48.7
+31.7
+48.7
+48.7
+0.0
+Navigate
+EM
+45.3
+54.7
+48.5
+56.7
+50.0
+50.0
+50.7
+50.7
+52.0
+50.7
+50.7
+50.7
+46.0
+52.0
+51.7
+54.0
+51.3
+53.3
+Object Counting
+EM
+35.3
+38.0
+39.1
+20.7
+27.3
+24.0
+41.3
+44.0
+35.2
+40.7
+44.0
+43.3
+46.0
+46.7
+40.9
+44.0
+44.0
+38.7
+Sports Understanding
+EM
+0.0
+8.7
+8.9
+0.0
+1.3
+3.3
+22.7
+76.7
+73.1
+76.7
+80.0
+78.7
+0.0
+0.0
+26.8
+0.0
+0.0
+0.7
+Web-of-lies
+EM
+2.0
+30.7
+21.6
+32.0
+14.7
+26.7
+5.3
+49.3
+41.6
+54.0
+49.3
+51.3
+0.0
+0.0
+13.9
+0.0
+0.0
+0.0
+Word Sorting
+EM
+11.3
+34.7
+16.7
+34.0
+41.3
+42.0
+0.0
+4.7
+1.9
+12.7
+12.0
+9.3
+3.3
+6.0
+4.4
+7.3
+5.3
+1.3
+Average
+27.3
+42.5
+37.0
+40.4
+38.3
+40.0
+38.7
+52.2
+48.1
+53.6
+53.3
+52.6
+23.7
+33.8
+33.6
+33.6
+33.2
+21.9
+Translation
+WMT’14 FR->EN
+BLEU
+27.7
+29.5
+27.1
+28.7
+28.6
+28.6
+28.5
+30.4
+6.0
+30.3
+30.4
+30.3
+26.0
+27.7
+25.4
+27.2
+27.0
+26.5
+WMT’14 EN->FR
+BLEU
+25.3
+27.5
+25.2
+27.7
+27.2
+27.5
+27.8
+28.6
+5.7
+28.8
+28.7
+28.7
+19.3
+22.3
+21.3
+22.2
+22.5
+22.0
+WMT’16 DE->EN
+BLEU
+29.8
+31.5
+29.8
+30.7
+31.0
+30.9
+28.8
+32.0
+9.5
+31.7
+31.5
+31.4
+27.2
+29.2
+27.0
+28.1
+28.6
+27.8
+WMT’16 EN->DE
+BLEU
+20.0
+21.3
+19.4
+21.3
+21.6
+21.8
+20.0
+20.6
+4.2
+20.6
+20.6
+20.6
+12.6
+15.1
+13.9
+14.5
+15.0
+14.3
+WMT’16 RO->EN
+BLEU
+27.9
+28.5
+23.9
+29.1
+28.1
+28.7
+25.5
+28.9
+6.4
+29.1
+28.9
+28.9
+25.9
+27.6
+19.5
+27.1
+26.7
+26.0
+WMT’16 EN->RO
+BLEU
+16.3
+18.0
+16.1
+18.3
+17.7
+18.4
+15.5
+15.8
+1.1
+15.5
+15.7
+15.7
+11.0
+14.1
+12.5
+14.2
+14.1
+13.5
+Average
+24.5
+26.0
+23.6
+25.9
+25.7
+26.0
+24.4
+26.0
+5.5
+26.0
+25.9
+25.9
+20.3
+22.7
+19.9
+22.2
+22.3
+21.7
+Struct-to-Text
+CommonGen
+Rouge-1
+54.8
+55.5
+46.8
+55.5
+56.0
+56.0
+52.3
+54.5
+33.7
+54.7
+54.7
+54.3
+0.0
+52.0
+51.9
+50.8
+52.5
+53.5
+Rouge-2
+23.6
+24.3
+20.4
+24.9
+24.7
+25.0
+21.5
+22.9
+14.0
+23.1
+23.1
+22.5
+0.0
+21.8
+20.9
+21.5
+21.8
+22.7
+Rouge-L
+44.0
+44.6
+38.1
+45.4
+45.5
+45.8
+41.6
+44.4
+27.6
+44.7
+44.8
+44.4
+0.0
+43.3
+42.7
+42.8
+44.0
+44.7
+DART
+Rouge-1
+63.9
+66.3
+53.8
+63.6
+67.6
+68.7
+71.0
+73.0
+4.9
+73.0
+73.2
+73.3
+0.5
+62.2
+61.3
+60.4
+66.5
+50.6
+Rouge-2
+37.9
+39.7
+32.2
+37.6
+40.9
+42.0
+44.2
+47.2
+1.8
+47.1
+47.4
+47.5
+0.3
+36.8
+36.4
+35.4
+40.0
+27.9
+Rouge-L
+47.9
+49.6
+40.7
+48.1
+50.6
+51.4
+53.8
+56.1
+4.5
+55.9
+56.1
+56.0
+0.4
+47.9
+47.3
+46.8
+49.4
+38.1
+E2ENLG
+Rouge-1
+65.4
+67.2
+53.6
+64.7
+69.0
+69.0
+70.0
+71.0
+24.8
+70.9
+71.0
+71.0
+0.0
+60.6
+58.6
+57.8
+65.3
+60.7
+Rouge-2
+35.8
+37.4
+30.0
+35.6
+38.8
+39.0
+41.1
+42.4
+13.8
+42.5
+42.7
+42.6
+0.0
+32.8
+31.9
+30.6
+36.2
+32.2
+Rouge-L
+44.6
+45.8
+36.6
+45.1
+46.9
+46.8
+48.6
+49.6
+18.6
+49.7
+49.8
+49.6
+0.0
+42.9
+42.1
+41.6
+44.9
+42.3
+WebNLG
+Rouge-1
+58.4
+66.8
+64.2
+63.7
+68.1
+69.0
+72.3
+73.1
+18.3
+72.6
+72.6
+72.6
+0.0
+63.4
+54.4
+60.8
+65.7
+55.5
+Rouge-2
+35.8
+40.5
+38.9
+38.2
+41.8
+42.5
+46.4
+47.7
+10.8
+47.1
+46.5
+46.4
+0.0
+39.2
+33.2
+37.8
+40.7
+32.7
+Rouge-L
+45.1
+51.3
+49.5
+49.1
+52.1
+53.1
+55.8
+57.1
+14.7
+56.6
+56.3
+56.3
+0.0
+50.9
+44.0
+48.8
+51.2
+43.7
+Average
+46.4
+49.1
+42.1
+47.6
+50.2
+50.7
+51.6
+53.3
+15.6
+53.2
+53.2
+53.0
+0.1
+46.2
+43.7
+44.6
+48.2
+42.0
+Closed-Book QA
+ARC-c
+EM
+64.7
+67.2
+64.8
+67.9
+69.1
+69.9
+85.9
+86.8
+86.3
+86.9
+86.6
+86.9
+0.0
+43.6
+45.1
+45.1
+33.0
+28.2
+ARC-e
+EM
+78.7
+79.6
+69.4
+79.0
+81.3
+81.2
+91.6
+91.4
+22.3
+91.6
+91.6
+91.6
+0.0
+58.5
+58.0
+56.7
+43.6
+37.2
+Natural Questions
+EM
+5.3
+11.0
+7.1
+12.6
+11.1
+11.7
+4.8
+11.8
+6.8
+12.8
+12.4
+12.3
+8.7
+10.3
+8.9
+10.2
+9.0
+9.1
+Trivia QA
+EM
+12.7
+14.1
+12.2
+15.0
+14.6
+14.5
+6.6
+11.7
+9.1
+11.6
+10.5
+10.8
+10.9
+11.8
+11.4
+12.1
+11.8
+11.3
+Average
+40.4
+43.0
+38.4
+43.6
+44.0
+44.3
+47.2
+50.4
+31.1
+50.7
+50.3
+50.4
+4.9
+31.1
+30.8
+31.0
+24.4
+21.4
+Natural Language Inference (NLI)
+ANLI-R1
+EM
+35.0
+39.9
+35.2
+38.4
+42.0
+42.5
+55.5
+61.5
+58.6
+61.2
+61.3
+61.5
+7.5
+33.4
+12.8
+33.5
+33.6
+33.2
+ANLI-R2
+EM
+32.6
+39.4
+31.4
+40.5
+42.4
+42.8
+45.9
+53.1
+48.9
+53.3
+53.2
+53.7
+8.6
+33.4
+30.2
+33.6
+33.4
+33.1
+ANLI-R3
+EM
+37.3
+40.8
+23.1
+41.9
+43.0
+43.4
+51.2
+54.5
+52.4
+54.2
+54.3
+54.2
+4.0
+33.5
+16.3
+33.4
+33.5
+33.2
+QNLI
+EM
+31.0
+31.0
+41.2
+7.5
+16.3
+19.9
+85.8
+86.2
+46.2
+86.1
+86.1
+86.0
+0.2
+3.4
+4.3
+2.4
+1.4
+4.0
+Average
+34.0
+37.8
+32.7
+32.1
+35.9
+37.2
+59.6
+63.8
+51.5
+63.7
+63.7
+63.8
+5.1
+25.9
+15.9
+25.7
+25.5
+25.9
+Table 1: Performance of LOGO (with norm- and entropy-based signals) compared to baselines across diverse tasks
+on the LLaMA-3.1-8B, Qwen-2.5-7B, and DeepSeek-LLM-7B-Base backbones. The best results are in bold, the
+second-best are underlined, and our results are highlighted with a blue background. For Struct-to-Text tasks, the
+reported average is computed over all ROUGE metrics (Rouge-1, Rouge-2, and Rouge-L).
+Base
+Adapter-
+Soup
+LoRA-
+Hub
+LoRA-
+Retriever
+LOGO
+(Norm)
+LOGO
+(Entropy)
+Code Refinement
+13.8
+41.3
+33.5
+29.2
+46.3
+41.5
+Code Translation: Java to C#
+0.2
+9.1
+9.7
+10.7
+11.2
+10.6
+Code Translation: C# to Java
+1.6
+9.2
+10.4
+9.4
+7.6
+11.7
+Code-to-Text: Java
+1.8
+1.1
+1.5
+1.2
+1.0
+1.1
+Code-to-Text: Python
+1.5
+1.7
+3.2
+1.5
+6.1
+3.7
+Average
+3.8
+12.5
+11.6
+10.4
+14.4
+13.7
+Table 2: Comparison of LOGO with baselines on unseen
+mixed-dataset scenarios using the LLaMA-3.1-8B back-
+bone, evaluated on the CodeXGLUE dataset. The best
+results are in bold, the second-best are underlined, and
+our results are highlighted with a blue background.
+Appendix E.2, which show that LOGO maintains
+stable performance across these configurations. We
+further discuss compatibility with batched infer-
+ence in Appendix D.4.
+4.2
+Evaluation Results
+Main Results
+Table 1 reports the performance
+of LOGO with norm- and entropy-based signals
+compared to baseline methods on LLaMA-3.1-
+8B, Qwen-2.5-7B, and DeepSeek-LLM-7B-Base
+across multiple datasets. LOGO consistently out-
+performs the baselines in many tasks and remains
+competitive in the rest. This outcome is remarkable
+given that LOGO requires no additional training,
+whereas the baseline methods rely on fine-tuning.
+Mixed-dataset Scenario
+To further assess the
+generalization ability of LOGO beyond the training
+domains of the LoRA adapters, we evaluate it on
+CodeXGLUE (Lu et al., 2021), a benchmark com-
+prising diverse programming-language tasks un-
+seen during adapter training. Specifically, we con-
+sider five subtasks: Code Refinement, Code Trans-
+lation (Java→C#), Code Translation (C#→Java),
+Code-to-Text (Java), and Code-to-Text (Python).
+All tasks are evaluated using the BLEU metric.
+As shown in Table 2, LOGO outperforms all
+baselines on average. These results indicate that
+the signal-based selection and merging mechanism
+in LOGO generalizes effectively to unseen domains,
+capturing cross-task relevance even when input
+distributions differ substantially from those of the
+adapters’ training data.
+6
+
+
+Training
+Inference
+LoRA-
+Hub
+Base
+Adapter-
+Soup
+LoRA-
+Hub
+LoRA-
+Retriever
+LOGO
+(Norm)
+LOGO
+(Entropy)
+Boolean Expressions
+24.52
+0.37
+2.27
+1.76
+1.83
+2.87
+1.73
+Causal Judgement
+47.59
+0.32
+0.99
+0.36
+1.91
+1.98
+2.07
+Formal Fallacies
+25.29
+0.44
+0.67
+0.39
+1.85
+1.77
+1.65
+Navigate
+21.87
+0.40
+1.71
+0.92
+1.89
+1.86
+1.97
+Object Counting
+23.63
+0.41
+4.78
+1.57
+2.06
+2.36
+1.75
+Sports Understanding
+16.20
+0.72
+1.24
+0.73
+1.99
+1.86
+1.67
+Web-of-lies
+17.61
+0.38
+1.91
+1.85
+2.38
+1.62
+1.93
+Word Sorting
+17.51
+0.76
+0.83
+1.61
+2.29
+2.32
+2.22
+Average
+24.28
+0.47
+1.80
+1.15
+2.03
+2.08
+1.87
+Table 3: Per-sample inference time (in seconds) of
+LOGO compared with baseline methods for LLaMA-
+3.1-8B model. For LoRAHub, we additionally report
+training time for learning task-specific merging weights.
+4.3
+Computation Time
+We also analyze the computational cost of LOGO
+relative to baseline methods. Table 3 reports per-
+sample inference times on the LLaMA-3.1-8B
+model using a single NVIDIA H100 GPU. As ex-
+pected, the base pretrained model is the fastest,
+since no adapters are attached. LoRAHub intro-
+duces additional overhead and requires training to
+learn task-specific merging weights (24.28 seconds
+on average), which limits its practicality when new
+adapters are frequently introduced.
+LOGO, AdapterSoup, and LoRARetriever ex-
+hibit comparable inference times (∼2 sec/sample),
+reflecting the cost of adapter-level operations.
+Given that AdapterSoup and LoRARetriever re-
+quire maintaining task datasets, and that Lo-
+RARetriever further involves training an auxiliary
+embedding model, these results underscore the
+practicality of LOGO.
+5
+Analysis
+We conduct a series of analyses to gain deeper
+insights into the behavior and design choices of
+LOGO. Section 5.1 examines the alignment be-
+tween merging weights and task similarity. Sec-
+tion 5.2 analyzes the characteristics of selected Lo-
+RAs. Section 5.4 evaluates the memory consump-
+tion and latency introduced by the probe pass in
+our method. Section 5.5 highlights its benefits in
+long-generation scenarios. Appendix E.1 demon-
+strates that applying domain-mismatched LoRA
+adapters can substantially degrade performance,
+Appdneix E.2 provides additional ablation studies
+of LOGO, Appendix E.3 examines the robustness
+of LOGO to adapter quality and rank variations,
+and Appendix E.4 analyzes representational inter-
+ference among the selected adapters.
+0~0.05
+0.05~0.10
+0.10~0.20
+Weight
+0.30
+0.45
+0.60
+Similarity
+(a) Norm
+0~0.05
+0.05~0.10
+0.10~0.20
+Weight
+0.30
+0.45
+0.60
+Similarity
+(b) Entropy
+Figure 3: Alignment between merging weights and task
+similarity of LOGO with (a) norm and (b) entropy as
+signals for BIG-Bench Hard task and DeepSeek-LLM-
+7B-Base.
+0
+50
+100
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+Weight
+Ranking
+1
+2
+3
+4
+5
+(a) LoRA Selection Count
+wiki_hop_original_generate_object
+wiki_bio_what_content
+wiki_bio_key_content
+wiki_bio_comprehension
+trivia_qa_rc
+quac
+math_dataset_algebra__linear_1d
+duorc_SelfRC_build_story_around_qa
+duorc_ParaphraseRC_build_story_around_qa
+ag_news_subset
+0.38
+0.40
+0.42
+0.44
+(b) Task Similarity
+Figure 4: Comparison of (a) LoRA selection count by
+LOGO with Llama-3.1-8B model and (b) task similarity
+for BBH Word Sorting dataset. Each color in the bar
+present the priority of the LoRA when it was selected.
+5.1
+Alignment with Task Similarity
+We examine whether the merging weights produced
+by LOGO align with task similarity. Since weights
+in LOGO are derived from projection-based sig-
+nals, LoRAs trained on similar tasks should assign
+higher weights to each other’s inputs.
+Task similarity is measured as the average cosine
+similarity, computed from the pretrained model’s
+embeddings between the given input and samples
+from the FLAN-v2 dataset. Fig. 3 shows a box
+plot with merging weight on the x-axis and task
+similarity on the y-axis. The results display a clear
+upward trend: LoRAs given larger weights corre-
+spond to more similar tasks. This confirms that
+LOGO’s signal-based weighting not only enables
+efficient merging but also captures semantic rela-
+tions between tasks without additional training.
+7
+
+
+Sample A
+Sample B
+Question
+Sort the following words alphabetically:
+List: thunderclap swab built poland
+Sort the following words alphabetically:
+List: sanhedrin scratchy helical beau
+venezuela awash bessie extricable
+indoeuropean vice pendulum cream animism
+Answer
+built poland swab thunderclap
+animism awash beau bessie cream extricable
+helical indoeuropean pendulum sanhedrin
+scratchy venezuela vice
+(a) Samples from BBH Word Sorting
+Sample A
+Sample B
+Question
+Given a meaning representation,
+write a short and simple sentence
+that contains all the information
+in the meaning representation.
+Meaning Representation:
+[eatType[pub], food[Fast food],
+customer rating[high], area[riverside],
+familyFriendly[no], near[Café Rouge]]
+Given a meaning representation,
+write a short and simple sentence
+that contains all the information
+in the meaning representation.
+Meaning Representation:
+[name[Blue Spice], eatType[pub],
+food[Chinese], area[city centre],
+near[Rainbow Vegetarian Café]]
+Answer
+The Mills is not kid friendly as it is a
+riverside pub near Café Rouge. Its mid
+priced fast food is highly rated.
+Blue Spice, located near Rainbow
+Vegetarian Café in the city centre,
+is a pub that also sells Chinese food.
+Children should not visit.
+(b) Samples from E2ENLG
+Dataset
+Common
+Only in A
+Only in B
+BBH Word Sorting
+wiki_bio_key_content,
+wiki_bio_what_content
+ag_news_subset,
+math_dataset_algebra
+__linear_1d,
+trivia_qa_rc
+duorc_SelfRC_build_
+story_around_qa,
+wiki_bio_comprehension,
+wiki_hop_original_
+generate_object
+E2ENLG
+duorc_ParaphraseRC_
+build_story_around_qa,
+duorc_SelfRC_build_
+story_around_qa,
+wiki_bio_comprehension,
+wiki_bio_key_content,
+wiki_bio_what_content
+N/A
+N/A
+(c) LoRA adapters selected by LOGO
+Table 4: Comparison of top-5 selected LoRA adapters
+for two samples from the BBH Word Sorting and
+E2ENLG dataset. For the E2ENLG dataset, selected
+LoRA adapters are common across both samples.
+5.2
+Analysis of Selected LoRAs
+In this section, we analyze the LoRA adapters se-
+lected by LOGO.
+We employ LOGO with the
+LLaMA-3.1-8B model on the BBH Word Sort-
+ing task and report the selection counts of LoRA
+adapters in Figure 4a. Each color within a bar rep-
+resents the ranking of a LoRA adapter when it was
+selected. Results show that certain LoRA adapters
+are consistently selected across samples, although
+their relative priorities vary considerably. We fur-
+ther compare these selection frequencies with each
+adapter’s task similarity to the BBH Word Sorting
+dataset, as shown in Figure 4b. This confirms that
+LoRAs trained on tasks more similar to the target
+dataset tend to be selected more frequently.
+Anecdotal Examples: We compare the LoRA se-
+lections of LOGO for two samples from the BBH
+Word Sorting and E2ENLG dataset in Table 4. For
+BBH Word Sorting, a small set of general-purpose
+adapters (e.g., wiki_bio family) are consistently ac-
+tivated across both samples. These modules are typ-
+ically associated with reasoning and factual com-
+Task
+Metric
+Base
+Top1-
+Adapter
+Uniform
+Weight
+Similarity-
+based
+LOGO
+BBH
+EM
+27.3
+43.3
+33.9
+43.7
+38.3
+Translation
+BLEU
+24.5
+23.3
+25.1
+25.7
+25.7
+Struct-to-Text
+Rouge
+46.4
+40.7
+48.4
+48.9
+50.2
+Closed-Book QA
+EM
+40.4
+40.2
+42.6
+43.7
+44.0
+NLI
+EM
+34.0
+35.8
+33.0
+38.4
+35.9
+Table 5: Comparison between LOGO and its variants.
+0
+100
+200
+260
+Number of Adapters
+30
+40
+Memory (GB)
+With Adapters
+Base
+(a) Model Parameters
+0
+100
+200
+260
+Number of Adapters
+50
+75
+100
+125
+Memory (MB)
+(b) Activation in Probe Pass
+Figure 5: Memory usage of LOGO for (a) model param-
+eters and (b) activations during the probe pass.
+prehension, providing a general foundation across
+tasks. Beyond these common adapters, Sample A
+relies on adapters related to summarization (e.g.,
+ag_news), which facilitate short and structured out-
+puts. In contrast, Sample B engages modules em-
+phasizing long story generation ability (e.g., duorc
+family). Meanwhile, E2ENLG commonly selects
+general-purpose comprehension modules, as its
+story-generation task involves casual content that
+does not require domain-specific expertise.
+5.3
+Ablation Study
+We conduct an ablation study to evaluate adapter se-
+lection and merging strategies. We compare LOGO
+with its three variants: (1) top-1 adapter selection,
+(2) merging adapters with uniform weights, and (3)
+similarity-based adapter selection and merging. All
+experiments use LLaMA-3.1-8B as backbone, with
+LOGO using the norm-based weighting. Except for
+Base and Top-1, all methods select and merge 20
+LoRAs.
+Table 5 shows that merging multiple adapters
+consistently outperforms top-1 selection, highlight-
+ing the advantage of combining diverse adaptations.
+Uniform-weight merging is consistently weaker
+than LOGO’s signal-weighted merging, indicating
+that the weighting mechanism contributes mean-
+ingfully to performance. Compared to similarity-
+based selection, LOGO achieves competitive or
+better results across task categories while avoiding
+the need to maintain per-task datasets.
+5.4
+Scalability Analysis
+In this section, we analyze the computational and
+memory costs of our probe pass based selection
+8
+
+
+0
+500
+1000
+Number of Tokens
+0.0
+0.1
+0.2
+0.3
+Inference Time Per Token
+LoGo
+Pretrained
+Figure 6: Inference time per token with varying numbers
+of tokens in CNN-DailyMail dataset samples.
+procedure with respect to the total adapter pool
+size N. Note that after selection, LOGO reduces
+the set to the top-k adapters, where k ≪N. All
+subsequent merging and inference therefore incur
+the same cost as using only k adapters concurrently.
+Memory. The overall additional memory overhead
+consists of two components: model parameters and
+activations during the probe pass. Both parame-
+ter memory and activation memory scale linearly
+with the number of adapters (i.e., O(N)), as shown
+in Fig. 5. With LLaMA-3.1-8B and 260 LoRA
+adapters, the total parameter memory was 6.8 GB,
+which is ∼22% of the pretrained model size (30.6
+GB). During the probe pass, we store only a single
+forward activation per probed layer; hence, the ac-
+tivation overhead is 126.7 MB (i.e., less than 1% of
+the pretrained model size) even with 260 adapters.
+We disable KV caching during probing to avoid
+unnecessary memory usage.
+Latency. The probe pass incurs a fixed overhead of
+∼0.005s per adapter, roughly 8.3% of the forward-
+pass time without an adapter (∼0.06s).
+5.5
+Benefits in Long Generation Task
+We analyze how the computational overhead of
+LOGO behaves in long text generations. Experi-
+ments are conducted on the CNN-DailyMail (See
+et al., 2017) dataset using the LLaMA-3.1-8B
+model with an NVIDIA H200 GPU. We measure
+the inference time per token as a function of the
+number of generated tokens, and compare LOGO
+against the pretrained model.
+As shown in Figure 6, the per-token inference
+time of LOGO decreases rapidly as the number of
+generated tokens increases, stabilizing after approx-
+imately 100 tokens. While a gap remains between
+LOGO and the pretrained model, this difference
+reflects the intrinsic overhead of employing LoRA
+adapters. These results indicate that the cost of
+signal extraction at the beginning of generation is
+effectively amortized over longer sequences.
+6
+Conclusion
+We present LoRA on the Go (LOGO), a training-
+free framework that dynamically selects and
+merges LoRA adapters in deployment scenarios
+without any task-specific training. By extracting
+lightweight relevance signals from a single forward
+pass, LOGO identifies the most suitable adapters
+for each input and merges them through signal-
+weighted summation. Experiments across diverse
+NLP benchmarks show that LOGO achieves com-
+parable or better performance than training-based
+baselines, while maintaining inference throughput.
+These results highlight the potential of training-
+free, instance-specific adaptation as a promising
+direction for deploying large language models in
+real-world, heterogeneous environments.
+Limitations
+While LOGO demonstrates strong performance
+without any task-specific training, several lim-
+itations remain.
+First, our approach relies on
+projection-based signals extracted from a single
+forward pass. Although effective in practice, this
+mechanism does not guarantee that the selected
+adapters always align with task relevance, particu-
+larly in highly out-of-distribution scenarios.
+Second, while the probe-based signals implicitly
+integrate multiple dimensions of relevance through
+forward activations, they do not explicitly disen-
+tangle factors such as topic, style, or skill. Ex-
+ploring richer signals (e.g., multi-layer probes or
+attention-based signals) for finer-grained relevance
+decomposition is an interesting direction for future
+work.
+Third, our experiments primarily use adapters
+fine-tuned on the FLAN-v2 dataset. Extending
+evaluation to LoRAs trained on diverse domains
+(e.g., multimodal, or low-resource data) would help
+assess generality.
+Fourth, the current framework assumes access
+to a shared pretrained model and a large pool of
+LoRA adapters. Attaching many adapters simulta-
+neously can increase memory usage and slow in-
+ference. Furthermore, the probe pass introduces an
+additional forward computation, which increases
+the time to first token—particularly in short-text
+generation scenarios where the overhead cannot be
+amortized over longer outputs. Since the additional
+cost stems from low-rank projection operations, it
+is substantially cheaper than the base model’s at-
+tention and MLP layers, and can be further reduced
+9
+
+
+through practical optimizations such as caching
+probe results for repeated inputs, top-k preselec-
+tion, or early-exit probing.
+Fifth, the current framework does not account
+for redundancy within the adapter pool, which may
+lead to inefficient memory usage and suboptimal
+selection when multiple adapters encode similar
+representations. Addressing this through pool com-
+pression strategies, such as filtering adapters with
+redundant activation signals, pruning, or selective
+loading, remains an important direction for future
+work.
+References
+Xiao Bi, Deli Chen, Guanting Chen, Shanhuang Chen,
+Damai Dai, Chengqi Deng, Honghui Ding, Kai Dong,
+Qiushi Du, Zhe Fu, and 1 others. 2024. Deepseek llm:
+Scaling open-source language models with longter-
+mism. arXiv preprint arXiv:2401.02954.
+Ondˇrej Bojar, Christian Buck, Christian Federmann,
+Barry Haddow, Philipp Koehn, Johannes Leveling,
+Christof Monz, Pavel Pecina, Matt Post, Herve Saint-
+Amand, and 1 others. 2014. Findings of the 2014
+workshop on statistical machine translation.
+Ondˇrej Bojar, Rajen Chatterjee, Christian Federmann,
+Yvette Graham, Barry Haddow, Matthias Huck, An-
+tonio Jimeno Yepes, Philipp Koehn, Varvara Lo-
+gacheva, Christof Monz, Matteo Negri, Aurélie
+Névéol, Mariana Neves, Martin Popel, Matt Post,
+Raphael Rubino, Carolina Scarton, Lucia Specia,
+Marco Turchi, and 2 others. 2016. Findings of the
+2016 conference on machine translation. In Proceed-
+ings of the First Conference on Machine Translation:
+Volume 2, Shared Task Papers.
+Samuel R. Bowman, Gabor Angeli, Christopher Potts,
+and Christopher D. Manning. 2015. A large anno-
+tated corpus for learning natural language inference.
+In Proceedings of the 2015 Conference on Empirical
+Methods in Natural Language Processing (EMNLP),
+pages 632–642. Association for Computational Lin-
+guistics.
+Alexandra Chronopoulou, Matthew E Peters, Alexander
+Fraser, and Jesse Dodge. 2023. Adaptersoup: Weight
+averaging to improve generalization of pretrained
+language models. In Findings of the Association
+for Computational Linguistics: EACL 2023, pages
+2054–2063.
+Hyung Won Chung, Le Hou, Shayne Longpre, Barret
+Zoph, Yi Tay, William Fedus, Yunxuan Li, Xuezhi
+Wang, Mostafa Dehghani, Siddhartha Brahma, and
+1 others. 2024. Scaling instruction-finetuned lan-
+guage models. Journal of Machine Learning Re-
+search, 25(70):1–53.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. 2018. Think you have solved question an-
+swering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,
+Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+Akhil Mathur, Alan Schelten, Amy Yang, Angela
+Fan, and 1 others. 2024. The llama 3 herd of models.
+arXiv e-prints, pages arXiv–2407.
+Wenfeng Feng, Chuzhan Hao, Yuewei Zhang, Yu Han,
+and Hao Wang. 2024. Mixture-of-loras: An efficient
+multitask tuning for large language models. COL-
+ING.
+Niki Foteinopoulou, Ignas Budvytis, and Stephan Li-
+wicki. 2025. Loratorio: An intrinsic approach to lora
+skill composition. arXiv preprint arXiv:2508.11624.
+Claire Gardent, Anastasia Shimorina, Shashi Narayan,
+and Laura Perez-Beltrachini. 2017. Creating training
+corpora for nlg micro-planning.
+Sebastian Gehrmann, Tosin Adewumi, Karmanya
+Aggarwal,
+Pawan
+Sasanka
+Ammanamanchi,
+Anuoluwapo
+Aremu,
+Antoine
+Bosselut,
+Khy-
+athi Raghavi Chandu, Miruna Clinciu, Dipanjan
+Das, Kaustubh Dhole, and 1 others. 2021.
+The
+gem benchmark: Natural language generation, its
+evaluation and metrics.
+Google Gemini. 2023.
+Gemini.
+https://gemini.
+google.com/.
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski,
+Bruna Morrone, Quentin De Laroussilhe, Andrea
+Gesmundo, Mona Attariyan, and Sylvain Gelly. 2019.
+Parameter-efficient transfer learning for nlp. ICML.
+Edward J Hu, Phillip Wallis, Zeyuan Allen-Zhu,
+Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen,
+and 1 others. 2022. Lora: Low-rank adaptation of
+large language models. ICLR.
+Chengsong Huang, Qian Liu, Bill Yuchen Lin, Tianyu
+Pang, Chao Du, and Min Lin. 2024. Lorahub: Effi-
+cient cross-task generalization via dynamic lora com-
+position. ICLR.
+Mandar Joshi, Eunsol Choi, Daniel S Weld, and Luke
+Zettlemoyer. 2017. Triviaqa: A large scale distantly
+supervised challenge dataset for reading comprehen-
+sion. In Proceedings of the 55th Annual Meeting of
+the Association for Computational Linguistics (Vol-
+ume 1: Long Papers).
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Red-
+field, Michael Collins, Ankur Parikh, Chris Alberti,
+Danielle Epstein, Illia Polosukhin, Jacob Devlin, Ken-
+ton Lee, and 1 others. 2019. Natural questions: A
+benchmark for question answering research.
+Hector Levesque, Ernest Davis, and Leora Morgenstern.
+2012. The winograd schema challenge. In Thirteenth
+International Conference on Principles of Knowledge
+Representation and Reasoning (KR).
+10
+
+
+Xiang Lisa Li and Percy Liang. 2021. Prefix-tuning:
+Optimizing continuous prompts for generation. ACL.
+Bill Yuchen Lin, Wangchunshu Zhou, Ming Shen, Pei
+Zhou, Chandra Bhagavatula, Yejin Choi, and Xiang
+Ren. 2020. Commongen: A constrained text genera-
+tion challenge for generative commonsense reason-
+ing.
+Haokun Liu, Derek Tam, Mohammed Muqeeth, Jay Mo-
+hta, Tenghao Huang, Mohit Bansal, and Colin A Raf-
+fel. 2022. Few-shot parameter-efficient fine-tuning is
+better and cheaper than in-context learning. NeurIPS.
+Shuai Lu, Daya Guo, Shuo Ren, Junjie Huang, Alexey
+Svyatkovskiy, Ambrosio Blanco, Colin Clement,
+Dawn Drain, Daxin Jiang, Duyu Tang, and 1 others.
+2021. Codexglue: A machine learning benchmark
+dataset for code understanding and generation. In
+Thirty-fifth Conference on Neural Information Pro-
+cessing Systems Datasets and Benchmarks Track
+(Round 1).
+Sourab Mangrulkar, Sylvain Gugger, Lysandre De-
+but, Younes Belkada, Sayak Paul, and Benjamin
+Bossan. 2022.
+PEFT: State-of-the-art parameter-
+efficient fine-tuning methods.
+https://github.
+com/huggingface/peft.
+Microsoft. 2023. Copilot. https://www.microsoft.
+com/en-us/copilot.
+Linyong Nan, Dragomir Radev, Rui Zhang, Amrit
+Rau, Abhinand Sivaprasad, Chiachun Hsieh, Xiangru
+Tang, Aadit Vyas, Neha Verma, Pranav Krishna, and
+1 others. 2021. Dart: Open-domain structured data
+record to text generation.
+Yixin Nie, Adina Williams, Emily Dinan, Mohit Bansal,
+Jason Weston, and Douwe Kiela. 2020. Adversarial
+nli: A new benchmark for natural language under-
+standing.
+Jekaterina Novikova, Ondˇrej Dušek, and Verena Rieser.
+2017. The e2e dataset: New challenges for end-to-
+end generation.
+OpenAI. 2023. Chatgpt. https://chat.openai.com.
+Ziheng Ouyang, Zhen Li, and Qibin Hou. 2025. K-lora:
+Unlocking training-free fusion of any subject and
+style loras. In Proceedings of the Computer Vision
+and Pattern Recognition Conference, pages 13041–
+13050.
+Adam Paszke, Sam Gross, Francisco Massa, Adam
+Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca
+Antiga, Alban Desmaison, Andreas Köpf, Edward
+Yang, Zachary DeVito, Martin Raison, Alykhan Te-
+jani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang,
+and 2 others. 2019. Pytorch: An imperative style,
+high-performance deep learning library. Advances in
+Neural Information Processing Systems, 32.
+Abigail See, Peter J. Liu, and Christopher D. Manning.
+2017. Get to the point: Summarization with pointer-
+generator networks. In Proceedings of the 55th An-
+nual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers).
+Mirac Suzgun, Nathan Scales, Nathanael Schärli, Se-
+bastian Gehrmann, Yi Tay, Hyung Won Chung,
+Aakanksha Chowdhery, Quoc V Le, Ed H Chi, Denny
+Zhou, and 1 others. 2023. Challenging big-bench
+tasks and whether chain-of-thought can solve them.
+Alex Wang, Amanpreet Singh, Julian Michael, Felix
+Hill, Omer Levy, and Samuel Bowman. 2018. Glue:
+A multi-task benchmark and analysis platform for
+natural language understanding.
+Hanqing Wang, Bowen Ping, Shuo Wang, Xu Han, Yun
+Chen, Zhiyuan Liu, and Maosong Sun. 2024. Lora-
+flow: Dynamic lora fusion for large language models
+in generative tasks. In Proceedings of the 62nd An-
+nual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 12871–
+12882.
+Jason Wei, Maarten Bosma, Vincent Zhao, Kelvin Guu,
+Adams Wei Yu, Brian Lester, Nan Du, Andrew M
+Dai, and Quoc V Le. 2022.
+Finetuned language
+models are zero-shot learners. ICLR.
+Adina Williams, Nikita Nangia, and Samuel R. Bow-
+man. 2018.
+A broad-coverage challenge corpus
+for sentence understanding through inference. In
+Proceedings of the 2018 Conference on Empirical
+Methods in Natural Language Processing (EMNLP),
+pages 1112–1122. Association for Computational
+Linguistics.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clément Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz,
+Joe Davison, Sam Shleifer, Patrick von Platen, Clara
+Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven
+Le Scao, Sylvain Gugger, and 3 others. 2020. Hug-
+gingface’s transformers: State-of-the-art natural lan-
+guage processing. arXiv preprint arXiv:1910.03771.
+Also available at https://huggingface.co.
+Xun Wu, Shaohan Huang, and Furu Wei. 2024. Mixture
+of lora experts. ICLR.
+Ziyu Zhao, Leilei Gan, Guoyin Wang, Wangchunshu
+Zhou, Hongxia Yang, Kun Kuang, and Fei Wu. 2024.
+Loraretriever: Input-aware lora retrieval and compo-
+sition for mixed tasks in the wild. ACL.
+Shenghe Zheng, Hongzhi Wang, Chenyu Huang, Xi-
+aohui Wang, Tao Chen, Jiayuan Fan, Shuyue Hu,
+and Peng Ye. 2025. Decouple and orthogonalize: A
+data-free framework for lora merging. arXiv preprint
+arXiv:2505.15875.
+11
+
+
+Overview of Appendix Sections
+• Appendix A: Signals from LoRA Projections
+• Appendix B: Theoretical Background of
+Projection-based Signals
+• Appendix C: The LOGO Algorithm
+• Appendix D: Additional Details on Experi-
+ments
+• Appendix E: Additional Results
+A
+Signals from LoRA Projections
+We analyze the signal intensity of LoRA projec-
+tions across datasets for the LLaMA-3.1-8B and
+Qwen-2.5-7B models, using both norm and en-
+tropy as metrics. Fig. 7 presents a heatmap where
+columns correspond to LoRAs trained on different
+tasks and rows correspond to datasets from those
+tasks. Clear block structures emerge, with related
+tasks highlighted by red boxes, suggesting that sim-
+ilar tasks activate LoRAs in similar ways.
+B
+Theoretical Background of Signals
+Our choice of signals is grounded in empirical find-
+ings from the LoRA projection, which we comple-
+ment with a theoretical background of their distinct
+roles below.
+Norm.
+Let z denote the activation at the last
+Transformer block of the base model, ∆z the
+LoRA-induced activation update at that layer, and
+L the cross-entropy loss. A first-order Taylor ex-
+pansion gives,
+L(z + ∆z) ≈L(z) + ∇zL⊤∆z.
+(7)
+Thus, the potential loss change depends on both the
+magnitude of ∆z and its alignment with the loss
+gradient. By the Cauchy–Schwarz inequality,
+∇zL⊤∆z
+ ≤∥∇zL∥∥∆z∥.
+(8)
+This provides a first-order justification for using
+∥∆z∥, the norm of Lora update, as a proxy for the
+potential influence of an adapter on the loss.
+Entropy.
+Unlike the norm, entropy does not pro-
+vide a direct bound on the loss change nor guaran-
+tee alignment with the loss gradient. Instead, it re-
+flects the structural concentration of the activation
+update. Low-entropy updates correspond to con-
+centrated, decisive modifications along a small sub-
+set of activation dimensions, whereas high-entropy
+updates introduce noisy perturbations.
+C
+The LOGO Algorithm
+Algorithm 1 summarizes the overall procedure of
+LOGO.
+Algorithm 1 LOGO: Dynamic Selection and Merg-
+ing of LoRA Adapters
+1: Input: Hidden input hT at target block BT , N tasks Lo-
+RAs L = {Li}N
+i=1, the respective low rank Q-projection
+update ∆W (Q)
+i,T , top-k parameter k, scoring method
+2: Output: Merged adapter projection omerge
+3: Probe pass: Compute each LoRA’s projection output
+4: for i ←1 . . . N do
+5:
+oi,T ←∆W(Q)
+i,T hT
+6:
+if scoring method = ℓ2 then
+7:
+si ←∥oi,T ∥2
+8:
+else if scoring method = entropy then
+9:
+p ←softmax(oi,T )
+10:
+si ←1/
+
+−P
+j pj log pj
+
+11:
+end if
+12: end for
+13: Adapter selection:
+S ←TopK({(Li, si)}, k)
+14: Normalize weights ˜wi = si/ P
+j∈S sj for each Li ∈S
+15: Output-based merging:
+16: omerge ←P
+i∈S ˜wioi,T
+17: return omerge
+D
+Additional Details on Experiments
+D.1
+Details on LoRA Training
+We split each Flan-v2 dataset into training, valida-
+tion, and test sets with an 8:1:1 ratio. We trained
+the LoRA adapter with a per-device batch size of
+4 and gradient accumulation of 16, resulting in an
+effective batch size of 64. The learning rate was
+set to 2 × 10−4, and training was conducted for 20
+epochs. The best model checkpoint was selected
+based on validation loss. A full list of the Flan-v2
+datasets used for training is provided in Table 6.
+D.2
+Implementation Details
+We implement LOGO based on Pytorch (Paszke
+et al., 2019), Huggingface (Wolf et al., 2020), and
+PeFT library (Mangrulkar et al., 2022). Specifi-
+cally we utilize PeftMixedModel class, which al-
+lows multiple adapters simultaneously and control
+their scales. We fix the number of selected and
+merged LoRA adapters to 20, while keeping all
+other hyperparameters consistent with the default
+settings of the respective pretrained models used
+in our experiments. We use the last Transformer
+block of each model as the target block for sig-
+nal extraction. Similarly, the signal is extracted
+from the last token of each input sequence. Since
+the LoRA adapters are fixed and their respective
+12
+
+
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+LoRA Adapter
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+Dataset
+Signal Intensity by Norm
+0.0
+0.5
+1.0
+(a) LLaMA-3.1-8B signal intensity by norm
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+LoRA Adapter
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+Dataset
+Signal Intensity by Entropy
+0.0
+0.5
+1.0
+(b) LLaMA-3.1-8B signal Intensity by entropy
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+LoRA Adapter
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+Dataset
+Signal Intensity by Norm
+0.0
+0.5
+1.0
+(c) Qwen-2.5-7B signal intensity by norm
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+LoRA Adapter
+nq
+arc-c
+arc-e
+story
+piqa
+coqa
+hellaswag
+definite
+wsc
+cb
+wnli
+mnli
+anli-r1
+anli-r2
+anli-r3
+snli
+qnli
+rte
+paws
+mrpc
+qqp
+cosmos
+record
+multirc
+squad-v1
+squad-v2
+openbookqa
+bool
+drop
+sst2
+yelp
+imdb
+sentiment140
+webnlg
+dart
+e2enlg
+common-gen
+wmt-fr-en
+wmt-cs-en
+wmt-de-en
+wmt-fi-en
+wmt-ro-en
+wmt-ru-en
+wmt-tr-en
+Dataset
+Signal Intensity by Entropy
+0.0
+0.5
+1.0
+(d) Qwen-2.5-7B signal Intensity by entropy
+Figure 7: Heatmaps illustrating signal intensity patterns across LoRA adapters trained on top of the LLaMA-3.1-8B
+and Qwen-2.5-7B backbone. The x-axis represents LoRAs trained on different tasks, while the y-axis corresponds
+to datasets from those tasks. Each cell shows the norm or (1 / entropy) of the projection outputs. The cell values are
+min-max normalized across datasets for each LoRA. The related tasks are highlighted in red boxes.
+Category
+Datasets (Flan-v2 subsets used)
+Question Answering
+adversarial_qa_dbert_*, adversarial_qa_dbidaf_*, adversarial_qa_droberta_*, ai2_arc_ARC-Challenge, ai2_arc_ARC-Easy, bool_q,
+coqa, cosmos_qa, drop, duorc_ParaphraseRC_*, duorc_SelfRC_*, hotpotqa (kilt_tasks_hotpotqa_*), natural_questions_open, open-
+bookqa, qasc_*, quac, quail_*, quarel_*, quartz_*, quoref_*, race_high_*, race_middle_*, ropes_*, sciq_*, squad_v1.1, squad_v2.0,
+trivia_qa_rc, unified_qa_science_inst, web_questions_*, wiki_hop_original_*, wiki_qa_*
+Natural Language Inference
+anli_r1, anli_r2, anli_r3, glue_mnli, glue_rte, glue_wnli, snli, super_glue_cb, super_glue_copa, super_glue_multirc, super_glue_record,
+super_glue_wic, super_glue_wsc.fixed
+Classification / Sentiment
+ag_news_subset,
+amazon_polarity_*,
+app_reviews_*,
+dbpedia_14_*,
+glue_cola,
+glue_mrpc,
+glue_qqp,
+glue_sst2,
+imdb_reviews_plain_text, opinion_abstracts_idebate, opinion_abstracts_rotten_tomatoes, sentiment140, trec, yelp_polarity_reviews
+Commonsense Reasoning
+cos_e_v1.11_*, hellaswag, lambada, piqa, social_i_qa_*, story_cloze_2016, winogrande, wiqa_*
+Summarization / Dialogue
+aeslc, dream_*, gem_wiki_lingua_english_en, samsum, gigaword
+Data-to-Text
+/
+Structured
+Generation
+gem_common_gen, gem_dart, gem_e2e_nlg, gem_web_nlg_en, wiki_bio_*
+Translation
+para_crawl_enes, wmt14_translate_fr-en, wmt16_translate_cs-en, wmt16_translate_de-en, wmt16_translate_fi-en, wmt16_translate_ro-
+en, wmt16_translate_ru-en, wmt16_translate_tr-en
+Miscellaneous / Preprocess-
+ing
+definite_pronoun_resolution,
+fix_punct,
+huggingface,
+math_dataset_algebra__linear_1d,
+opinion_abstracts_*,
+true_case,
+word_segment
+Table 6: Full list of Flan-v2 datasets used for LoRA training, grouped by task category. For brevity, “*” denotes
+multiple variants included in the collection.
+13
+
+
+LoRA Trained on
+Task
+Base
+GSM8K
+MedQA
+WritingPrompts
+GSM8K
+3.8
+14.6
+2.4
+1.4
+MedQA
+0.5
+0.5
+63.1
+0.6
+WritingPrompts
+20.1
+20.6
+20.7
+22.2
+Table 7:
+Performance of domain-specific LoRA
+adapters evaluated across conflicting domains. Accu-
+racy is reported for GSM8K and MedQA; ROUGE-1
+is reported for WritingPrompts. The best results are in
+bold.
+signals (norm and entropy) are deterministic, we
+conduct our experiment over a single run.
+D.3
+Details on Evaluation Datasets
+In our evaluation, we used the designated test split
+of each dataset. When test labels were not available,
+we relied on the validation or development split
+for evaluation. For training LoRAHub, we sam-
+pled five instances from the training split. For the
+BIG-Bench Hard datasets, we followed the same
+train–test split configuration as LoRAHub.
+D.4
+Compatibility with Batched Inference
+Our primary target scenario is heterogeneous or
+streaming inference, where inputs arrive individu-
+ally and task identity is not known a priori. In such
+settings, instance-level selection is the more natural
+choice, but it does not preclude efficient batched
+inference.
+Specifically, selection is implemented as a
+lightweight scoring step over adapter activations
+from a single shared forward pass. Because all
+LoRA adapters can be attached simultaneously,
+their activations and relevance scores can be com-
+puted in parallel using standard batched tensor op-
+erations. Merging is likewise implemented as a
+weighted sum of adapter activations, so instance-
+specific adapter weights do not require separate
+forward passes.
+Thus, the overhead scales linearly with the num-
+ber of adapters but introduces no sequential de-
+pendency across batch elements. In practice, it is
+negligible relative to the base model forward pass
+and is further amortized in long-generation tasks.
+In addition, LOGO requires no retraining, retrieval
+model, or labeled data, simplifying deployment in
+dynamic adapter pools.
+First
+Average
+Last
+BBH
+Translation
+Struct-to-text
+Closed-Book QA
+NLI
+Datasets
+0
+20
+40
+60
+Performance
+(a) Norm
+BBH
+Translation
+Struct-to-text
+Closed-Book QA
+NLI
+Datasets
+0
+20
+40
+60
+Performance
+(b) Entropy
+Figure 8: Performance of LOGO using (a) norm and (b)
+entropy across datasets with different tokens for signal
+extraction, first, average, and last. Here, average denotes
+the mean signal values across all tokens. The last token
+serves as the default setting of our method.
+E
+Additional Results
+E.1
+Cross-Domain Evaluation of LoRAs
+It is known that applying a LoRA adapter to
+out-of-domain inputs can degrade model perfor-
+mance. To empirically verify this, we conduct a
+cross-domain evaluation across three conflicting
+domains: creative writing, mathematical reason-
+ing, and medical QA. Results in Table 7 exhibit
+a clear diagonal pattern – each domain-specific
+adapter performs best on its matched domain, while
+activation on a mismatched domain leads to sub-
+stantial performance degradation, often falling be-
+low the base model.
+This underscores the im-
+portance of accurate instance-level adapter selec-
+tion to prevent harmful interference from domain-
+mismatched adapters.
+E.2
+Additional Ablation Studies
+In this section, we conduct ablation studies on
+LOGO to examine the effects of the token used
+for signal extraction, the number of selected mod-
+ules, the specific block used for signal extrac-
+tion, and merging method. All experiments are
+performed using LOGO with LLaMA-3.1-8B on
+the BIG-Bench Hard, Translation, Struct-to-Text,
+Closed-Book QA, and Natural Language Inference
+tasks. Evaluation metrics are BLEU for translation,
+ROUGE for Struct-to-Text, and Exact Match for
+the other datasets. The reported results are aver-
+aged over each dataset category.
+Token for Signal Extraction
+In LOGO, signals
+are extracted from the projection outputs corre-
+sponding to the last token of the input, which serves
+as our default setting. To investigate the effect
+of this choice, we compare three alternatives: us-
+14
+
+
+BIG-Bench Hard
+Translation
+Struct-to-Text
+Closed-Book QA
+Natural Language Inference
+3
+5
+10
+20
+Number of Modules
+20
+40
+60
+Performance
+(a) Norm
+3
+5
+10
+20
+Number of Modules
+20
+40
+60
+Performance
+(b) Entropy
+Figure 9: Performance of LOGO using (a) norm and
+(b) entropy across datasets with different numbers of
+selected modules.
+BIG-Bench Hard
+Translation
+Struct-to-Text
+Closed-Book QA
+Natural Language Inference
+0
+7
+15
+23
+31
+Block for Signal
+20
+40
+60
+Performance
+(a) Norm
+0
+7
+15
+23
+31
+Block for Signal
+20
+40
+60
+Performance
+(b) Entropy
+Figure 10: Performance of LOGO using (a) norm and
+(b) entropy across datasets with different target block
+for signal extraction.
+ing the first token, the last token, and the aver-
+age across all tokens. Results are shown in Fig. 8,
+which presents bar plots comparing all alternatives.
+Across both norm- and entropy-based scoring, we
+observe that the performance differences between
+token choices are small, indicating that LOGO is
+robust to this design decision. Among the three op-
+tions, however, the last token consistently achieves
+slightly higher performance across most datasets,
+supporting its use as the default configuration in
+our method.
+Number of Selected Modules
+We analyze the
+effect of varying the number of selected mod-
+ules k in LOGO by evaluating performance with
+k ∈3, 5, 10, 20. Fig. 9 presents the results for both
+norm- and entropy-based scoring. Overall, perfor-
+mance improves as the number of selected modules
+increases, but the gains are relatively modest. This
+suggests that LOGO is not highly sensitive to the
+exact choice of k: even with only a few modules,
+it achieves performance close to the larger settings.
+Such robustness further highlights the practicality
+of LOGO, as it enables efficient operation with a
+small number of modules while retaining strong
+performance.
+Block for Signal Extraction
+To assess the sen-
+sitivity of LOGO to the layer from which signals
+Mixture
+Fusion
+BBH
+Translation
+Struct-to-Text
+Closed-Book QA
+NLI
+Datasets
+0
+20
+40
+60
+Performance
+(a) Norm
+BBH
+Translation
+Struct-to-Text
+Closed-Book QA
+NLI
+Datasets
+0
+20
+40
+60
+Performance
+(b) Entropy
+Figure 11: Performance of LOGO using (a) norm and (b)
+entropy across datasets with different merging methods
+– mixture and fusion.
+are extracted, we vary the target Transformer block
+used for signal computation. Specifically, we ex-
+tract projection-based signals from the 0-th, 7-th,
+15-th, 23-rd, and 31-st blocks. Results in Fig. 10
+show minor variations in performance across lay-
+ers, indicating that LOGO is not sensitive to the
+specific block chosen for signal extraction. This
+suggests that task-relevant activation patterns are
+distributed across multiple layers, and that LOGO
+can robustly estimate adapter relevance from vari-
+ous depths without requiring careful layer tuning.
+Analysis on Merging Method
+LOGO adopts the
+mixture as merging strategy, where the projection
+outputs of selected adapters are combined. To as-
+sess this choice, we conduct an ablation study by
+replacing mixture with fusion, which merges the
+parameters of the selected adapters into a single set
+of weights before re-attaching them to the model.
+Results are summarized in Fig. 11, which com-
+pares the two strategies on the LLaMA-3.1-8B
+model across five task categories: BBH, Trans-
+lation, Struct-to-Text, Closed-Book QA, and NLI.
+The reported results are averaged over each dataset
+category.
+Overall, we find that mixture and fusion achieve
+comparable performance across all categories.
+However, fusion requires heavy parameter recom-
+putation and re-attaching at the instance level,
+which introduces a substantial computational bur-
+den in deployment scenarios with large adapter
+pools. In contrast, mixture achieves similar accu-
+racy while incurring much lower computational
+overhead, making it a more practical choice.
+E.3
+Robustness to Adapter Quality and Rank
+Variations
+We study the robustness of LOGO to variations
+in adapter quality and rank. Throughout the pa-
+15
+
+
+per, we use adapters trained under a standardized
+instruction-tuning setup to enable controlled com-
+parisons and isolate the behavior of probe-based
+signals.
+Adapter Quality.
+LOGO’s probe-based signals
+are inherently agnostic to the cause of poor perfor-
+mance. Adapters that are poorly trained or mis-
+aligned with the input tend to exhibit lower activa-
+tion norms or higher-entropy responses, which nat-
+urally results in lower selection frequencies or re-
+duced merging weights. As a consequence, LOGO
+deprioritizes low-quality adapters without supervi-
+sion or task-specific signals.
+To validate this behavior, we construct a mixed
+adapter pool containing both well-trained adapters
+and intentionally under-trained checkpoints. When
+all adapters are well trained, LOGO selects adapters
+from both groups at comparable rates (e.g., 57%
+vs. 43% on BBH tasks). In contrast, when under-
+trained adapters are introduced, LOGO shifts its
+preference strongly toward well-trained adapters
+(e.g., 80% vs. 20%), demonstrating robustness
+to noisy or uneven-quality LoRAs. While under-
+trained adapters are not completely suppressed,
+they are consistently deprioritized by the signals.
+Adapter Rank.
+Higher-rank adapters may, in
+principle, produce larger projection norms due to
+increased representational capacity. Since selec-
+tion is performed comparatively at the instance
+level, such rank-based inflation would only matter
+if it consistently overrides task-alignment signals.
+To empirically assess this, we construct a mixed
+adapter pool of 45 adapters using 15 FLAN-v2
+training datasets, each trained at three different
+ranks (r ∈{8, 16, 32}), and evaluate norm-based
+top-10 selection on BBH. We find that approxi-
+mately 80% of selected adapters belong to training-
+dataset groups with multiple rank variants, indicat-
+ing that selection is primarily driven by training-
+dataset alignment rather than adapter rank.
+E.4
+Representational Interference Between
+LoRAs
+A potential concern when merging multiple LoRA
+adapters is representational interference arising
+from conflicting parameter updates.
+We argue
+that our setting is less susceptible to this issue
+for the following reasons. First, LoRA adapters
+are low-rank updates applied on top of a shared
+frozen backbone, constraining perturbations to low-
+dimensional subspaces and thereby reducing the
+risk of large-scale representational conflict. Sec-
+ond, our method performs instance-level, input-
+conditioned weighting rather than static parameter
+averaging: adapters with stronger relevance sig-
+nals dominate the merged update for a given input,
+while unrelated adapters receive near-zero weights.
+Third, we merge adapter activations during the for-
+ward pass rather than permanently combining pa-
+rameters in weight space, avoiding commitment to
+a single merged parameter state.
+To directly assess potential interference, we ana-
+lyze the adapters that are actually merged, i.e., the
+selected top-20 set. Specifically, we measure the
+proportion of negatively aligned adapter pairs (co-
+sine similarity < 0) within the selected sets at the
+activation level. We find that approximately 16%
+of selected adapter pairs exhibit negative cosine
+similarity, indicating that the majority (84%) are
+non-negatively aligned. Together with the stable
+downstream performance observed across bench-
+marks, this suggests that destructive interference is
+not a dominant effect under the proposed method.
+E.5
+Selected LoRAs
+Figures 12 to 16 show the LoRA adapter selec-
+tion counts by our proposed method, LOGO, with
+LLaMA-3.1-8B model for various datasets.
+16
+
+
+Weight Ranking
+1
+2
+3
+4
+5
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+bbh.boolean_expressions
+(a) BBH Boolean Expressions
+0
+20
+40
+60
+80
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_common_gen
+gem_dart
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_choose_best_object_affirmative_1
+wiki_hop_original_generate_object
+LoRA
+bbh.causal_judgement
+(b) BBH Causal Judgement
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+bbh.formal_fallacies
+(c) BBH Formal Fallacies
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+bbh.navigate
+(d) BBH Navigate
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+bbh.object_counting
+(e) BBH Object Counting
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+bbh.sports_understanding
+(f) BBH Sports Understanding
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+math_dataset_algebra__linear_1d
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+bbh.web_of_lies
+(g) BBH Web-of-lies
+0
+25
+50
+75
+100
+125
+150
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+bbh.word_sorting
+(h) BBH Word Sorting
+Figure 12: The LoRA selection count by LOGO with LLaMA-3.1-8B model for BIG Bench Hard datasets.
+17
+
+
+Weight Ranking
+1
+2
+3
+4
+5
+0
+1000
+2000
+3000
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt14.fr-en
+(a) WMT’14 FR->EN
+0
+1000
+2000
+3000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt14.en-fr
+(b) WMT’14 EN->FR
+0
+500
+1000
+1500
+2000
+2500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt16.de-en
+(c) WMT’16 DE->EN
+0
+500
+1000
+1500
+2000
+2500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt16.en-de
+(d) WMT’16 EN->DE
+0
+500
+1000
+1500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt16.ro-en
+(e) WMT’16 RO->EN
+0
+500
+1000
+1500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+wmt16.en-ro
+(f) WMT’16 EN->RO
+Figure 13: The LoRA selection count by LOGO with LLaMA-3.1-8B model for translation datasets.
+Weight Ranking
+1
+2
+3
+4
+5
+0
+200
+400
+600
+800
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+math_dataset_algebra__linear_1d
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+gem.common_gen
+(a) CommonGen
+0
+1000
+2000
+3000
+4000
+5000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+gem.dart
+(b) DART
+0
+500
+1000
+1500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+gem.e2e_nlg
+(c) E2ENLG
+0
+500
+1000
+1500
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+gem.web_nlg
+(d) WebNLG
+Figure 14: The LoRA selection count by LOGO with LLaMA-3.1-8B model for struct-to-text datasets.
+18
+
+
+Weight Ranking
+1
+2
+3
+4
+5
+0
+200
+400
+600
+800
+1000
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+ai2_arc.ARC-Challenge
+(a) ARC-c
+0
+500
+1000
+1500
+2000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+ai2_arc.ARC-Easy
+(b) ARC-e
+0
+1000
+2000
+3000
+4000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+LoRA
+nq.natural-questions
+(c) Natural Questions
+0
+5000
+10000
+15000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+tqa.rc
+(d) Trivia QA
+Figure 15: The LoRA selection counts by LOGO with LLaMA-3.1-8B model for closed-book QA datasets.
+Weight Ranking
+1
+2
+3
+4
+5
+0
+200
+400
+600
+800
+1000
+Count
+ag_news_subset
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+math_dataset_algebra__linear_1d
+quac
+trivia_qa_rc
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+anli.r1
+(a) ANLI-R1
+0
+200
+400
+600
+800
+1000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+anli.r2
+(b) ANLI-R2
+0
+250
+500
+750
+1000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_choose_best_object_affirmative_1
+wiki_hop_original_generate_object
+LoRA
+anli.r3
+(c) ANLI-R3
+0
+1000
+2000
+3000
+4000
+5000
+Count
+duorc_ParaphraseRC_build_story_around_qa
+duorc_SelfRC_build_story_around_qa
+gem_dart
+quac
+wiki_bio_comprehension
+wiki_bio_key_content
+wiki_bio_what_content
+wiki_hop_original_generate_object
+LoRA
+glue.qnli
+(d) QNLI
+Figure 16: The LoRA selection counts by LOGO with LLaMA-3.1-8B model for NLI datasets.
+19

@@ -1,0 +1,3378 @@
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and
+Per-thread INT4 Quantization
+Jintao Zhang * 1 Haofeng Huang * 1 2 Pengle Zhang 1 Jia Wei 1 Jun Zhu 1 Jianfei Chen 1
+https://github.com/thu-ml/SageAttention
+Abstract
+Although quantization for linear layers has been
+widely used, its application to accelerate the atten-
+tion process remains limited. To further enhance
+the efficiency of attention computation compared
+to SageAttention while maintaining precision, we
+propose SageAttention2, which utilizes sig-
+nificantly faster 4-bit matrix multiplication (Mat-
+mul) alongside additional precision-enhancing
+techniques. First, we propose to quantize matri-
+ces (Q, K) to INT4 in a hardware-friendly thread-
+level granularity and quantize matrices ( eP, V ) to
+FP8. Second, we propose a method to smooth Q,
+enhancing the accuracy of INT4 QK⊤. Third, we
+propose a two-level accumulation strategy for ePV
+to enhance the accuracy of FP8 ePV . The oper-
+ations per second (OPS) of SageAttention2
+surpass FlashAttention2 and xformers by about
+3x and 4.5x.
+Moreover, SageAttention2
+matches the speed of FlashAttention3(fp8) on the
+Hopper GPUs, while delivering much higher ac-
+curacy. Comprehensive experiments confirm that
+our approach incurs negligible end-to-end met-
+rics loss across diverse models, including those
+for language, image, and video generation. The
+code is available at https://github.com/
+thu-ml/SageAttention.
+1. Introduction
+Due to the quadratic time complexity of attention, its effi-
+cient implementation becomes crucial as sequence lengths
+*Equal contribution
+1Dept. of Comp. Sci. and Tech., Insti-
+tute for AI, BNRist Center, THBI Lab, Tsinghua-Bosch Joint ML
+Center, Tsinghua University 2Institute for Interdisciplinary Infor-
+mation Sciences, Tsinghua University. Correspondence to: Jianfei
+Chen <jianfeic@tsinghua.edu.cn>.
+Proceedings of the 42 nd International Conference on Machine
+Learning, Vancouver, Canada. PMLR 267, 2025. Copyright 2025
+by the author(s).
+increase in real-world applications (Jiang et al., 2024; Zhang
+et al., 2025b). Several strategies have been developed to
+mitigate the computational demands of attention —such as
+(1) Linear attention methods (Wang et al., 2020; Choro-
+manski et al., 2021; Yu et al., 2022; Katharopoulos et al.,
+2020) that reduce complexity to O(N) and (2) Sparse at-
+tention methods (Liu et al., 2021; Chu et al., 2021; Li et al.,
+2022; Xiao et al., 2024b;a; Chen et al., 2024; Jiang et al.,
+2024; Venkataramanan et al., 2024; Gao et al., 2024; Fu
+et al., 2024; Zhang et al., 2025e; Xi et al., 2025; Yang et al.,
+2025a; Zhang et al., 2025f;h;i) that selectively process parts
+of the context — these methods are only suitable for a lim-
+ited range of models and tasks. The widely used attention
+methods optimize attention by exploiting hardware capaci-
+ties, such as FlashAttention V1, V2, V3 (Dao et al., 2022;
+Dao, 2024; Shah et al., 2024), xformers (Lefaudeux et al.,
+2022), and SageAttention (Zhang et al., 2025c;d;g;a). These
+works do not omit computations across the entire sequence
+and achieve impressive speed and accuracy performance
+across various tasks.
+Motivation. For the two matrix multiplication (Matmul)
+operations in attention: QK⊤and ePV , SageAttention ac-
+celerates them by quantizing the QK⊤to INT8 and uses
+FP16 Matmul with FP16 accumulators for ePV . More-
+over, to maintain attention accuracy, SageAttention pro-
+poses smoothing K by eliminating its channel-wise out-
+liers. SageAttention achieves 2 × speedup compared with
+FlashAttention2 and is the first quantized attention that in-
+curs a negligible end-to-end metrics loss across language,
+image, and video generation models. However, SageAt-
+tention has two weaknesses. (W1) INT8 Matmul achieves
+only half the speed of INT4. (W2) FP16 Matmul with FP16
+accumulators provides a speedup only on RTX 4090 and
+RTX 3090 GPUs. To leverage the faster INT4 tensor cores
+for QK⊤and using a method that can accelerate ePV on
+a broader range of GPUs, we propose to quantize Q, K to
+INT4 and eP, V to FP8.
+Challenges. Quantizing Q, K to INT4 and eP, V to FP8
+presents significant challenges. For example, when only per-
+tensor quantizing Q, K to INT4, the text-to-video model
+CogvideoX will generate a completely blurry video, and
+1
+arXiv:2411.10958v7  [cs.LG]  1 Oct 2025
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+L20
+3x
+163
+481
+RTX4090
+SageAttention2
+FlashAttention2
+23s
+39s
+1.7x
+FlashAttention2: 
+End-to-End Latency: 
+1040s on RTX4090 
+SageAttention2: 
+End-to-End Latency: 
+577s on RTX4090
+1.8x Speedup 
+Figure 1. The upper left figure shows the kernel speedup on RTX4090 GPU. The upper right figure shows the end-to-end inference
+speedup of generating the first token and performance metrics for the Needle-in-a-Haystack task (Kamradt, 2023) with a sequence length
+of 100K on Llama3.1 on L20 GPU. The figure below shows two videos generated by CogvideoX (1.5-5B) using FlashAttention2 and
+SageAttention2 on RTX4090, showing that SageAttention2 accelerates generation by 1.8x with no video quality loss.
+Llama3 only achieves a random-guessing-level accuracy
+of 25% on MMLU. After an in-depth investigation, we
+identified three primary challenges: (C1) The numerical
+range of INT4 is quite limited compared to FP16 or INT8,
+leading to significant quantization errors when Q and K
+have some abnormal values. (C2) We discover that the
+FP32 accumulator designed for FP8 matrix multiplication in
+the tensor core (mma.f32.f8.f8.f32) is actually FP22,
+specifically with 1 sign bit, 8 exponent bits, and 13 mantissa
+bits. This will lead to an accuracy loss of ePV .
+Our approach. To address (C1), we first discover that the
+per-block quantization of Q, K in SageAttention does not
+achieve sufficient accuracy for INT4 quantization. Simul-
+taneously, to avoid the extra latency caused by per-token
+dequantization, where each GPU thread corresponds to mul-
+tiple quantization scales, we propose an adequately precise
+quantization method that incurs no additional dequantization
+overhead. Specifically, we introduce a per-thread quanti-
+zation approach based on the mapping between the GPU
+threads and the memory layout of matrices as dictated by
+the PTX mma instructions. This method groups tokens cor-
+responding to the same thread for quantization and dequan-
+tization, ensuring that each thread is associated with a single
+quantization scale. This approach achieves much better ac-
+curacy performance than per-block quantization with no
+additional dequantization overhead. Second, for the signifi-
+cant channel-wise outliers in matrices Q and K, we adopt
+smoothing K in SageAttention and further propose an effec-
+tive method to remove these outliers in Q. Specifically, we
+propose subtracting the average value of the channel dimen-
+sion of Q, referred to as −→
+Qm. Then, we add −→
+QmK after
+the QK⊤Matmul to ensure the correctness of the attention
+computation. To address (C2), the accuracy loss caused by
+the 22-bit accumulator for FP8 Matmul of ePV , we propose
+a two-level accumulation strategy that uses an FP32 buffer
+to accumulate the values from the 22-bit accumulator after
+each block Matmul of ePV . This method confines the errors
+to the block range. Additionally, we design an optional
+technique to enhance the accuracy of the 22-bit accumulator.
+Specifically, we could smooth V by subtracting the average
+value of its channel dimension and adding the subtracted
+item to the attention output to maintain the correctness.
+Performance. We offer a high-performance implementation
+of SageAttention2 on RTX4090 and L20 GPUs. This
+implementation achieves a peak performance of 481 TOPS
+on the RTX4090, outperforming FlashAttention2 and xform-
+ers by approximately 3x and 4.5x, respectively. To support
+NVIDIA Hopper GPUs, which lack native INT4 tensor core
+support, we additionally provide SageAttention2-8b,
+a variant that quantizes Q, K to INT8. FlashAttention3, in
+contrast, is tailored to and only compatible with the Hopper
+architecture. Moreover, SageAttention2-8b matches
+the speed of FlashAttention3(fp8) on Hopper GPUs, while
+delivering much better accuracy. For example, on popu-
+lar video generation models, our method does not compro-
+mise end-to-end accuracy, whereas FlashAttention3(fp8)
+brings noticeable degradation, as visualized in Fig. 7 and
+9.
+We extensively evaluate the end-to-end metrics of
+state-of-the-art text, image, and video generation models.
+SageAttention2 can accelerate models in a plug-and-
+2
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+play way with negligible loss in end-to-end metrics.
+2. Preliminary
+2.1. FlashAttention
+The attention computation can be formulated as: S =
+QK⊤/
+√
+d, P
+= σ(S), O = PV , where σ(S)ij =
+exp(Sij)/ P
+k exp(Sik). The matrices Q, K, and V each
+have dimensionality N × d, and S, P are N × N. d is
+typically small, e.g., 64 or 128, and N can be thousands or
+millions. The time complexity of attention is O(N 2), pri-
+marily due to two matrix multiplications (QK⊤and PV ),
+both with complexities of O(N 2d). FlashAttention (Dao,
+2024) is a GPU-friendly attention implementation, which
+tiles Q, K, and V from the token dimension into blocks
+{Qi}nq
+i=1, {Ki}nk
+i=q, {Vi}nv
+i=1 with block sizes of bq, bk, bv
+tokens, respectively, where nq, nk, nv are the number of
+tiles, and bk = bv. FlashAttention computes the output ma-
+trix O in parallel in tiles. Each streaming multiprocessor
+(SM) computes a block Oi (corresponds to a Qi) by itera-
+tively loads Kj, Vj for each j, and update the output with
+online softmax (Milakov & Gimelshein, 2018):
+Sij =QiK⊤
+j /
+√
+d, (mij, ePij) = ˜σ(mi,j−1, Sij),
+(1)
+lij = exp(mi,j−1 −mij)li,j−1 + rowsum( ePij),
+Oij =diag (exp(mi,j−1 −mij)) Oi,j−1 + ePijVj,
+where mij and lij are bq-dimenalional vectors, initialized
+with −∞and 0 respectively. ˜σ(·) is an online softmax
+operator: mij = max{mi,j−1, rowmax(Sij)},
+ePij =
+exp(Sij −mij). Finally, the output is computed as Oi =
+diag(li,nq)−1Oi,nq.
+2.2. Quantization
+A matrix multiplication C = AB can be accelerated with
+quantization as:
+(δA, ˆA) = ψ(A), (δB, ˆB) = ψ(B), C = ψ−1
+δAδB( ˆA ˆB)
+ψ is a quantizer which converts a high-precision (e.g.,
+FP32 or FP16) matrix A to a low-precision format ˆA
+(e.g., INT4 or FP8) with a scale δA, and ψ−1 is a de-
+quantizer to convert back to high-precision. We should
+have ψ−1
+δA ( ˆA) ≈A. The actual matrix multiplication ˆA ˆB
+is performed with low precision. In modern GPUs, low-
+precision matrix multiplication is usually multiple times
+faster than higher-precision ones. Quantizers differ in nu-
+merical format and granularity, e.g., how many elements
+(“quantization group”) share a common scale factor. For
+example, an INT4, per-tensor quantizer first computes the
+scale as the maximum absolute value of the entire tensor,
+scales the elements to the maximum representable range
+of INT4 [-7, +7], and then casts to INT4 with rounding:
+ˆA = ⌈A/δA⌋, δA = max(|A|)/7. The dequantization pro-
+cess is an element-wise scaling. For example, for per-tensor
+dequantization, ψ−1
+δAδB( ˆA ˆB) = ˆA ˆB × δAδB.
+Table 1. Speedup compared to matrix multiplication in FP16 with
+an FP32 accumulator.
+GPU
+MM Input
+MM Accumulator
+Speedup
+RTX4090
+FP16
+FP16
+2x
+FP8
+FP32
+2x
+L40, L20
+H100
+FP16
+FP16
+1x
+FP8
+FP32
+2x
+2.3. SageAttention
+Based on the block tiling in FlashAttention (Dao et al.,
+2022), SageAttention (Zhang et al., 2025c) quantizes Q, K
+to INT8 in a per-block granularity, that is, each Qi, Ki
+has a separate scalar scale: δQi = max(|Qi|)/127, δKj =
+max(|Kj|)/127. In this way, the product Sij in Eq. (1)
+can be approximated as Sij ≈ˆQi ˆK⊤
+j × (δQiδKj/
+√
+d). To
+maintain accuracy, SageAttention proposes a preprocess-
+ing technique by subtracting the token-wise mean from K.
+Additionally, SageAttention keeps ePij and Vj in FP16, but
+utilizes an FP16 accumulator (rather than FP32) for com-
+puting the product ePijVj. Reducing accumulator precision
+can accelerate matrix multiplication (MM) on the RTX4090
+GPU. However, other GPUs, such as L20, L40, or H100, do
+not exhibit this behavior, as shown in Table 1.
+3. SageAttention2
+In this section, we introduce SageAttention2, an efficient
+and accurate quantized attention. The workflow of SageAt-
+tention2 is shown in Fig. 3. We quantize Q, K to INT4
+and ˜P, V to FP8 to maximize the efficiency and propose
+several techniques, including QK-smoothing, per-thread
+quantization, and two-level accumulation to preserve the
+accuracy, which we shall discuss in subsequent subsections.
+3.1. Smooth Q
+First, we discuss how to accurately compute QK⊤with
+INT4. The numerical range of INT4 is notably restrictive.
+This affects quantization due to the presence of outliers (Lin
+et al., 2025). Given the INT4 range [-7, +7], any element
+will be quantized to zero if it is more than 14 times (0.5
+vs 7) smaller than the largest element in the group. Since
+outliers are much larger than other elements, it is likely that
+many non-outlier elements are quantized to zero, leading
+to substantial accuracy degradation. Therefore, to keep the
+quantization accurate, we need to keep the largest element
+small, making the magnitude of elements as uniform as
+possible. Such technique is called smoothing.
+Here, we propose a smoothing technique inspired by
+3
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Figure 2. Typical examples of tensors’ data distribution in attention.
+VF P 16
+QF P 16
+KF P 16
+Per-thread Quantization
+Qmean
+Kmean
+|
+|
+=
+=
+QINT 4
+">AB73icbVDLSgNBEOyJrxhfUY9eBoPgKeyKr2PQiyJIhLwgWcLsZDYZMju7zswKYclPePGgiFd/x5t/4yTZgyYWNBRV3XR3+b
+Hg2jON8otLa+sruXCxubW9s7xd29ho4SRVmdRiJSLZ9oJrhkdcONYK1YMRL6gjX94fXEbz4xpXka2YUMy8kfckDTomxUum
+97e107H3WLJKTtT4EXiZqQEGard4lenF9EkZNJQbRu05svJQow6lg40In0SwmdEj6rG2pJCHTXjq9d4yPrNLDQaRsSYOn6u+Jl
+IRaj0LfdobEDPS8NxH/89qJCS69lMs4MUzS2aIgEdhEePI87nHFqBEjSwhV3N6K6YAoQo2NqGBDcOdfXiSNk7J7Xj57OC1VrI48
+nAh3AMLlxABW6gCnWgIOAZXuENPaIX9I4+Zq05lM3swx+gzx9sZo+V</latexit>KINT 4
+VF P 8
+Per-channel Quantization
+SageAttention2 Kernel
+O
+sq
+sk
+sv
+Mat
+Mul
+KF P 16
+QF P 16
+|
+Vmean
+">AB73icbVDLSgNBEOyNrxhfUY9eBoPgKeyKRo9BQTxGMA9IljA7mSRDZmfXmV4hLPkJLx4U8ervePNvnCR70MSChqKqm+6uIJ
+bCoOt+O7mV1bX1jfxmYWt7Z3evuH/QMFGiGa+zSEa6FVDpVC8jgIlb8Wa0zCQvBmMbqZ+84lrIyL1gOY+yEdKNEXjKVWo1ue
+lvzKpNuseSW3RnIMvEyUoIMtW7xq9OLWBJyhUxSY9qeG6OfUo2CST4pdBLDY8pGdMDblioacuOns3sn5MQqPdKPtC2FZKb+nkhpa
+Mw4DGxnSHFoFr2p+J/XTrB/5adCxQlyxeaL+okGJHp86QnNGcox5ZQpoW9lbAh1ZShjahgQ/AWX14mjbOyVylf3J+XqtdZHk4g
+mM4BQ8uoQp3UIM6MJDwDK/w5jw6L8678zFvzTnZzCH8gfP5A0mNj34=</latexit>VF P 16
+=
++
+1
+2
+3
+4
+5
+1
+1
+3
+Optional
+Optional
+Figure 3. Workflow of SageAttention2. 1 Smooth Q, K, V .
+2 A GEMV to obtain ∆S. 3 Per-thread quantize Q, K and per-
+channel quantize V . 4 Perform the SageAttention2 kernel.
+5 Correct the output.
+SageAttention (Zhang et al., 2025c). SageAttention ob-
+served that Q, K for all tokens are actually highly similar,
+with only small variations between different tokens (Fig. 2
+shows the heatmap distributions of the Q, K, and V ran-
+domly sampled from Llama3.1 (Dubey et al., 2024) and
+CogvideoX (Yang et al., 2025b)). We propose to smooth
+K as SageAttention does and further smooth Q by subtract-
+ing a common mean of each block:
+γ(Qi) = Qi −¯qi,
+γ(Kj) = Kj −¯k,
+(2)
+where ¯qi = mean(Qi), ¯k = mean(K) are 1 × D vectors,
+the mean is conducted along the token axis, and ¯qi, ¯k are
+broadcasted to tokens in a block and a tensor for subtraction.
+With the decomposion, we have Sij = QiK⊤
+j
+= (¯qi +
+γ(Qi))(¯k + γ(Kj))⊤= ¯qi¯k⊤+ ¯qiγ(Kj)⊤+ γ(Qi)¯k⊤+
+γ(Qi)γ(Kj)⊤= γ(Qi)γ(Kj)⊤+∆Sij +b. Here, ∆Sij =
+¯qiγ(Kj)⊤is an 1 × N vector, and b = ¯qi¯k⊤+ γ(Qi)¯k⊤is
+an N × 1 vector. We do not need to compute b since adding
+a common bias to an entire row of S does not affect the
+result after softmax. Therefore, we can accelerate QiK⊤
+j
+with INT4 by the following two stages:
+(1) preprocessing: smooth Q, K according to Eq. (2), ap-
+ply quantization (δQi, ˆQi) = ψQ(γ(Qi)), (δKj, ˆKj) =
+ψK(γ(Kj)), and compute ∆Sij = ¯qiγ(Kj)⊤. Smoothing,
+quantization, and GEMV (general matrix-vector multiplica-
+tion) for computing ∆S can be fused into a single kernel,
+which reads the off-chip Q and K only once.
+(2) attention: execute the low-precision GEMM, dequan-
+tize, and add back the vector ∆S: Sij = ψ−1
+δQiδKj ( ˆQi ˆK⊤
+j )+
+∆Sij. These operations are all done on chip, and the dequan-
+tization and vector addition only add a marginal overhead
+compared to the expensive mma operation for MM.
+Importantly, γ(Qi), γ(Kj) are quantized rather than Qi, Kj.
+Since the smoothed matrices are much smaller in magnitude
+and contain fewer outliers, the quantization accuracy can be
+significantly improved. A theoretical analysis of the benefit
+of smoothing is included in Appendix A.5.
+Remark. Classical techniques to improve the activation-
+weight
+MM,
+such
+as
+per-channel
+quantization,
+or
+SmoothQuant (Xiao et al., 2023) are not applicable here
+for the query-key MM in attention. Per-channel quantiza-
+tion cannot be applied to Q, K because the quantization
+must be conducted along the outer axis (token dimension)
+of QK⊤. On the other hand, both Q and K have significant
+outliers, so trading the quantization accuracy between them
+with SmoothQuant cannot work effectively, as shown in
+Sec. 4. Here, we utilize the unique token similarity pattern
+in attention to derive a dedicated quantization method for Q
+and K. The previous work SageAttention only smooths K,
+so it is less accurate than our method.
+Empirical results. Fig. 20 in Appendix A.9 shows an ex-
+ample from CogvideoX of the distribution of ˆQ with and
+without smoothing Q. We can find that with smoothing Q,
+the range of INT4 is utilized more uniformly and fully. Ta-
+ble 5 presents end-to-end metrics for different quantization
+methods with and without smoothing Q+K on Llama3.1
+and CogvideoX (2b). The results demonstrate that smooth-
+ing Q+K offers significant accuracy benefits. Also, Table 4
+and 17 show that the order of effectiveness is smoothing
+Q+K > smoothing Q > smoothing K > other baselines.
+3.2. INT4 Per-thread Quantization
+Orthogonal to smoothing, we can mitigate the problem
+of outliers by refining the quantization granularity so
+that the number of affected elements by outliers becomes
+smaller.
+Although per-token quantization offers a de-
+tailed level of granularity, it results in significant overhead
+4
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Token3
+Token2
+Token0
+Token1
+Token11
+Token10
+Token8
+Token9
+Token0
+Token1
+Token8
+Token9
+Token24
+Token25
+Token59
+Token58
+Token56
+Token57
+a1_base64="OxNWMW8gi
+o5nPun+01zUjW0INo=">
+AB7XicbVDLSgNBEOyNr
+xhfUY9eFoPgKeyKr2PQi8
+cI5gHJEmZnJ8mY2Zlpl
+cIS/7BiwdFvPo/3vwbJ8k
+eNLGgoajqprsrTAQ36Hnf
+TmFldW19o7hZ2tre2d0r
+7x80jUo1ZQ2qhNLtkBgmu
+GQN5ChYO9GMxKFgrXB0O/
+VbT0wbruQDjhMWxGQgeZ
+9TglZqdmk0PTKFa/qzeA
+uEz8nFchR75W/upGiacwk
+UkGM6fhegkFGNHIq2KTU
+TQ1LCB2RAetYKknMTJDNr
+p24J1aJ3L7StiS6M/X3RE
+ZiY8ZxaDtjgkOz6E3F/7x
+Oiv3rIOMySZFJOl/UT4W
+Lyp2+7kZcM4pibAmhmtb
+XTokmlC0AZVsCP7iy8uke
+Vb1L6sX9+eV2k0eRxGO4
+BhOwYcrqMEd1KEBFB7hGV
+7hzVHOi/PufMxbC04+cwh
+/4Hz+ALGXjzk=</latex
+it>· · ·
+"OxNWMW8gio5nPun+01zUjW0INo=">AB7XicbVD
+LSgNBEOyNrxhfUY9eFoPgKeyKr2PQi8cI5gHJEmZn
+J8mY2ZlplcIS/7BiwdFvPo/3vwbJ8keNLGgoajqp
+rsrTAQ36HnfTmFldW19o7hZ2tre2d0r7x80jUo1ZQ2
+qhNLtkBgmuGQN5ChYO9GMxKFgrXB0O/VbT0wbruQD
+jhMWxGQgeZ9TglZqdmk0PTKFa/qzeAuEz8nFchR7
+5W/upGiacwkUkGM6fhegkFGNHIq2KTUTQ1LCB2RAet
+YKknMTJDNrp24J1aJ3L7StiS6M/X3REZiY8ZxaDtj
+gkOz6E3F/7xOiv3rIOMySZFJOl/UT4WLyp2+7kZcM4
+pibAmhmtbXTokmlC0AZVsCP7iy8ukeVb1L6sX9+e
+V2k0eRxGO4BhOwYcrqMEd1KEBFB7hGV7hzVHOi/Pu
+fMxbC04+cwh/4Hz+ALGXjzk=</latexit>· · ·
+· · ·
+· · ·
+Kj
+ωQ[0]
+a1_base64="PaPSTzMX0+m
+l314XV08XLgLDPmk=">A
+B9HicbVDJSgNBEK2JW4xb1
+KOXxiB4CjPidgx68ZiAWSA
+ZQk9PT9KkZ7G7JhCGfIcXD
+4p49WO8+Td2kjlo4oOCx3
+tVNXzEik02va3Vhb39jc
+Km6Xdnb39g/Kh0ctHaeK8S
+aLZaw6HtVciog3UaDknURx
+GnqSt73R/cxvj7nSIo4ecZ
+JwN6SDSASCUTS2/O5RNrP
+GtOu4/bLFbtqz0FWiZOTC
+uSo98tfPT9macgjZJq3X
+sBN2MKhRM8mpl2qeUDaiA
+941NKIh1242P3pKzozikyB
+WpiIkc/X3REZDrSehZzpDi
+kO97M3E/7xuisGtm4koSZF
+HbLEoSCXBmMwSIL5QnKGc
+GEKZEuZWwoZUYmp5IJwV
+l+eZW0LqrOdfWqcVmp3eVx
+FOETuEcHLiBGjxAHZrA4A
+me4RXerLH1Yr1bH4vWgpXP
+HMfWJ8/lJSR/Q=</late
+xit>ωQ[1]
+ωK[0]
+ωK[1]
+Qw
+Token15
+Token14
+Token13
+Token12
+Token11
+Token10
+Token9
+Token8
+Token7
+Token6
+Token5
+Token4
+Token3
+Token2
+Token0
+Token1
+Token4
+Token3
+Token6
+Token2
+Token0
+Token5
+Token7
+Token1
+MMA.m16n8k64
+T3
+T7
+T3
+T31
+T31
+T7
+T3
+T7
+T3
+T31
+T31
+T7
+T30
+T30
+T2
+T6
+T6
+T2
+T2
+T2
+T6
+T30
+T6
+T30
+T5
+T1
+T1
+T5
+T29
+T29
+T1
+T29
+T5
+T1
+T5
+T29
+T28
+T4
+T0
+T0
+T28
+T4
+T28
+T4
+T0
+T0
+T28
+T4
+Quantization in each Warp
+Each Thread Corresponds to One Scale
+L9ehlIjHxRHaNryPqxSMk8khgQ2aHBkZmZzczsyZkwxd48aAxXv0kb/6NA+xBwUo6qVR1p7sriAXxnW/ndzK6tr6Rn6zsLW9s7tX3D9o6ChRDOsEpFqBVSj4BLrhuBrVghDQOBzWB0N/WbT6g0
+j+SDGcfoh3QgeZ8zaqxUu+kWS27ZnYEsEy8jJchQ7Ra/Or2IJSFKwTVu25sfFTqgxnAieFTqIxpmxEB9i2VNIQtZ/ODp2QE6v0SD9StqQhM/X3REpDrcdhYDtDaoZ60ZuK/3ntxPSv/ZTLODEo2
+XxRPxHERGT6NelxhcyIsSWUKW5vJWxIFWXGZlOwIXiLy+TxlnZuyxf1M5LldsjwcwTGcgdXUIF7qEIdGCA8wyu8OY/Oi/PufMxbc042cwh/4Hz+AJYdjM8=</latexit>A
+B
+C
+OYByRJmJ7PJmNmZWZWCEv+wYsHRbz6P978GyfJHjSxoKGo6qa7K4g508Z1v53cyura+kZ+s7C1vbO7V9w/aGqZKEIbRHKp2gHWlDNBG4YZTtuxojgKOG0Fo9rUbz1RpZkUD2YcUz/CA8FCRrCxUrOGbtBtVcsuWV3BrRMvIyUIEO9V/zq9iVJIioM4Vjrju
+fGxk+xMoxwOil0E01jTEZ4QDuWChxR7aezayfoxCp9FEplSxg0U39PpDjSehwFtjPCZqgXvan4n9dJTHjtp0zEiaGCzBeFCUdGounrqM8UJYaPLcFEMXsrIkOsMDE2oINwVt8eZk0z8reZfni/rxUqWZx5OEIjuEUPLiCtxBHRpA4BGe4RXeHOm8O/Ox7w
+152Qzh/AHzucP2NKOAw=</latexit>C = AB
+Dequantization
+T0
+T0
+T0
+T0
+( ˆQ)
+( ˆK→)
+( ˆQ ˆK→)
+J8keNLGgoajqprsrTAQ36HnfTmFldW19o7hZ2tre2d0r7x80jUo1ZQ2qhNLtkBgmuGQN5ChYO9GMxKFgrXB0O/VbT0wbruQDjhMWxGQgecQpQSs1u8hjZnrlilf1ZnCXiZ+TCuSo98pf3b6iacwkUkGM6fhegkFGNHIq2KTUTQ1LCB2RAetYKoldEmSzayfuiVX6bqS0LYnuTP09kZHYmHEc2s6Y4NAselPxP6+TYnQdZFwmKTJ54uiVLio3Onrbp9rRl
+GMLSFUc3urS4dE4o2oJINwV98eZk0z6r+ZfXi/rxSu8njKMIRHMp+HAFNbiDOjSAwiM8wyu8Ocp5cd6dj3lrwclnDuEPnM8fuWuPg=</latexit>→
+NBEOyNrxhfUY9eFoPgKeyKr2PQi8cI5gHJEmYns8mY2ZlplcIS/7BiwdFvPo/3vwbJ8keNLGgoajqprsrTAQ36HnfTmFldW19o7hZ2tre2d0r7x80jUo1ZQ2qhNLtkBgmu
+GQN5ChYO9GMxKFgrXB0O/VbT0wbruQDjhMWxGQgecQpQSs1u8hjZnrlilf1ZnCXiZ+TCuSo98pf3b6iacwkUkGM6fhegkFGNHIq2KTUTQ1LCB2RAetYKoldEmSzayfuiVX6
+bqS0LYnuTP09kZHYmHEc2s6Y4NAselPxP6+TYnQdZFwmKTJ54uiVLio3Onrbp9rRlGMLSFUc3urS4dE4o2oJINwV98eZk0z6r+ZfXi/rxSu8njKMIRHMp+HAFNbiDOjS
+AwiM8wyu8Ocp5cd6dj3lrwclnDuEPnM8fuWuPg=</latexit>→
+T5
+T5
+T5
+T5
+ω→1
+ωQωK( ˆQ ˆK↑)
+→
+→
+T31
+T31
+T31
+T31→
+→
+gqSTi17HoRfBSwX5AGspms2XbjZxd1Iob/DiwdFvPpjvPlv3LY5aOuDgcd7M8zMCxLBNTrOt1VYWV1b3yhulra2d3b3yvsHTR2nirIGjUWs2gHRTHDJGshRsHaiGIkCwVrB8Hbqt0ZMaR7LRxwnzI9IX/IepwSN5HdCJ
+pB0s/uJ5/rdcsWpOjPYy8TNSQVy1Lvlr04Y0zRiEqkgWnuk6CfEYWcCjYpdVLNEkKHpM8QyWJmPaz2dET+8Qod2LlSmJ9kz9PZGRSOtxFJjOiOBAL3pT8T/PS7F37WdcJikySeLeqmwMbanCdghV4yiGBtCqOLmVp
+sOiCIUTU4lE4K7+PIyaZ5V3cvqxcN5pXaTx1GEIziGU3DhCmpwB3VoAIUneIZXeLNG1ov1bn3MWwtWPnMIf2B9/gCLZJH3</latexit>ωK[1]
+ωK[0]
+ωQ[0]
+ωQ[1]
+ωQ[7]
+ωK[3]
+UjW0INo=">AB7XicbVDLSgNBEOyNrxhfUY9eFoPgKeyKr2PQi8cI5gHJEmZnJ8mY2ZlplcIS/7BiwdFv
+Po/3vwbJ8keNLGgoajqprsrTAQ36HnfTmFldW19o7hZ2tre2d0r7x80jUo1ZQ2qhNLtkBgmuGQN5ChYO9G
+MxKFgrXB0O/VbT0wbruQDjhMWxGQgeZ9TglZqdmk0PTKFa/qzeAuEz8nFchR75W/upGiacwkUkGM6fhegk
+FGNHIq2KTUTQ1LCB2RAetYKknMTJDNrp24J1aJ3L7StiS6M/X3REZiY8ZxaDtjgkOz6E3F/7xOiv3rIOMyS
+ZFJOl/UT4WLyp2+7kZcM4pibAmhmtbXTokmlC0AZVsCP7iy8ukeVb1L6sX9+eV2k0eRxGO4BhOwYcrqMEd
+1KEBFB7hGV7hzVHOi/PufMxbC04+cwh/4Hz+ALGXjzk=</latexit>· · ·
+ωQ[7]
+ωK[3]
+· · ·
+· · ·
+Figure 4. An example of per-thread quantization. The left figure shows the correspondence between the quantization scales and the tokens
+in each GPU warp. The right figure shows the correspondence between quantization tokens and GPU threads in a MMA.m16n8k64
+instruction, showing that each GPU thread only corresponds to one quantization scale in δQ and δK in dequantization.
+during dequantization. Specifically, each GPU thread in
+per-token quantization must handle multiple quantization
+scales, leading to a high latency of the dot product of the
+quantization scale vectors δQ and δK. SageAttention uses
+per-block quantization, where each block Qi (bq tokens)
+and Ki (bk tokens) have a single quantization scale. Such
+a quantization strategy could achieve an accuracy perfor-
+mance close to per-token quantization and avoid the high
+dequantization overhead. However, quantizing Q and K to
+INT4 demands a finer quantization granularity. To address
+this, we propose per-thread quantization, a more precise
+and granular approach than the per-block quantizer, also
+without the additional overhead of the vector dot product
+between δQ and δK.
+Specifically, each block of Q, i.e., Qi, in SageAttention
+will be split into cw segments and processed by cw GPU
+warps in a GPU streaming processor (SM). We call each
+segment of Qi as Qw, and kw = Kj since Kj is shared
+among warps. Then, each warp containing 32 threads uses
+the mma.m16n8k64 PTX instruction (NVIDIA) for the
+QwK⊤
+j . According to the layout requirement of this instruc-
+tion, we find that Qw[8k + i] could share one quantization
+scale, and Kj[8k + 2i] together with Kj[8k + 2i + 1] could
+share one quantization scale. Such a quantization method
+is more fine-grained with no additional overhead. This is
+because it assigns different GPU threads to distinct quanti-
+zation groups based on the MMA instruction layout, with
+each thread performing dequantization only using a single
+quantization scale value. We show an example of per-thread
+quantization in Fig. 4. The detailed formulation is shown in
+Equation 8 and Fig. 18 (please see Appendix A.6 for more
+detail).
+Empirical results. As shown in Table 6 and Table 15, we
+compare the average and worst accuracy of INT4 quantiza-
+tion at per-token, per-thread, per-block, and per-tensor gran-
+ularity using real Q, K, V across all layers of CogvideoX.
+Results indicate that the accuracy of per-thread quantization
+is very close to per-token and significantly outperforms other
+granularities. Moreover, Table 19 shows that per-thread
+quantization incurs almost no speed degradation, while per-
+token quantization introduces noticeable overhead due to
+the reduced hardware efficiency.
+3.3. FP8 quantization for ˜PV
+We now turn to the MM ˜PV , where ˜Pij = exp(Sij −mij)
+is the unnormalized quantity according to Eq. (1). The dis-
+tribution of ˜P is unique and differs from other activations.
+First, we note that Sij −mij ≤0, so Pij ∈[0, 1] (≤and ∈
+apply element-wise). We find that ˜P often consists of many
+small elements, but their sum is non-negligible (e.g., 5000
+elements around 10−4). In this case, we must represent
+small elements accurately. INT quantization is unsuitable
+for this setting, since it distributes the quantization points
+evenly within the numerical range. SageAttention (Zhang
+et al., 2025c) choose to retain ˜P and V in FP16, and ac-
+celerate the MM by decreasing the accumulator precision.
+However, this strategy is only effective on very few GPUs.
+We propose to quantize eP, V to FP8 with 4 exponent bits
+and 3 mantissa bits (E4M3).
+The numerical range of
+E4M3 is [−448, +448]. We quantize P with a static scale:
+δP =
+1
+448 since the original P elements are already in [0, 1].
+We quantize V per-channel to address the channel-wise
+outliers shown in Fig. 2. Empirical results in Table 7 and
+Table 16 show the average and worst accuracy of different
+5
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Algorithm 1 Implementation of SageAttention2.
+Input: Matrices Q(FP16), K(FP16), V (FP16) ∈RN×d, block size bq, bkv, warp count cw.
+Preprocessing: K = K −mean(K), (δV , ˆV ) = ψV (V ). //per-channel.
+Divide Q to Tm = N/bq blocks {Qi}; divide K, and V to Tn = N/bkv blocks {Ki}, {Vi};
+for i = 1 to Tm do
+¯qi = mean(Qi), (δQ, ˆQi) = ψQ(Qi −¯qi) //per-thread ;
+for j in [1, Tn] do
+(δK, ˆKj) = ψK(Kj) //per-thread,
+w = range(cw), st = w ∗cw ;
+Sij[st : st + cw] = ψ−1
+δQδK(Matmul( ˆQi[st : st + cw], ˆK⊤
+j )) + GEMV(¯qi, K⊤
+j ) ; // Paralleled by cw warps. The ψ−1
+δQδK is
+illustrated in Fig. 4.
+mij = max(mi,j−1, rowmax(Sij)), ePij = exp(Sij −mij), lij = emi,j−1−mijli,j−1 + rowsum( ePij) ;
+Oij(FP22) = Matmul(( ePij ∗448).to(FP8.e4m3), Vj) ;
+Oij(FP32) = diag(emi,j−1−mij)Oi,j−1(FP32) + Oij(FP22) ;
+end for
+Load δV into an SM ;
+Oi = diag(li,Tn)−1Oi,Tn(FP32) /448 ∗δV ;
+Write Oi ;
+end for
+return O = {Oi}
+data types used for eP, V across all layers of CogvideoX.
+The accumulator is always 32-bit. We can see that the ac-
+curacy of E4M3 is very close to that of FP16 and superior
+to E5M2 and INT8. Most modern GPUs have tensor cores
+that support FP8 Matmul operations, which are twice as fast
+as those using FP16.
+3.4. FP32 MMA Buffer for FP22 Accumulator
+While FP8 quantization for ˜PV above is theoretically accu-
+rate in simulation, we observe that the actual CUDA imple-
+mentation suffers a consistent accuracy degradation. After
+narrowing down the problem, we find that the accumulator
+for the mma(f32f8f8f32) instruction on the Ada and
+Hopper architecture is actually FP22, specifically with 1
+sign bit, 8 exponent bits, and 13 mantissa bits. Specifically,
+for mma(f32f8f8f32) instruction C = AB +D, where
+A, B are FP8 matrices and C, D are FP32 matrices, we ini-
+tialize the A, B to zero and vary D to test the data type of
+the accumulator. When D is initialized with 1 sign bit, 8
+exponent bits, and 13 mantissa bits, the value of C exactly
+matches D. However, when D is initialized with more than
+13 mantissa bits, the value of C is equal to D with its least
+significant 10 mantissa bits zeroed out (i.e., truncated). Con-
+sequently, matrix multiplication of ePV , quantized to FP8,
+incurs a certain degree of accuracy loss compared to using
+an FP32 accumulator.
+To mitigate this accuracy loss, we adopt a two-level accumu-
+lation strategy, which uses an FP32 buffer to accumulate the
+values of ePijVj in FP22. Specifically, we rewrite Eq. (1) as
+Rij = ePijVj, Oij = diag (exp(mi,j−1 −mij)) Oi,j−1 +
+Rij.
+Here, two sets of accumulators Rij and Oij are
+maintained in the register.
+Rij is computed with the
+mma(f32f8f8f32) instruction, providing 22 effective
+bits, which is sufficient since we only accumulate over a
+small number of bk tokens (e.g., bk = 64). Then, Rij is
+accumulated to Oij in the high FP32 precision.
+Remark.
+The two-level accumulation strategy is also
+implemented in CUTLASS (NVIDIA, 2023) and Deep-
+Gemm (DeepSeek-AI et al., 2024) for computing weight-
+activation products in linear layers. To the best of our knowl-
+edge, we are the first to discover and investigate the effect
+of the FP22 accumulator and implement the two-level accu-
+mulation for attention.
+Optional smooth V technique. We also figure out an-
+other way to mitigate the accuracy loss due to the FP22
+accumulator when V possesses channel-wise biases: −→
+Vm =
+mean(V, axis = 0), V = V −−→
+Vm. Furthermore, to maintain
+the correctness of the attention computation, it is only neces-
+sary to add −→
+Vm to the final calculation of O: O = O + −→
+Vm.
+This is because the sum of each row of the eP matrix equals
+1, so eP−→
+Vm = −→
+Vm.
+Remark. For details on smoothing V, see Appendix A.3.
+This technique is optional and not employed in our main
+experiments, as it provides significant benefits only when
+V exhibits channel-wise bias, which are absent in some
+models, such as Llama3.1 (see Fig. 2).
+4. Experiment
+Main result. SageAttention2 is faster than FlashAtten-
+tion2 and xformers by about 3x and 4.5x.
+Moreover,
+SageAttention2 matches the speed of FlashAttn3(fp8)
+on the Hopper GPUs and is much more accurate than
+FlashAttn3(fp8). SageAttention2 maintains end-to-end met-
+rics across language, image, and video generation models.
+4.1. Setup
+Models.
+We
+validate
+the
+effectiveness
+of
+SageAttention2
+across
+a
+diverse
+set
+of
+repre-
+6
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+600
+800
+Speed (TOPS)
+46
+42
+55
+OOM
+OOM
+OOM
+93
+96
+104
+105
+106
+106
+145
+151
+161
+164
+164
+164
+259
+303
+322
+317
+323
+322
+338
+370
+397
+420
+424
+430
+399
+409
+439
+465
+471
+481
+RTX4090, (Head dim = 128, causal = False)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+600
+800
+16
+14
+16
+OOM
+OOM
+OOM
+78
+89
+100
+104
+105
+106
+118
+138
+155
+160
+161
+161
+188
+247
+292
+307
+316
+322
+256
+308
+356
+405
+425
+432
+310
+344
+391
+454
+473
+479
+RTX4090, (Head dim = 128, causal = True)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+Figure 5. Speed comparison between SageAttention2 and baselines (RTX4090, headdim=128).
+Table 2. End-to-end metrics across text, image, and video generation models. ✗indicates an inability to generate results for evaluation.
+Model
+Attention
+WikiText (Ppl.) ↓
+Lambda (Acc.) ↑
+MMLU (Acc.) ↑
+Longbench ↑
+Llama3.1
+Full-Precision
+6.013
+0.815
+0.635
+49.40
+HadmdAttn
+7.872
+0.762
+0.500
+44.07
+SmoothAttn
+7.180
+0.783
+0.541
+44.69
+SageAttention
+6.017
+0.812
+0.634
+49.55
+SageAttn2-4b
+6.256
+0.798
+0.607
+48.79
+SageAttn2-8b
+6.019
+0.811
+0.634
+49.59
+GLM4
+Full-Precision
+7.241
+0.432
+0.743
+49.78
+HadmdAttn
+7.989
+0.435
+0.669
+45.97
+SmoothAttn
+8.943
+0.449
+0.592
+42.20
+SageAttention
+7.243
+0.433
+0.744
+49.79
+SageAttn2-4b
+7.352
+0.433
+0.725
+49.23
+SageAttn2-8b
+7.242
+0.432
+0.745
+49.60
+Model
+Attention
+CLIPSIM ↑
+CLIP-T ↑
+VQA-a ↑
+VQA-t ↑
+FScore ↑
+CogvideoX
+(1.5-5B)
+Full-Precision
+0.1778
+0.9979
+70.231
+70.928
+2.507
+HadmdAttn
+0.1576
+0.9933
+8.990
+2.299
+✗
+SmoothAttn
+0.1559
+0.9950
+8.812
+2.277
+✗
+SageAttention
+✗
+✗
+✗
+✗
+✗
+FlashAttn3-fp8
+0.1562
+0.9918
+6.531
+2.181
+✗
+SageAttn2-4b
+0.1721
+0.9978
+57.729
+52.989
+2.884
+SageAttn2-8b
+0.1775
+0.9980
+69.492
+74.415
+2.487
+Hunyuan
+Video
+Full-Precision
+0.1783
+0.9995
+82.516
+75.934
+0.604
+HadmdAttn
+0.1727
+0.9989
+7.514
+0.762
+0.175
+SmoothAttn
+0.1739
+0.9988
+6.987
+0.609
+0.148
+SageAttention
+0.1786
+0.9995
+82.496
+79.843
+0.597
+FlashAttn3-fp8
+0.1742
+0.9941
+4.433
+1.460
+✗
+SageAttn2-4b
+0.1751
+0.9995
+81.478
+65.371
+0.610
+SageAttn2-8b
+0.1782
+0.9996
+81.786
+75.354
+0.586
+Mochi
+Full-Precision
+0.1798
+0.9986
+45.549
+65.416
+1.266
+HadmdAttn
+0.1733
+0.9980
+9.053
+25.133
+0.704
+SmoothAttn
+0.1687
+0.9978
+3.383
+3.480
+0.241
+SageAttention
+0.1800
+0.9987
+48.707
+63.763
+1.269
+FlashAttn3-fp8
+0.1762
+0.9982
+14.964
+13.711
+0.457
+SageAttn2-4b
+0.1783
+0.9986
+35.955
+43.735
+1.137
+SageAttn2-8b
+0.1797
+0.9986
+46.760
+64.901
+1.255
+Model
+Attention
+FID ↓
+sFID ↓
+CLIP ↑
+IR ↑
+Flux
+Full-Precision
+10.960
+16.648
+26.180
+1.009
+HadmdAttn
+11.353
+18.495
+26.123
+0.965
+SmoothAttn
+11.149
+19.017
+26.109
+0.959
+SageAttention
+10.944
+16.641
+26.171
+1.008
+SageAttn2-4b
+10.577
+17.497
+26.141
+0.998
+SageAttn2-8b
+10.927
+16.723
+26.175
+1.009
+Stable-Dif
+fusion3.5
+Full-Precision
+14.105
+15.646
+25.505
+0.902
+HadmdAttn
+14.259
+15.909
+25.513
+0.886
+SmoothAttn
+14.161
+15.649
+25.510
+0.887
+SageAttention
+14.140
+15.678
+25.503
+0.902
+SageAttn2-4b
+14.097
+15.397
+25.487
+0.895
+SageAttn2-8b
+14.106
+15.647
+25.499
+0.901
+7
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+SageAttention2-8b
+HadmdAttn
+SmoothAttn
+Full precision Attention
+SageAttention2-4b
+Figure 6. Comparison examples from HunyuanVideo, prompts are sampled from open-sora prompt sets.
+SageAttn2-8b
+Full-Precision
+FlashAttn3(fp8)
+Figure 7. A comparison example using SageAttn2-8b and FlashAttention3 on CogvideoX-1.5.
+sentative models from language,
+image,
+and video
+generation.
+Specifically, we conduct experiments on
+ten models:
+Llama2 (7B) (Touvron et al., 2023),
+Llama3.1 (8B) (Dubey et al., 2024),
+and GLM4
+(9B) (GLM et al., 2024) for text2text, CogvideoX
+(2B),
+CogvideoX
+(1.5-5B)
+(Yang
+et
+al.,
+2025b),
+HunyuanVideo (Kong et al., 2024), and Mochi (Team,
+2024) for text2video, Flux (schnell) (Black Forest Labs,
+2023) and Stable-Diffusion3.5 (turbo) (Stability
+AI, 2023) for text2image, and TIMM (Wightman, 2019) for
+image classification.
+Datasets and metrics. For Details about the datasets and
+metrics we used, please refer to Appendix. A.7.
+Table 3. Two kernel implementations of SageAttention2.
+Kernel
+ψQ(Q), ψK(K)
+ψP ( eP), ψV (V )
+SageAttn2-4b INT4 per-thread FP8 per-block and per-channel
+SageAttn2-8b INT8 per-thread FP8 per-block and per-channel
+Implemetation. We implement two attention kernels as
+shown in Table 3 using CUDA. The 8-bit variant is adapted
+for NVIDIA Hopper GPUs, which lack native INT4 tensor
+core support, and incorporates all techniques described in
+Sec. 3 except for smoothing Q.
+Baselines.
+(1) SmoothAttn.
+Following Qserve (Lin
+et al., 2025), we apply smooth quant for Q, K with
+smoothing factor α = 0.5. (2) HadmdAttn. Follow-
+ing Quarot (Ashkboos et al., 2024), we apply random
+Hadamard transformation for Q, K before INT4 quanti-
+zation. (3) SageAttention (Zhang et al., 2025c), which
+uses smoothing K, INT8 per-block quantization for Q, K,
+and FP16 for eP, V . (4) FlashAttn3(fp8), the FP8 ver-
+sion of FlashAttention3, which only runs on Hopper GPUs.
+4.2. Speed and Accuracy of Kernels
+Kernel
+Speed.
+We
+compare
+the
+speed
+of
+SageAttention2
+against
+baselines
+using
+head-
+dim=64 and headdim=128, both with and without Causal
+Mask (Vaswani, 2017).
+Detailed setup can be found
+8
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Table 4. Average accuracy across all layers of CogvideoX using
+different smoothing methods.
+Method
+CosSim ↑
+Relative L1 ↓
+RMSE ↓
+None
+80.04%
+0.3906
+0.2223
+HadmdAttn
+79.77%
+0.3782
+0.2180
+SmoothAttn
+90.21%
+0.3383
+0.1952
+Smooth K
+98.07%
+0.1493
+0.0743
+Smooth Q
+98.30%
+0.1250
+0.0712
+Smooth Q+K
+99.46%
+0.0648
+0.0334
+Table 5. End-to-end metrics comparison, where Q, K are quan-
+tized into INT4, while eP, V stay in full precision.
+Q, K
+Smooth
+(Q+K)
+Llama3.1
+(Lambda) ↑Llama3.1
+(WikiText) ↓CogVideoX
+(vqa-t)
+↑
+Full-Precision
+-
+81.5%
+6.013
+75.360
+INT4
+Quantization
+✗
+72.6%
+11.698
+24.670
+✓
+80.8%
+6.219
+75.147
+Table 6. Average accuracy across all layers of CogvideoX using
+different quantization granularities.
+Method
+Cos Sim ↑
+Relative L1 ↓
+RMSE ↓
+Per-token
+99.45%
+0.0649
+0.0335
+Per-thread
+99.45%
+0.0622
+0.0313
+Per-block
+98.03%
+0.1492
+0.0744
+Per-tensor
+97.15%
+0.1800
+0.0865
+Table 7. Average accuracy using different data types of ( eP, V )
+across all layers of CogvideoX, where (Q, K) are smoothed.
+Q, K
+eP, V
+Cos Sim ↑
+Relative L1 ↓
+RMSE ↓
+INT4
+INT8
+77.05%
+0.5618
+0.5044
+E5M2
+99.20%
+0.0905
+0.0903
+E4M3
+99.44%
+0.0683
+0.0347
+FP16
+99.45%
+0.0649
+0.0335
+Table 8. End-to-end generation latency using SageAttention2
+(The latency of Llama3.1 is the time to first token generation
+using different sequence lengths).
+Model
+GPU
+OriginalSageAttn
+2-8b
+SageAttn
+2-4b
+CogvideoX (2B)
+RTX4090
+86 s
+54 s
+52 s
+CogvideoX (1.5-5B) RTX4090 1040 s
+577 s
+555 s
+HunyuanVideo
+L20
+2221 s
+1486 s
+1435 s
+Mochi
+L20
+2336 s
+1316 s
+1190 s
+Llama3.1 (48K token) RTX4090
+9.2 s
+5.7 s
+5.6 s
+Llama3.1 (100K token)
+L20
+39.9 s
+25.4 s
+23.2 s
+in Appendix A.8. Specifically, Fig. 5 shows the speed
+across varying sequence lengths on RTX4090, indicat-
+ing that SageAttn2-4b and SageAttn2-8b are
+approximately 3x and 2.7x faster than FlashAttention2,
+and about 4.5x and 4x faster than xformers, respectively.
+Fig. 10, 11, 12, 13, 14, 15, and 16 in Appendix A.2 show
+more speed results on RTX4090, L20, H20, H100 GPUs.
+Accuracy. Table 4 and 17 show the average accuracy of
+different methods with INT4 Q, K and FP8 P, V across all
+layers of CogvideoX. The results indicate the accuracy of
+SageAttn2-4b is superior to other baselines.
+4.3. End-to-end Performance
+Metrics loss. We assessed the end-to-end metrics of various
+models using SageAttention2 compared to baselines.
+Detailed evaluation results are presented in Table 2. The
+results indicate that SageAttn2-4b outperforms all base-
+lines and maintains most of the end-to-end accuracy across
+all models. Additionally, SageAttn2-8b incurs almost
+no metrics loss across various models. More experiment
+results on other models are shown in Appendix A.9.
+Visible image and video examples.
+Fig. 6, 7, 8,
+and 9 show some visible comparison examples from
+HunyuanVideo, Mochi and CogvideoX. We can ob-
+serve that SageAttn2-8b does not introduce any visible
+differences compared to full-precision attention, whereas
+SageAttn2-4b has minor differences but is much better
+than the baselines.
+End-to-end speedup. We compared the original genera-
+tion latency and the latency using SageAttention2 for
+models with long sequence lengths in Table 8, observing sig-
+nificant speedup effects. For instance, SageAttention2
+achieved a 1.8x speedup in CogvideoX (1.5-5B) without
+any metrics loss (SageAttn2-8b). SageAttn2-4b fur-
+ther accelerated these models but with a little metrics loss.
+4.4. Ablation Study
+Overhead of techniques we proposed. As shown in Ta-
+ble 18, the overhead on kernel speed of per-thread quantiza-
+tion, smoothing Q, and two-level accumulation are 0.35%,
+3.7%, and 0% compared to the attention kernel.
+Benefit of smoothing V. The experiment showing the bene-
+fit of smoothing V is shown in Appendix. A.4.
+5. Conclusion
+We introduce SageAttention2, an efficient and accu-
+rate quantized attention.
+First, we propose to quantize
+matrices (Q, K) in a thread-level granularity and ( eP, V )
+to FP8. Second, we propose a method to smooth Q, en-
+hancing the accuracy of QK⊤. Third, we propose a two-
+level accumulation strategy to enhance the accuracy of
+FP8 ePV . SageAttention2 is faster than FlashAtten-
+tion2 and xformers by approximately 3x and 4.5x, respec-
+tively. Moreover, SageAttention2 matches the speed
+of FlashAttention3(fp8) on the Hopper GPUs, but offers
+significantly higher accuracy. Extensive experiments con-
+firm that our approach maintains end-to-end metrics across
+language, image, and video generation models.
+9
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Acknowledgment
+This work was supported by the NSFC Projects (Nos.
+92270001, 62376131). J.Z is also supported by the XPlorer
+Prize.
+Impact Statement
+This paper presents work that aims to advance the field
+of Machine Learning. There are many potential societal
+consequences of our work, none of which we feel must be
+specifically highlighted here.
+References
+Ashkboos, S., Mohtashami, A., Croci, M. L., Li, B.,
+Cameron, P., Jaggi, M., Alistarh, D., Hoefler, T., and
+Hensman, J. Quarot: Outlier-free 4-bit inference in ro-
+tated LLMs. In The Thirty-eighth Annual Conference on
+Neural Information Processing Systems, 2024.
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z., Du,
+Z., Liu, X., Zeng, A., Hou, L., Dong, Y., Tang, J., and
+Li, J. LongBench: A bilingual, multitask benchmark for
+long context understanding. In Proceedings of the 62nd
+Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pp. 3119–3137,
+2024.
+Black Forest Labs.
+Flux.
+https://github.com/
+black-forest-labs/flux, 2023.
+Chen, Y., Qian, S., Tang, H., Lai, X., Liu, Z., Han, S., and
+Jia, J. Longlora: Efficient fine-tuning of long-context
+large language models. In The International Conference
+on Learning Representations, 2024.
+Choromanski, K. M., Likhosherstov, V., Dohan, D., Song,
+X., Gane, A., Sarlos, T., Hawkins, P., Davis, J. Q., Mo-
+hiuddin, A., Kaiser, L., Belanger, D. B., Colwell, L. J.,
+and Weller, A. Rethinking attention with performers. In
+International Conference on Learning Representations,
+2021.
+Chu, X., Tian, Z., Wang, Y., Zhang, B., Ren, H., Wei, X.,
+Xia, H., and Shen, C. Twins: Revisiting the design of
+spatial attention in vision transformers. In Beygelzimer,
+A., Dauphin, Y., Liang, P., and Vaughan, J. W. (eds.), Ad-
+vances in Neural Information Processing Systems, 2021.
+Chu, Y., Xu, J., Yang, Q., Wei, H., Wei, X., Guo, Z., Leng,
+Y., Lv, Y., He, J., Lin, J., Zhou, C., and Zhou, J. Qwen2-
+audio technical report, 2024.
+Dao, T. Flashattention-2: Faster attention with better paral-
+lelism and work partitioning. In The Twelfth International
+Conference on Learning Representations, 2024.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Re, C. Flashat-
+tention: Fast and memory-efficient exact attention with
+IO-awareness. In Oh, A. H., Agarwal, A., Belgrave, D.,
+and Cho, K. (eds.), Advances in Neural Information Pro-
+cessing Systems, 2022.
+DeepSeek-AI, Liu, A., Feng, B., Xue, B., Wang, B., Wu, B.,
+Lu, C., Zhao, C., Deng, C., Zhang, C., Ruan, C., Dai, D.,
+Guo, D., Yang, D., Chen, D., Ji, D., Li, E., Lin, F., Dai,
+F., Luo, F., Hao, G., Chen, G., Li, G., Zhang, H., Bao,
+H., Xu, H., Wang, H., Zhang, H., Ding, H., Xin, H., Gao,
+H., Li, H., Qu, H., Cai, J. L., Liang, J., Guo, J., Ni, J., Li,
+J., Wang, J., Chen, J., Chen, J., Yuan, J., Qiu, J., Li, J.,
+Song, J., Dong, K., Hu, K., Gao, K., Guan, K., Huang,
+K., Yu, K., Wang, L., Zhang, L., Xu, L., Xia, L., Zhao,
+L., Wang, L., Zhang, L., Li, M., Wang, M., Zhang, M.,
+Zhang, M., Tang, M., Li, M., Tian, N., Huang, P., Wang,
+P., Zhang, P., Wang, Q., Zhu, Q., Chen, Q., Du, Q., Chen,
+R. J., Jin, R. L., Ge, R., Zhang, R., Pan, R., Wang, R., Xu,
+R., Zhang, R., Chen, R., Li, S. S., Lu, S., Zhou, S., Chen,
+S., Wu, S., Ye, S., Ye, S., Ma, S., Wang, S., Zhou, S., Yu,
+S., Zhou, S., Pan, S., Wang, T., Yun, T., Pei, T., Sun, T.,
+Xiao, W. L., Zeng, W., Zhao, W., An, W., Liu, W., Liang,
+W., Gao, W., Yu, W., Zhang, W., Li, X. Q., Jin, X., Wang,
+X., Bi, X., Liu, X., Wang, X., Shen, X., Chen, X., Zhang,
+X., Chen, X., Nie, X., Sun, X., Wang, X., Cheng, X., Liu,
+X., Xie, X., Liu, X., Yu, X., Song, X., Shan, X., Zhou,
+X., Yang, X., Li, X., Su, X., Lin, X., Li, Y. K., Wang,
+Y. Q., Wei, Y. X., Zhu, Y. X., Zhang, Y., Xu, Y., Xu, Y.,
+Huang, Y., Li, Y., Zhao, Y., Sun, Y., Li, Y., Wang, Y., Yu,
+Y., Zheng, Y., Zhang, Y., Shi, Y., Xiong, Y., He, Y., Tang,
+Y., Piao, Y., Wang, Y., Tan, Y., Ma, Y., Liu, Y., Guo, Y.,
+Wu, Y., Ou, Y., Zhu, Y., Wang, Y., Gong, Y., Zou, Y., He,
+Y., Zha, Y., Xiong, Y., Ma, Y., Yan, Y., Luo, Y., You, Y.,
+Liu, Y., Zhou, Y., Wu, Z. F., Ren, Z. Z., Ren, Z., Sha, Z.,
+Fu, Z., Xu, Z., Huang, Z., Zhang, Z., Xie, Z., Zhang, Z.,
+Hao, Z., Gou, Z., Ma, Z., Yan, Z., Shao, Z., Xu, Z., Wu,
+Z., Zhang, Z., Li, Z., Gu, Z., Zhu, Z., Liu, Z., Li, Z., Xie,
+Z., Song, Z., Gao, Z., and Pan, Z. Deepseek-v3 technical
+report. arXiv preprint arXiv:2412.19437, 2024.
+Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., and Fei-Fei,
+L. Imagenet: A large-scale hierarchical image database.
+In 2009 IEEE conference on computer vision and pattern
+recognition, pp. 248–255. Ieee, 2009.
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer,
+L. QLoRA: Efficient finetuning of quantized LLMs. In
+Thirty-seventh Conference on Neural Information Pro-
+cessing Systems, 2023.
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+A., et al. The llama 3 herd of models. arXiv preprint
+arXiv:2407.21783, 2024.
+10
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Fu, T., Huang, H., Ning, X., Zhang, G., Chen, B., Wu,
+T., Wang, H., Huang, Z., Li, S., Yan, S., Dai, G., Yang,
+H., and Wang, Y.
+Moa: Mixture of sparse attention
+for automatic large language model compression. arXiv
+preprint arXiv:2406.14909, 2024.
+Gao, Y., Zeng, Z., Du, D., Cao, S., So, H. K.-H., Cao,
+T., Yang, F., and Yang, M.
+Seerattention: Learning
+intrinsic sparse attention in your llms. arXiv preprint
+arXiv:2410.13276, 2024.
+GLM, T., Zeng, A., Xu, B., Wang, B., Zhang, C., Yin, D.,
+Rojas, D., Feng, G., Zhao, H., Lai, H., Yu, H., Wang, H.,
+Sun, J., Zhang, J., Cheng, J., Gui, J., Tang, J., Zhang, J.,
+Li, J., Zhao, L., Wu, L., Zhong, L., Liu, M., Huang, M.,
+Zhang, P., Zheng, Q., Lu, R., Duan, S., Zhang, S., Cao, S.,
+Yang, S., Tam, W. L., Zhao, W., Liu, X., Xia, X., Zhang,
+X., Gu, X., Lv, X., Liu, X., Liu, X., Yang, X., Song, X.,
+Zhang, X., An, Y., Xu, Y., Niu, Y., Yang, Y., Li, Y., Bai,
+Y., Dong, Y., Qi, Z., Wang, Z., Yang, Z., Du, Z., Hou,
+Z., and Wang, Z. Chatglm: A family of large language
+models from glm-130b to glm-4 all tools. arXiv preprint
+arXiv:2406.12793, 2024.
+Hendrycks, D., Basart, S., Mu, N., Kadavath, S., Wang, F.,
+Dorundo, E., Desai, R., Zhu, T., Parajuli, S., Guo, M.,
+et al. The many faces of robustness: A critical analysis of
+out-of-distribution generalization. In Proceedings of the
+IEEE/CVF international conference on computer vision,
+pp. 8340–8349, 2021a.
+Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika, M.,
+Song, D., and Steinhardt, J. Measuring massive multitask
+language understanding. Proceedings of the International
+Conference on Learning Representations (ICLR), 2021b.
+Hessel, J., Holtzman, A., Forbes, M., Le Bras, R., and
+Choi, Y. Clipscore: A reference-free evaluation metric for
+image captioning. In Proceedings of the 2021 Conference
+on Empirical Methods in Natural Language Processing,
+pp. 7514–7528, 2021.
+Heusel, M., Ramsauer, H., Unterthiner, T., Nessler, B., and
+Hochreiter, S. Gans trained by a two time-scale update
+rule converge to a local nash equilibrium. Advances in
+neural information processing systems, 30, 2017.
+Hu, Y., Huang, W., Liang, Z., Chen, C., Zhang, J., Zhu,
+J., and Chen, J. Identifying sensitive weights via post-
+quantization integral. arXiv preprint arXiv:2503.01901,
+2025.
+Jelinek, F., Mercer, R. L., Bahl, L. R., and Baker, J. K. Per-
+plexity—a measure of the difficulty of speech recognition
+tasks. The Journal of the Acoustical Society of America,
+62(S1):S63–S63, 1977.
+Jiang, H., LI, Y., Zhang, C., Wu, Q., Luo, X., Ahn, S., Han,
+Z., Abdi, A. H., Li, D., Lin, C.-Y., Yang, Y., and Qiu, L.
+MInference 1.0: Accelerating pre-filling for long-context
+LLMs via dynamic sparse attention. In The Thirty-eighth
+Annual Conference on Neural Information Processing
+Systems, 2024.
+Kamradt, G.
+Llmtest needle in a haystack - pressure
+testing llms. https://github.com/gkamradt/
+LLMTest_NeedleInAHaystack, 2023.
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret, F.
+Transformers are rnns: Fast autoregressive transformers
+with linear attention. In International conference on ma-
+chine learning, pp. 5156–5165. PMLR, 2020.
+Kong, W., Tian, Q., Zhang, Z., Min, R., Dai, Z., Zhou, J.,
+Xiong, J., Li, X., Wu, B., Zhang, J., Wu, K., Lin, Q.,
+Wang, A., Wang, A., Li, C., Huang, D., Yang, F., Tan,
+H., Wang, H., Song, J., Bai, J., Wu, J., Xue, J., Wang,
+J., Yuan, J., Wang, K., Liu, M., Li, P., Li, S., Wang, W.,
+Yu, W., Deng, X., Li, Y., Long, Y., Chen, Y., Cui, Y.,
+Peng, Y., Yu, Z., He, Z., Xu, Z., Zhou, Z., Xu, Z., Tao,
+Y., Lu, Q., Liu, S., Zhou, D., Wang, H., Yang, Y., Wang,
+D., Liu, Y., Jiang, J., and Zhong, C. Hunyuanvideo: A
+systematic framework for large video generative models.
+arXiv preprint arXiv:2412.03603, 2024.
+Lefaudeux, B., Massa, F., Liskovich, D., Xiong, W.,
+Caggiano, V., Naren, S., Xu, M., Hu, J., Tintore, M.,
+Zhang, S., Labatut, P., Haziza, D., Wehrstedt, L., Reizen-
+stein, J., and Sizov, G. xformers: A modular and hack-
+able transformer modelling library. https://github.
+com/facebookresearch/xformers, 2022.
+Li, D., Kamko, A., Akhgari, E., Sabet, A., Xu, L., and Doshi,
+S.
+Playground v2.5: Three insights towards enhanc-
+ing aesthetic quality in text-to-image generation. arXiv
+preprint arXiv:2402.17245, 2024.
+Li, K., Wang, Y., Peng, G., Song, G., Liu, Y., Li, H., and
+Qiao, Y. Uniformer: Unified transformer for efficient
+spatial-temporal representation learning. In International
+Conference on Learning Representations, 2022.
+Lin, Y., Tang, H., Yang, S., Zhang, Z., Xiao, G., Gan, C., and
+Han, S. QServe:w4a8KV4 quantization and system co-
+design for efficient LLM serving. In Eighth Conference
+on Machine Learning and Systems, 2025.
+Liu, Y., Cun, X., Liu, X., Wang, X., Zhang, Y., Chen, H.,
+Liu, Y., Zeng, T., Chan, R., and Shan, Y. Evalcrafter:
+Benchmarking and evaluating large video generation
+models. In Proceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pp. 22139–
+22149, 2024.
+11
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Liu, Z., Lin, Y., Cao, Y., Hu, H., Wei, Y., Zhang, Z., Lin,
+S., and Guo, B. Swin transformer: Hierarchical vision
+transformer using shifted windows. In Proceedings of the
+IEEE/CVF international conference on computer vision,
+pp. 10012–10022, 2021.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer
+sentinel mixture models. In International Conference on
+Learning Representations, 2022.
+Milakov, M. and Gimelshein, N. Online normalizer cal-
+culation for softmax. arXiv preprint arXiv:1805.02867,
+2018.
+NVIDIA.
+Parallel
+thread
+execution
+isa
+version
+8.5.
+https://docs.nvidia.com/cuda/
+parallel-thread-execution/.
+NVIDIA. CUTLASS: CUDA Templates for Linear Algebra
+Subroutines and Solvers. GitHub repository, 2023. URL
+https://github.com/NVIDIA/cutlass.
+Panayotov, V., Chen, G., Povey, D., and Khudanpur, S.
+Librispeech: An asr corpus based on public domain au-
+dio books. In 2015 IEEE International Conference on
+Acoustics, Speech and Signal Processing (ICASSP), pp.
+5206–5210, 2015. doi: 10.1109/ICASSP.2015.7178964.
+Paperno, D., Kruszewski, G., Lazaridou, A., Pham, N.-Q.,
+Bernardi, R., Pezzelle, S., Baroni, M., Boleda, G., and
+Fern´andez, R. The lambada dataset: Word prediction
+requiring a broad discourse context. In Proceedings of
+the 54th Annual Meeting of the Association for Compu-
+tational Linguistics (Volume 1: Long Papers), pp. 1525–
+1534, 2016.
+Salimans, T., Goodfellow, I., Zaremba, W., Cheung, V.,
+Radford, A., and Chen, X.
+Improved techniques for
+training gans. Advances in neural information processing
+systems, 29, 2016.
+Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani, P.,
+and Dao, T. Flashattention-3: Fast and accurate attention
+with asynchrony and low-precision. In The Thirty-eighth
+Annual Conference on Neural Information Processing
+Systems, 2024.
+Stability
+AI.
+Introducing
+stable
+diffusion
+3.5.
+https://stability.ai/news/
+introducing-stable-diffusion-3-5, 2023.
+Team,
+G.
+Mochi 1.
+https://github.com/
+genmoai/models, 2024.
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+Bhosale, S., et al. Llama 2: Open foundation and fine-
+tuned chat models. arXiv preprint arXiv:2307.09288,
+2023.
+Vaswani, A. Attention is all you need. Advances in Neural
+Information Processing Systems, 2017.
+Venkataramanan, S., Ghodrati, A., Asano, Y. M., Porikli,
+F., and Habibian, A. Skip-attention: Improving vision
+transformers by paying less attention. In The Twelfth
+International Conference on Learning Representations,
+2024.
+Wang, H., Ge, S., Lipton, Z., and Xing, E. P. Learning
+robust global representations by penalizing local predic-
+tive power. Advances in Neural Information Processing
+Systems, 32, 2019.
+Wang, S., Li, B. Z., Khabsa, M., Fang, H., and Ma, H.
+Linformer: Self-attention with linear complexity. arXiv
+preprint arXiv:2006.04768, 2020.
+Wang, Y., Chen, Z., Chen, X., Zhu, J., and Chen, J. Frame-
+bridge: Improving image-to-video generation with bridge
+models. arXiv preprint arXiv:2410.15371, 2024.
+Wightman, R. Pytorch image models. https://github.
+com/rwightman/pytorch-image-models,
+2019.
+Wu, H., Zhang, E., Liao, L., Chen, C., Hou, J., Wang, A.,
+Sun, W., Yan, Q., and Lin, W. Exploring video quality
+assessment on user generated contents from aesthetic and
+technical perspectives. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision, pp. 20144–
+20154, 2023.
+Xi, H., Yang, S., Zhao, Y., Xu, C., Li, M., Li, X., Lin, Y., Cai,
+H., Zhang, J., Li, D., et al. Sparse videogen: Accelerating
+video diffusion transformers with spatial-temporal spar-
+sity. In International Conference on Machine Learning
+(ICML), 2025.
+Xiao, C., Zhang, P., Han, X., Xiao, G., Lin, Y., Zhang, Z.,
+Liu, Z., and Sun, M. Infllm: Training-free long-context
+extrapolation for llms with an efficient context memory.
+In First Workshop on Long-Context Foundation Models@
+ICML 2024, 2024a.
+Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+S. Smoothquant: Accurate and efficient post-training
+quantization for large language models. In International
+Conference on Machine Learning, pp. 38087–38099.
+PMLR, 2023.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+ficient streaming language models with attention sinks.
+In The Twelfth International Conference on Learning
+Representations, 2024b.
+12
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Xu, J., Liu, X., Wu, Y., Tong, Y., Li, Q., Ding, M., Tang,
+J., and Dong, Y. Imagereward: Learning and evaluat-
+ing human preferences for text-to-image generation. In
+Thirty-seventh Conference on Neural Information Pro-
+cessing Systems, 2023.
+Yang, S., Xi, H., Zhao, Y., Li, M., Zhang, J., Cai, H., Lin, Y.,
+Li, X., Xu, C., Peng, K., et al. Sparse videogen2: Accel-
+erate video generation with sparse attention via semantic-
+aware permutation. arXiv preprint arXiv:2505.18875,
+2025a.
+Yang, Z., Teng, J., Zheng, W., Ding, M., Huang, S., Xu,
+J., Yang, Y., Hong, W., Zhang, X., Feng, G., et al.
+Cogvideox: Text-to-video diffusion models with an ex-
+pert transformer. In The Thirteenth International Confer-
+ence on Learning Representations, 2025b.
+Yu, W., Luo, M., Zhou, P., Si, C., Zhou, Y., Wang, X., Feng,
+J., and Yan, S. Metaformer is actually what you need
+for vision. In Proceedings of the IEEE/CVF conference
+on computer vision and pattern recognition, pp. 10819–
+10829, 2022.
+Zhang, J., Huang, H., Zhang, P., Wei, J., Zhu, J., and Chen,
+J. Sageattention2: Efficient attention with smoothing q
+and per-thread quantization. 2025a.
+Zhang, J., Li, G., and Su, J. Sage: A framework of precise
+retrieval for rag. In 2025 IEEE 41st International Confer-
+ence on Data Engineering (ICDE), pp. 1388–1401. IEEE
+Computer Society, 2025b.
+Zhang, J., Wei, J., Zhang, P., Chen, J., and Zhu, J. Sageatten-
+tion: Accurate 8-bit attention for plug-and-play inference
+acceleration. In The International Conference on Learn-
+ing Representations, 2025c.
+Zhang, J., Wei, J., Zhang, P., Xu, X., Huang, H., Wang, H.,
+Jiang, K., Zhu, J., and Chen, J. Sageattention3: Microscal-
+ing fp4 attention for inference and an exploration of 8-bit
+training. arXiv preprint arXiv:2505.11594, 2025d.
+Zhang, J., Xiang, C., Huang, H., Wei, J., Xi, H., Zhu, J., and
+Chen, J. Spargeattn: Accurate sparse attention accelerat-
+ing any model inference. In International Conference on
+Machine Learning (ICML), 2025e.
+Zhang, J., Xiang, C., Huang, H., Wei, J., Xi, H., Zhu, J.,
+and Chen, J. Spargeattn: Training-free sparse attention
+accelerating any model inference. 2025f.
+Zhang, J., Xu, X., Wei, J., Huang, H., Zhang, P., Chendong,
+X., Zhu, J., and Chen, J. Sageattention2++: A more
+efficient implementation of sageattention2. arXiv preprint
+arXiv:2505.21136, 2025g.
+Zhang, P., Chen, Y., Su, R., Ding, H., Stoica, I., Liu, Z.,
+and Zhang, H. Fast video generation with sliding tile
+attention. arXiv preprint arXiv:2502.04507, 2025h.
+Zhang, P., Huang, H., Chen, Y., Lin, W., Liu, Z., Sto-
+ica, I., Xing, E. P., and Zhang, H.
+Faster video dif-
+fusion with trainable sparse attention. arXiv preprint
+arXiv:2505.13389, 2025i.
+Zhang, P., Wei, J., Zhang, J., Zhu, J., and Chen, J. Accurate
+int8 training through dynamic block-level fallback. arXiv
+preprint arXiv:2503.08040, 2025j.
+Zhang, X., Chen, Y., Hu, S., Xu, Z., Chen, J., Hao, M., Han,
+X., Thai, Z., Wang, S., Liu, Z., and Sun, M. ∞Bench:
+Extending long context evaluation beyond 100K tokens.
+In Ku, L.-W., Martins, A., and Srikumar, V. (eds.), Pro-
+ceedings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers),
+pp. 15262–15277, 2024.
+Zhao, M., Zhu, H., Xiang, C., Zheng, K., Li, C., and
+Zhu, J. Identifying and solving conditional image leak-
+age in image-to-video diffusion model. arXiv preprint
+arXiv:2406.15735, 2024.
+Zhao, M., He, G., Chen, Y., Zhu, H., Li, C., and Zhu, J.
+Riflex: A free lunch for length extrapolation in video
+diffusion transformers. arXiv preprint arXiv:2502.15894,
+2025a.
+Zhao, T., Fang, T., Huang, H., Liu, E., Wan, R., Soedar-
+madji, W., Li, S., Lin, Z., Dai, G., Yan, S., Yang, H.,
+et al. Vidit-q: Efficient and accurate quantization of dif-
+fusion transformers for image and video generation. In
+International Conference on Learning Representations,
+2025b.
+Zheng, K., Lu, C., Chen, J., and Zhu, J. Dpm-solver-v3: Im-
+proved diffusion ode solver with empirical model statis-
+tics. Advances in Neural Information Processing Systems,
+36:55502–55542, 2023.
+Zheng, K., Chen, Y., Mao, H., Liu, M.-Y., Zhu, J., and
+Zhang, Q. Masked diffusion models are secretly time-
+agnostic masked models and exploit inaccurate categori-
+cal sampling. arXiv preprint arXiv:2409.02908, 2024a.
+Zheng, K., He, G., Chen, J., Bao, F., and Zhu, J. Diffusion
+bridge implicit models. arXiv preprint arXiv:2405.15885,
+2024b.
+Zheng, K., Chen, Y., Chen, H., He, G., Liu, M.-Y., Zhu, J.,
+and Zhang, Q. Direct discriminative optimization: Your
+likelihood-based visual generative model is secretly a gan
+discriminator. arXiv preprint arXiv:2503.01103, 2025.
+13
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Zheng, Z., Peng, X., Yang, T., Shen, C., Li, S., Liu, H.,
+Zhou, Y., Li, T., and You, Y. Open-sora: Democratiz-
+ing efficient video production for all. arXiv preprint
+arXiv:2412.20404, 2024c.
+14
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+A. Appendix
+A.1. Visible Comparison Exmaples
+SageAttention2-8b
+HadmdAttn
+SmoothAttn
+Full precision Attention
+SageAttention2-4b
+Figure 8. Comparison examples from CogvideoX (2B), prompts are sampled from open-sora prompt sets.
+A.2. Additional Kernel Speed Comparison
+Fig. 10, 11, 12, 13, 14, 15, and 16 compare the speed of SageAttention2 against baselines using headdim=64 and
+headdim=128, both with and without Causal Mask (Vaswani, 2017), on RTX4090, L20, H100, and H20 GPUs.
+Table 9 summarizes the performance gain of different attention methods against baselines on various modern GPUs.
+Table 9. Speedup of different attention methods on various GPUs.
+Method
+3090
+4090
+A100
+L40
+L20
+H100
+H20
+FlashAttention2
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+FlashAttention3
+✗
+✗
+✗
+✗
+✗
+1.37
+1.57
+FlashAttention3 (fp8)
+✗
+✗
+✗
+✗
+✗
+2.63
+3.06
+SageAttention1
+1.97
+1.96
+1.37
+1.45
+1.24
+1.53
+1.52
+SageAttention2
+✗
+2.93
+✗
+2.60
+2.46
+2.61
+3.12
+Table 10. An accuracy example on real tensors of CogvideoX model with or without smoothing V .
+Smooth V
+Cos Sim ↑
+Relative L1 ↓
+RMSE ↓
+✗
+98.25%
+0.1980
+0.2387
+✓
+99.75%
+0.0406
+0.0773
+A.3. Smoothing V
+As shown in Fig. 17, this strategy could enhance the accuracy of FP22 for values in ePV for the following reasons: Each
+row of eP spans a value range from 0 to 1, and each column of V in some models consistently features channel-wise biases
+that are exclusively positive or negative, for instance, ranging between 8 and 9 in CogvideoX. Consequently, the values
+of ePV could be quite large. However, the floating-point number representation range is not uniform—it is denser near
+zero. Therefore, by subtracting the mean −→
+Vm along the channel dimension from V , the values of ePV will be closer to
+zero, resulting in a higher representational precision (see Fig. 17 for a visual demonstration). Additionally, to maintain
+the correctness of the attention computation, it is only necessary to add −→
+Vm to the final calculation of O: O = O + −→
+Vm.
+This is because the sum of each row of the eP matrix equals 1, so eP−→
+Vm = −→
+Vm. In other words, this method decomposes V
+into two parts: −→
+Vm and V . For V , it centers the values of each column around zero, which leads to the dot product result
+between a row from the quantized eP matrix and a column from the quantized V matrix being closer to zero. This makes the
+representation of FP22 more accurate. Meanwhile, −→
+Vm is retained in FP16 and is added to O at the end without causing a
+loss of precision for the −→
+Vm part.
+15
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+SageAttn2-8b
+Full-Precision
+FlashAttention3
+(fp8)
+Mochi
+SageAttn2-8b
+Full-Precision
+FlashAttention3
+(fp8)
+HunyuanVideo
+Figure 9. A comparison example using SageAttn2-8b and FlashAttention3 on Mochi and HunyuanVideo.
+A.4. Experiment of Smoothing V
+Table 10 shows the attention accuracy on real tensors sampled from CogvideoX with and without smoothing V . It
+demonstrates that smoothing V could improve the accuracy of SageAttention2 when quantizing Q, K to INT4 and
+eP, V to FP8. We find that smoothing V is generally effective for diffusion models (Zheng et al., 2023; 2024b;a; 2025; Zhao
+et al., 2024; 2025a; Wang et al., 2024).
+A.5. Theoretical Analysis of Smoothing
+In this section, we analyze the benefit of smoothing from a theoretical perspective. Let X ∈RN×d be N activation tokens
+of dimension d. Following (Dettmers et al., 2023), we suppose that an activation token follows an Gaussian distribution
+16
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+600
+800
+Speed (TOPS)
+26
+22
+28
+OOM
+OOM
+OOM
+116
+125
+128
+127
+123
+124
+143
+153
+161
+167
+167
+167
+273
+312
+323
+322
+326
+320
+334
+348
+360
+390
+395
+393
+389
+412
+420
+446
+449
+445
+RTX4090, (Head dim = 64, causal = False)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+600
+800
+9
+7
+8
+OOM
+OOM
+OOM
+88
+106
+117
+123
+125
+126
+94
+124
+150
+159
+162
+164
+174
+246
+289
+308
+315
+322
+263
+313
+322
+360
+384
+386
+298
+368
+372
+406
+434
+436
+RTX4090, (Head dim = 64, causal = True)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+Figure 10. Speed comparison between SageAttention2 and baselines (RTX4090, headdim=64).
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+Speed (TOPS)
+23
+24
+25
+OOM
+OOM
+OOM
+90
+89
+90
+90
+90
+89
+107
+111
+112
+113
+113
+113
+125
+136
+140
+141
+142
+143
+190
+198
+202
+204
+205
+205
+230
+248
+257
+259
+262
+263
+L20, (Head dim = 64, causal = False)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+8
+8
+9
+OOM
+OOM
+OOM
+78
+81
+84
+86
+87
+88
+88
+101
+107
+111
+113
+114
+98
+120
+132
+139
+143
+144
+157
+178
+192
+199
+202
+204
+192
+218
+235
+245
+250
+254
+L20, (Head dim = 64, causal = True)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+Figure 11. Speed comparison between SageAttention2 and baselines (L20, headdim=64).
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+Speed (TOPS)
+41
+45
+48
+OOM
+OOM
+OOM
+70
+72
+73
+74
+74
+74
+106
+110
+110
+111
+111
+111
+120
+130
+135
+136
+137
+138
+201
+209
+212
+214
+217
+217
+249
+262
+265
+269
+272
+273
+L20, (Head dim = 128, causal = False)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+15
+16
+16
+OOM
+OOM
+OOM
+61
+67
+70
+72
+73
+74
+98
+104
+108
+110
+112
+112
+98
+116
+126
+132
+135
+137
+165
+188
+201
+207
+214
+217
+207
+238
+255
+264
+270
+273
+L20, (Head dim = 128, causal = True)
+Torch
+xformers
+FlashAttn2
+SageAttn1
+SageAttn2-8b
+SageAttn2-4b
+Figure 12. Speed comparison between SageAttention2 and baselines (L20, headdim=128).
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+250
+500
+750
+1000
+Speed (TOPS)
+124
+131
+139
+139
+141
+142
+268
+290
+298
+299
+303
+303
+311
+339
+359
+374
+381
+383
+355
+452
+456
+491
+474
+482
+398
+498
+549
+597
+598
+615
+457
+524
+567
+599
+604
+606
+H100, Head Dim = 64, causal = False
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+250
+500
+750
+1000
+99
+118
+126
+135
+139
+140
+181
+244
+274
+288
+297
+302
+228
+300
+349
+380
+400
+407
+190
+330
+393
+430
+450
+467
+215
+357
+452
+519
+564
+588
+331
+446
+519
+548
+588
+599
+H100, Head Dim = 64, causal = True
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+Figure 13. Speed comparison between SageAttention2 and baselines (H100, headdim=64).
+N(µ, Σ2), where µ = (µ1, µ2, . . . , µd) and Σ2 is a diagonal matrix with Σ2 = diag(σ2
+1, σ2
+2, . . . , σ2
+d). Further, we suppose
+that different token Xi is i.i.d. sampled from the same distribution.
+Suppose the absolute maximum value in a quantization group (Hu et al., 2025; Zhang et al., 2025j) is M, and the bit width
+is b, then there are 2b quantization levels. Under the round-to-nearest strategy, the expected quantization error is 1
+2 · 2M
+2b ,
+which is proportional to the maximum absolute value in the quantization group. So a smaller absolute maximum value leads
+to smaller quantization error.
+17
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+500
+1000
+1500
+Speed (TOPS)
+166
+175
+181
+180
+181
+180
+319
+343
+339
+339
+339
+339
+430
+471
+495
+516
+517
+518
+410
+444
+441
+459
+465
+470
+614
+772
+830
+891
+878
+892
+676
+807
+852
+900
+871
+882
+H100, Head Dim = 128, causal = False
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+500
+1000
+1500
+134
+156
+169
+174
+177
+180
+217
+281
+307
+330
+328
+329
+310
+400
+453
+478
+498
+506
+361
+495
+528
+546
+576
+590
+263
+439
+595
+707
+776
+817
+451
+627
+747
+798
+838
+861
+H100, Head Dim = 128, causal = True
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+Figure 14. Speed comparison between SageAttention2 and baselines (H100, headdim=128).
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+Speed (TOPS)
+53
+55
+56
+56
+56
+57
+79
+84
+86
+86
+86
+87
+123
+137
+141
+142
+145
+145
+118
+129
+134
+140
+140
+142
+204
+238
+255
+271
+273
+277
+232
+253
+261
+264
+266
+266
+H20, Head Dim = 64, causal = False
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+46
+51
+54
+56
+56
+57
+64
+74
+80
+83
+85
+86
+97
+117
+130
+137
+140
+142
+79
+108
+120
+132
+136
+140
+122
+184
+216
+247
+260
+270
+185
+227
+250
+263
+269
+272
+H20, Head Dim = 64, causal = True
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+Figure 15. Speed comparison between SageAttention2 and baselines (H20, headdim=64).
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+Speed (TOPS)
+59
+61
+62
+62
+62
+63
+82
+87
+89
+89
+89
+90
+119
+129
+134
+135
+136
+136
+123
+132
+136
+140
+140
+141
+218
+249
+266
+272
+275
+273
+247
+266
+276
+279
+281
+279
+H20, Head Dim = 128, causal = False
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+1K
+2K
+4K
+8K
+16K
+32K
+Sequence Length
+0
+200
+400
+51
+57
+60
+61
+62
+62
+68
+78
+84
+87
+89
+90
+97
+115
+126
+132
+135
+137
+108
+124
+133
+138
+140
+141
+134
+185
+224
+249
+264
+271
+199
+238
+260
+272
+278
+281
+H20, Head Dim = 128, causal = True
+Xformers
+FlashAttn2
+SageAttention1
+FlashAttn3-fp16
+FlashAttn3-fp8
+SageAttn2-8b
+Figure 16. Speed comparison between SageAttention2 and baselines (H20, headdim=128).
+Figure 17. An example of dot product precison a row of eP and a column of V presented by FP22 data type.
+After smoothing, we have:
+Yij = Xij −1
+N
+N
+X
+k=1
+Xkj
+(3)
+18
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+and Yij also follows a Gaussian distribution. The mean and variance of Yij can be calculated as follows:
+E[Yij] = E[Xij] −1
+N
+N
+X
+k=1
+E[Xkj] = µj −1
+N
+N
+X
+k=1
+µj = 0
+(4)
+Var[Yij] = Var[N −1
+N
+Xij] +
+N
+X
+k=1,k̸=i
+Var[ 1
+N Xkj] = (N −1)2
+N 2
+σ2
+j + (N −1) 1
+N 2 σ2
+j = (N −1)
+N
+σ2
+j
+(5)
+So Yij has a smaller mean and variance compared to Xij. Following the property of Gaussian distribution, we have:
+P(|Yij| < ϵ) > P(|Xij| > ϵ), ∀ϵ > 0
+(6)
+So the distribution of Xij is more concentrated toward 0 after smoothing. Then we know that
+P(absmax(Yi) < ϵ) =
+d
+Y
+j=1
+P(|Yij| < ϵ) >
+d
+Y
+j=1
+P(|Xij| > ϵ) = P(absmax(Xi) < ϵ)
+(7)
+So this makes the distribution of absolute max value in a token more concentrated towards 0, leading to smaller quantization
+error.
+A.6. Per-Thread Quantization Formulation
+Figure 18. Memory layout of INT4/INT8 tensor core for accumulator matrix C and D in D = A ∗B + C among 32 threads (T0 ∼T31)
+in a warp. C and D is of shape 16x8. Each thread only holds 4 out of the 128 elements.
+To further clarify the per-thread quantization, we first introduce the INT4 MMA instruction of Tensor Core, and then give
+the formulation of per-thread quantization.
+Tensor cores, first introduced in NVIDIA’s Volta architecture, are specialized units designed for efficient matrix-multiply-
+and-accumulate (MMA) operations. Their usage significantly enhances computational efficiency and performance in AI
+and high-performance computing (HPC) workloads. Tensor cores compute small tiles of MMA operations, specifically
+D = A ∗B + C on a warp (32 contiguous threads) basis. Each thread in the warp holds a fragment of input matrices and
+will get a fragment of output matrix as a computation result. The INT4 mma.m16n8k64 tensor core operation computes
+the product of a 16 × 64 INT4 matrix A and a 64 × 8 INT4 matrix B, both stored in registers. It accumulates the result
+into a 16 × 8 INT32 matrix C, also stored in registers, and returns the final product matrix D, which has the same shape
+(16 × 8), data type (INT32), and storage location (registers). Each thread holds only
+1
+32 of the input and output data. Fig. 18
+extracted from the PTX document (NVIDIA) shows the memory layout of matrix C and D among 32 threads in a warp.
+Each thread only holds 4 out of the 128 result elements.
+19
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+iδq =⌊(n ∗8 ∗cw/bq)⌋
+qi[iδq] ={8 × (n%8) + ⌊(n ∗cw
+bq
+)⌋∗bq
+cw
+}, n ∈[0, N]
+δQ[iδq] =max(| Q[qi[iδq]] |)
+7
+ˆQ[qi[iδq]] =
+Q[qi[iδq]]
+δQ[iδq]
+
+iδk =⌊(n ∗4/bk)⌋
+(8)
+kn[iδk] ={8 × (n%8) + ⌊n/bk⌋∗bk}∪
+{8 × (n%8) + 1 + ⌊n/bk⌋∗bk}, n ∈[0, N]
+δK[iδk] =max(| K[kn[iδk]] |)
+7
+ˆK[kn[iδk]] =
+K[kn[iδk]]
+δK[iδk]
+
+By ensuring results held by each thread share a common dequantization scale (belong to the same quantization group),
+we can avoid the overhead associated with per-token quantization. Leveraging this observation, we design per-thread
+quantization as formulated in Eq. 8, where cw is the count of GPU Warps, bq and bk are the block size of Q, K, and n is the
+token index of Q, K. For typical block size of bq = 128, bk = 64 and warp number cw = 4 (as used in FlashAttention2),
+each warp processes a tile of 32 query tokens and 64 key tokens. Query tokens i, 8 + i, 16 + i, 24 + i (i = 0, 1, · · · , 7) can
+be made into one quantization group and key tokens j, 1 + j, 8 + j, 9 + j, · · · , 56 + j, 57 + j (j = 0, 1, 2, 3) can be made
+into one quantization group, as visualized in Fig. 4. This design aligns with the memory layout of output matrix D of tensor
+core shown in Fig. 18, ensuring that each thread only needs one Q scale and one K scale for dequantization.
+As a result, this approach creates 32 quantization groups for Q (8 for each of the 4 warps) and 4 quantization groups for K
+in a 128x64 block, providing 32× and 4× finer granularity compared to per-block quantization for query tokens and key
+tokens, respectively. Table 6 and Table 15 show the accuracy gains by using per-thread quantization. Per-thread quantization
+achieves accuracy that closely matches per-token quantization, without introducing any kernel speed degradation (see
+Table 18 and 19).
+A.7. Datasets and Metrics in Experiments
+Datasets. Text-to-text models are evaluated on four zero-shot tasks: WikiText (Merity et al., 2022) to assess the model’s
+prediction confidence, LAMBADA (Paperno et al., 2016) evaluate contextual understanding, MMLU (Hendrycks et al.,
+2021b) for measuring knowledge across various subjects, and Longbench (Bai et al., 2024) for comprehensive assessment
+of long context understanding capabilities. Text-to-video models are evaluated using the open-sora (Zheng et al., 2024c)
+prompt sets. Text-to-image models are assessed on MJHQ-30K (Li et al., 2024). TIMM is evaluated on on three image
+datasets: ImageNet (Deng et al., 2009), ImageNet-Sketch (Sketch) (Wang et al., 2019), and ImageNet-Rendition (ImageNet-
+r) (Hendrycks et al., 2021a).
+End-to-end metrics. For text-to-text models, we use perplexity (ppl.) (Jelinek et al., 1977) for WikiText, Accuracy (Acc.)
+for LAMBADA and MMLU, and Longbench score (Bai et al., 2024). For text-to-video models, following Zhao et al.
+(2025b), we evaluate the quality of generated videos on five metrics: CLIPSIM and CLIP-Temp (CLIP-T) (Liu et al., 2024)
+to measure the text-video alignment; (VQA-a) and (VQA-t) to assess the video aesthetic and technical quality, respectively;
+and Flow-score (FScore) for temporal consistency (Wu et al., 2023). For text-to-image models, generated images are
+compared with the images in MJHQ-30K dataset in three aspects: FID (Heusel et al., 2017) and sFID (Salimans et al., 2016)
+for fidelity evaluation, Clipscore (CLIP) (Hessel et al., 2021) for text-image alignment, and ImageReward (IR) (Xu et al.,
+2023) for human preference. For TIMM, we use classification accuracy.
+Accuracy metrics. We use three metrics to assess the accuracy of quantized attention output O′ compared to atten-
+tion output in full-precision O: First, we flatten O′ and O into vectors in the shape of 1 × n. Then, Cosine similar-
+ity: CosSim = P OO′/
+pP O2pP O′2, Relative L1 distance: L1 = P |O −O′|/ P |O|, Root mean square error:
+20
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+RMSE =
+p
+(1/n) P(O −O′)2.
+A.8. Kernel Benchmark Setup
+We benchmark kernel speed with a batch size of 4 and 32 attention heads across a variety of sequence lengths. Benchmarks
+are conducted using head dimensions of 64 and 128, both with and without Causal Mask (Vaswani, 2017). To generate input
+tensors for benchmarking, we follow standard practices adopted in prior works such as FlashAttention (Dao et al., 2022).
+For floating-point data types, inputs are drawn from a Gaussian distribution with mean 0 and standard deviation 1, while for
+integer data types, inputs are uniformly sampled within the representation range:[-128, 127] for INT8 and [-8, 7] for INT4.
+Table 11. End-to-end metrics on Llama2 (7B).
+Model
+Attention
+WikiText (Ppl.) ↓
+Lambda (Acc.) ↑
+MMLU (Acc.) ↑
+Llama2
+Full-Precision
+5.823
+0.886
+0.439
+HadmdAttn
+6.771
+0.860
+0.360
+SmoothAttn
+6.717
+0.867
+0.392
+SageAttention
+5.824
+0.887
+0.439
+SageAttn2-4b
+5.912
+0.881
+0.428
+SageAttn2-8b
+5.828
+0.886
+0.438
+Table 12. End-to-end metrics on CogvideoX (2B).
+Model
+Attention
+CLIPSIM ↑
+CLIP-T ↑
+VQA-a ↑
+VQA-t ↑
+FScore ↑
+CogvideoX
+(2B)
+Full-Precision
+0.1836
+0.9975
+77.605
+75.360
+3.006
+HadmdAttn
+0.1742
+0.9877
+29.780
+23.985
+0.499
+SmoothAttn
+0.1741
+0.9870
+41.703
+47.043
+0.624
+SageAttention
+0.1833
+0.9976
+76.997
+71.360
+2.988
+SageAttn2-4b
+0.1821
+0.9973
+77.368
+74.906
+2.603
+SageAttn2-8b
+0.1829
+0.9977
+76.532
+74.281
+2.941
+Table 13. End-to-end metrics on an image classification model.
+Model
+Attention
+ImageNet (Acc.) ↑
+Sketch (Acc.) ↑
+ImageNet-r (Acc.) ↑
+TIMM
+Full-Precision
+84.79%
+45.32%
+59.55%
+HadmdAttn
+84.50%
+44.89%
+58.80%
+SmoothAttn
+84.40%
+44.68%
+58.73%
+SageAttention
+84.74%
+45.38%
+59.95%
+SageAttn2-4b
+86.67%
+45.24%
+59.29%
+SageAttn2-8b
+84.79%
+45.39%
+59.57%
+Table 14. Comparison with FlashAttention3(fp8) on Llama-3-262k (8B) on InfiniBench (Zhang et al., 2024) (H100 GPU).
+Attention
+Eng.Sum
+Eng.QA
+Eng.MC
+Code.Debug
+Math.Find
+Retr.PassKey
+Retr.Num
+Retr.KV
+Avg.
+Full-Precision
+18.03
+12.5
+64.19
+24.37
+18.29
+100.0
+100.0
+7.0
+43.05
+FlashAttn3-fp8
+19.03
+11.73
+55.90
+22.59
+22.57
+100.0
+100.0
+0.4
+41.53
+SageAttention2
+18.17
+12.46
+64.19
+25.63
+17.43
+100.0
+100.0
+6.6
+43.06
+Table 15. Worst accuracy across all layers of CogvideoX using different quantization granularities.
+Method
+Cos Sim ↑
+Relative L1 ↓
+RMSE ↓
+Per-token
+96.76%
+0.1916
+0.0775
+Per-thread
+96.72%
+0.1932
+0.0776
+Per-block
+90.68%
+0.3615
+0.1490
+Per-tensor
+85.85%
+0.4687
+0.2261
+21
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+6K
+38K
+70K
+102K
+134K
+166K
+198K
+230K
+262K
+Token Limit
+0.0
+11.0
+22.0
+33.0
+44.0
+56.0
+67.0
+78.0
+89.0
+100.0
+Depth (%)
+NIAH Llama-3-8B-262k
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(a) Full Precision
+6K
+38K
+70K
+102K
+134K
+166K
+198K
+230K
+262K
+Token Limit
+0.0
+11.0
+22.0
+33.0
+44.0
+56.0
+67.0
+78.0
+89.0
+100.0
+Depth (%)
+NIAH Llama-3-8B-262k w/ FlashAttn3-fp8
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(b) FlashAttn3-fp8
+6K
+38K
+70K
+102K
+134K
+166K
+198K
+230K
+262K
+Token Limit
+0.0
+11.0
+22.0
+33.0
+44.0
+56.0
+67.0
+78.0
+89.0
+100.0
+Depth (%)
+NIAH Llama-3-8B-262k w/ SageAttn2
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(c) SageAttention2
+Figure 19. Needle In A Haystack results on Llama-3-262k (8B).
+-7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Frequency
+×105 Quantized value without smoothing Q
+-7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7
+Quantized value with smoothing Q
+Figure 20. An example of quantized value distribution of Q before and after smoothing Q.
+Table 16. Worst accuracy using different data types of ( eP, V ) across all layers of a CogvideoX model, where (Q, K) are smoothed.
+Q, K
+eP, V
+Cos Sim ↑
+Relative L1 ↓
+RMSE ↓
+INT4
+INT8
+19.52%
+0.9579
+1.4483
+E5M2
+94.94%
+0.2327
+0.2361
+E4M3
+96.70%
+0.1956
+0.0779
+FP16
+96.76%
+0.1916
+0.0775
+Table 17. Worst accuracy across all layers of CogvideoX using different smooth methods.
+Method
+CosSim ↑
+Relative L1 ↓
+RMSE ↓
+None
+4.83%
+0.9979
+0.7784
+HadmdAttn
+4.85%
+0.9978
+0.7785
+SmoothAttn
+64.49%
+0.9262
+0.7204
+Smooth K
+90.86%
+0.3565
+0.1464
+Smooth Q
+93.10%
+0.2989
+0.2195
+SageAttn2-4b
+96.71%
+0.1956
+0.0779
+A.9. Additional Experiments and Analysis
+Additional Results.
+Table 11, 12 and 13 show results of SageAttention2 and other baselines on Llama2 (7B),
+CogvideoX (2B) and TIMM.
+Results of Super-Long Context. We further conduct experiments on super-long context using Llama-3-262k (8B)1 on
+1https://huggingface.co/gradientai/Llama-3-8B-Instruct-262k
+22
+
+
+SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization
+Table 18. Overhead of per-thread quantization, smoothing Q, and
+two-level accumulation techniques measured on L20 GPU.
+Method
+TOPS
+Attention (INT4 + FP8)
+284
++ Per-thread quantization
+283
++ Two-level accumulation
+283
++ Smoothing Q
+273
+Table 19. Comparison of different quantization granularities mea-
+sured on L20 GPU, with QK⊤in INT4 and ePV in FP8.
+Granularity
+TOPS
+Per-tensor
+286
+Per-block
+284
+Per-thread
+283
+Per-token
+268
+InfiniBench (Zhang et al., 2024) and Needle-in-a-Haystack (NIAH) (Kamradt, 2023), with sequence lengths reaching up to
+262k tokens on an H100 GPU. Since Hopper GPUs lack native INT4 tensor core support, we use SageAttention2-8b
+for this evaluation. We compare it against FlashAttention3(fp8), ensuring both methods operate under the same bit width.
+Results are shown in Table 14 and Fig 19. SageAttention2 maintains model performance even under super-long
+context, while FlashAttention3(fp8) suffers from end-to-end accuracy degradation.
+Results of Audio Tasks. We evaluate Qwen2-Audio (7b) (Chu et al., 2024), a speech-to-text model, on the ASR task
+using the Librispeech (Panayotov et al., 2015) test split and measured its performance with the WER metric (Word Error
+Rate). As shown in Table 20, SageAttention2 consistently outperforms the baselines, highlighting its effectiveness in
+audio-related models and benchmarks.
+Table 20. End-to-end metrics on Qwen2-Audio (7B).
+Model
+Attention
+Test-Clean ↓
+Test-Dev ↓
+Qwen2-Audio
+Full-Precision
+1.74
+4.01
+HadmdAttn
+1.77
+4.05
+SmoothAttn
+1.76
+4.01
+SageAttention
+1.74
+4.02
+SageAttn2-4b
+1.73
+3.99
+SageAttn2-8b
+1.72
+4.03
+23

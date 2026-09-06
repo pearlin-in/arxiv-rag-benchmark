@@ -1,0 +1,2404 @@
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+1
+Spot-adaptive Knowledge Distillation
+Jie Song, Member, IEEE, Ying Chen, Jingwen Ye, Mingli Song, Senior Member, IEEE
+Abstract—Knowledge distillation (KD) has become a well
+established paradigm for compressing deep neural networks. The
+typical way of conducting knowledge distillation is to train the
+student network under the supervision of the teacher network
+to harness the knowledge at one or multiple spots (i.e., layers)
+in the teacher network. The distillation spots, once speciﬁed,
+will not change for all the training samples, throughout the
+whole distillation process. In this work, we argue that distillation
+spots should be adaptive to training samples and distillation
+epochs. We thus propose a new distillation strategy, termed spot-
+adaptive KD (SAKD), to adaptively determine the distillation
+spots in the teacher network per sample, at every training
+iteration during the whole distillation period. As SAKD actually
+focuses on “where to distill” instead of “what to distill” that is
+widely investigated by most existing works, it can be seamlessly
+integrated into existing distillation methods to further improve
+their performance. Extensive experiments with 10 state-of-the-
+art distillers are conducted to demonstrate the effectiveness of
+SAKD for improving their distillation performance, under both
+homogeneous and heterogeneous distillation settings. Code is
+available at https://github.com/zju-vipa/spot-adaptive-pytorch.
+Index Terms—Knowledge distillation, deep neural networks,
+distillation spots, spot-adaptive distillation.
+I. INTRODUCTION
+With the rapid development of deep learning in the last
+decade, deep neural networks (DNNs) have become the pre-
+dominant models in various ﬁelds, including computer vi-
+sion, natural language processing (NLP), etc. However, for
+a long time till today, DNNs have always been criticized as
+being excessively large to be deployed to resource-limited
+edge devices. To make DNNs more applicable in these real-
+world scenarios, knowledge distillation (KD) [1], [2] has
+been proposed for crafting the lightweight substitutes for
+these expensive DNNs. The main idea is adopting a teacher-
+student learning scheme, where the competitive lightweight
+substitutes, called students, are produced by mimicking some
+behaviors from well-behaved yet cumbersome DNNs which
+play the role of teachers. By harnessing the dark knowledge
+learned by teacher models, the lightweight student models are
+expected to achieve comparable performance, yet with much
+fewer parameters.
+After recent years of development, KD has made remarkable
+progress and nowadays become a well established paradigm
+for compressing DNNs. Based on the number of distillation
+spots, existing distillation methods can be roughly categorized
+into two schools: one-spot distillation [1]–[5], and multi-
+spot distillation [6]–[11], as shown in Fig. 1. In one-spot
+This work is funded by the National Key R&D Program of China (Grant
+No: 2018AAA0101503) and the Science and technology project of SGCC
+(State Grid Corporation of China): fundamental theory of human-in-the-loop
+hybrid-augmented intelligence for power grid dispatch and control.
+J. Song, Y. Chen, J. Ye and M. Song are with the Zhejiang University,
+Hangzhou, China. Email: sjie@zju.edu.cn; lynesychen@zju.edu.cn; yejing-
+wen@zju.edu.cn; brooksong@zju.edu.cn
+logits
+Block 1
+Block 2
+Block 3
+Block 4
+ Teacher
+Block 1
+Block 2
+Block 3
+Block 4
+ Student
+Distillation spot
+logits
+One-spot distillation
+logits
+Block 1
+Block 2
+Block 3
+Block 4
+ Teacher
+Block 1
+Block 2
+Block 3
+Block 4
+ Student
+logits
+Multi-spot distillation
+logits
+Block 1
+Block 3
+Block 1
+Block 2
+Block 4
+logits
+Spot-adaptive distillation 
+Block 2
+Block 3
+Block 4
+√
+√
+√
+×
+×
+ Teacher
+ Student
+Fig. 1. A schematic illustration of one-spot distillation, multi-spot distillation
+and the proposed spot-adaptive distillation. The dotted green arrows denote
+that these distillation spots are adaptively excluded dependent on samples and
+training iterations.
+distillation, KD happens at only one layer, typically the
+logit layer, in the teacher model. For example, Hinton et
+al. [1] proposed to minimize the KL divergence between the
+probabilistic outputs of the teacher and the student networks.
+Contrastive representation distillation (CRD) [2] adopts a
+contrastive learning approach to distill structural knowledge,
+i.e., inter-dependencies between different output dimensions
+of the representation layer. Relational knowledge distilla-
+tion (RKD) [3] transfers mutual relations of data examples
+from teacher models to student models, where the mutual
+relations are produced within a single representation layer. As
+DNNs are typically composed of dozens of layers, researchers
+have also investigated how to leverage more layers to boost the
+performance of KD. Multi-spot distillation provides student
+models with more supervision signals by mining knowledge
+from multiple layers in the teacher network. For example, Fit-
+Nets [6] adopts not only the outputs but also the intermediate
+representations learned by the teacher as hints for training the
+student. Attention transfer [7] improves the performance of a
+student CNN network by forcing it to mimic the attention maps
+at different layers of a powerful teacher network. Activation
+boundary (AB) [10] transfers the knowledge in teacher models
+via distilling activation boundaries formed by hidden neurons
+at different layers. As multi-spot distillation methods utilize
+more information from teacher models than one-spot counter-
+parts, they are usually deemed to exhibit superior performance
+for training student models.
+Existing distillation methods, whether they are one-spot or
+multi-spot, share one common characteristic: the distillation
+spot is usually a manual design choice which is inefﬁcient
+arXiv:2205.02399v1  [cs.CV]  5 May 2022
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+2
+to optimize for, especially for networks with hundreds or
+thousands of layers. On the one hand, if the distillation spots
+are set too sparsely, the student model is not sufﬁciently
+supervised by the teacher. On the other hand, if the distil-
+lation spots are set too densely, e.g., every possible layer or
+neuron, the student model learning can be over-regularized,
+which also deteriorates distillation performance. Furthermore,
+current methods employ a global distillation strategy, i.e., the
+distillation spots are ﬁxed for all the samples once speciﬁed.
+The underlying assumption is that such distillation spots are
+optimal for the entire data distribution, which is not true in
+many cases. Ideally, we would like the distillation spots to be
+determined automatically for each possible spot, per sample.
+In this work, we propose a new distillation strategy, termed
+spot-adaptive KD (SAKD), to make the distillation spots
+adaptive to training samples and distillation stages. To this
+end, we ﬁrst merge the student model and the teacher model
+into a multi-path routing network, as shown in Fig. 2. When
+the data ﬂow through the network, there are many feasible
+paths for the data to reach the output layer. A lightweight
+policy network is devised to make decisions per sample on
+the optimal propagation path when data reach the branch spots
+in the network. If the data are routed to layers of the teacher
+model by the policy network, it indicates that the counterpart
+layers in the student model (abbreviated to student layers) can
+not yet replace the layers in the teacher model (abbreviated
+to teacher layers). The knowledge in these teacher layers
+thus should be distilled into corresponding student layers.
+Otherwise, if the data are routed to some student layers by the
+policy network, it indicates that these student layers are good
+substitutes for corresponding teacher layers, yielding superior
+or at least comparable performance. In this case, the distillation
+is not allowed in these layers. As the policy network is devised
+on top of the routing network and is optimized simultaneously
+with the routing network, it can automatically determine the
+optimal distillation spots per sample, at different training
+iterations of the student model.
+The proposed method focuses on “where to distill”, which is
+vastly different from and orthogonal to current literature where
+“what to distill” is mainly investigated. It thus can be seam-
+lessly combined with existing methods to further enhance their
+distillation performance. Speciﬁcally, the proposed method is
+naturally compatible with homogeneous distillation where the
+student model is in the same-style architecture as the teacher
+model. However, experiments demonstrate that the proposed
+method also works surprisingly well under heterogeneous dis-
+tillation settings where the student model differs largely from
+that of the teacher model. Moreover, although the proposed
+method is designed primarily for multi-spot distillation, it
+can also boost the performance of one-spot distillation by
+dynamically determining distillation or not for each training
+sample.
+In a nutshell, we made following three main contributions
+in this work:
+• To our best knowledge, we are the ﬁrst to introduce
+the adaptive distillation problem where the distillation
+spots should be adaptive to different training samples and
+varying distillation stages.
+• We propose a novel spot-adaptive distillation strategy to
+automatically determine the distillation spots, making the
+distillation spots adaptive to the training samples and
+distillation stages.
+• Extensive experiments under various experimental set-
+tings are conducted to showcase the effectiveness of the
+proposed method for improving distillation performance
+of existing state-of-the-art distillers.
+The reminder of this work is organized as follows. Section II
+presents an overview of related works on knowledge distilla-
+tion and routing networks. Section III describes the proposed
+spot-adaptive distillation in detail. The experimental setups and
+results are provided in Section IV.The conclusions are drawn
+in Section V.
+II. RELATED WORK
+A. Knowledge Distillation
+Knowledge distillation has attracted widespread attention
+due to its importance in deploying DNNs to low-capacity edge
+devices. The main idea is leveraging the dark knowledge in
+a bulky teacher to craft a compact student model, of which
+the performance is expected to be on par with the teacher.
+Over the last several years, most works devote themselves to
+the exploration of “what to distill”, i.e., forms of knowledge
+for distillation. Representative forms include soft targets [1],
+features [6], [12], attention [7], factors [9], activation bound-
+ary [10], sample relationship [3], [13], [14] and so on. By
+imitating the teacher to behave in a similar way, the student
+model achieves comparable performance to the teacher model
+even with much fewer parameters. In this work, we focus on
+“where to distill” instead of “what to distill”, which is largely
+overlooked by existing works. Moreover, as “where to distill”
+is orthogonal to “what to distill”, the proposed method can
+be seamlessly integrated into existing distillation methods to
+further improve their performance.
+Existing KD methods can be divided into different cate-
+gories according to different taxonomies. Based on the number
+of spots where distillation happens, we roughly divide existing
+KD methods into one-spot [1]–[5] and multi-spot [6]–[11]
+distillation. The proposed distiller is a spot-adaptive approach
+where the number of spots for distillation is automatically
+determined rather than pre-deﬁned. Based on the similarity
+between the teacher and the student in architectures, KD
+can also be categorized into homogeneous distillation [2],
+[8] and heterogeneous distillation [2], [15], [16], where the
+heterogeneous distillation is deemed more challenging due to
+the large architecture difference [2]. The proposed method in
+this work makes few assumptions about the architectures of
+the teacher and the student, and thus it can be applied to
+both homogeneous and heterogeneous distillation scenarios.
+KD has derived a variety of different problem settings except
+the canonical teacher-student distillation, including mutual
+distillation [17], [18], self-distillation [19]–[21], knowledge
+amalgamation [22], [23] and data-free distillation [24]–[27].
+In mutual distillation, an ensemble of student models learn
+collaboratively and teach each other throughout the training
+process, enabling the teacher and the student models progress
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+3
+logits
+FC
+Block 1
+Block 2
+Block 3
+Block 4
+KD loss
+CE loss
+CE loss
+KL loss
+KD loss
+KD loss
+KD loss
+KD loss
+Teacher
+Student
+Block 1
+Block 2
+Block 3
+Block 4
+FC
+logits
+Routing Network
+FC
+Gumbel
+Softmax
+Policy Network
+Features
+𝑾𝑾=
+𝑤𝑤0
+0
+⋯
+𝑤𝑤0
+5
+𝑤𝑤1
+0
+⋯
+𝑤𝑤1
+5
+∈{0, 1}𝟐𝟐×𝟔𝟔
+𝑤𝑤0
+0
+𝑤𝑤1
+0
+𝑤𝑤1
+1
+𝑤𝑤1
+2
+𝑤𝑤1
+3
+𝑤𝑤1
+4
+𝑤𝑤1
+5
+𝑤𝑤0
+5
+𝑤𝑤0
+4
+𝑤𝑤0
+3
+𝑤𝑤0
+2
+𝑤𝑤0
+1
+𝑤𝑤0
+0
+𝑤𝑤0
+1
+𝑤𝑤0
+2
+𝑤𝑤0
+3
+𝑤𝑤0
+4
+𝑤𝑤0
+5
+Fig. 2. An illustrative diagram of the proposed method. The upper is the policy network and the bottom is the routing network. In this example, there are
+six possible distillation spots. The input of the policy network is the features from the teacher and the student models. The output of the policy network
+determines the spots for distillation. The teacher is ﬁxed during distillation.
+together. Self distillation assumes no teacher network available
+and distills knowledge within the student network itself by
+using outputs of deeper layers to supervise shallower layers.
+Knowledge amalgamation aims to craft a single multi-task
+student model by fusing the knowledge from multiple teacher
+models. Data-free distillation relaxes the assumption that the
+training data of the teacher model is available for training the
+student, i.e., the knowledge should be distilled to the student
+without any original training data. In this work, we follow the
+canonical distillation settings where both the teacher network
+and the original training data are available for training the
+student network. However, we believe the general idea can be
+also applied to various KD settings, which is left for future
+work.
+B. Routing Networks
+Routing networks [28]–[30] are a type of neural networks
+with high modularity, which is a key property required for
+encouraging task decomposition, reducing model complexity,
+and improving model generalization. A routing network usu-
+ally consists of two trainable components: a set of function
+modules and a policy agent. In neural network settings, the
+function modules are implemented by sub-networks and used
+as candidate modules for processing the input data. For each
+sample, the policy agent selects a subset of function modules
+from these candidates, assembles them into a complete model,
+and applies the assembled model to the input data for task
+predictions. Several algorithms have been proposed for opti-
+mizing the policy module, including genetic algorithm [31],
+multi-agent reinforcement learning [28], reparameterization
+strategies [29], etc.
+Routing networks are closely related to conditional com-
+putation [32], [33], mixture of experts [34], as well as their
+modern attention based [35] and sparse [36] variants. They
+have been successfully applied to several ﬁelds like multi-
+task learning [28], transfer learning [37] and language model-
+ing [30]. In this work, with the aid of a routing network, we
+propose a novel distillation strategy to automatically determine
+the spots of distillation in the network.
+III. SPOT-ADAPTIVE KNOWLEDGE DISTILLATION
+In this section, we introduce the proposed spot-adaptive KD.
+The overview of the proposed method is shown in Fig. 2. The
+whole model consists of two main components: a multi-path
+routing network and a lightweight policy network. The multi-
+path routing network is composed by the teacher model and the
+student model, with the adaption layers to adapt their features
+to each other if necessary. The policy network is used to make
+routing decisions per sample on the data ﬂow path when the
+data reach the branch spots in the routing network.
+The general idea of the proposed distillation method is
+to automatically determine whether or not to conduct the
+distillation at the candidate distillation spots, as shown in
+Fig. 2. If the samples are routed to certain teacher layers by the
+policy network, it indicates that the counterpart student layers
+can not yet replace these teacher layers. The knowledge in
+these teacher layers thus should be distilled into corresponding
+student layers. Otherwise, if the data are transmitted to some
+student layers by the policy network, it indicates that these
+student layers are good substitutes for corresponding teacher
+layers, yielding superior or at least comparable performance.
+No distillation is needed any more in this case. The ultimate
+goal of distillation is to make the policy network gradually
+choose the student layers for routing the data, which implies
+the student model is a good substitute for the teacher network.
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+4
+A. The Multi-path Routing Network
+Without loss of generality, assume a canonical Convolution
+Neural Network (CNN) for visual classiﬁcation is composed
+of several convolution blocks for representation learning, a
+fully connected layer for vectorizing the feature maps, and
+a softmax layer for making probability predictions. Each
+convolution block consists of several convolution layers, each
+followed by a non-linear activation layer and a batch normal-
+ization [38] layer1. Generally speaking, after each block, the
+feature maps are downsized by factor of 2 or more with a
+pooling layer or a convolution layer. Formally, we denote the
+function underlying a teacher CNN by
+T = S ◦F t ◦Bt
+N ◦· · · ◦Bt
+1,
+(1)
+and the function underlying a student CNN by
+S = S ◦F s ◦Bs
+N ◦· · · ◦Bs
+1,
+(2)
+where S denotes the softmax function, and F the linear
+function. Bi denotes the function underlying the i-th block.
+The superscript s and t denote the student and the teacher
+models, respectively. The symbol ◦denotes the function
+composition operation. The multi-path routing network is
+composed by the teacher and the student networks, with their
+intermediate layers interconnected with each other. However,
+there may exist dimension mismatch between the teacher and
+the student features. We adopt adaption layers [6], which
+are implemented by 1 × 1 convolution layers, to align their
+features. The underlying function of the multi-path routing
+network is denoted by
+M = S ◦ˆF ◦ˆBN ◦· · · ◦ˆB1,
+(3)
+( ˆF = wF t + (1 −w)F s,
+ˆBi = wiBt
+i + (1 −wi)Bs
+i , 1 ≤i ≤N,
+(4)
+where w and wi are the feature fusing weights produced by
+the policy network, bounded by [0, 1]. When the feature fusing
+weights take discrete values from {0, 1}, the network actually
+becomes a combinatorial network whose layers are composed
+of intertwined teacher and student layers. Note that in Eqn. (4),
+for simplicity we omit the adaption layers that are used for
+feature alignment. With the routing network M, our ultimate
+goal is to obtain an isolated student model S which performs
+on the task in interest as better as possible.
+B. The Policy Network
+We adopt a policy network to make decisions per sample
+on the data ﬂow path through the routing network. Here we
+simply adopt a lightweight fully connected layer to imple-
+ment the policy network. The input of the policy network is
+the concatenated features from the teacher and the student
+models. The outputs of the policy network are N + 1 two-
+dimensional routing vectors, where N +1 denotes the number
+of branch points, i.e., the number of candidate distillation
+spots. Each routing vector is a probability distribution, from
+which we stochastically draw a categorical value to make the
+1Different architectures may have different network conﬁgurations.
+decision on the data ﬂow path for one branch point in the
+routing network. The sampling operation is not differentiable
+due to the discretization. To enable the differentiability for
+the sampling operation, we utilize Gumbel-Softmax [39] to
+implement the policy network. Formally, assume for the i-
+th branch point in the routing network, the corresponding
+routing vector is ai
+j = {ai
+1, ai
+2}, where element ai
+1 stores the
+probability value that denotes how likely the teacher layers in
+the i-th block would be used to process the incoming data.
+During the forward propagation, the policy makes a discrete
+decision drawn from the categorical distribution based on the
+distribution:
+wi = one hot{arg max
+k
+(log ai
+k) + ϵk}.
+(5)
+Here wi is a two-dimensional one-hot vector. “one hot” is the
+function returning a one-hot vector where only the speciﬁed
+element is 1 and all the others are 0. ϵ ∈R2 is a vector in
+which the elements are i.i.d samples drawn from the Gumbel
+distribution (0, 1) to add a small amount of noise to avoid
+the argmax operation always selecting the element with the
+highest probability value.
+To enable differentiability of the discrete sampling function,
+we use the Gumbel-Softmax trick to relax wi during backward
+propagation as
+wi =
+exp((log ai + ϵ)/τ)
+P
+k exp((log ai
+k + ϵk)/τ),
+(6)
+where τ is the temperature that controls how sharp the dis-
+tribution is after the approximation. Note that for each vector
+wi, as wi
+1 + wi
+2 = 1, we simply use wi and 1 −wi to denote
+the routing decision on the teacher and the student layers, as
+shown in Eqn. (4).
+C. Spot-adaptive Distillation
+The proposed spot-adaptive distillation is conducted by
+training the routing network and the policy network simul-
+taneously. Training the proposed network is non-stationary
+from the perspective of both the policy network, and the
+routing network, because the optimal routing strategy depends
+on the module parameters and vice versa. In this work, the
+multi-path routing network and the policy network are trained
+simultaneously in an end-to-end manner. The overall objective
+is
+L = Lstudent + β1LKL + β2LKD + β3Lrouting,
+(7)
+where Lstudent is the widely-used cross-entropy loss [40]
+between the targets and the predictions from only the student
+model. LKL is the Kullback-Leibler divergence [41] between
+the teacher and the student predictions, which is also the
+vanilla distillation loss proposed by Hinton et al. [1]. LKD
+is existing knowledge distillation loss imposed on the inter-
+mediate layers, such as the losses proposed by FitNets [6],
+Attention Transfer [7], etc. As the proposed method focuses
+on “where to distill” instead of “what to distill” that is mainly
+investigated by current literature, it can be combined with most
+existing distillation methods. Lstudent, LKL and LKD are
+used to make the student model perform similarly with the
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+5
+teacher model. Lrouting is the cross entropy loss between the
+targets and the predictions from routing network. β1, β2 and
+β3 are three hyper-parameters for trading off these loss terms.
+Note that during the whole training phase, the pre-trained
+parameters of the teacher model are kept ﬁxed. The trainable
+parameters include only the parameters of the student models,
+the adaption layers and the policy netowrk. As the policy
+network and the adaption layers are involved in computing
+only Lrouting, their parameters are trained under the super-
+vision of only Lrouting. The student network and the policy
+network forms a loop where the output of the student model
+goes into the policy network, and the output of the policy
+network goes into the student network again. To stabilize the
+training of the student network, we do not back-propagate
+the gradients from policy network to the student network
+anymore. At the early stage of the training process, as the
+teacher model is well pre-trained, samples are more likely
+to be passed to the teacher layers by the policy network.
+In this case, knowledge distillation happens at all candidate
+distillation spots. As the training proceeds, the student model
+gradually master the knowledge of the teacher to different
+degrees at different layers. In this situation, the policy network
+may plan a path per sample where both teacher layers and
+student layers are intertwined. Knowledge distillation is thus
+conducted adaptively at certain layers to push the optimal
+policy to involve only student layers. In the following section,
+we provide detailed optimization algorithm to more clearly
+describe the proposed distillation method.
+D. Optimization algorithm
+To make the proposed method clearer to readers, the pseudo-
+code of SAKD is provided in Algorithm 1. Given two deep
+neural networks, a student S and a teacher T. Let x be
+the network input; we denote the lists of the intermediate
+representations from teacher and student models as featT and
+featS, the ﬁnal predictions as logitT and logitS, respectively.
+The input of the policy network P is the concatenated features
+from the teacher and the student models, as seen in Line #20.
+The outputs of the policy model P are N +1 two-dimensional
+routing vectors, donates as w (Line #21 ∼22), which
+are discrete decisions during the forward propagation and
+will be relaxed with Gumbel-softmax [39] during backward
+propagation. An apparent difﬁculty here is that the distillation
+loss Ls for the student depend on the routing decision w,
+so it is problematic to optimize the student model together
+with the policy network. We circumvent this difﬁculty by
+stop-gradient (Line #23) operation. This means that d is
+treated as a constant in the loss terms. The complete objective
+for the student model is shown in Line #26 ∼28, which
+includes the cross-entropy loss, Kullback-Leibler divergence,
+and knowledge distillation loss.
+After that, we begin the forward propagation of the multi-
+path routing network, which is composed of the teacher and
+the student networks, with their intermediate layers intercon-
+nected with each other. We set the student to eval mode
+in advance in order to make the multi-path routing network
+work more steadily, and set the student back to train mode
+Algorithm 1 SAKD Pseudocode, PyTorch-like
+1: # Si: i-th block in the student model
+2: # Ti: i-th block in the teacher model
+3: # P: policy module
+4: # Hst, Hts: adaption layer for adopting feature
+from student to teacher and from teacher to
+student, respectively
+5:
+6: # LCE: cross-entropy loss
+7: # LKL: Kullback-Leibler divergence
+8: # LKD: knowledge distillation loss
+9: # β1,β2,β3: hyper-parameters for trading off loss
+terms
+10:
+11: S.train()
+12: T.eval()
+13: for x, target in loader:
+14:
+# load a mini-batch (x, target) with B samples
+15:
+16:
+with torch.no_grad():
+17:
+logitT , featT = T(x)
+18:
+logitS, featS = S(x)
+19:
+20:
+ft = torch.cat((featT [-1], featS[-1]), 1)
+21:
+w = P(ft) # shape: [B, N + 1, 2]
+22:
+w = Gumbel-Softmax(w)[:, :, 0] # routing
+decisions
+23:
+d = w.detach() # stop gradient
+24:
+25:
+# loss for student
+26:
+Ls = LCE(logitS, target)
+27:
+Ls += β1· LKL(logitS, logitT ) · d[:, -1]
+28:
+Ls += β2· PN
+i LKD(featS[i], featT [i]) · d[:, i]
+29:
+30:
+input_s = x
+31:
+input_t = x
+32:
+S.eval()
+33:
+# Multi-path Routing Network
+34:
+for i in range(1, N + 1):
+35:
+f_t = Ti(input_t)
+36:
+f_s = Si(input_s)
+37:
+input_s = f_s · (1 - w[:, i]) + Hts(f_t) ·
+w[:, i]
+38:
+input_t = Hst(f_s) · (1 - w[:, i]) + f_t ·
+w[:, i]
+39:
+f_t = TN+1(input_t)
+40:
+f_s = SN+1(input_s)
+41:
+42:
+# output from routing network
+43:
+out = f_s · (1 - w[:, -1]) + f_t · w[:, -1]
+44:
+S.train()
+45:
+46:
+# loss for policy and adaption layers
+47:
+Lrouting = β3 · LCE(out, target)
+48:
+Lrouting.backward() # back-propagate
+49:
+update(P, Hst, Hts) # SGD update
+50:
+51:
+Ls.backward() # back-propagate
+52:
+update(S) # SGD update
+after gaining the ﬁnal prediction of the routing network.
+To align features between the teacher and the student, We
+adopt adaption layers (i.e., Hst and Hts), as shown in Line
+#37 ∼38. The cross-entropy loss is used for optimizing the
+parameters of the policy module and adaption layers.
+IV. EXPERIMENTS
+Here we ﬁrst brieﬂy describe the main experimental set-
+tings which are necessary to understand our experiments in
+this work. Then the benchmark comparisons are provided to
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+6
+demonstrate the superiority of the proposed method. Finally
+we conduct extensive ablation study to illustrate the effective-
+ness of the proposed method.
+A. Experimental Settings
+We compare the distillation performance with the top-1 and
+top-5 accuracy at the last epoch. Experiments are randomly
+repeated three times and the average results are provided.
+1) Datasets:
+Experiments
+are
+conducted
+on
+CIFAR-
+100 [42], tiny-ImageNet [43] and ImageNet [44]. CIFAR-
+100 consists of 60,000 32×32 colour images in 100 classes,
+with 600 images per class. There are 50,000 training images
+and 10,000 test images in the ofﬁcial split. The 100 classes
+in the CIFAR-100 are grouped into 20 superclasses. Tiny-
+ImageNet is a subset of ImageNet with 200 classes, where
+each image is down-sized to 64 × 64 pixels. Each class has
+500 training images, 50 validation images, and 50 test images.
+For data augmentation, all images are normalized to zero
+mean and unit variance at each channel, we normalize each
+channel of all images to zero mean and unit variance for
+pre-processing. Images in CIFAR-100 are zero-padded with
+4 pixels on every side, randomly cropped to 32×32 pixels,
+then randomly horizontal ﬂipped; and for tiny-ImageNet, we
+just employ random horizontal ﬂipping. ImageNet consists of
+1.2M training images and 50k validation images with 1,000
+classes. Following the common practice, images in ImageNet
+are augmented with random cropping of size 224×224 and
+horizontal ﬂipping.
+2) Model Architectures: To validate the effectiveness of the
+proposed method, we adopt a variety of backbone architectures
+to implement the proposed model, including ResNet [45],
+WideResNet (WRN) [46], Vgg [47], ShufﬂeNet V1 [48],
+MobieNet V2 [49]. In this work, we adopt C-ResNet to
+denote the cifar-style ResNet with 3 groups of basic blocks,
+each with 16, 32, and 64 channels, respectively. and I-ResNet
+represents ImageNet-style ResNet with bottleneck blocks and
+more channels. More detailed conﬁgurations about the two
+types of networks can be found in [2]. WRN-d-w represents
+a WideResNet with depth d and width factor w.
+3) Distillation Methods: The proposed adaptive distilla-
+tion method can be combined with most existing distillation
+methods. We combine the proposed method with ten state-of-
+the-art distillation methods to demonstrate the superiority of
+the proposed method, including FitNets [6], AT [7], SP [14],
+CC [50], VID [51], RKD [3], PKT [52], FT [9], NST [53],
+CRD [2]. For all methods, we combine their objectives with
+the vanilla KD [1] objective, the KL divergence between the
+softened predictions from teacher and the student models, to
+boost their performance. Thus all the methods involve at least
+two distillation spots, turning into a multi-spot version no
+matter they are originally one-spot or multi-spot distillation
+methods.
+4) Distillation Spots: In this work, we combine the pro-
+posed spot-adaptive KD (SAKD) with ten state-of-the-art
+knowledge distillation methods, including FitNets [6], AT [7],
+SP [14], CC [50], VID [51], RKD [3], PKT [52], FT [9],
+NST [53], CRD [2]. Additionally, we bond these objectives
+Method
+Fitnets [6]
+AT [7]
+SP [14]
+CC [50]
+DS.
+3
+2, 3, . . . , N −1
+N −1
+N
+Method
+VID [51]
+RKD [3]
+PKT [52]
+FT [9]
+DS.
+2, 3, . . . , N −1
+N
+N
+N −1
+Method
+NST [53]
+CRD [2]
+KD [1]
+DS.
+2, 3, . . . , N −1
+N
+N + 1
+TABLE I
+DETAILED SETTING OF DISTILLATION SPOTS ON VARIOUS DISTILLATION
+METHODS. “DS.” DENOTES DISTILLATION SPOTS.
+Method
+Fitnets [6]
+AT [7]
+SP [14]
+CC [50]
+VID [51]
+β2
+1.0
+1,000
+3,000
+0.02
+1.0
+Method
+RKD [3]
+PKT [52]
+FT [9]
+NST [53]
+CRD [2]
+β2
+1.0
+30,000
+200
+50
+0.8
+TABLE II
+SETTING OF THE DISTILLATION LOSS FACTOR (β2).
+with the vanilla KD [1] objective. The above distillation
+methods determine different distillation spots before training
+and remain the same throughout the whole distillation process.
+We assume that the network consists of N blocks and one
+linear function. If one method adopts the output from Block
+i (1 ≤i ≤N + 1) learned by the teacher as knowledge for
+training the student, its distillation spot is referred to as i. The
+detailed experimental setups about distillation spots are shown
+in Table I.
+5) Implementation Details: For fair comparisons, we keep
+the implementation settings of all the experiments the same.
+Speciﬁcally, following CRD [2], we set the batch size to 64,
+the number of total training epochs to 240. Most experiments
+employ SGD as the optimizer for training the student model.
+The initial learning rate is set to 0.05 for most backbone
+architectures, except MobineNet V2 and ShufﬂeNet V1 where
+the initial learning rate is set to 0.01. Weight decay is set to
+be 0.0005. The learning rate decays by a factor of 0.1 at the
+150-th, the 180-th, and the 210-th epochs. The temperature
+value for softening the predicted distributions is set to 4. τ
+in Gumbel-Softmax is initially set to 5 and decays gradually
+during training so the network can explore freely in the early
+stage and exploit the converged distillation policy in the later
+stage. For simplicity, the hyper-parameters β1 and β3 in Eqn. 7
+are set to 1. β2 is set based on the distillation methods. We
+adopt corresponding hyper-parameters in CRD [2] to set β2
+for most distillation methods, except FitNets where β2 is set to
+1 instead of 1, 000 for more stable training. Detailed settings
+of β2 are shown in Table II.
+B. Benchmark Comparisons
+1) Homogeneous Distillation: In this section, we evaluate
+the proposed method under homogeneous distillation. To this
+end, we adopt various teacher-student combinations, where
+the teacher models and the student models are in the same-
+style architectures, including C-ResNet56 →C-ResNet20, C-
+ResNet110 →C-ResNet32, C-ResNet32x4 →C-ResNet8x4,
+Vgg13 →Vgg8, WRN 40 2 →WRN 16 2. In our exper-
+iments, the candidate distillation spots include the softmax
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+7
+C-ResNet56→C-ResNet20
+C-ResNet110→C-ResNet32
+C-ResNet32×4→C-ResNet8×4
+Vgg13→Vgg8
+WRN 40 2→WRN 16 2
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+T
+72.34
+–
+–
+74.31
+–
+–
+79.42
+–
+–
+74.64
+–
+–
+75.61
+–
+–
+S
+69.06
+–
+–
+71.14
+–
+–
+72.50
+–
+–
+70.36
+–
+–
+73.26
+–
+–
+KD
+70.66
+–
+–
+73.08
+–
+–
+73.33
+–
+–
+72.98
+–
+–
+74.92
+–
+–
+Fitnets
+71.05
+71.40
++0.35
+73.19
+73.58
++0.39
+74.66
+74.95
++0.29
+73.22
+73.54
++0.32
+75.12
+75.29
++0.17
+AT
+70.99
+71.41
++0.42
+73.16
+73.47
++0.31
+74.53
+75.53
++1.00
+73.48
+73.81
++0.33
+75.32
+75.15
+-0.17
+SP
+70.65
+71.22
++0.57
+73.03
+73.26
++0.23
+74.02
+74.64
++0.60
+73.49
+73.61
++0.12
+74.98
+75.06
++0.08
+CC
+71.03
+71.48
++0.45
+73.07
+73.42
++0.35
+74.21
+74.64
++0.43
+73.04
+73.26
++0.22
+75.09
+75.41
++0.32
+VID
+71.06
+71.34
++0.28
+73.31
+73.71
++0.40
+74.56
+75.26
++0.70
+73.19
+74.12
++0.93
+75.14
+75.27
++0.13
+RKD
+71.07
+71.33
++0.26
+72.87
+73.17
++0.30
+73.79
+74.44
++0.65
+72.97
+73.44
++0.47
+74.89
+75.21
++0.32
+PKT
+70.72
+71.56
++0.84
+73.61
+73.92
++0.31
+74.23
+74.49
++0.26
+73.25
+73.53
++0.28
+75.33
+75.49
++0.16
+FT
+71.15
+71.37
++0.22
+73.44
+73.65
++0.21
+74.62
+75.19
++0.57
+73.44
+73.46
++0.02
+75.15
+75.30
++0.15
+NST
+70.68
+71.07
++0.39
+72.91
+73.50
++0.59
+74.28
+75.16
++0.88
+73.33
+75.44
++0.31
+74.67
+75.27
++0.60
+CRD
+71.46
+71.78
++0.32
+73.58
+74.25
++0.67
+75.46
+75.81
++0.25
+74.29
+74.53
++0.24
+75.64
+76.03
++0.39
+TABLE III
+TOP-1 ACCURACY OF HOMOGENEOUS DISTILLATION ON CIFAR-100 (IN %). EXPERIMENTS ARE REPEATED FOR THREE TIMES AND THE AVERAGE
+RESULTS ARE PROVIDED. “STAN.” DENOTES THE STANDARD DISTILLATION STRATEGY IN EXISTING METHODS. “ADAP.” DENOTES THE ADAPTIVE
+DISTILLATION STRATEGY PROPOSED IN THIS WORK. ∆: ACCURACY DIFFERENCE BETWEEN “ADAP.” AND “STAN.”. NUMBERS IN GREEN (RED) DENOTE
+THAT “ADAP.” OUTPERFORMS (UNDERPERFORMS) “STAN.”. T AND S REPRESENT THE TEACHER AND THE STUDENT MODELS, RESPECTIVELY.
+Vgg13→MobileNetV2
+I-ResNet50→MobileNetV2
+I-ResNet50→Vgg8
+C-ResNet32×4→C-ResNet32
+WRN 40 2→ShufﬂeNetV1
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+T
+74.64
+–
+–
+79.34
+–
+–
+79.34
+–
+–
+74.92
+–
+–
+75.61
+–
+–
+S
+64.60
+–
+–
+64.60
+–
+–
+70.36
+–
+–
+71.14
+–
+–
+70.50
+–
+–
+KD
+67.37
+–
+–
+67.35
+–
+–
+73.81
+–
+–
+72.98
+–
+–
+74.83
+–
+–
+Fitnets
+72.47
+73.11
++0.64
+72.69
+73.03
++0.34
+73.24
+73.75
++0.51
+72.35
+72.63
++0.28
+75.67
+75.93
++0.26
+AT
+72.00
+72.60
++0.60
+71.54
+72.11
++0.57
+74.01
+73.82
+-0.19
+72.67
+72.86
++0.19
+76.24
+76.55
++0.29
+SP
+73.04
+73.31
++0.27
+73.17
+73.42
++0.25
+73.52
+74.23
++0.71
+71.79
+72.65
++0.86
+76.29
+76.54
++0.25
+CC
+72.41
+72.93
++0.52
+72.61
+72.73
++0.32
+73.48
+73.54
++0.06
+72.37
+72.71
++0.34
+75.24
+75.77
++0.53
+VID
+72.10
+72.70
++0.60
+72.58
+73.08
++0.50
+73.46
+73.92
++0.46
+72.29
+72.85
++0.56
+75.88
+76.21
++0.33
+RKD
+72.58
+72.87
++0.29
+72.90
+73.86
++0.96
+73.51
+73.85
++0.34
+71.35
+72.17
++0.82
+75.66
+75.88
++0.22
+PKT
+72.76
+73.23
++0.47
+73.01
+73.41
++0.40
+73.61
+73.90
++0.29
+72.04
+72.75
++0.71
+75.66
+76.05
++0.39
+FT
+72.02
+72.30
++0.28
+72.85
+73.11
++0.26
+72.98
+73.54
++0.56
+72.42
+73.46
++1.02
+72.96
+73.60
++0.64
+NST
+72.31
+72.66
++0.35
+73.01
+73.41
++0.40
+71.74
+72.00
++0.26
+72.34
+72.69
++0.35
+76.45
+75.96
+-0.49
+CRD
+73.56
+73.81
++0.25
+73.76
+74.29
++0.53
+74.58
+74.81
++0.23
+72.99
+73.21
++0.22
+76.03
+76.26
++0.23
+TABLE IV
+TOP-1 ACCURACY OF HETEROGENEOUS DISTILLATION ON CIFAR-100 (IN %). EXPERIMENTS ARE REPEATED FOR THREE TIMES AND THE AVERAGE
+RESULTS ARE PROVIDED.
+layer for LKL, and some intermediate layers for LKD. Note
+that all competitors are combined with KD [1] to enhance
+their performance in the standard distillation scheme, and
+thus the softmax layer is always a candidate distillation spot
+in the proposed adaptive scheme. However, for intermediate
+layers, different distillers conduct knowledge distillation at
+different number of layers (one-spot distillation or multi-spot
+distillation). The proposed adaptive distillation strategy only
+determines where or not to conduct distillation at these dis-
+tillation spots. It does not add any other candidate distillation
+spots to the standard distillation methods.
+Experimental results on CIFAR-100 are shown in Table III,
+and results on tiny-ImageNet are shown in Table V. From
+these results, it can be seen that the proposed adaptive distilla-
+tion strategy consistently outperforms the standard distillation
+strategy with nearly all distillers, under all teacher-student
+architectures, and on both CIFAR-100 and tiny-ImageNet
+datasets. For example, when combined with PKT [52] for
+distilling knowledge from C-ResNet56 to C-ResNet20, the
+proposed adaptive distillation strategy improves the accuracy
+by 0.84% (from 70.72% to 71.56%) and 0.21% (from 54.29%
+to 54.50%), respectively. The standard distillation strategy
+imposes distillation constraints on all distillation spots and
+throughout the whole distillation process, which leads to over-
+regularization on the student and thus the performance degra-
+dation. Similar results are also observed on other distillation
+methods and student-teacher combinations. The highly con-
+sistent results demonstrate the effectiveness of the proposed
+method for improving performance of existing distillation
+methods.
+2) Heterogeneous Distillation: The proposed adaptive dis-
+tillation strategy is naturally compatible with homogeneous
+distillation. However, it seems not so compatible with hetero-
+geneous distillation. In this section, we evaluate the proposed
+method under heterogeneous distillation settings. On CIFAR-
+100, the adopted teacher-student combinations include Vgg13
+→MobileNetV2, I-ResNet50 →MobileNetV2, I-ResNet50
+→Vgg8, C-ResNet32×4 →C-ResNet32 and WRN 40 2
+→ShufﬂeNetV1. On tiny-ImageNet, we provide results of
+only Vgg13 →MobileNetV2 for space consideration, as other
+teacher-student combinations produce similar results. Similar
+to homogeneous distillation, the candidate distillation spots
+include the softmax layer for LKL, and intermediate layers
+for LKD. The softmax layer is always a candidate distillation
+spot in the proposed adaptive scheme.
+Experimental results on CIFAR-100 are provided in Ta-
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+8
+C-ResNet56→C-ResNet20
+C-ResNet110→C-ResNet20
+Vgg13 →Vgg8
+WRN 40 2 →WRN 16 2
+Vgg13 →MobileNetV2
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+Stan.
+Adap.
+∆
+T
+58.34
+–
+–
+58.46
+–
+–
+60.09
+–
+–
+61.26
+–
+–
+60.09
+–
+–
+S
+52.66
+–
+–
+51.89
+–
+–
+56.03
+–
+–
+57.17
+–
+–
+57.73
+–
+–
+KD
+53.04
+–
+–
+53.40
+–
+–
+57.33
+–
+–
+59.16
+–
+–
+60.02
+–
+–
+Fitnets
+54.43
+54.53
++0.10
+54.04
+54.25
++0.21
+58.33
+59.10
++0.77
+58.88
+59.33
++0.45
+61.37
+61.83
++0.46
+AT
+54.39
+54.88
++0.49
+54.57
+54.71
++0.14
+58.85
+59.31
++0.46
+59.39
+59.65
++0.26
+60.84
+61.34
++0.50
+FT
+53.90
+54.32
++0.42
+54.46
+55.10
++0.64
+58.87
+59.21
++0.34
+58.85
+58.90
++0.05
+61.78
+61.96
++0.18
+PKT
+54.29
+54.50
++0.21
+54.70
+55.01
++0.31
+58.87
+59.13
++0.26
+59.19
+59.59
++0.40
+61.90
+62.14
++0.24
+SP
+54.23
+54.39
++0.16
+54.38
+54.52
++0.14
+58.78
+59.26
++0.48
+57.63
+58.26
++0.13
+61.90
+62.29
++0.39
+VID
+53.89
+53.95
++0.06
+53.94
+54.28
++0.34
+58.55
+58.80
++0.25
+58.78
+58.99
++0.21
+60.84
+61.23
++0.39
+CC
+54.22
+54.83
++0.63
+54.26
+54.35
++0.09
+58.18
+58.67
++0.49
+58.83
+59.08
++0.25
+61.32
+61.82
++0.50
+RKD
+53.95
+54.05
++0.10
+53.88
+54.09
++0.21
+58.58
+58.62
++0.04
+59.31
+59.32
++0.01
+61.19
+61.58
++0.39
+NST
+53.66
+54.27
++0.61
+53.82
+54.01
++0.19
+58.85
+59.53
++0.68
+59.07
+59.20
++0.13
+60.59
+60.64
++0.05
+CRD
+55.04
+55.06
++0.02
+54.69
+55.28
++0.59
+58.88
+59.38
++0.50
+59.42
+59.87
++0.45
+61.63
+61.89
++0.26
+TABLE V
+TOP-1 ACCURACY OF ADAPTIVE DISTILLATION ON TINY-IMAGENET (IN %). BOTH HOMOGENEOUS AND HETEROGENEOUS DISTILLATION ARE
+INCLUDED HERE.
+Method
+AT
+SP
+CC
+CRD
+top@1
+Standard
+70.70
+70.62
+69.96
+71.38
+Adaptive
+70.94
+71.17
+70.72
+71.63
+∆
++0.24
++0.55
++0.76
++0.25
+top@5
+Standard
+90.00
+89.80
+89.17
+90.49
+Adaptive
+90.33
+90.22
+90.28
+90.85
+∆
++0.33
++0.42
++1.11
++0.36
+TABLE VI
+TOP@1 AND TOP@5 ACCURACY RESULTS ON IMAGENET. HERE
+I-RESNET34 IS USED AS THE TEACHER NETWORK, AND I-RESNET18 AS
+THE STUDENT.
+ble IV, and the results on tiny-ImageNet are provided in
+Table V (Vgg13 →MobileNetV2). The results show that
+the proposed adaptive distillation strategy also consistently
+improves performance of existing distillation methods under
+the heterogeneous distillation settings. For example, when
+combined with VID [51] for distilling knowledge from Vgg13
+to MobileNetV2, the proposed adaptive distillation strategy
+improves the accuracy by 0.60% (from 72.10% to 72.70%)
+and 0.39% (from 60.84% to 61.23%), respectively. The highly
+consistent results again demonstrate the effectiveness and
+universality of the proposed spot-adaptive distillation strategy
+across various experimental settings.
+3) Results on ImageNet: To validate the scalability of the
+proposed method on large-scale datasets, here we evaluate the
+proposed method on ImageNet. For a fair comparison with ex-
+isting methods [2], [7] that have been tested on ImageNet, here
+we follow their experimental settings, adpoting ResNet-34 as
+the teacher and ResNet-18 as the student. Experimental results
+are provided in Table VI. It can be seen that the proposed
+adaptive distillation strategy also consistently improves both
+top@1 and top@5 accuracy of existing distillers on ImageNet.
+For examples, with the proposed method, CC [50] improves
+its top@1 accuracy from 69.96% to 70.72%, and top@5 from
+89.17% to 90.28%. These results verify the scalability of the
+proposed method to larger datasets.
+C. Ablation Study
+We perform ablation study in this section to demonstrate the
+effectiveness of the proposed method. Speciﬁcally, we answer
+the following questions with carefully designed experiments.
+1) Does the policy network make useful decisions?
+Here we validate usefulness of the decision made by the
+policy network. To this end, we introduce four baseline dis-
+tillation strategies: always-distillation, rand-distillation, anti-
+distillation and no-distillation. Always-distillation is actually
+the standard distillation strategy where distillation is always
+conducted at every distillation spot. Rand-distillation, as its
+name implies, randomly decides on whether or not to make
+the distillation at candidate distillation spots. Anti-distillation
+adopts an opposite distillation strategy to the proposed adap-
+tive distillation: if adaptive distillation distills at a certain
+spot, anti-distillation does not distill; otherwise, it distills at
+this spot. No-distillation means that the student is trivially
+trained without any distillation. Experiments are conducted
+on CIFAR-100 and tiny-ImageNet with different KD methods
+and network pairs under both homogeneous and heteroge-
+neous distillation. The results are provided in Table VII. It
+can be seen that the proposed adaptive distillation consis-
+tently outperforms other baselines, including the competitive
+always-distillation. Although the improvement is sometimes
+marginal for some distillation methods, the consistent im-
+provement with almost all the distillation veriﬁes that the pro-
+posed policy network indeed makes useful routing decisions
+for distillation. Furthermore, anti-distillation usually produces
+much worse performance than adaptive-, always- and rand-
+distillation, sometimes even worse than no-distillation (e.g.,
+WRN 40 2→ShufﬂeNetV1 on CIFAR100). These results in-
+dicate that conducting distillation at inappropriate spots can
+be harmful for training the student.
+2) How does the decision change at different spots?
+Here we study how the distillation decisions made by
+the policy network change at different distillation spots and
+distillation stages (i.e., training epochs). At each candidate
+distillation spot, the probability of distillation is the ratio of
+the number of samples that are distilled at this spot to the
+total number of training samples. The probability curves at
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+9
+Adaptive
+Always
+Anti
+Rand
+No
+Adaptive
+Always
+Anti
+Rand
+No
+Adaptive
+Always
+Anti
+Rand
+No
+CIFAR100
+C-ResNet32×4→C-ResNet8×4
+Vgg13→Vgg8
+WRN 40 2→WRN 16 2
+Fitnets
+74.95
+74.66
+73.22
+74.23
+72.50
+73.54
+73.22
+71.37
+72.82
+70.36
+75.29
+75.12
+73.56
+75.17
+73.26
+AT
+75.53
+74.53
+73.24
+75.04
+72.50
+73.81
+73.48
+71.43
+73.59
+70.36
+75.15
+75.32
+72.47
+74.83
+73.26
+SP
+74.64
+74.02
+71.89
+73.57
+72.50
+73.61
+73.49
+69.91
+72.54
+70.36
+75.06
+74.98
+70.32
+71.25
+73.26
+VID
+75.26
+74.56
+73.02
+74.52
+72.50
+74.12
+73.19
+71.16
+72.87
+70.36
+75.27
+75.14
+73.44
+74.76
+73.26
+CRD
+75.81
+75.46
+72.38
+75.42
+72.50
+74.53
+74.29
+70.38
+73.41
+70.36
+76.03
+75.64
+72.84
+75.41
+73.26
+CIFAR100
+Vgg13→MobileNetV2
+I-ResNet50→MobineNetV2
+WRN 40 2→ShufﬂeNetV1
+Fitnets
+73.11
+72.47
+69.98
+72.01
+64.60
+73.03
+72.69
+69.00
+72.61
+64.60
+75.93
+75.67
+73.00
+75.37
+73.26
+AT
+72.60
+72.00
+67.39
+71.33
+64.60
+72.11
+71.54
+68.85
+70.28
+64.60
+76.55
+76.24
+73.77
+75.74
+73.26
+SP
+73.31
+73.04
+65.41
+72.09
+64.60
+73.42
+73.17
+64.61
+72.62
+64.60
+76.54
+76.29
+70.51
+75.21
+73.26
+VID
+72.70
+72.10
+69.72
+72.13
+64.60
+73.08
+72.58
+68.33
+72.61
+64.60
+76.21
+75.88
+72.24
+75.67
+73.26
+CRD
+73.81
+73.56
+68.08
+73.25
+64.60
+74.29
+73.76
+68.78
+73.48
+64.60
+76.26
+76.03
+71.50
+75.75
+73.26
+tiny-ImageNet
+Vgg13→Vgg8
+WRN 40 2→WRN 16 2
+Vgg13→MobileNetV2
+SP
+59.26
+58.78
+55.65
+57.92
+56.03
+58.26
+57.63
+56.65
+54.25
+57.17
+62.29
+61.90
+59.24
+60.67
+57.73
+CRD
+59.38
+58.88
+54.97
+58.14
+56.03
+59.87
+59.42
+56.09
+59.29
+57.17
+61.89
+61.63
+58.02
+61.11
+57.73
+TABLE VII
+ABLATION STUDY OF THE PROPOSED SPOT-ADAPTIVE DISTILLATION STRATEGY ON CIFAR-100 AND TINY-IMAGENET (IN %).
+0
+50
+100
+150
+200
+250
+Epoch
+100
+Probability (%)
+CIFAR100
+KD_1
+KD_2
+KD_3
+KL
+0
+50
+100
+150
+200
+250
+Epoch
+100
+Probability (%)
+TINY-IMAGENET
+KD_1
+KD_2
+KD_3
+KD_4
+KL
+Fig. 3.
+Distillation probability curves at different distillation spots. Left:
+WRN 40 2 →WRN 16 2, VID [51] on CIFAR-100. Right: Vgg13 →
+MobileNetV2, AT [7] on tiny-ImageNet. KD 1, KD 2, KD 3, KD 4, KL
+are the candidate distillation spots ordered by their position in the network.
+1.03.05.0
+10.0
+20.0
+70.4
+70.6
+70.8
+71.0
+71.2
+71.4
+71.6
+71.8
+72.0
+Acc
+CRD
+SP
+0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6
+3
+70.4
+70.6
+70.8
+71.0
+71.2
+71.4
+71.6
+71.8
+72.0
+Acc
+CRD
+SP
+Fig. 4.
+Sensitivity analysis of β3 and τ. Experiments are conducted on
+CIFAR-100. The dotted horizontal lines denote orignial KD without the
+proposed spot-adaptive distillation.
+different spots along the training epochs are depicted in Fig. 3.
+At early stages, as the teacher network is well trained, the
+optimal routing decision should be choosing the teacher layers
+at all branch points in the routing network. Thus the distillation
+probability should be nearly 100% at all distillation spots.
+However, as the policy network is randomly initialized and has
+not been well trained yet, it makes nearly random decisions
+on routing and thus the distillation probability is low. As the
+training proceeds, the policy network gradually learns how to
+make the right decisions and ﬁnds that the teacher layers tend
+to be better, thus the distillation probability increases rapidly.
+After a period of distillation, the student model master the
+knowledge of the teacher. Some samples become less useful
+PKT [52]
+FitNet [6]
+Teacher
+C-ResNet56
+Vgg13
+C-ResNet56
+Vgg13
+Student
+C-ResNet20
+MobileNetV2
+C-ResNet20
+MobileNetV2
+Scratch†
+70.94
+71.58
+70.80
+72.19
+Pre-trained†
+71.04
+71.66
+71.30
+72.61
+SAKD
+71.56
+73.23
+71.40
+73.11
+TABLE VIII
+TRAINABLE vs FROZEN TEACHER NETWORK. † DENOTES THE TEACHER
+NETWORK IS CO-TRAINED WITH THE STUDENT NETWORK.
+for training the student model, and thus the distillation prob-
+ability decreases (e.g., KD 1). Generally speaking, shallow
+layers are more sensitive to adaptive distillation. Deep layers,
+on the other hand, requires distillation nearly all the time and
+for almost all the samples, as shown by curves of KD 4 and
+KL. The reasons for this phenomenon may be that the features
+from shallow layers are relatively noisy for distillation. As the
+capacity of the student model is much smaller than the teacher,
+learning from these noisy features degrades its performance on
+the ﬁnal target task.
+3) Trainable vs frozen teacher networks, which is better?
+The teacher network is frozen all the time in the proposed
+method. Here we relax this constraint and introduce two
+alternative settings: (1) the teacher network is randomly initial-
+ized and co-trained with the student network; (2) the teacher
+network is initialized with the pre-trained parameters and co-
+trained with the student network. The trainable teacher net-
+work improves the capacity of the multi-path routing network,
+but may impair the training of the student model which will
+be deployed in isolation. Experimental results are provided in
+Table VIII. It can be seen that training the teacher network,
+whether from scratch or from pre-trained parameters, degrades
+the distillation performance, which veriﬁes our assumption.
+What is worse is that training the teacher network slows down
+the distillation process, as updating teacher parameters needs
+more computation.
+4) Sensitivity analysis of β3 and τ.
+The proposed method involves several hyperparameters.
+However, most of them are introduced in previous works.
+We follow the common settings in the literature for these
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+10
+×
+√
+goldfish
+koala
+lobster
+chihuahua
+hog
+bullfrog
+jellyfish
+penguin
+guinea pig
+ox
+×
+√
+×
+√
+×
+√
+×
+√
+Fig. 5. Visualization of the distillation decisions from the proposed SAKD on tiny-ImageNet [43] with VID [51] under C-ResNet56 →C-ResNet20 distillation.
+”✓” denotes distilling knowledge from the teacher to the student, ”×” means the student will not accept knowledge from the teacher.
+hyperparameters. This work introduces two new hyperpa-
+rameters, including τ in Eqn. 6 and β3 in Eqn. 7. Here
+we make sensitivity analysis to discuss their impact on the
+ﬁnal performance. The results are listed in Fig. 4. It can
+be seen that both β3 and τ affect the ﬁnal performance to
+some degree. However, they make the proposed spot-adaptive
+method achieve superior results in a wide range of values to
+standard distillation methods. This feature makes the proposed
+method very attractive as we do not have make great efforts
+to tune the parameters.
+5) Visualization of the distillation decision.
+To better understand the distillation decisions made by
+the policy network, we provide visualization of distillation
+decisions on ten categories of tiny-ImageNet [43] in Fig. 5.
+It can be seen that most images that will be distilled (✓) are
+usually of better quality than those not (×). We summarize the
+samples without knowledge distillation into four categories:
+missing content, ambiguous subjects, group of objects and
+unusual morphology, which are represented by red, yellow,
+purple and green frames in the ﬁgure, respectively.
+Missing content (red). Some images of this type, due to
+their extreme close-ups or uncharacteristic views, capture only
+parts of the object, such as the tail of a goldﬁsh, the body of a
+penguin and the body of a hog. In other images with missing
+content, the objects are indistinguishable from the background,
+e.g., bullfrog, jellyﬁsh, penguin, chihuahua and ox.
+Ambiguous subjects (yellow). These images contain multi-
+ple objects without identifying which object is the focus of
+the image, e.g., bullfrog and human, koala and human leg,
+lobster and human, penguin and human, chihuahua and human,
+chihuahua and bag, guinea pig and human, etc. With these
+input images, it is easy for a model to learn features that do
+not fall into the target category, and eventually leads to errors.
+The group of objects (purple). The close-up of an individual
+object reveals its characteristics in detail, whereas the group
+of samples only provide overall features, e.g., the group of
+goldﬁsh and the group of penguins.
+Unusual morphology (green). Some of the images are
+different from most of those in the dataset, which will not
+be distilled because of their extraordinary. The rarity of these
+images makes the features they provide incompatible with the
+general features. For example, we can see the lobster in blue,
+the furry penguin and the pink-haired hog in this ﬁgure, which
+provide conﬂicting features with red lobsters, molted penguins
+and pigs without head hair that are common in the dataset.
+These low-quality features can produce noisy features or
+predictions, which may hurt the learning of the student model
+due to its limited capacity. We admit that these non-distilled
+images can provide information for the model from another
+perspective, but the noise introduced by them is also worth
+considering. Generally, the distillation decision shown in this
+ﬁgure is reasonable as discriminating images offer informative
+features, and thus the knowledge from these images will guide
+the student well.
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+11
+V. CONCLUSIONS
+In this work, we argue knowledge distillation strategy
+should not be ﬁxed throughout the training process and for all
+training samples. We thus propose a spot-adaptive distillation
+strategy to automatically decide on the distillation spots per
+sample at different distillation stages. The proposed distillation
+strategy ﬁrst merges the teacher network and the student
+network into a multi-path routing network. Then a policy
+network is introduced to make decisions per sample on the data
+ﬂow path through the network. The distillation decisions are
+made based on the routing decisions from the policy network.
+We evaluate the proposed method under both homogeneous
+and heterogeneous distillation settings. And extensive ablation
+study is also conducted to demonstrate the effectiveness of the
+proposed method. The experimental results showcase that the
+proposed adaptive distillation strategy consistently improves
+the performance of various existing distillation methods.
+For possible future work, the proposed method can be stud-
+ied to applied to broader scenarios, e.g., data-free distillation
+where original training data is not available, or transformer-
+based distillation where the model architectures are replaced
+with the trending transformers.
+REFERENCES
+[1] G. E. Hinton, O. Vinyals, and J. Dean, “Distilling the knowledge in a
+neural network,” ArXiv, vol. abs/1503.02531, 2015.
+[2] Y. Tian, D. Krishnan, and P. Isola, “Contrastive representation distilla-
+tion,” in International Conference on Learning Representations, 2020.
+[3] W. Park, D. Kim, Y. Lu, and M. Cho, “Relational knowledge distil-
+lation,” 2019 IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 3962–3971, 2019.
+[4] J. H. Cho and B. Hariharan, “On the efﬁcacy of knowledge distillation,”
+2019 IEEE/CVF International Conference on Computer Vision (ICCV),
+pp. 4793–4801, 2019.
+[5] L. Yuan, F. E. Tay, G. Li, T. Wang, and J. Feng, “Revisiting knowledge
+distillation via label smoothing regularization,” in Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR), June 2020.
+[6] A. Romero, N. Ballas, S. Kahou, A. Chassang, C. Gatta, and Y. Bengio,
+“Fitnets: Hints for thin deep nets,” CoRR, vol. abs/1412.6550, 2015.
+[7] S. Zagoruyko and N. Komodakis, “Paying more attention to attention:
+Improving the performance of convolutional neural networks via atten-
+tion transfer,” in International Conference on Learning Representations,
+2017.
+[8] J. Yim, D. Joo, J. Bae, and J. Kim, “A gift from knowledge distillation:
+Fast optimization, network minimization and transfer learning,” 2017
+IEEE Conference on Computer Vision and Pattern Recognition (CVPR),
+pp. 7130–7138, 2017.
+[9] J. Kim, S. Park, and N. Kwak, “Paraphrasing complex network: Network
+compression via factor transfer,” in Advances in Neural Information
+Processing Systems, 2018.
+[10] B. Heo, M. Lee, S. Yun, and J. Choi, “Knowledge transfer via distillation
+of activation boundaries formed by hidden neurons,” in AAAI, 2019.
+[11] S. Srinivas and F. Fleuret, “Knowledge transfer with Jacobian match-
+ing,” in Proceedings of the 35th International Conference on Machine
+Learning.
+PMLR, 10–15 Jul 2018, pp. 4723–4731.
+[12] J. Song, H. Zhang, X. Wang, M. Xue, Y. Chen, L. Sun, D. Tao,
+and M. Song, “Tree-like decision distillation,” in Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+2021, pp. 13 488–13 497.
+[13] Y. Liu, J. Cao, B. Li, C. Yuan, W. Hu, Y. Li, and Y. Duan, “Knowledge
+distillation via instance relationship graph,” 2019 IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR), pp. 7089–7097,
+2019.
+[14] F. Tung and G. Mori, “Similarity-preserving knowledge distillation,”
+2019 IEEE/CVF International Conference on Computer Vision (ICCV),
+pp. 1365–1374, 2019.
+[15] X. Jin, B. Peng, Y. Wu, Y. Liu, J. Liu, D. Liang, J. Yan, and
+X. Hu, “Knowledge distillation via route constrained optimization,” 2019
+IEEE/CVF International Conference on Computer Vision (ICCV), pp.
+1345–1354, 2019.
+[16] H. Touvron, M. Cord, M. Douze, F. Massa, A. Sablayrolles, and
+H. J´egou, “Training data-efﬁcient image transformers & distillation
+through attention,” in International Conference on Machine Learning.
+PMLR, 2021, pp. 10 347–10 357.
+[17] Y. Zhang, T. Xiang, T. M. Hospedales, and H. Lu, “Deep mutual
+learning,” 2018 IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pp. 4320–4328, 2018.
+[18] A. Yao and D. Sun, “Knowledge transfer via dense cross-layer mutual-
+distillation,” in Proceedings of the European Conference on Computer
+Vision, 2020.
+[19] L. Zhang, J. Song, A. Gao, J. Chen, C. Bao, and K. Ma, “Be your own
+teacher: Improve the performance of convolutional neural networks via
+self distillation,” 2019 IEEE/CVF International Conference on Computer
+Vision (ICCV), pp. 3712–3721, 2019.
+[20] L. Yuan, F. Tay, G. Li, T. Wang, and J. Feng, “Revisiting knowledge dis-
+tillation via label smoothing regularization,” 2020 IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR), pp. 3902–3910,
+2020.
+[21] Z. Zhang and M. Sabuncu, “Self-distillation as instance-speciﬁc label
+smoothing,” in Advances in Neural Information Processing Systems,
+H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin, Eds.,
+vol. 33.
+Curran Associates, Inc., 2020, pp. 2184–2195.
+[22] J. Ye, Y. Ji, X. Wang, K. Ou, D. Tao, and M. Song, “Student becoming
+the master: Knowledge amalgamation for joint scene parsing, depth
+estimation, and more,” 2019 IEEE/CVF Conference on Computer Vision
+and Pattern Recognition (CVPR), pp. 2824–2833, 2019.
+[23] C. Shen, X. Wang, J. Song, L. Sun, and M. Song, “Amalgamating
+knowledge towards comprehensive classiﬁcation,” in Association for the
+Advancement of Artiﬁcial Intelligence (AAAI), 2019.
+[24] H. Chen, Y. Wang, C. Xu, Z. Yang, C. Liu, B. Shi, C. Xu, C. Xu, and
+Q. Tian, “Data-free learning of student networks,” in Proceedings of
+the IEEE/CVF International Conference on Computer Vision, 2019, pp.
+3514–3522.
+[25] G. Fang, J. Song, C. Shen, X. Wang, D. Chen, and M. Song, “Data-free
+adversarial distillation,” arXiv preprint arXiv:1912.11006, 2019.
+[26] Y. Fu, S. Li, H. Zhao, W. Wang, W. Fang, Y. Zhuang, Z. Pan, and
+X. Li, “Elastic knowledge distillation by learning from recollection,”
+IEEE Transactions on Neural Networks and Learning Systems, 2021.
+[27] G. Fang, Y. Bao, J. Song, X. Wang, D. Xie, C. Shen, and M. Song,
+“Mosaicking to distill: Knowledge distillation from out-of-domain data,”
+Advances in Neural Information Processing Systems, vol. 34, 2021.
+[28] C. Rosenbaum, T. Klinger, and M. Riemer, “Routing networks: Adaptive
+selection of non-linear functions for multi-task learning,” in Interna-
+tional Conference on Learning Representations (ICLR), 2018.
+[29] C. Rosenbaum, I. Cases, M. Riemer, and T. Klinger, “Routing networks
+and the challenges of modular and compositional computation,” ArXiv,
+vol. abs/1904.12774, 2019.
+[30] L. Kirsch, J. Kunze, and D. Barber, “Modular networks: Learning to
+decompose neural computation,” in Advances in Neural Information
+Processing Systems, S. Bengio, H. Wallach, H. Larochelle, K. Grauman,
+N. Cesa-Bianchi, and R. Garnett, Eds., vol. 31. Curran Associates, Inc.,
+2018.
+[31] C. Fernando, D. Banarse, C. Blundell, Y. Zwols, D. R. Ha, A. A.
+Rusu, A. Pritzel, and D. Wierstra, “Pathnet: Evolution channels gradient
+descent in super neural networks,” ArXiv, vol. abs/1701.08734, 2017.
+[32] E. Bengio, P. Bacon, J. Pineau, and D. Precup, “Conditional computation
+in neural networks for faster models,” ArXiv, vol. abs/1511.06297, 2015.
+[33] R. Stafford and J. Shawe-Taylor, “Accme : Actively compressed condi-
+tional mean embeddings for model-based reinforcement learning,” 2018.
+[34] R. Jacobs, M. I. Jordan, S. Nowlan, and G. E. Hinton, “Adaptive
+mixtures of local experts,” Neural Computation, vol. 3, pp. 79–87, 1991.
+[35] M. Riemer, A. Vempaty, F. Calmon, F. T. Heath, R. Hull, and E. Khabiri,
+“Correcting forecasts with multifactor neural attention,” in International
+Conference on Machine Learning (ICML), 2016.
+[36] N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. V. Le, G. E.
+Hinton, and J. Dean, “Outrageously large neural networks: The sparsely-
+gated mixture-of-experts layer,” in International Conference on Learning
+Representations (ICLR), 2017.
+[37] Y. Guo, H. Shi, A. Kumar, K. Grauman, T. Simunic, and R. Feris, “Spot-
+tune: Transfer learning through adaptive ﬁne-tuning,” 2019 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), pp.
+4800–4809, 2019.
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+12
+[38] S. Ioffe and C. Szegedy, “Batch normalization: Accelerating deep
+network training by reducing internal covariate shift,” in Proceedings
+of the 32nd International Conference on Machine Learning, ser.
+Proceedings of Machine Learning Research, F. Bach and D. Blei, Eds.,
+vol. 37.
+Lille, France: PMLR, 07–09 Jul 2015, pp. 448–456. [Online].
+Available: http://proceedings.mlr.press/v37/ioffe15.html
+[39] E.
+Jang,
+S.
+Gu,
+and
+B.
+Poole,
+“Categorical
+reparameterization
+with gumbel-softmax,” in ICLR, 2017. [Online]. Available: https:
+//openreview.net/forum?id=rkE3y85ee
+[40] P.-T. De Boer, D. P. Kroese, S. Mannor, and R. Y. Rubinstein, “A tutorial
+on the cross-entropy method,” Annals of operations research, vol. 134,
+no. 1, pp. 19–67, 2005.
+[41] J. R. Hershey and P. A. Olsen, “Approximating the kullback leibler di-
+vergence between gaussian mixture models,” in 2007 IEEE International
+Conference on Acoustics, Speech and Signal Processing-ICASSP’07,
+vol. 4.
+IEEE, 2007, pp. IV–317.
+[42] A. Krizhevsky, “Learning multiple layers of features from tiny images,”
+2009.
+[43] Y. Le and X. Yang, “Tiny imagenet visual recognition challenge,” 2015.
+[44] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei, “Imagenet:
+A large-scale hierarchical image database,” in 2009 IEEE conference on
+computer vision and pattern recognition.
+Ieee, 2009, pp. 248–255.
+[45] K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image
+recognition,” 2016 IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 770–778, 2016.
+[46] S. Zagoruyko and N. Komodakis, “Wide residual networks,” in
+Proceedings of the British Machine Vision Conference (BMVC),
+E. R. H. Richard C. Wilson and W. A. P. Smith, Eds.
+BMVA
+Press, September 2016, pp. 87.1–87.12. [Online]. Available: https:
+//dx.doi.org/10.5244/C.30.87
+[47] K. Simonyan and A. Zisserman, “Very deep convolutional networks for
+large-scale image recognition,” CoRR, vol. abs/1409.1556, 2015.
+[48] X. Zhang, X. Zhou, M. Lin, and J. Sun, “Shufﬂenet: An extremely efﬁ-
+cient convolutional neural network for mobile devices,” 2018 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition, pp. 6848–
+6856, 2018.
+[49] A. Howard, M. Zhu, B. Chen, D. Kalenichenko, W. Wang, T. Weyand,
+M. Andreetto, and H. Adam, “Mobilenets: Efﬁcient convolutional neural
+networks for mobile vision applications,” ArXiv, vol. abs/1704.04861,
+2017.
+[50] B. Peng, X. Jin, J. Liu, S. Zhou, Y. Wu, Y. Liu, D. sheng Li, and
+Z. Zhang, “Correlation congruence for knowledge distillation,” 2019
+IEEE/CVF International Conference on Computer Vision (ICCV), pp.
+5006–5015, 2019.
+[51] S. Ahn, S. X. Hu, A. Damianou, N. Lawrence, and Z. Dai, “Varia-
+tional information distillation for knowledge transfer,” 2019 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), pp.
+9155–9163, 2019.
+[52] N. Passalis and A. Tefas, “Learning deep representations with probabilis-
+tic knowledge transfer,” in European Conference on Computer Vision,
+2018.
+[53] Z. Huang and N. Wang, “Like what you like: Knowledge distill via
+neuron selectivity transfer,” ArXiv, vol. abs/1707.01219, 2017.
+Jie Song (Member, IEEE) is an assistant research
+fellow in College of Software Technology, Zhe-
+jiang University. He received his B.Sc. degree in
+Computer Science and Technology from Sichuan
+University, China, in 2015, and Ph.D. degree in
+Computer Science and Technology from College of
+Computer Science, Zhejiang University, China, in
+2020. His research interests mainly include knowl-
+edge distillation, transfer learning, few- and zero-
+shot learning, and interpretable machine learning.
+Ying Chen received the B.E. degree with the Col-
+lege of Software, Zhejiang University. Her research
+interests include ﬁne-grained image classiﬁcation
+and knowledge distillation.
+Jingwen Ye received the B.Sc. degree from the
+Dalian University of Technology in 2016 and the
+Ph.D. degree from Zhejiang University in 2021. She
+is currently a Postdoctoral Fellow with National Uni-
+versity of Singapore. Her research interests include
+transfer learning, human parsing, scene parsing,
+depth estimation, and image processing in various
+applications.
+Mingli Song (Senior Member, IEEE) is a Professor
+in Microsoft Visual Perception Laboratory, Zhejiang
+University. He received the Ph.D. degree in Com-
+puter Science from Zhejiang University, China, in
+2006. He was awarded Microsoft Research Fellow-
+ship in 2004. His research interests include pattern
+classiﬁcation, weakly supervised clustering, color
+and texture analysis, object recognition, and recon-
+struction. He is a senior member of the IEEE.

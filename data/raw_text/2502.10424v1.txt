@@ -1,0 +1,1621 @@
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Rishabh Tiwari 1 * Haocheng Xi 1 * Aditya Tomar 1 * Coleman Hooper 1 Sehoon Kim 1 Maxwell Horton 2
+Mahyar Najibi 2 Michael W. Mahoney 1 3 4 Kurt Keutzer 1 Amir Gholami 1 3
+Abstract
+Large Language Models (LLMs) are increasingly
+being deployed on edge devices for long-context
+settings, creating a growing need for fast and ef-
+ficient long-context inference. In these scenar-
+ios, the Key-Value (KV) cache is the primary
+bottleneck in terms of both GPU memory and
+latency, as the full KV cache must be loaded for
+each decoding step. While speculative decod-
+ing is a widely accepted technique to accelerate
+autoregressive decoding, existing methods often
+struggle to achieve significant speedups due to
+inefficient KV cache optimization strategies and
+result in low acceptance rates. To address these
+challenges, we propose a novel self-speculative
+decoding framework, QuantSpec, where the draft
+model shares the architecture of the target model
+but employs a hierarchical 4-bit quantized KV
+cache and 4-bit quantized weights for accelera-
+tion. QuantSpec maintains high acceptance rates
+(>90%) and reliably provides consistent end-
+to-end speedups upto ∼2.5×, outperforming
+other self-speculative decoding methods that use
+sparse KV cache for long-context LLM inference.
+QuantSpec also reduces the memory requirements
+by ∼1.3× compared to these alternatives.
+1. Introduction
+Large Language Models (LLMs) have been widely used in
+recent years, revolutionizing natural language processing
+(NLP) and artificial intelligence (AI) applications. As their
+applications expand, there is a growing demand to deploy
+LLMs in long-context settings – handling extended text
+inputs such as document summarization, lengthy conver-
+sations, or comprehensive instructions. The model must
+maintain coherence in such contexts and track intricate de-
+*Equal contribution
+Apple team members served in an advisory role.
+1UC Berkeley 2Apple 3ICSI 4LBNL. Correspondence to: Amir
+Gholami <amirgh@berkeley.edu>.
+Preprint.
+Token / s
+0
+10
+20
+30
+40
+Context Length
+16k, 1 GPU
+32k, 1 GPU
+64k, 2 GPU
+AutoRegressive
+StreamingLLM
+QuantSpec
+1.78×
+1.99×
+2.23×
+Figure 1. Throughput in tokens/sec of various decoding methods.
+QuantSpec achieves > 1.78× speedup over the autoregressive
+baseline across several context lengths. Benchmarked on LWM-
+Text-Chat-128k.
+tails across extended sequences. However, long-context
+inference presents significant challenges in terms of effi-
+ciency and scalability. For example, token eviction (Zhang
+et al., 2024c; Ge et al., 2023; Liu et al., 2024b) and KV
+cache quantization (Liu et al., 2024c; Kang et al., 2024;
+Hooper et al., 2024) have been proposed to improve the
+efficiency for long-context inference. However, they often
+entail noticeable degradation in generation quality.
+One promising alternative to enhance the efficiency of LLMs
+while preserving generation quality is speculative decod-
+ing (Leviathan et al., 2023; Chen et al., 2023; Kim et al.,
+2024). This method accelerates inference by using a smaller
+(draft) model to rapidly generate candidate tokens, and uses
+the original (target) model to verify these tokens to ensure
+generation quality. However, the efficient application of
+speculative decoding in long-context settings has not been
+thoroughly explored.
+Traditional speculative decoding approaches often rely on
+using smaller models as the draft model in order to mini-
+mize the memory-bandwidth overhead of loading the model
+weights of the larger target model. In long-context scenarios,
+however, the primary bottleneck shifts from model weights
+to the KV cache, which grows linearly with the context
+length. Additionally, since small models do not usually pos-
+sess good long-context understanding ability, the acceptance
+rates of the candidate tokens by the target model drop signifi-
+1
+arXiv:2502.10424v1  [cs.LG]  5 Feb 2025
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+cantly, leading to suboptimal speedup. Moreover, traditional
+speculative decoding methods maintain the KV cache for
+both the target model and the draft model, causing a large
+memory footprint. Therefore, finding a solution that both
+optimizes the KV cache’s memory efficiency and improves
+the acceptance rate within speculative decoding is essential
+for performant LLMs in long-context applications.
+To mitigate these issues and to enable efficient and accu-
+rate long-context inference, we propose QuantSpec, a self-
+speculative decoding method that utilizes 4-bit weights and
+a 4-bit hierarchical KV cache to speedup long-context infer-
+ence. In particular we make the following contributions:
+• We perform a comprehensive analysis of LLM infer-
+ence to identify bottlenecks across various context
+lengths, demonstrating that quantizing the KV cache
+improves efficiency for long contexts, while quantizing
+model weights is more beneficial for short contexts
+(see Section 3.1).
+• We introduce a novel hierarchical quantization tech-
+nique that enables bit-sharing between the target and
+draft models’ KV caches, eliminating the need for ad-
+ditional memory for the draft model (see Section 4.2).
+• We propose a double full-precision cache buffer used
+for storing the most recent KV cache in full precision
+to improve acceptance rates and also eliminate waste-
+ful quantization and dequantization operations (see
+Section 4.3).
+• We show that using a quantized KV cache leads to
+better acceptance rates between the target and the draft
+model, and thus leads to better overall speedups (see
+Section 5.2).
+• We implement custom CUDA kernels for attention with
+our hierarchical quantized KV cache achieving up to
+∼2.88× speedups at 4-bit precision relative to FP16
+FlashAttention kernels. (see Section 5.2.1)
+2. Related Work
+2.1. Efficient Long-Context Inference
+An important challenge in optimizing long-context infer-
+ence lies in reducing memory and computation requirements
+while retaining high performance on tasks that involve long
+sequences. Sparse attention mechanisms (Liu et al., 2021;
+Xiao et al., 2023b; Yao et al., 2024; Tang et al., 2024; Yang
+et al., 2024; Liu et al., 2024b; Ge et al., 2023; Jiang et al.,
+2024) have been widely adopted to manage the quadratic
+complexity of traditional full attention in long contexts.
+These techniques typically maintain efficiency by dropping
+non-essential Key-Value (KV) pairs from the cache. To-
+ken pruning (Fu et al., 2024) selectively computes the KV
+for tokens relevant for next token prediction. KV Predic-
+tion (Horton et al., 2024) improves prompt processing time
+by predicting the KV cache needed for autoregressive gener-
+ation. Retrieval-augmented generation (Tan et al., 2024; Liu
+et al., 2024a) enhances the accuracy of language model out-
+puts by combining generative models with external retrieval
+mechanisms whose context length is very long.
+2.2. Quantization
+Quantization has emerged as a powerful technique to re-
+duce the memory footprint and computational complexity in
+large-scale neural networks. Weight-only quantization (Lin
+et al., 2024; Kim et al., 2023a; Shao et al., 2023; Chee et al.,
+2024) focuses on reducing the precision of model weights to
+reduce the memory requirements of the model. As models
+grow larger, the memory footprint of KV caches can become
+substantial, especially for long input sequences. KV cache
+quantization (Liu et al., 2024c; Hooper et al., 2024; Kang
+et al., 2024) addresses this issue by quantizing the key and
+value caches to enable longer sequence inference.
+2.3. Speculative Decoding
+Speculative decoding has become an important technique
+for improving the inference efficiency of LLMs (Leviathan
+et al., 2023; Chen et al., 2023; Kim et al., 2024). It uses a
+smaller draft model to rapidly generate candidate tokens,
+which are then verified by a larger target model to ensure
+correctness. Parallelization in speculative decoding has
+also been studied to enhance the efficiency by predicting
+multiple tokens at one time (Cai et al., 2024; Bhendawade
+et al., 2024; Li et al., 2024b; Chen et al., 2024b). We include
+additional related works in Appendix B.
+Self-speculative decoding is the class of speculative decod-
+ing methods in which the draft model shares the same archi-
+tecture as that of target model for better alignment. Recent
+works like Magicdec (Anonymous, 2025) and TriForce (Sun
+et al., 2024) have shown that self-speculation with sparse
+KV can effectively speedup the draft model in long-context
+settings, where KV is the main bottleneck. While this design
+avoids loading the entire KV cache throughout the autore-
+gressive generation process, KV cache sparsification can
+lead to noticeable performance degradation as evidenced in
+previous works (Zhang et al., 2024c; Liu et al., 2024b; Ge
+et al., 2023; Zhou et al., 2024). This can potentially yield
+a mismatch between the draft and target model’s predic-
+tions (i.e., lower acceptance rate), which is a critical factor
+in overall speedup. QuantSpec addresses this limitation
+by proposing a draft model with a novel hierarchical quan-
+tized KV cache, which maintains a higher acceptance rate
+between the draft and target models, therefore leading to
+better speedup. Note that our method can be combined with
+sparse KV methods (Sun et al., 2024; Anonymous, 2025)
+2
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+for additional speedup, which we leave for future work.
+3. LLM Inference Bottlenecks
+3.1. Arithmetic Intensity
+To understand the primary bottlenecks in LLM inference
+and to motivate our method, we perform a thorough analysis
+of inference under several different regimes. These regimes
+include a combination of small versus large batch sizes and
+short versus long context lengths during both the prefill and
+decoding stages. We use arithmetic intensity as the central
+metric in our analysis, where arithmetic intensity is defined
+as the number of floating point operations (FLOPs) that can
+be performed per byte loaded from memory, or memory
+operations (MOPs) (Williams et al., 2009):
+Arithmetic Intensity = # FLOPs
+# MOPs .
+Arithmetic intensity allows us to classify which regimes
+of LLM inference are compute-bound or memory-bound
+and determine appropriate optimizations to improve latency.
+Compute-bound operations are limited by the hardware’s
+peak FLOP/s (FLOPs per second) performance and benefit
+from algorithmic improvements that reduce computational
+complexity (e.g., subquadratic attention). On the other hand,
+memory-bound operations are limited by the hardware’s
+memory bandwidth (GB/s) and benefit from techniques that
+optimize memory load-store operations, such as quantizing
+the weights of a model even if they are later scaled up to a
+higher precision during computation to preserve accuracy.
+For a finer-grained analysis, we break down the major
+operations in the Transformer into two categories: lin-
+ear, which consists of the weight-to-activation matrix
+multiplications (i.e., WQ, WK, WV , Wout, mlp up proj,
+mlp down proj, and the linear classification layer), and
+attention, which consists of the activation-to-activation ma-
+trix multiplications (i.e., query × key and attention weights
+× values). Note that the aggregate of all Transformer oper-
+ations includes the above operations as well as non-linear
+operations like activation functions in the feed-forward net-
+work, softmax in the attention mechanism, and layer normal-
+ization. Because we are interested in studying the linear and
+attention operations, we do not explicitly focus on the non-
+linear operations and classification layer in our asymptotic
+analysis, although we include them in our final results.
+3.1.1. ASYMPTOTIC ANALYSIS OF ARITHMETIC
+INTENSITY FOR PREFILL AND DECODING
+During prefill, the model weights are only loaded once to
+process all tokens in the input and generate the first token.
+Because the context length can range from a couple thou-
+sand to hundreds of thousands of tokens, this phase consists
+of large matrix-matrix multiplications (matmuls) with high
+arithmetic intensities. Table 1 shows asymptotic analysis
+of arithmetic intensity for prefill and decoding broken up
+into linear, attention, and aggregate operations for batch
+size B, sequence length SL, hidden dimension d, and a
+generation length of k tokens. During prefill, the aggregate
+arithmetic intensity is similar to the arithmetic intensity of
+the linear projections when SL ≪d because self-attention
+is relatively inexpensive for short contexts. Thus the linear
+projections dominate latency in this regime. However, as
+the context length increases and SL ≫d, the aggregate
+arithmetic intensity reflects the arithmetic intensity of atten-
+tion, which begins to dominate latency since self-attention
+incurs additional cost with longer context lengths. Note that
+our analysis assumes the use of FlashAttention (Dao et al.,
+2022), such that the attention scores matrix which grows
+on the order of O(B · SL
+2) is never fully materialized, and
+thus the memory operations for this matrix are limited to
+O(B · SL).
+On the other hand, in the decoding stage, generating k
+tokens requires loading and storing the weights and KV
+cache k times. Since the input at each iteration is a single
+token per sequence in the batch (x ∈RB×1×d), these oper-
+ations mainly consist of small matmuls with low arithmetic
+intensity. For short context lengths where SL ≪d, the ag-
+gregate arithmetic intensity for decoding again reflects the
+arithmetic intensity of the linear projections as loading and
+storing a small KV cache is relatively inexpensive compared
+to loading and storing the model weights. However, as the
+context length grows (SL ≫d), the load-store operations
+for the large KV cache exacerbate and dominate latency,
+and the aggregate arithmetic intensity reflects the arithmetic
+intensity of attention. Ultimately, the aggregate arithmetic
+intensity for decoding is much lower than that of prefill:
+(
+O(B · SL),
+SL ≪d
+O(SL),
+SL ≫d
+|
+{z
+}
+prefill
+≫
+(
+O(B),
+SL ≪d
+O(1),
+SL ≫d
+|
+{z
+}
+decode
+.
+While the aggregate arithmetic intensity for prefill scales
+proportionally to the context length which can be in the
+hundreds of thousands, the aggregate arithmetic intensity
+for decoding does not scale with the context length at all.
+Moreover, using larger batch sizes only seems to increase
+the arithmetic intensity for decoding in the short-context
+setting. For long contexts, decoding has an extremely low
+arithmetic intensity irrespective of the batch size since every
+sequence in the batch undergoes self-attention separately
+and therefore cannot benefit from batching in the same way
+linear layers do.
+3
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Table 1. Asymptotic analysis of arithmetic intensity for linear, attention, and aggregate operations under prefill and decoding for batch
+size B, sequence length SL, hidden dimension d, and generation length of k tokens.
+Prefill
+Linear
+Attention
+Aggregate
+FLOPs
+O(B · SL · d2)
+O(B · SL
+2 · d)
+O(B·SL·d2) + O(B·SL
+2·d)
+MOPs
+O(B · SL · d)
+|
+{z
+}
+activations
++ O(d2)
+| {z }
+weights
+O(B · SL)
+|
+{z
+}
+flash-attn scores
++ O(B · SL · d)
+|
+{z
+}
+activations {Q,CK,CV }
+O(B · SL · d) + O(d2)
+Arithmetic Intensity
+≈
+(
+O(B · SL),
+SL ≪d
+O(d),
+SL ≫d
+≈
+(
+O(SL),
+SL ≪d
+O(SL),
+SL ≫d
+≈
+(
+O(B · SL),
+SL ≪d
+O(SL),
+SL ≫d
+Decode
+Linear
+Attention
+Aggregate
+FLOPs
+O(k · B · d2)
+O(k · B · SL · d)
+O(k·B·d2) + O(k·B·SL·d)
+MOPs
+O(k · B · d)
+|
+{z
+}
+activations
++ O(k · d2)
+|
+{z
+}
+weights
+O(k·B·SL)
+|
+{z
+}
+attention scores
++ O(k·B·SL·d)
+|
+{z
+}
+activations {CK,CV }
+O(k · d2) + O(k · B · SL · d)
+Arithmetic Intensity
+≈
+(
+O(B),
+SL ≪d
+O(B),
+SL ≫d
+≈
+(
+O(1),
+SL ≪d
+O(1),
+SL ≫d
+≈
+(
+O(B),
+SL ≪d
+O(1),
+SL ≫d
+3.1.2. COMPUTE VERSUS MEMORY-BOUND REGIMES
+The asymptotic analysis suggests that in general, decoding
+suffers from low arithmetic intensities compared to prefill
+in all regimes. However, to decide which optimizations will
+most effectively improve latency, all regimes must be classi-
+fied as either compute-bound or memory-bound. Whether
+an operation is compute or memory-bound depends on the
+hardware it is being run on as well as the magnitude of the
+arithmetic intensity achieved by the operation.
+We utilize an analytical roofline model (Williams et al.,
+2009; Kim et al., 2023a;b) to help determine which regimes
+are compute or memory-bound in a practical inference set-
+ting. The roofline model defines a ridge point which is
+calculated as
+peak compute performance (FLOP/s)
+peak memory-BW (GB/s)
+.
+Note that the ridge point has the same units as arithmetic
+intensity (FLOPs/byte). In the roofline model, any operation
+with an arithmetic intensity smaller than the ridge point is
+memory-bound, and any operation with an arithmetic inten-
+sity greater than the ridge point is compute-bound. For our
+analysis, we extrapolate this to a ridge plane and use hard-
+ware specifications for an NVIDIA A6000 GPU to study
+inference for the Llama-2-7B model in 16 bit precision.
+For optimizing speculative decoding, we specifically focus
+on the decoding phase, although we include results for prefill
+in Appendix C.1. Figure 2 shows the arithmetic intensity for
+generating 1k tokens at different context lengths and batch
+sizes for the Linear/Attention components as well as the ag-
+gregate arithmetic intensity. To decide the ideal quantization
+strategy for different regimes, we consider the aggregate
+arithmetic intensity, which is colored by the percentage of
+the total latency taken up by attention and provides a com-
+plete view of decoding in all regimes. Based on these results,
+we can clearly see that in the small batch + short context
+regime, the memory operations for the linear projections
+dominate latency, so weight quantization could provide
+considerable speedup in this regime. In the small batch +
+long context, large batch + short context, and large batch +
+long context regimes, attention dominates latency due to the
+expensive load-store operations for the large KV cache. KV
+cache quantization could help provide performance im-
+provements in these regimes. In the small batch + medium
+context and short context + medium batch regimes, the lin-
+ear and attention operations are approximately equivalent in
+their contributions to total latency. Thus, both weight and
+KV cache quantization are ideal here.
+4. QuantSpec
+4.1. Overview of QuantSpec
+In this section, we introduce QuantSpec, a self-speculative
+decoding framework designed to accelerate both short- and
+long-context generation by quantizing the model weights
+and KV cache into INT4 precision. We begin by noting
+that self-speculative decoding is particularly well-suited
+4
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Figure 2. Breakdown of how arithmetic intensity changes during decoding as the context length and batch size are scaled logarithmically
+for linear, attention, and aggregate operations. All regimes lie below the ridge plane and thus are memory-bound. The ridge plane is
+calculated for an NVIDIA A6000 GPU. The colors for the linear and attention surface plots simply represent the magnitude of the
+arithmetic intensity. The aggregate plot is colored by attention’s runtime as a percentage of the total latency. Prefill results in Appendix C.1.
+for long-context generation, as the draft model shares the
+same architecture as the target model. This architectural
+alignment improves both the acceptance rate and the model’s
+ability to handle long contexts effectively. However, a naive
+implementation of self-speculative decoding (e.g. based
+on sparse KV) would require maintaining a separate, fully
+quantized copy of the KV cache, leading to inefficiencies in
+memory usage and computational overhead.
+To address this limitation, QuantSpec introduces a novel
+hierarchical KV cache design, which we discuss in detail
+in Section 4.2. This design enables dynamic switching
+between INT4 and INT8 representations of the KV cache
+without the overhead of on-the-fly quantization. By elimi-
+nating redundancy between the draft and target models’ KV
+caches, our method significantly reduces the total memory
+footprint while preserving efficiency. We also address the
+inefficient combination of conventional quantization strate-
+gies with the reject-and-revert-back mechanism specific to
+speculative decoding methods by proposing a full-precision
+KV cache buffer in QuantSpec. As we further explain in
+Section 4.3, this helps achieve high acceptance rates for the
+draft model and thus results in greater end-to-end speedup.
+4.2. Hierarchical KV Cache
+We propose a 4-bit hierarchical KV cache wherein we strate-
+gically structure each tensor’s representation such that the
+draft and target models are able to dynamically reconstruct
+their KV cache without any on-the-fly quantization over-
+head. Firstly, we observe that using an INT8 KV cache for
+the target model is comparable in terms of accuracy and
+performance with the same target model using an FP16 KV
+cache. To demonstrate this, we conduct a perplexity analysis
+for Llama-2-7B on the WikiText-2 (Merity et al., 2016) and
+C4 (Raffel et al., 2020) datasets in Table 2, which shows that
+the target model with an INT8 KV cache maintains com-
+petitve generation quality with respect to the FP16 baseline
+while using half the KV cache’s memory.
+Datasets
+KV Cache
+WikiText2
+C4
+FP16 (Baseline)
+6.4595
+7.2617
+INT8 (QuantSpec target)
+6.4696
+7.2620
+Table 2. Perplexity evaluations of Llama-2-7B with FP16, INT8
+with group size = 128, residual length = 256 on different datasets.
+Having observed this, we further note that an INT8 KV
+cache can be represented as an INT4 KV cache plus its
+INT4 residual. This works by decomposing an INT8 value
+into two INT4 components corresponding to its first and
+second 4-bit segments, which we call the upper and lower
+4-bits. This effectively allows us to use a hierarchical design
+to represent the KV cache of the draft model in INT4 and
+the target model in INT8 at the same time, removing the
+need to store a separate INT4 copy.
+Our method is visualized in Figure 3.
+During prefill,
+QuantSpec quantizes the FP16 KV cache to form the up-
+per and lower INT4 representations. To obtain the upper
+4-bits CINT4
+U
+and lower 4-bits CINT4
+L
+values, we first calcu-
+late CINT4
+U
+, then quantize the quantization error EINT4
+U
+to
+get CINT4
+L
+. CINT4
+U
+∈[0, 15] uses asymmetric and round-
+to-nearest quantization. Since the distribution of EINT4
+U
+is symmetric and has an expectation close to zero, for
+CINT4
+L
+∈[−8, 7] we use symmetric and round-to-nearest
+quantization to better match the distribution of errors.
+Then during decoding, when using the draft model to gener-
+ate candidate tokens, we only load the upper 4-bit representa-
+tion in our kernel and dequantize it for inference. When ver-
+ifying the drafted tokens using the target model, we utilize
+both the upper and lower 4-bit representations to reconstruct
+5
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Input Tokens
+Target Model
+(FP16 Weight)
+FP16 KV
+Cache
+Residual
+Cache
+② Quantize the Quantization Error 
+Lower INT4
+Cache
+Upper INT4
+Cache
+① Quantize the KV Cache
+③ Maintain the recent
+cache in Full Precision
+Upper INT4
+Cache
+Lower INT4
+Cache
+Target Model
+(FP16 Weight)
+Draft Model
+(INT4 Weight)
+Load Upper INT4
+Load All 8-bit
+√
+Candidate Tokens
+Generate
+Verify
+Accepted Tokens
+···
+Rejected Tokens
+√
+√
+√
+×
+×
+(a) During prefill, our hierarchical KV cache quantizes the FP16 KV
+cache to get the upper and lower INT4 representations.
+(b) During decoding, our hierarchical KV Cache loads the Upper INT4 KV
+Cache for the draft model and loads all 8-bits for the target model.
+Figure 3. How our Hierarchical KV Cache works in the speculative decoding setting.
+the KV cache in the higher INT8 precision. To represent
+the INT8 KV cache CINT8 as the upper INT4 KV cache
+CINT4
+U
+and the lower INT4 cache CINT4
+L
+, the INT8 KV cache
+can be expressed as CINT8 = 24CINT4
+U
++ CINT4
+L
+, where we
+multiply by 24 to align their represented values. The asym-
+metric quantization for the KV cache can be represented as
+CFP32 = CINT8SINT8 + ZINT8, where SINT8 is the scaling
+factor, ZINT8 is the zero point, and CINT8 ∈[0, 28 −1]. In
+this scenario, its 4-bit representation can be viewed as
+CFP32 = (24CINT4
+U
++ CINT4
+L
+)SINT8 + ZINT8
+= CINT4
+U
+SINT4 + CINT4
+L
+SINT4
+24
++ ZINT4,
+where ZINT4 = ZINT8, SINT4 = 24SINT8.
+4.3. KV Cache with Double Full Precision Buffer
+4.3.1. CHALLENGES WITH KV CACHE QUANTIZATION
+AND SPECULATIVE DECODING
+The key and value caches have each been found to exhibit
+unique characteristics indicating that they should be quan-
+tized with different strategies (Liu et al., 2024c). Specifi-
+cally, quantizing the key cache along the channel axis and
+quantizing the value cache along the token axis minimizes
+quantization error (as shown in Appendix D Table 5), and
+therefore leads to a higher acceptance rate in speculative
+decoding. We apply asymmetric quantization and per-group
+quantization to both the key and value caches in INT4 pre-
+cision, and we set the group size G to be equal to the head
+dimension to reduce overhead. These quantization tech-
+niques are illustrated in Appendix D Figure 7.
+However, these quantization strategies for the key and value
+caches pose efficiency challenges when combined with spec-
+ulative decoding. Regarding the value cache wherein the
+values are quantized along the token axis, the naive strategy
+of directly quantizing newly generated tokens at each decod-
+ing step is expensive, as it introduces high computational
+overhead that occurs very frequently. Moreoever, regarding
+the key cache for which we apply quantization along the
+channel axis, the naive approach is to store multiple tokens
+in full precision until they equal the quantization group size,
+and then quantize them. However, since the KV cache for
+the most recent tokens is no longer preserved in full preci-
+sion after quantization, this strategy adversally affects the
+acceptance rate, thus reducing the effectiveness of specula-
+tive decoding. Moreover, since speculative decoding may
+result in frequent rollbacks due to the target model rejecting
+the draft tokens, the quantized KV cache for the rejected
+tokens need to be discarded and replaced with new tokens in
+the quantization group. This leads to repeated quantization
+and dequantization, slowing down the decoding process.
+4.3.2. ADAPT TO SPECULATIVE DECODING USING
+FULL PRECISION BUFFER
+To enhance efficiency and ensure compatibility with spec-
+ulative decoding, we propose maintaining a double full-
+precision buffer of size 2G, where G is the quantization
+group size. This buffer is divided into two equal parts: CF1
+and CF2, each of size G. During prefill, we quantize the
+input tokens in batches of G while ensuring that at least
+G but no more than 2G of the most recent tokens remain
+in full precision. This ensures that CF1 is always filled.
+In the decoding stage, newly generated tokens are stored
+in full precision in the second buffer, CF2. Once the full-
+precision buffer reaches its maximum capacity of 2G, we
+wait for the target model to verify the generated tokens. If
+any tokens are rejected, we first remove the corresponding
+full-precision KV cache entries. Then, we quantize CF1
+and append it to the quantized KV cache. We then move
+CF2 to CF1, which fully occupies CF1 while leaving CF2
+empty and ready for tokens generated in future decoding
+steps. This whole process is visualized in Figure 8.
+Using this design, we ensure that (1) at every step CF1 is
+always filled, so there are at least recent G tokens kept in
+full precision, which is beneficial for the acceptance rate.
+(2) Quantization and KV cache movement will only happen
+every G decoding steps, which significantly reduces the
+overhead. (3) The design is compatible with speculative
+decoding since we can discard the KV cache for rejected
+tokens very flexibly by only operating on the second full-
+6
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Table 3. Efficiency result of QuantSpec on Llama-2-7B-32K-Instruct and LWM-Text-Chat-128k. We benchmark on multiple context
+length settings, ranging from 4k to 128k for batch size 1, and take their average across 10 different examples. Speedup ratio is compared
+with autoregressive generation of the target model (AR). We compare with Sparsity-based self-speculative baselines that use StreamLLM
+and SnapKV to quantize the KV cache. Acceptance rate of each method is shown for the respective optimal γ. We outperform these
+baselines and achieve a maximum of 2.49× speedup compared with autoregressive generation.
+Llama-2-7B-32K-Instruct
+Dataset
+Context Length
+# GPUs
+Method
+Acceptance Rate (%) ↑
+Peak GPU Memory (GB) ↓
+Speedup (× AR) ↑
+PG19
+4k
+1
+StreamingLLM
+88.87
+15.20
+1.13
+SnapKV
+93.59
+15.39
+1.17
+QuantSpec
+92.46
+16.26
+1.35
+8k
+1
+StreamingLLM
+90.31
+17.75
+1.27
+SnapKV
+94.39
+18.10
+1.31
+QuantSpec
+89.88
+17.66
+1.44
+Multi-LexSum
+8k
+1
+StreamingLLM
+90.78
+17.75
+1.27
+SnapKV
+55.55
+18.10
+1.01
+QuantSpec
+91.23
+17.66
+1.61
+32k
+1
+StreamingLLM
+91.19
+32.61
+1.84
+SnapKV
+72.54
+33.96
+1.63
+QuantSpec
+91.16
+25.84
+2.08
+LWM-Text-Chat-128k
+Dataset
+Context Length
+# GPUs
+Method
+Acceptance Rate (%) ↑
+Peak GPU Memory (GB) ↓
+Speedup (× AR)↑
+∞BENCH Sum
+16k
+1
+StreamingLLM
+87.41
+22.63
+1.49
+SnapKV
+88.61
+23.33
+1.50
+QuantSpec
+91.64
+20.36
+1.78
+32k
+1
+StreamingLLM
+85.38
+32.63
+1.15
+SnapKV
+84.55
+33.98
+1.78
+QuantSpec
+90.99
+25.86
+1.99
+Multi-LexSum
+64k
+2
+StreamingLLM
+78.95
+52.96
+2.16
+SnapKV
+82.79
+55.66
+2.11
+QuantSpec
+92.18
+38.18
+2.23
+128k
+2
+StreamingLLM
+-
+OOM
+-
+SnapKV
+-
+OOM
+-
+QuantSpec
+94.31
+61.22
+2.49
+precision buffer CF2 and without needing extra quantize
+and dequantize operations. We also show that our method is
+fully compatible with FlashDecoding in Appendix E.
+4.3.3. SUMMARY
+In summary, QuantSpec allows the draft and target models
+to share the same architecture in a self-speculative decoding
+manner, ensuring greater consistency between drafting and
+verification as opposed to traditional big-little speculative
+decoding methods. Our approach is mainly designed for
+long-context scenarios, where efficient KV cache manage-
+ment is critical, but it also supports short contexts where
+using weight quantization becomes more critical. We quan-
+tize the KV cache using our hierarchical INT4 design and
+use a double full-precision cache buffer for higher accep-
+tance rates and flexibility with speculative decoding. Then
+in the decoding stage, when generating draft tokens, we only
+load the upper 4-bit of the KV cache and achieve speedup
+by significantly reducing the memory load/store operations.
+When verifying these draft tokens, we load both the upper
+and lower 4-bit KV cache representations and dequantize
+them into their INT8 representation to achieve performance
+that is comparable with an FP16 KV cache. If the full-
+precision buffer is saturated, after verification we quantize
+and clear one-half of the full-precision buffer to prepare for
+the next round of generation. The whole algorithm can be
+visualized in Figure 3 (and Algorithm 1 in Appendix).
+5. Evaluation
+In this section, we evaluate the performance of QuantSpec
+across multiple datasets and context lengths. Our evalua-
+tion focuses on three key dimensions: (1) the acceptance
+ratio between the draft and target models, (2) GPU mem-
+ory consumption, and (3) end-to-end serving speedup. We
+begin by presenting a detailed benchmarking of acceptance
+rate, memory usage, and end-to-end speedup across dif-
+ferent datasets. Then, we highlight the performance gains
+achieved by our custom kernels for quantized KV cache.
+7
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+5.1. Setup
+All experiments are performed on a node equipped with
+8 NVIDIA RTX A6000 GPUs. We evaluate QuantSpec
+using long-context variants of LLaMA-2 and LWM models
+as target models. For benchmarking decoding speedup,
+we use PG-19 (Rae et al., 2019), (a language modeling
+benchmark) and two long context summarization datasets,
+namely ∞BENCH Sum (Zhang et al., 2024b; Yen et al., 2024)
+and Multi-LexSum (Shen et al., 2022; Yen et al., 2024).
+More details about the datasets are provided in Appendix
+F. Following Anonymous (2025), we compare against two
+recent sparse KV-based self-speculative decoding baselines:
+StreamingLLM (Anonymous, 2025; Xiao et al., 2023a) and
+SnapKV (Anonymous, 2025; Li et al., 2024a). To ensure
+a fair comparison, the draft KV budget for the baselines
+is set to one-fourth of the context length, matching our 4-
+bit quantized KV cache. We fix the quantization group
+size at 128, the residual length R for the KV cache at 256,
+and limit the number of output tokens to 90. The optimal
+speculation length γ for each dataset is determined through a
+hyperparameter search for each dataset-model pair. Details
+of the hyperparameter search are provided in Appendix G.
+5.2. Speedup Evaluation
+Table 3 shows the acceptance rate, GPU memory required,
+and speedup achieved compared to autoregressive decod-
+ing. We observe that QuantSpec provides consistently better
+speedups for all context lengths. For short and medium
+context lengths (e.g. 8k and 32k prompt length), QuantSpec
+achieves ∼1.61× to ∼2.08× speedups respectively on the
+Multi-LexSum dataset. For longer context lengths (e.g.
+128k), our speedups are even greater, up to ∼2.49×, all
+while using lower GPU memory than the baselines. We also
+see that acceptance rates of QuantSpec are considerably
+higher than the baselines for summarization tasks (refer to
+Appendix H for detailed comparison); this shows that for
+such tasks where the whole context is important, sparse KV
+cache methods are much more lossy, whereas quantization
+preserves most of the information in the context. Conse-
+quently, QuantSpec proves to be a more reliable choice, de-
+livering consistent speedups across varying context lengths
+and query complexities.
+5.2.1. KERNEL SPEEDUPS
+In Table 4 we show the speedup achieved using our custom
+attention kernel that makes use of quantized KV cache ver-
+sus the standard FP16 FlashAttention kernels. For a context
+length of 128k, our INT4 attention kernel is ∼2.88× faster
+than the standard FlashAttention kernel.
+Context Length
+Kernels
+64k
+256k
+FlashAttention (FP16)
+3.07 ms
+6.16 ms
+QuantSpec INT 8
+1.08 ms (1.44x)
+4.06 ms (1.51x)
+QuantSpec INT 4
+0.54 ms (2.88x)
+2.15 ms (2.86x)
+Table 4. Latency benchmark of our custom attention kernels
+for calculating attention with quantized hierarchical KV cache.
+QuantSpec INT4 refers to only loading the upper-4-bit, QuantSpec
+INT8 refers to loading both the upper and lower 4-bit. Bench-
+marked on kernel level.
+5.3. Ablation Results
+We present an extensive ablation study of QuantSpec focus-
+ing on the contribution of weight versus KV cache quantiza-
+tion in the final speedup.
+Weight versus KV Quantization: Figure 4 illustrates the
+speedup ratio of QuantSpec compared to autoregressive
+baseline as context length increases. The figure benchmarks
+QuantSpec with KV cache-only quantization, weight-only
+quantization, and both. The results are aligned with the
+analysis done in Section 3.1, showing that for short contexts
+most of the speedup comes from quantizing weights, for
+medium length prompts both weight and KV cache quanti-
+zation contribute to the final speedup, and KV cache quanti-
+zation is most effective for long contexts.
+Figure 4. Speedup ratio of QuantSpec compared to autoregressive
+baseline as we scale the context length. We report QuantSpec with
+KV cache-only quantization, weight-only quantization, and both.
+Benchmarked on Llama-2-7B-32k-Instruct using PG-19.
+6. Conclusions
+In this paper, we have introduced a novel approach to en-
+hance the efficiency and scalability of Large Language
+Models (LLMs) in long-context settings through quantized
+speculative decoding. Our method addresses the increas-
+ing memory and computational demands by optimizing the
+Key-Value (KV) cache operations, which become a sig-
+nificant bottleneck as the context length grows. We pro-
+pose a double full-precision cache buffer to resolve conflicts
+between per-group quantization and speculative decoding.
+Our comprehensive approach shows that by integrating ad-
+8
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+vanced quantization techniques with speculative decoding,
+it is possible to significantly improve processing speed with-
+out compromising the accuracy and performance of LLMs.
+This work paves the way for more scalable and effective
+deployment of LLMs in applications that require extensive
+contextual understanding, offering a robust solution to the
+challenges posed by long-context settings.
+Acknowledgements
+We acknowledge gracious support from Apple team. We
+also appreciate the support from Microsoft through their
+Accelerating Foundation Model Research. Furthermore, we
+appreciate support from Google Cloud, the Google TRC
+team, and specifically Jonathan Caton, Divy Thakkar, and
+Prof. David Patterson. Prof. Keutzer’s lab is sponsored
+by the Intel corporation, Intel One-API, Intel VLAB team,
+the Intel One-API center of excellence, as well as funding
+through BDD, BAIR, and Furiosa. We appreciate great feed-
+back and support from Ellick Chan, Saurabh Tangri, Andres
+Rodriguez, and Kittur Ganesh. Sehoon Kim would like to
+acknowledge the support from the Korea Foundation for Ad-
+vanced Studies (KFAS). Michael W. Mahoney would also
+like to acknowledge a J. P. Morgan Chase Faculty Research
+Award as well as the DOE, NSF, and ONR. Our conclusions
+do not necessarily reflect the position or the policy of our
+sponsors, and no official endorsement should be inferred.
+References
+Anonymous. Magicdec: Breaking the latency-throughput
+tradeoff for long context generation with speculative
+decoding. In The Thirteenth International Conference
+on Learning Representations, 2025. URL https://
+openreview.net/forum?id=CS2JWaziYr.
+Bhendawade, N., Belousova, I., Fu, Q., Mason, H., Raste-
+gari, M., and Najibi, M. Speculative streaming: Fast
+llm inference without auxiliary models. arXiv preprint
+arXiv:2402.11131, 2024.
+Brandon, W., Mishra, M., Nrusimha, A., Panda, R.,
+and Kelly, J. R.
+Reducing transformer key-value
+cache size with cross-layer attention.
+arXiv preprint
+arXiv:2405.12981, 2024.
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,
+and Dao, T. Medusa: Simple llm inference acceleration
+framework with multiple decoding heads. arXiv preprint
+arXiv:2401.10774, 2024.
+Chee, J., Cai, Y., Kuleshov, V., and De Sa, C. M. Quip: 2-bit
+quantization of large language models with guarantees.
+Advances in Neural Information Processing Systems, 36,
+2024.
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,
+L., and Jumper, J. Accelerating large language model
+decoding with speculative sampling.
+arXiv preprint
+arXiv:2302.01318, 2023.
+Chen, S., Liu, Z., Wu, Z., Zheng, C., Cong, P., Jiang,
+Z., Su, L., and Yang, T. Int-flashattention: Enabling
+flash attention for int8 quantization.
+arXiv preprint
+arXiv:2409.16997, 2024a.
+Chen, Z., May, A., Svirschevski, R., Huang, Y., Ryabinin,
+M., Jia, Z., and Chen, B. Sequoia: Scalable, robust, and
+hardware-aware speculative decoding. arXiv preprint
+arXiv:2402.12374, 2024b.
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and R´e, C. Flashat-
+tention: Fast and memory-efficient exact attention with io-
+awareness, 2022. URL https://arxiv.org/abs/
+2205.14135.
+Dao,
+T.,
+Haziza,
+D.,
+Massa,
+F.,
+and
+Sisov,
+G.
+Flash-decoding
+for
+long-context
+inference:
+https://crfm.stanford.edu/2023/10/
+12/flashdecoding.html, 2023.
+Fishman, M., Chmiel, B., Banner, R., and Soudry, D. Scal-
+ing fp8 training to trillion-token llms. arXiv preprint
+arXiv:2409.12517, 2024.
+Fu, Q., Cho, M., Merth, T., Mehta, S., Rastegari, M.,
+and Najibi, M. Lazyllm: Dynamic token pruning for
+efficient long context llm inference.
+arXiv preprint
+arXiv:2407.14057, 2024.
+Ge, S., Zhang, Y., Liu, L., Zhang, M., Han, J., and Gao,
+J. Model tells you what to discard: Adaptive kv cache
+compression for llms. arXiv preprint arXiv:2310.01801,
+2023.
+Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+Kvquant: Towards 10 million context length llm infer-
+ence with kv cache quantization. Advances in Neural
+Information Processing Systems, 2024.
+Horton, M., Cao, Q., Sun, C., Jin, Y., Mehta, S., Rastegari,
+M., and Nabi, M. Kv prediction for improved time to
+first token, 2024. URL https://arxiv.org/abs/
+2410.08391.
+Jiang, H., Li, Y., Zhang, C., Wu, Q., Luo, X., Ahn, S., Han,
+Z., Abdi, A. H., Li, D., Lin, C.-Y., et al. Minference 1.0:
+Accelerating pre-filling for long-context llms via dynamic
+sparse attention. arXiv preprint arXiv:2407.02490, 2024.
+Kang, H., Zhang, Q., Kundu, S., Jeong, G., Liu, Z., Krishna,
+T., and Zhao, T. Gear: An efficient kv cache compression
+recipefor near-lossless generative inference of llm. arXiv
+preprint arXiv:2403.05527, 2024.
+9
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Kim, S., Hooper, C., Gholami, A., Dong, Z., Li,
+X., Shen, S., Mahoney, M. W., and Keutzer, K.
+Squeezellm:
+Dense-and-sparse quantization.
+arXiv
+preprint arXiv:2306.07629, 2023a.
+Kim, S., Hooper, C., Wattanawong, T., Kang, M., Yan, R.,
+Genc, H., Dinh, G., Huang, Q., Keutzer, K., Mahoney,
+M. W., Shao, Y. S., and Gholami, A. Full stack opti-
+mization of transformer inference: a survey, 2023b. URL
+https://arxiv.org/abs/2302.14017.
+Kim, S., Mangalam, K., Moon, S., Malik, J., Mahoney,
+M. W., Gholami, A., and Keutzer, K. Speculative decod-
+ing with big little decoder. Advances in Neural Informa-
+tion Processing Systems, 36, 2024.
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+from transformers via speculative decoding. In Inter-
+national Conference on Machine Learning, pp. 19274–
+19286. PMLR, 2023.
+Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A.,
+Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm
+knows what you are looking for before generation. arXiv
+preprint arXiv:2404.14469, 2024a.
+Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative
+sampling requires rethinking feature uncertainty. arXiv
+preprint arXiv:2401.15077, 2024b.
+Lin, J., Tang, J., Tang, H., Yang, S., Chen, W.-M., Wang,
+W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. Awq:
+Activation-aware weight quantization for on-device llm
+compression and acceleration. Proceedings of Machine
+Learning and Systems, 6:87–100, 2024.
+Liu, D., Chen, M., Lu, B., Jiang, H., Han, Z., Zhang, Q.,
+Chen, Q., Zhang, C., Ding, B., Zhang, K., et al. Re-
+trievalattention: Accelerating long-context llm inference
+via vector retrieval. arXiv preprint arXiv:2409.10516,
+2024a.
+Liu, L., Qu, Z., Chen, Z., Ding, Y., and Xie, Y. Trans-
+former acceleration with dynamic sparse attention. arXiv
+preprint arXiv:2110.11299, 2021.
+Liu, Z., Desai, A., Liao, F., Wang, W., Xie, V., Xu, Z., Kyril-
+lidis, A., and Shrivastava, A. Scissorhands: Exploiting
+the persistence of importance hypothesis for llm kv cache
+compression at test time. Advances in Neural Information
+Processing Systems, 36, 2024b.
+Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman,
+V., Chen, B., and Hu, X. Kivi: A tuning-free asym-
+metric 2bit quantization for kv cache. arXiv preprint
+arXiv:2402.02750, 2024c.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer
+sentinel mixture models, 2016.
+Nawrot, P., Ła´ncucki, A., Chochowski, M., Tarjan, D.,
+and Ponti, E. M.
+Dynamic memory compression:
+Retrofitting llms for accelerated inference. arXiv preprint
+arXiv:2403.09636, 2024.
+Park, Y., Hyun, J., Cho, S., Sim, B., and Lee, J. W.
+Any-precision llm: Low-cost deployment of multiple,
+different-sized llms. arXiv preprint arXiv:2402.10517,
+2024.
+Peng, H., Wu, K., Wei, Y., Zhao, G., Yang, Y., Liu, Z.,
+Xiong, Y., Yang, Z., Ni, B., Hu, J., et al.
+Fp8-lm:
+Training fp8 large language models.
+arXiv preprint
+arXiv:2310.18313, 2023.
+Rae, J. W., Potapenko, A., Jayakumar, S. M., Hillier, C.,
+and Lillicrap, T. P. Compressive transformers for long-
+range sequence modelling. arXiv preprint, 2019. URL
+https://arxiv.org/abs/1911.05507.
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+Matena, M., Zhou, Y., Li, W., Liu, P. J., et al. Exploring
+the limits of transfer learning with a unified text-to-text
+transformer. J. Mach. Learn. Res., 21(140):1–67, 2020.
+Shah, J., Bikshandi, G., Zhang, Y., Thakkar, V., Ramani,
+P., and Dao, T. Flashattention-3: Fast and accurate atten-
+tion with asynchrony and low-precision. arXiv preprint
+arXiv:2407.08608, 2024.
+Shao, W., Chen, M., Zhang, Z., Xu, P., Zhao, L., Li, Z.,
+Zhang, K., Gao, P., Qiao, Y., and Luo, P. Omniquant:
+Omnidirectionally calibrated quantization for large lan-
+guage models. arXiv preprint arXiv:2308.13137, 2023.
+Shen, Z., Lo, K., Yu, L., Dahlberg, N., Schlanger, M., and
+Downey, D. Multi-lexsum: Real-world summaries of civil
+rights lawsuits at multiple granularities. In Thirty-sixth
+Conference on Neural Information Processing Systems
+Datasets and Benchmarks Track, 2022. URL https:
+//openreview.net/forum?id=z1d8fUiS8Cr.
+Sun, H., Chen, Z., Yang, X., Tian, Y., and Chen, B. Tri-
+force: Lossless acceleration of long sequence generation
+with hierarchical speculative decoding. arXiv preprint
+arXiv:2404.11912, 2024.
+Tan, S., Li, X., Patil, S., Wu, Z., Zhang, T., Keutzer, K.,
+Gonzalez, J. E., and Popa, R. A. Lloco: Learning long
+contexts offline. arXiv preprint arXiv:2404.07979, 2024.
+Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,
+S. Quest: Query-aware sparsity for efficient long-context
+llm inference. arXiv preprint arXiv:2406.10774, 2024.
+10
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Williams, S., Waterman, A., and Patterson, D. Roofline:
+an insightful visual performance model for multicore
+architectures. Communications of the ACM, 52(4):65–76,
+2009.
+Xi, H., Cai, H., Zhu, L., Lu, Y., Keutzer, K., Chen, J.,
+and Han, S. Coat: Compressing optimizer states and
+activation for memory-efficient fp8 training, 2024a. URL
+https://arxiv.org/abs/2410.19313.
+Xi, H., Chen, Y., Zhao, K., Zheng, K., Chen, J., and Zhu,
+J. Jetfire: Efficient and accurate transformer pretraining
+with int8 data flow and per-block quantization. arXiv
+preprint arXiv:2403.12422, 2024b.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+ficient streaming language models with attention sinks.
+arXiv, 2023a.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+ficient streaming language models with attention sinks.
+arXiv preprint arXiv:2309.17453, 2023b.
+Yang, S., Sheng, Y., Gonzalez, J. E., Stoica, I., and Zheng, L.
+Post-training sparse attention with double sparsity. arXiv
+preprint arXiv:2408.07092, 2024.
+Yao, Y., Li, Z., and Zhao, H. Sirllm: Streaming infinite
+retentive llm. arXiv preprint arXiv:2405.12528, 2024.
+Yen, H., Gao, T., Hou, M., Ding, K., Fleischer, D., Izsak, P.,
+Wasserblat, M., and Chen, D. Helmet: How to evaluate
+long-context language models effectively and thoroughly.
+arXiv preprint arXiv:2410.02694, 2024.
+Zhang, J., Zhang, P., Zhu, J., Chen, J., et al. Sageatten-
+tion: Accurate 8-bit attention for plug-and-play inference
+acceleration. arXiv preprint arXiv:2410.02367, 2024a.
+Zhang, X., Chen, Y., Hu, S., Xu, Z., Chen, J., Hao, M. K.,
+Han, X., Thai, Z. L., Wang, S., Liu, Z., and Sun, M.
+∞bench: Extending long context evaluation beyond 100k
+tokens, 2024b.
+URL https://arxiv.org/abs/
+2402.13718.
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+R., Song, Z., Tian, Y., R´e, C., Barrett, C., et al. H2o:
+Heavy-hitter oracle for efficient generative inference of
+large language models. Advances in Neural Information
+Processing Systems, 36, 2024c.
+Zhao, J., Lu, W., Wang, S., Kong, L., and Wu, C. Qspec:
+Speculative decoding with complementary quantization
+schemes. arXiv preprint arXiv:2410.11305, 2024.
+Zhou, Y., Chen, Z., Xu, Z., Lin, V., and Chen, B. Sir-
+ius: Contextual sparsity with correction for efficient llms.
+arXiv preprint arXiv:2409.03856, 2024.
+11
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Appendix
+A. Attention Module’s Inference Workflow
+The inference of LLMs can be divided into 2 parts: the prefill stage and the decoding stage. In the prefill stage, for the input
+sequence X ∈RB×SL×d, the KV cache update rule can be calculated as
+Q = XWQ, CK = XWK, CV = XWV ,
+where we denote the query, key, and value weight matrices as WQ, WK, WV ∈Rd×d and denote the key and value caches
+as CK and CV respectively. B refers to batch size, SL refers to sequence length, and d refers to hidden size. We then
+calculate the multi-head attention (MHA) as:
+O = MultiHeadAttn(Q, CK, CV ).
+In the decode stage, for input token x ∈RB×1×d, we first calculate the query, key, and value of the current token:
+q = xWQ, ck = xWK, cv = xWV ,
+then concatenate the KV cache with the current token’s key and value to update the KV cache:
+CK = concat(CK, ck), CV = concat(CV , cv).
+Then, the multi-head attention output is calculated:
+O = MultiHeadAttn(q, CK, CV ).
+B. More Related Works
+We list some related works that we find interesting, but can not elaborate on in the related works section due to space
+limitations.
+Efficient Long Context Inference
+Some research maintains the full key-value pairs but dynamically loads them from
+high-bandwidth memory (Yang et al., 2024; Tang et al., 2024), and usually achieves higher performance at the cost of higher
+memory consumption. Shared KV cache across tokens (Nawrot et al., 2024) and layers (Brandon et al., 2024) provides a
+new way to reduce the KV cache budget through sharing.
+Quantization
+Any Precision representation (Park et al., 2024) incorporates multiple precision levels (e.g., INT2, INT4,
+and INT8) within a single representation, eliminating the need to store separate KV caches for each precision and allowing
+the framework to dynamically select the optimal precision based on the complexity of the task. Training quantization (Peng
+et al., 2023; Xi et al., 2024b; Fishman et al., 2024; Xi et al., 2024a) reduces the bit precision of various model parameters,
+gradients, and activations to accelerate training. Attention quantization (Chen et al., 2024a; Zhang et al., 2024a; Shah et al.,
+2024) reduces the computational overhead associated with attention computations, which becomes dominant in the prefill
+stage of the long-context inference setting.
+Speculative Decoding
+Zhao et al., (Zhao et al., 2024) explored complementary quantization schemes in speculative
+decoding with QSpec, enhancing efficiency without significant performance degradation. Sirius (Zhou et al., 2024) finds
+that contextual sparsity will lead to poor performance under the speculative decoding setting since the model performance is
+degraded, and thus it cannot accelerate LLM inference.
+C. Additional LLM Inference Bottlenecks Analysis
+C.1. Prefill Arithmetic Intensity Analysis
+Keeping in line with the asymptotic analysis in Table 1, the arithmetic intensity of attention during prefill does not scale
+with batch size at all, as attention is unable to benefit from batching in the same way that linear operations do. Moreover,
+12
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+for long contexts, attention entirely dominates the linear operations due to the quadratic nature of self-attention. For short
+contexts however, this quadratic cost is relatively inexpensive when compared to the linear operations. As shown in Figure 5,
+the arithmetic intensity for all prefill operations in all regimes is above the ridge plane, which means that prefill is entirely
+compute-bound.
+Figure 5. During prefill, all regimes lie above the ridge plane and thus are compute-bound.
+C.2. Modern GPU Hardware VRAM Size Constraints
+Figure 6. KV cache memory usage by Llama-2-7B on a single node (8 GPUs) as context length and batch size are scaled logarithmically.
+The surface plot’s color represents the ratio of KV cache memory to the model weights memory. The dotted-lines represent GPU DRAM
+capacities for several different GPUs. At (B = 16, SL = 262k), the KV cache takes up 160x more memory than the model weights.
+The relatively higher linear arithmetic intensities observed in decoding for batch sizes greater than 8 in Figure 2 are
+misleading due to the limited VRAM sizes in modern GPUs. As shown in Figure 6, the size of the KV cache for a
+Llama-2-7B model exceeds the total VRAM capacities of a single node equipped with 8 A100/H100 GPUs with 80 GB of
+memory each. This means that simply scaling the batch size for decoding will not translate the memory-bound nature of
+generation to being compute-bound.
+13
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+D. Quantization Strategies for KV cache
+Here we provide a visualization of our quantization scheme in Figure 7. We apply asymmetric quantization for both the
+keys and values cache, and apply channel-wise quantization to the key cache and apply token-wise quantization to the value
+cache. We also provide a table to show that this quantization scheme offers the best performance in Table 5 by showing that
+it gives the lowest perplexity.
+Figure 7. We apply asymmetric and per-group quantization for both the key cache and value cache, along the channel axis and token axis,
+respectively. This figure describes how it works when only the upper-4 bit cache is applied.
+Key Cache
+Value Cache
+token-wise
+channel-wise
+token-wise
+6.587
+6.507
+channel-wise
+7.041
+6.911
+Table 5. Perplexity of Llama-2-7B on WikiText-2 dataset with different quantization strategies. Group size G = 128. Channel-wise
+quantization for key cache and token-wise quantization for value cache gives the best performance.
+E. Compatibility with Flash Decoding
+Our full-precision buffer design, as shown in Figure 8, is fully compatible with Flash Decoding (Dao et al., 2023), a fast
+attention implementation available for the decoding stage. In this setup, the quantized section divides naturally into several
+chunks, aligning perfectly with the structure of Flash Decoding. For the full-precision buffer, given its upper bound length
+of 2G, it can be processed independently with minimal overhead. This full-precision segment can be treated as an additional
+chunk, which can then be summed with the quantized segments and seamlessly integrated into the Flash Decoding algorithm.
+F. Details about the Datasets Used
+We provide an overview of the datasets used in our experiments, highlighting their key characteristics.
+• WikiText-2 (Merity et al., 2016): WikiText-2 is a widely used dataset for language modeling. It is a subset of the larger
+WikiText dataset and consists of high-quality, clean, and well-structured English text extracted from Wikipedia articles.
+14
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+①  Quantize the first half of 
+the full precision cache buffer
+Quantized Cache (INT4)
+head dim
+Full Precision 
+cache buffer
+Verified Tokens
+sequence length 
+head dim
+②  Move the second half to the first 
+half when the second half is full
+Quantized Cache (INT4)
+First Half of the Full 
+precision cache buffer
+Second Half of the Full 
+precision cache buffer
+Tokens verified by 
+the Target Model
+Allocated Static Cache 
+(Currently Empty)
+INT4 Quantized KV Cache
+③  Move the rest 
+to the second half 
+of the cache buffer
+Figure 8. Our KV cache with 2 full precision cache buffers for recent KV cache.
+• C4 (Raffel et al., 2020): C4 is a large scale web-crawled language modelling dataset mostly used for pretraining LLMs.
+• PG-19 (Rae et al., 2019): It is a dataset of books from Project Gutenberg, designed for long-context language modeling.
+• ∞BENCH Sum (Zhang et al., 2024b): InfiniteBench benchmark is tailored for evaluating the capabilities of language
+models to process, understand, and reason over super long contexts. We used one of its summarization datasets where
+the task is to summarize a fake book created by core entity substitution. The average length of input prompt is ∼171k.
+• Multi-LexSum (Shen et al., 2022): Multi-LexSum is a multi-doc summarization dataset for civil rights litigation
+lawsuits. The average length of prompt in this dataset is ∼90k.
+G. Hyperparameter Search
+Here we present details about the hyperparameter search done to select optimal γ for each experiment. We search γ for
+each dataset and method pair using a prompt length of 8192 and use the same value for all other context length experiments.
+Table 6 shows the results of the search. We find that sparse-based methods achieves a maximum performance when γ equals
+to 1, while our quantization-based method usually achieves the best performance with a larger γ, such as 4 or 6.
+H. Comparing Acceptance Rates
+Figure 9. Acceptance rate of self-speculative decoding methods at different speculation length measured for model LWM-Text-Chat-128k
+on Multi-LexSum dataset.
+15
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Table 6. Hyperparameter Search for Llama-2-7B-32K and LWM-Text-Chat-128k models on PG19, Multi-LexSum, and ∞BENCH Sum
+datasets. Context length is kept as 8k.
+(a) Llama-2-7B-32k on PG19
+Method
+γ
+Acceptance Rate ↑
+Speedup ↑
+StreamingLLM
+1
+90.78
+39.1
+2
+89.42
+38.5
+3
+90.21
+38.66
+SnapKV
+1
+94.39
+40.34
+2
+91.03
+39.38
+3
+91.84
+39.28
+QuantSpec
+1
+91.88
+41.52
+2
+89.88
+44.51
+4
+83.17
+43.84
+6
+77.07
+41.88
+(b) Llama-2-7B-32k on Multi-LexSum
+Method
+γ
+Acceptance Rate ↑
+Speedup ↑
+StreamingLLM
+1
+90.78
+39.17
+2
+86.82
+37.84
+3
+83.29
+36
+SnapKV
+1
+55.55
+31.05
+2
+43.96
+24.39
+3
+36.61
+19.78
+QuantSpec
+1
+96.58
+42.83
+2
+96.61
+47.51
+4
+95.59
+49.47
+6
+91.23
+49.62
+(c) LWM-Text-Chat-128k on ∞BENCH Sum
+Method
+γ
+Acceptance Rate ↑
+Speedup ↑
+StreamingLLM
+1
+81.79
+37.17
+2
+74.86
+34.33
+3
+64.48
+30.14
+SnapKV
+1
+85.55
+38.27
+2
+82.92
+36.97
+3
+77.13
+34.40
+QuantSpec
+1
+93.83
+42.01
+2
+94.38
+46.74
+4
+90.33
+47.30
+6
+82.13
+45.51
+(d) LWM-Text-Chat-128k on Multi-LexSum
+Method
+γ
+Acceptance Rate ↑
+Speedup ↑
+StreamingLLM
+1
+83.96
+37.80
+2
+77.41
+35.13
+3
+71.28
+32.37
+SnapKV
+1
+89.25
+39.04
+2
+83.53
+37.22
+3
+80.04
+35.48
+QuantSpec
+1
+95.94
+42.79
+2
+95.06
+47.10
+4
+92.55
+48.15
+6
+87.73
+48.20
+Although the acceptance rates in Table 3 for the sparse KV baselines and QuantSpec do not seem exceedingly different, this
+is misleading because the acceptance rates shown are for the optimal γ values observed from our hyperparameter search in
+Table 6. Table 3 effectively compares the acceptance rates of the baselines at very low γ (e.g. 1) with those of QuantSpec
+at much higher γ (e.g. 6). Here, we compare the acceptance rates of different self-speculative decoding algorithms. For
+fair comparison, Figure 9 illustrates the acceptance rate between the draft and target models as a function of speculation
+length. We observe that QuantSpec consistently outperforms sparse KV approaches in terms of acceptance rate. Notably, as
+speculation length increases, the acceptance rate of sparse KV methods degrades much faster, whereas our method maintains
+high acceptance rates.
+16
+
+
+QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache
+Algorithm 1 QuantSpec Algorithm
+Input: Model M, Upper 4-bit Cache CU, Lower 4-bit Cache CL, Full Precision Cache Buffer [CF1, CF2],
+Input: Prefill Length SP , Target Decode Length SD, Prefill Context X = [x0, · · · , xSP −1], Speculate Length γ
+Input: Number of Layers L, Sensitive Layer Number LS, Quantization Group Size G
+Function: PREFILL, DRAFT, TARGET, VERITY, QUANTIZE, REJECTCACHE
+Notation: Verified tokens xi, generated draft tokens gi, logits of draft model qi, logits of target model pi, number of
+tokens already been generated in total N, number of tokens already been generated in this speculate step n, number of
+tokens accepted in this speculate step v
+Prefill Stage
+1: XSP , CKV ←PREFILL(M, X<SP )
+▷KV Cache is written together for simplicity
+2: CU, CL ←QUANTIZE(CKV:SP −G, LS)
+▷Prepare the hierarchical quantized KV Cache
+3: CF1, CF2 ←CKVSP −G:, None
+▷Prepare the full-precision cache buffer for recent tokens
+Decode Stage
+4: while N < SD do
+5:
+n ←0 and v ←0
+6:
+while n < γ do
+7:
+qn+1, CF2 ←DRAFT(M, CU, CF1, CF2, LS, X≤SP +N + g<n)
+8:
+Sample gn+1 ∼qn+1 and n ←n + 1
+9:
+end while
+10:
+p1, · · · pγ, CF2 ←TARGET(M, CU, CL, CF1, CF2, X≤SP +N + g<γ)
+11:
+for i = 1 to γ do
+12:
+if VERIFY(gi, pi, qi) then
+13:
+xN+i ←gi and v ←v + 1
+14:
+else
+15:
+xN+i ←CORRECT(pi, qi) and v ←v + 1
+16:
+CF2 ←REJECTCACHE(CF2, i)
+▷Clear the rejected KV cache from the full precision cache buffer
+Break
+17:
+end if
+18:
+if i = γ then
+19:
+xN+γ+1 ←pγ+1 and N ←N + 1
+20:
+end if
+21:
+end for
+N ←N + v
+22:
+if CF2 is full then
+23:
+Concatenate QUANTIZE(CF1) with CU and CL
+▷Quantize the first half of the full precision cache buffer
+24:
+CF1 ←CF2 :−G and CF2 ←CF2 −G:
+▷Move the second part to the first part of full precision buffer
+25:
+end if
+26: end while
+17

@@ -1,0 +1,805 @@
+RUN LORA RUN: FASTER AND LIGHTER LORA
+IMPLEMENTATIONS
+A PREPRINT
+Daria Cherniuk
+Center for Artifical Intelligence Technology
+Skolkovo Institute of Science and Technology
+Moscow, Russia
+daria.cherniuk@skoltech.ru
+Aleksandr Mikhalev
+Center for Artifical Intelligence Technology
+Skolkovo Institute of Science and Technology
+Moscow, Russia
+al.mikhalev@skoltech.ru
+Ivan Oseledets
+Artificial Intelligence Research Institute
+oseledets@airi.net
+Center for Artifical Intelligence Technology
+Skolkovo Institute of Science and Technology
+Moscow, Russia
+i.oseledets@skoltech.ru
+ABSTRACT
+LoRA is a technique that reduces the number of trainable parameters in a neural network by introduc-
+ing low-rank adapters to linear layers. This technique is used both for fine-tuning and full training of
+large language models. This paper presents the RunLoRA framework for efficient implementations of
+LoRA that significantly improves the speed of neural network training and fine-tuning using low-rank
+adapters. The proposed implementation optimizes the computation of LoRA operations based on
+dimensions of corresponding linear layer, layer input dimensions and lora rank by choosing best
+forward and backward computation graph based on FLOPs and time estimations, resulting in faster
+training without sacrificing accuracy. The experimental results show up to 28% speedup on language
+modeling networks.
+Keywords LoRA · FLOPs · Computation graph
+1
+Introduction
+LoRA Hu et al. [2022] paper has introduced the idea of updating a low-rank correction instead of the full weight
+matrix. This approach quickly became popular due to reduced cost of the update: number of parameters in the adapter
+is significantly lower than the original due to a low-rank structure. There emerged a number of papers that proved
+LoRA’s efficacy not only for fine-tuning on downstream tasks, but also for full training (ReLoRALialin et al. [2023])
+or style-transfer (ZipLoRAShah et al. [2023]). Different modifications of LoRA followed as well, incorporating
+quantization (QLoRADettmers et al. [2023]), weight-sharing (LoTRBershatsky et al. [2024], VeRAKopiczko et al.
+[2024]), etc..
+However, all variations of LoRA use the default chain of operations while calculating the output, which often leads
+to sub-optimal graph of computations. And none of the papers on low-rank adapter training considers computation
+costs. We propose RunLora: a framework which contains different variations of forward and backward pass through an
+adapter-induced linear layer and chooses the best pair for a given architecture. We provide a thorough analysis (both
+empirically and theoretically) on areas of applicability of each pass in the parameter space.
+arXiv:2312.03415v2  [cs.LG]  14 Jun 2024
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Figure 1: Maximum speedups for forward-backward pass through network achieved on different families of models and
+with different data types. Note that OPT implementation used in these experiments does not support float32 training. b -
+batch size, r - lora rank, s - sequence length.
+Our framework is compatible with pytorch and can be used as a simple model wrapper, similar to Lora implementation
+from PEFT library. We also provide a functionality to work with quantized model weights to fine-tune models in fasion
+of QLORA Dettmers et al. [2023] paper.
+We evaluated our framework’s performance on a series of NLP models, including RoBerta, OPT and Llama, and
+achieved up to 28% speedup (Figure 1) only due to optimized chain of PyTorch operations. Additionally, we managed
+to save up to 6Gb of memory due to reduction in number of saved activations (Table 4).
+The summary of our contributions is as follows:
+1. We implemented a number of alternative forward and backward computation passes through low-rank adapters
+and investigated areas of applicability of each pass under parameter reduction condition.
+2. We developed a framework called RunLoRA: a model wrapper for training with low-rank adapters which uses
+the best forward-backward passes considering the model architecture and training parameters.
+3. We evaluate our framework on a number of common language models: OPT, Llama, RoBerta and demonstrate
+significant speedups (up to 28%) proving efficiency of RunLora.
+2
+Problem setting and Methodology
+Default forward pass of LoRA looks the following:
+LoRA(X) = XW + (XA)B,
+(1)
+The backward pass is then automatically determined by the framework from an autograd technique. All the optimizations
+are left to the neural network training framework, which often performs sub-optimally.
+Many scientists and engineers avoid the following chain of computations:
+LoRA(X) = X(W + AB).
+(2)
+This is due to an implicit assumption that weights W are quite large and forming a same-size matrix AB is undesirable.
+However, real-world LoRA-adapter training deals with large input X in an attempt of increasing batch size to utilize
+GPU RAM at its full capacity. Large batch size leads to a contradiction to the assumption and inefficient LoRA
+implementation.
+Our current implementation contains 2 major and 2 minor variants of the forward pass and 5 major and 30 minor
+variants of the backward pass. Major variants are different by opening brackets differently, while minor variants are
+based on major variants with operations reordered. Formally, the major forward variants are:
+1. Y = (XW) + ((XA)B)
+2. Y = X(W + AB)
+2
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Unlike default LoRA implementation, neither forward function in RunLoRA saves result of XA to context.
+The backward of the LoRA adapter requires us to calculate the following tensors:
+
+
+
+dA = X⊤dY B⊤,
+dB = A⊤X⊤dY,
+dX = dY W ⊤+ dY B⊤A⊤.
+(3)
+Due to associativity of matrix multiplications, there are several ways of doing it and getting the same result up to
+rounding errors:
+ABC = (AB)C = A(BC).
+(4)
+There are 3 multiplications and each can be done in 2 ways, which leads to 8 variants of the backward pass:
+1. dA = X⊤(dY B⊤),
+dB = (A⊤X⊤)dY ,
+dX = dY W ⊤+ (dY B⊤)A⊤.
+2. dA = X⊤(dY B⊤),
+dB = A⊤(X⊤dY ),
+dX = dY W ⊤+ (dY B⊤)A⊤.
+3. dA = (X⊤dY )B⊤,
+dB = A⊤(X⊤dY ),
+dX = dY W ⊤+ (dY B⊤)A⊤.
+4. dA = (X⊤dY )B⊤,
+dB = A⊤(X⊤dY ),
+dX = dY (W ⊤+ B⊤A⊤).
+5. dA = X⊤(dY B⊤),
+dB = (A⊤X⊤)dY ,
+dX = dY (W ⊤+ B⊤A⊤).
+6. dA = (X⊤dY )B⊤,
+dB = (A⊤X⊤)dY ,
+dX = dY W ⊤+ (dY B⊤)A⊤.
+7. dA = (X⊤dY )B⊤,
+dB = (A⊤X⊤)dY ,
+dX = dY (W ⊤+ B⊤A⊤).
+8. dA = X⊤(dY B⊤),
+dB = A⊤(X⊤dY ),
+dX = dY (W ⊤+ B⊤A⊤).
+However, out of eight variants we implement only first five (Algorithms 1 - 5) since others require more or equal number
+of FLOPs in any setting. Specifically, backward6 would require more FLOPs than backward5 for any architecture and
+training configuration and backward7, backward8 require the same number of FLOPSs as backward3 (Table 1).
+Algorithm 1 backward1
+Z1 ←dY B⊤
+Z2 ←XA
+dA ←X⊤Z1
+dB ←Z⊤
+2 dY
+dX ←dY W ⊤+ Z1A⊤
+Then we analyse area of applicability for each backward, considering a necessary condition on parameters reduction:
+number of trainable parameters after LoRA transform should be less than that of the original layer.
+r(i + o) < io
+(5)
+where r denotes LoRA rank, i and o denote input and output dimensions respectively.
+3
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Algorithm 2 backward2
+Z1 ←dY B⊤
+Z2 ←X⊤dY
+dA ←X⊤Z1
+dB ←A⊤Z2
+dX ←dY W ⊤+ Z1A⊤
+Algorithm 3 backward3
+Z1 ←dY B⊤
+Z2 ←X⊤dY
+dA ←Z2B⊤
+dB ←A⊤Z2
+dX ←dY W ⊤+ Z1A⊤
+Algorithm 4 backward4
+Z1 ←W + AB
+Z2 ←X⊤dY
+dA ←Z2B⊤
+dB ←A⊤Z2
+dX ←dY Z⊤
+1
+Algorithm 5 backward5
+Z1 ←dY B⊤
+Z2 ←XA
+Z3 ←W + AB
+dA ←X⊤Z1
+dB ←Z⊤
+2 dY
+dX ←dY Z⊤
+3
+Figure 2 depicts a case study examples for some batch sizes and sequence lengths. Areas of color depict best choice of
+forward or backward pass based on minimal number of required FLOPs. Subfigures 2a and 2d on the left consider
+a square weight layer where number of input features and output features equal model’s embedding size (i.e., query,
+key and value layers in transformers). Subfigures 2b and 2c on the right depict expanding linear layer (typically, 4x
+expantion is used in MLP blocks of transformers). In all cases, parameter reduction is satisfied only under the dashed
+line.
+In all depicted cases backward2 and backward3 did not appear as the best choice which satisfies condition 5. It can be
+further proved that neither backward2 nor backward3 will provide the least number of FLOPs under this restriction. It
+is sufficient to prove that at least one of other backward algorithms is a better option. For both cases, it is convenient to
+compare against backward5. We will use proof by contradiction:
+Suppose FLOPs(backward2) ≤FLOPs(backward5). From 1 it follows that:
+2bs(or + 2ir + 2io) + 2ior ≤2bs(2or + 2ir + oi) + 2ior
+2bsor + 4bsir + 4bsio + 2ior ≤4bsor + 4bsir + 2bsoi + 2ior
+2bsio ≤2bsor
+i ≤r
+Using 5 and knowing that i > 0, o > 0:
+i ≤r <
+io
+i + o ≤i
+We reached a contradiction. That means FLOPs(backward2) > FLOPs(backward5).
+4
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Table 1: Number of floating-point operations per second(FLOPs) for our implemented forward and backward passes. b -
+batch size; s - sequence length; i - input dimension, o - output dimension; r - adapter rank;
+Method
+FLOPs
+forward1
+2b · s · (i · o + r · i + o · r)
+forward2
+2(i · o · r + b · s · o · i)
+backward1
+2b · s · (2o · r + 3i · r + o · i)
+backward2
+2b · s(o · r + 2i · r + 2i · o) + 2i · o · r
+backward3
+2b · s · (2i · o + o · r + i · r) + 4i · r · o
+backward4
+2(2b · s · i · o + 3i · o · r)
+backward5
+2b · s · (2o · r + 2i · r + o · i) + 2i · o · r
+backward6
+2b · s · (2o · r + 2i · r + 2o · i) + 4i · o · r
+backward7
+2b · s · (o · r + i · r + 2o · i) + 4i · o · r
+backward8
+2b · s · (o · r + i · r + 2o · i) + 4i · o · r
+Suppose FLOPs(backward3) ≤FLOPs(backward5). From 1 it follows that:
+2bs(2io + or + ir) + 4ior ≤2bs(2or + 2ir + oi) + 2ior
+4bsio + 2bsor + 2bsir + 4iro ≤4bsor + 4bsir + 2bsoi + 2ior
+2bsio + 2iro ≤2bsor + 2bsir
+bs(io −or −ir) ≤−iro
+Using 5 and knowing that i > 0, r > 0, o > 0, b > 0, s > 0:
+0 < bs ≤
+−iro
+io −or −ir < 0
+We reached a contradiction. That means FLOPs(backward3) > FLOPs(backward5).
+Areas of applicability can also be researched in batch size/sequence length space. For example, Figure 3 depicts best
+backward and forward paths for the LlamaMLP linear layer with adapters of rank 128 (this configuration satisfies
+condition 5).
+3
+Numerical experiments
+To evaluate RunLora performance, we have conducted experiments on several NLP Models with number of parameters
+ranging from 60 millions up to 1.3 billion: LLama Touvron et al. [2023], OPT Zhang et al. [2022], RoBERTa Liu
+et al. [2020]. We measured mean time of a Forward-Backward pass through the network for different architectures and
+training settings and compared it to Peft LoRA implementation. Additionally, we performed 100 epochs of adapters
+training on wikitext-2 Merity et al. [2016] and compared steps-per-second and samples-per-second metrics as well as
+total training runtime.
+Llama
+We used Llama model implementation which employs Flash Attention from PyTorch framework. We consider
+several configurations (from 60 millions of parameters up to 1.3 billions) and initialize layer weights randomly. As
+showed in Table 2, we managed to achieve up to 16% speedup compared to Peft when running model with float32 data
+type for weights and operations. When running the same experiment in bfloat16 (Table 3) we manage to achieve up to
+17.8% speedup. This slight improvement results from the fact that training in bfloat16 is generally faster than training
+in full precision, which makes reduction of flops due to RunLoRA to be more influencing on the loop runtime.
+When training Llama for 100 epochs on wikitext-2, we manage to achieve 17.56% reduction in total runtime. Ac-
+cordingly, number of training samples per second and number of train steps per seconds increase in 1.2 times (Table
+8).
+RoBerta
+Another family of models we consider in our experiments consists of roberta-base and roberta-large
+pretrained models from Huggingface Hub. They contain about 125 millions and 355 millions of parameters respectively.
+In terms of mean Forward-Backward RunLoRA performs 11.88% faster in float32 and 22.06% faster in bloat16 data
+type.
+As for training RoBerta on wikitext-2, RunLoRA shows up to 20.27% speedup in total runtime and 1.25 times increase
+in train samples per second and train steps per second (Table 9).
+5
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+(a) Input and output dimensions are equal to the model’s em-
+bedding size. batch size = 2, sequence length = 100.
+(b) Input dimension equals model’s embedding size, output
+dimension is four times bigger. batch size = 2, sequence length
+= 100.
+(c) Input and output dimensions are equal to the model’s em-
+bedding size. batch size = 20, sequence length = 1024.
+(d) Input dimension equals model’s embedding size, output
+dimension is four times bigger. batch size = 1, sequence length
+= 600.
+Figure 2: Areas of best forward/backward pass choice. Region under the dashed line satisfies condition 5.
+(a) Best backward path as a function of batch size and sequence
+length.
+(b) Best forward path as a function of batch size and sequence
+length.
+Figure 3: Areas of best forward/backward pass choice for the LlamaMLP linear layer. Input dimention equals 4096,
+output dimention equals 11008. Rank is 128.
+OPT
+As with RoBerta, we use pretrained weights and model implementation from Huggingface Hub. With OPT
+models we also use FlashAttention2 Dao [2024] mechanism which only supports bfloat16 data type.
+6
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Table 4 shows maximum of 28.29% speedup of Forward-Backward pass for sequence length of 512 and 26.24% for
+maximum sequence length of the model. Thereafter, wikitext-2 training experiment (Table 10) depicts maximum
+26.65% reduction in total runtime, 1.36 increase in train samples per second and train steps per second.
+Additionally, since RunLoRA forward functions do not save intermediate result XA, in certain experiments we manage
+to save up to 6Gb of GPU memory.
+Llama2-7b
+We also evaluate our framework on a large model with 7 billion parameters. Since training such model on
+a single gpu proves to be a tedious and often impossible task, we use LitGPT1 framework to get advantages of FSDP
+training. We train Llama2-7b on Alpaca dataset for 100 iteration steps. We use two GPUs with minibatch size of 40.
+Results are presented in Table 11: RunLoRA achieves 21.47% speedup in mean iteration time.
+All experiments were performed on a single Nvidia A100 GPU 80Gb (except for Llama2-7b experiment, which was
+conducted on two gpus). In all experiments, lora dropout was fixed to 0, other parameters are stated in the referenced
+tables. For measuring mean Forward-Backward pass we utilized torch.benchmarking2 package. RunLoRA adapters
+were applied to all linear weights in attention and MLP blocks.
+Note that we use Adam optimizer Kingma and Ba [2014] and torch.autocast3 when training adapters. Adam requires
+memory to store optimizer states and autocast converts some activations to fp32 data type. This forces us to use smaller
+batch sizes or sequence lengths for wikitext-2 training compared to mean Forward-Backward measurements.
+Table 2: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on Llama family of models. Sequence length was set to the maximum sequence length of the
+model (2048). Experiments were run in float32 data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+llama 130m, b=64, r=128
+RunLoRA
+2404.12
+67272.5
+10.78
+2648.38
+PEFT
+2694.56
+69920.88
+-
+-
+llama 250m, b=38, r=128
+RunLoRA
+3032.54
+72926.02
+10.92
+3107.5
+PEFT
+3404.35
+76033.52
+-
+-
+llama 250m, b=34, r=256
+RunLoRA
+3092.25
+65345.14
+15.99
+5543.5
+PEFT
+3680.99
+70888.64
+-
+-
+llama 350m, b=30, r=256
+RunLoRA
+3747.33
+65453.66
+12.38
+4831.88
+PEFT
+4276.92
+70285.54
+-
+-
+Table 3: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on Llama family of models. Sequence length was set to the maximum sequence length of the
+model (2048). Experiments were run in bfloat16 data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+llama 130m, b=64, r=8
+RunLoRA
+463.46
+38248.02
+15.18
+81.67
+PEFT
+546.38
+38329.69
+-
+-
+llama 250m, b=58, r=128
+RunLoRA
+877.34
+64134.84
+17.81
+2381.38
+PEFT
+1067.41
+66516.21
+-
+-
+llama 350m, b=48, r=128
+RunLoRA
+902.74
+61515.97
+16.94
+1954.91
+PEFT
+1086.8
+63470.88
+-
+-
+llama 1.3b, b=24, r=512
+RunLoRA
+2120.75
+57419.04
+12.06
+3530.33
+PEFT
+2411.64
+60949.38
+-
+-
+4
+Conclusion and Future Work
+We have proposed several computation algorithms alternative to a default forward-backward pass through low-rank
+adapters and derived theoretical bounds of their applicability. We have implemented the proposed methods as pytorch-
+1https://github.com/Lightning-AI/litgpt
+2https://pytorch.org/docs/stable/benchmark_utils.html
+3https://pytorch.org/docs/stable/amp.html
+7
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Table 4: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on OPT family of models. Sequence length was set to the maximum sequence length of the
+model (2048). Experiments were run in bfloat16 data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+opt 125m, b=64, r=8
+RunLoRA
+716.13
+65630.65
+21.62
+145.61
+PEFT
+913.65
+65776.26
+-
+-
+opt 350m, b=42, r=128
+RunLoRA
+1065.99
+73416.92
+26.24
+2970.25
+PEFT
+1445.17
+76387.17
+-
+-
+opt 1.3b, b=24, r=128
+RunLoRA
+1641.24
+69893.79
+19.97
+1620.0
+PEFT
+2050.82
+71513.79
+-
+-
+opt 1.3b, b=22, r=512
+RunLoRA
+1737.97
+64411.39
+20.19
+5895.0
+PEFT
+2177.51
+70306.39
+-
+-
+Table 5: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on OPT family of models. Sequence length was set to 512. Experiments were run in bfloat16
+data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+opt-125m, b=64, r=128
+RunLoRA
+172.49
+16418.51
+24.87
+556.75
+PEFT
+229.58
+16975.26
+-
+-
+opt-350m, b=64, r=128
+RunLoRA
+378.4
+27992.26
+27.68
+1098.0
+PEFT
+523.2
+29090.26
+-
+-
+opt-350m, b=100, r=128
+RunLoRA
+569.2
+43708.9
+28.29
+1745.25
+PEFT
+793.75
+45454.15
+-
+-
+opt-1.3, b=64, r=128
+RunLoRA
+1022.75
+46622.26
+20.21
+1044.0
+PEFT
+1281.86
+47666.26
+-
+-
+opt-1.3, b=100, r=128
+RunLoRA
+1551.24
+72789.15
+21.41
+1690.0
+PEFT
+1973.8
+74479.15
+-
+-
+Table 6: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on RoBERTa family of models. Sequence length was set to the maximum sequence length of
+the model(512). Experiments were run in float32 data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+roberta-base, b=64, r=128
+RunLoRA
+1416.9
+46810.08
+11.88
+1126.12
+PEFT
+1607.87
+47936.21
+-
+-
+roberta-large, b=50, r=128
+RunLoRA
+2988.21
+72727.46
+11.33
+1703.5
+PEFT
+3370.13
+74430.96
+-
+-
+Table 7: Comparison between RunLora (with flops criterion) and default LoRA implementation from peft library.
+b-batch size, r-lora rank on RoBERTa family of models. Sequence length was set to the maximum sequence length of
+the model(512). Experiments were run in bfloat16 data type.
+Implementation
+Mean F-B loop, ms
+Memory for F-B loop, MB
+Speedup, %
+Memory Saved, MB
+roberta-base, b=64, r=128
+RunLoRA
+295.61
+23408.94
+20.02
+563.56
+PEFT
+369.63
+23972.5
+-
+-
+roberta-large, b=64, r=128
+RunLoRA
+644.19
+46536.75
+22.66
+1106.1
+PEFT
+832.93
+47642.85
+-
+-
+compatible framework RunLoRA which chooses the best computation graph based on model architecture and training
+parameters. We have proved RunLoRA’s efficiency by comparing to the peft LoRA implementation.
+One of the possible directions for future work is finding optimal computation graphs for approximate versions of
+low-rank adapters (for example, vector analogues like VeRAKopiczko et al. [2024], DoRALiu et al. [2024]).
+8
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Table 8: Training Llama Causal LM model for 100 epochs on wikitext-2 dataset. Training was conducted in bfloat16
+data type on a single A100 GPU. Texts are grouped to batches with sequence length of 1024 tokens.
+Implementation
+Train Samples per Second
+Train Steps per Second
+Train Runtime, Min
+Speedup, %
+llama-130m, b=60, r=128
+PEFT
+89.46
+1.51
+51.91
+-
+RunLoRA
+103.9
+1.75
+44.69
+13.91
+llama-250m, b=48, r=128
+PEFT
+47.1
+0.99
+98.54
+-
+RunLoRA
+56.2
+1.19
+82.62
+16.16
+llama-350m, b=40, r=128
+PEFT
+38.1
+0.96
+121.98
+-
+RunLoRA
+46.2
+1.16
+100.56
+17.56
+llama-1.3b, b=24, r=128
+PEFT
+11.18
+0.47
+415.25
+-
+RunLoRA
+12.46
+0.52
+372.69
+10.2
+Table 9: Training RoBerta Causal LM model for 100 epochs on wikitext-2 dataset. Training was conducted in bfloat16
+data type on a single A100 GPU. Texts are grouped to batches with sequence length of 512 tokens.
+Implementation
+Train Samples per Second
+Train Steps per Second
+Train Runtime, Min
+Speedup, %
+roberta-base, b=64, r=128
+PEFT
+95.84
+1.5
+85.4
+-
+RunLoRA
+115.04
+1.8
+71.17
+16.7
+roberta-large, b=46, r=128
+PEFT
+42.79
+0.93
+186.87
+-
+RunLoRA
+53.67
+1.18
+148.99
+20.27
+Table 10: Training OPT Causal LM model for 100 epochs on wikitext-2 dataset. Training was conducted in bfloat16
+data type on a single A100 GPU. Texts are grouped to batches with sequence length of 1024 tokens.
+Implementation
+Train Samples per Second
+Train Steps per Second
+Train Runtime, Min
+Speedup, %
+opt-125m, b=48, r=128
+PEFT
+75.63
+1.6
+51.89
+-
+RunLoRA
+96.85
+2.1
+40.53
+21.89
+opt-350m, b=32, r=128
+PEFT
+34.07
+1.07
+115.19
+-
+RunLoRA
+46.45
+1.46
+84.49
+26.65
+opt-1.3b, b=20, r=128
+PEFT
+15.81
+0.79
+248.29
+-
+RunLoRA
+20.03
+1.0
+196.01
+21.05
+Table 11: Training Llama2-7b model for 100 iterations on Alpaca dataset. Training was conducted in bfloat16 data type
+on two A100 GPUs. Texts were grouped to batches with sequence length of 512 tokens. Minibatch size = 40. LoRA
+rank = 128.
+Implementation
+Mean Iteration Time, Sec
+Speedup, %
+Train Runtime, Sec
+Memory used, GB
+PEFT
+7283.90
+-
+719.76
+24.09
+RunLoRA
+5720.12
+21.47
+573.35
+23.72
+5
+Related Work
+Introduction of LoRA Hu et al. [2022] caused a wave of new publications on topic of low-rank updates. For example,
+ReLoRALialin et al. [2023] has devised a special learning rate scheduler for full training with low-rank updates,
+ZipLoRAShah et al. [2023] merges adapters trained separately for style and object, performing effective style transfer,
+DyLoRAValipour et al. [2023] trains LoRA blocks for a range of ranks instead of a single rank.
+Many papers try to further reduce the costs of training. QLoRADettmers et al. [2023] utilizes adapters together with
+quantization of original weights to reduce memory requirements, Vector-based Random Matrix Adaptation (VeRA)
+Kopiczko et al. [2024] reduces number of trainable parameters by using a single pair of low-rank matrices shared
+across all layers and learning small scaling vectors instead. LoTR Bershatsky et al. [2024] also proposes weight sharing
+for factors in Tucker2 decomposition of low-rank adapters. LoRA-FAZhang et al. [2023] aimes to reduce memory
+consumption by freezing downscaling half of the LoRA adapters.
+9
+
+
+Run LoRA Run: Faster and Lighter LoRA Implementations
+A PREPRINT
+Our method also tries to further increase the efficiency of low-rank adapters training, but with different approach:
+we nigher reduce the number of LoRA parameters nor compromise training accuracy. Our framework achieves
+computational speedups and memory reduction only due to the choice of optimal computation graph.
+References
+Edward Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+Lora: Low-rank adaptation of large language models. 2022.
+Vladislav Lialin, Namrata Shivagunde, Sherin Muckatira, and Anna Rumshisky. Stack more layers differently:
+High-rank training through low-rank updates, 2023.
+Viraj Shah, Nataniel Ruiz, Forrester Cole, Erika Lu, Svetlana Lazebnik, Yuanzhen Li, and Varun Jampani. Ziplora: Any
+subject in any style by effectively merging loras, 2023.
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient finetuning of quantized llms.
+ArXiv, abs/2305.14314, 2023. URL https://api.semanticscholar.org/CorpusID:258841328.
+Daniel Bershatsky, Daria Cherniuk, Talgat Daulbaev, Aleksandr Mikhalev, and Ivan Oseledets. Lotr: Low tensor rank
+weight adaptation, 2024.
+Dawid J. Kopiczko, Tijmen Blankevoort, and Yuki M. Asano. Vera: Vector-based random matrix adaptation, 2024.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste
+Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez, Armand Joulin, Edouard Grave, and
+Guillaume Lample. Llama: Open and efficient foundation language models, 2023.
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan, Mona
+Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel Simig, Punit Singh
+Koura, Anjali Sridhar, Tianlu Wang, and Luke Zettlemoyer. Opt: Open pre-trained transformer language models,
+2022.
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer,
+and Veselin Stoyanov. Ro{bert}a: A robustly optimized {bert} pretraining approach, 2020. URL https://
+openreview.net/forum?id=SyxS0T4tvS.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. 09 2016.
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. In The Twelfth International
+Conference on Learning Representations, 2024. URL https://openreview.net/forum?id=mZn2Xyh9Ec.
+Diederik Kingma and Jimmy Ba. Adam: A method for stochastic optimization. International Conference on Learning
+Representations, 12 2014.
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-Ting Cheng, and
+Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation, 2024.
+Mojtaba Valipour, Mehdi Rezagholizadeh, Ivan Kobyzev, and Ali Ghodsi. DyLoRA: Parameter-efficient tuning of pre-
+trained models using dynamic search-free low-rank adaptation. In Andreas Vlachos and Isabelle Augenstein, editors,
+Proceedings of the 17th Conference of the European Chapter of the Association for Computational Linguistics, pages
+3274–3287, Dubrovnik, Croatia, May 2023. Association for Computational Linguistics. doi:10.18653/v1/2023.eacl-
+main.239. URL https://aclanthology.org/2023.eacl-main.239.
+Longteng Zhang, Lin Zhang, Shaohuai Shi, Xiaowen Chu, and Bo Li. Lora-fa: Memory-efficient low-rank adaptation
+for large language models fine-tuning, 2023.
+10

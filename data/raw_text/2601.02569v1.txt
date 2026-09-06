@@ -1,0 +1,1813 @@
+1
+LoRA-Drop: Temporal LoRA Decoding for Efficient
+LLM Inference
+Hossein Rajabzadeh1, Maryam Dialameh1, Chul B. Park2, Il-Min Kim3, Hyock Ju Kwon1
+1Department of Mechanical and Mechatronics Engineering, University of Waterloo
+2Department of Mechanical and Industrial Engineering, University of Toronto
+3Department of Electrical and Computer Engineering, Queen’s University
+{hossein.rajabzadeh, maryam.dialameh,hjkwon}@uwaterloo.ca
+Park@mie.utoronto.ca,Ilmin.kim@queensu.ca
+Abstract—Autoregressive large language models (LLMs) are
+bottlenecked by sequential decoding, where each new token
+typically requires executing all transformer layers. Existing
+dynamic-depth and layer-skipping methods reduce this cost, but
+often rely on auxiliary routing mechanisms or incur accuracy
+degradation when bypassed layers are left uncompensated. We
+present LoRA-Drop, a plug-and-play inference framework that
+accelerates decoding by applying a temporal compute schedule
+to a fixed subset of intermediate layers: on most decoding
+steps, selected layers reuse the previous-token hidden state and
+apply a low-rank LoRA correction, while periodic refresh steps
+execute the full model to prevent drift. LoRA-Drop requires
+no routing network, is compatible with standard KV caching,
+and can reduce KV-cache footprint by skipping KV updates in
+droppable layers during LoRA steps and refreshing periodically.
+Across LLaMA2-7B, LLaMA3-8B, Qwen2.5-7B, and Qwen2.5-
+14B, LoRA-Drop achieves up to 2.6× faster decoding and 45–55%
+KV-cache reduction while staying within 0.5 percentage points
+(pp) of baseline accuracy. Evaluations on reasoning (GSM8K,
+MATH, BBH), code generation (HumanEval, MBPP), and long-
+context/multilingual benchmarks (LongBench, XNLI, XCOPA)
+identify a consistent safe zone of scheduling configurations that
+preserves quality while delivering substantial efficiency gains,
+providing a simple path toward adaptive-capacity inference in
+LLMs. Codes are available at https://github.com/hosseinbv/LoRA-
+Drop.git.
+I. INTRODUCTION
+L
+ARGE Language Models (LLMs) have emerged as a
+cornerstone of modern artificial intelligence, demonstrat-
+ing remarkable performance across a wide range of natural
+language processing tasks such as reasoning, code generation,
+and dialogue systems [1]–[3]. Their ability to generalize
+across domains with minimal task-specific supervision has
+driven widespread adoption in both academia and industry,
+powering applications in search engines, conversational agents,
+recommendation systems, and enterprise productivity tools
+[4]–[6].
+Despite their success, the practical deployment of LLMs is
+often hindered by the high computational cost of autoregressive
+inference, where each token must be generated sequentially
+through the entire stack of transformer layers. This process
+Fig. 1.
+(Left) Adjacent-token redundancy measured as the average cosine
+similarity between the hidden state of token t and those of the next tokens t+∆
+(with ∆∈{1, ..., 10}), averaged over all positions t across 1024 batches
+of diverse data. All evaluated models show high similarity (approximately
+0.6–0.85), indicating that hidden states change little between consecutive
+tokens. (Right) The similarity horizon, defined as the largest token distance
+∆for which the cosine similarity between token t and t + ∆remains at least
+0.50. Horizons between 3 and 6 tokens demonstrate that several future tokens
+share highly similar hidden states.
+leads to substantial latency and energy consumption, especially
+for long sequences and interactive applications. To address this
+challenge, several lines of research have emerged:
+Model Compression and Quantization- Methods such as
+weight pruning [7], [8] and low-bit quantization [9]–[11] reduce
+the parameter footprint and arithmetic cost of LLMs, enabling
+more efficient deployment on constrained hardware. While
+effective for reducing memory and throughput requirements,
+these approaches often require delicate tuning to balance
+efficiency with model accuracy.
+Efficient Attention and KV-Caching- Given that attention
+layers dominate LLM inference cost, many works focus on
+optimizing sequence processing. KV-caching [12]–[14] reduces
+redundant computation across tokens, while efficient attention
+variants such as FlashAttention [15] and streaming/context-
+parallel attention [16], [17] accelerate long-context inference.
+These methods improve throughput but do not directly address
+the redundancy across layers during generation.
+Dynamic Computation and Layer Skipping- More recently,
+researchers have proposed adaptive computation strategies that
+reduce the number of active layers or sublayers per token.
+Examples include Unified Layer Skipping [18], FlexiDepth
+[19], AdaSkip [20], ColT5 [21], Balcony [22], and FiRST [23],
+which either skip intermediate layers or use lightweight routers
+and adapters to allocate variable computational budgets across
+tokens. These methods highlight that not all tokens require the
+full depth of the model, though many approaches either incur
+arXiv:2601.02569v1  [cs.CL]  5 Jan 2026
+
+
+2
+additional routing overhead or bypass layers entirely without
+compensatory transformations, leading to potential degradation.
+Recent interpretability studies have shown that the intermedi-
+ate layer representations of large language models (LLMs) are
+remarkably expressive, often containing sufficient information
+to anticipate not only the next token but even subsequent
+ones. Logit Lens [24], [25] first, and recently demonstrated
+that hidden states from early and middle layers already
+encode meaningful token distributions when projected through
+the model’s output embedding, suggesting that prediction
+refinement, rather than new information synthesis, occurs as
+tokens propagate through deeper layers. Building on this, Tuned
+Lens [26] aligned each layer’s representation to the output
+space via lightweight linear transformations, revealing that layer
+outputs form a coherent progression of increasingly confident
+latent predictions. Extending this temporal perspective, Future
+Lens [27] showed that a single hidden state can often anticipate
+multiple future tokens, indicating significant temporal redun-
+dancy across decoding steps. Together, these works suggest
+that the intermediate activations of autoregressive transformers
+already encapsulate much of the predictive signal used in later
+computations, implying that full-depth inference at every time
+step is not always necessary.
+Following the reported representation similarities across
+layers in LLMs, our analysis reveals that large language models
+exhibit a striking degree of temporal redundancy in their hidden
+states. As shown in Fig. 1, adjacent tokens in models such as
+Qwen, DeepSeek, and NatureLM maintain very high cosine
+similarity (0.6–0.85 on average), and this similarity persists
+across several future positions—typically up to 3–6 tokens.
+This indicates that the model’s internal representation at time
+step t already contains much of the information needed for
+the representations at steps t + 1, . . . , t + ∆1, even before
+these tokens are generated. Building on this observation,
+we propose LoRA-Drop, a method that directly exploits the
+inherent predictability of hidden states to reduce unnecessary
+computation during autoregressive decoding.
+Whereas existing dynamic inference methods rely on
+complex routing or skip layers without compensatory up-
+dates—often degrading generation quality—we paper propose
+LoRA-Drop which reuses the rich intermediate representation
+from step t and applies a lightweight LoRA transformation at
+step t+∆to adjust it for the next tokens. This design preserves
+contextual continuity while avoiding full-layer computation at
+every step. LoRA-Drop offers two key benefits. First, it enables
+fine-grained control over the drop ratio, allowing practitioners
+to decide how frequently the full model should be invoked
+versus the fast LoRA-only pathway, thereby flexibly trading
+off latency and accuracy. Second, it is fully plug-and-play:
+it introduces no architectural changes, integrates seamlessly
+with pretrained LLMs, and requires only a small amount of
+continual fine-tuning.
+1∆denotes the temporal offset between two token positions, i.e., the number
+of future nearby tokens over which hidden-state similarity is evaluated in the
+LoRA-Drop analysis.
+II. PROPOSED METHOD: LORA-DROP
+The goal of LoRA-Drop is to accelerate the inference pro-
+cess of autoregressive in large language models by dynamically
+modulating the model’s computational capacity according to the
+initial layers’ similarities. Instead of computing all transformer
+layers at every time step, LoRA-Drop allows certain layers to
+be skipped while preserving representational continuity through
+lightweight low-rank adaptation (LoRA) modules. Figure 2
+illustrates the main workflow of LoRA-Drop using an inference
+example with a sequence length of four. As shown in the figure,
+at time step t, the model performs a standard forward pass
+through all layers, while the LoRA modules are disabled. At
+the subsequent time step t + 1, a subset of intermediate layers
+is skipped: instead of executing their full computations, the
+corresponding LoRA modules are activated, and their outputs
+are added to the cached outputs of the same layers from
+the previous time step. The same computational workflow
+is repeated at time step t + 2, and a full-layer computation
+is performed again at time step t + 3, allowing the model to
+periodically refine its representations across all layers. This
+produces an approximate update of the hidden states while
+avoiding the full layer computation. This approach leverages the
+empirical observation that intermediate layer representations
+of LLMs already encode rich predictive information about
+upcoming tokens [24]. Thus, the full model call is not always
+required for predicting nearby tokens.
+A. Model Formulation
+Consider an n-layer autoregressive transformer receiving an
+input sequence of tokens S = {t1, t2, . . . , tT } and generating
+a sequence of m tokens S′ = {ˆtT +1, ˆtT +2, . . . , ˆtT +m}. Let
+xi
+t ∈Rd denote the output hidden state of layer i and time step
+t, where d is the model’s dimension. The standard forward
+propagation for layer i is given by
+xi
+t = f i(xi−1
+t
+),
+(1)
+where f i(·) represents the standard transformation performed
+by the attention, normalization, and MLP modules of layer i
+and xi−1
+t
+is the output of layer i −1 at time step t.
+In LoRA-Drop, we first need to define a list of drop-layers,
+i.e. L, 2, in which each layer i ∈L in that list are equipped with
+a LoRA module consisting of two learnable low-rank matrices
+Ai ∈Rr×d and Bi ∈Rd×r, with rank r ≪d. These matrices
+approximate a residual transformation of the form
+W i
+L = BiAi,
+rank(W i
+L) = r.
+(2)
+During selected time steps, the main layer computation f i(·)
+is bypassed and replaced by this lightweight linear mapping:
+ˆxi
+t = xi
+t−1 + α W i
+Lxi−1
+t
+,
+(3)
+where α is a scaling coefficient controlling the contribution
+of the LoRA update. Equation (3) serves as a compressed
+surrogate for the full layer output in (1).
+2Please check Subsection IV-C, to see how the list of drop-layers is created.
+
+
+3
+Fig. 2. The workflow of LoRA-Drop. Each transformer layer is augmented with a low-rank adaptation module (matrices Ai and Bi). During low-complexity
+steps (eg. t + 1 and t + 2), only the lightweight LoRA modules are activated, bypassing the pre-specified layers to reduce inference computation. At periodic
+or complexity-triggered steps, the full layers are reactivated to refine representations.
+B. Temporal Scheduling of Layer Activation
+LoRA-Drop accelerates autoregressive decoding by tempo-
+rally scheduling a subset of transformer layers to alternate
+between (i) a full evaluation and (ii) a lightweight LoRA-
+only surrogate update. Let the model have n layers and let
+L ⊆{1, . . . , n} denote the fixed drop-layer list. We define
+ρ ≜|L|/n as the fraction of layers that are droppable (i.e.,
+eligible for LoRA-mode). Layers outside L are always executed
+in full.
+a) Two decoding modes and refresh period.: Decoding
+proceeds in cycles of length k+1:
+• Full mode (refresh step). Every (k+1)-th decoding step,
+all layers are executed in full. This refresh recomputes
+exact hidden states and updates internal states such as
+KV-cache, preventing drift from accumulating over long
+generations.
+• LoRA mode (lightweight steps). For the following k
+decoding steps, layers in L bypass the full computation and
+instead apply a low-rank LoRA update with cost O(rd),
+while layers not in L remain fully active. In this phase,
+LoRA-Drop exploits temporal redundancy in hidden states
+across nearby tokens to approximate the effect of the
+skipped computation.
+In this work, we adopt the above fixed periodic schedule; we
+leave adaptive confidence-based scheduling (e.g., via token
+entropy or logit margin) as future work.
+b) Activation indicator with (ρ, k) control.: Let δi
+t ∈
+{0, 1} indicate whether layer i is executed in full at decoding
+step t:
+δi
+t =
+
+
+
+
+
+1,
+if (t mod (k+1) = 0) (refresh step),
+1,
+if i /∈L (non-droppable layer),
+0,
+otherwise (LoRA-mode on droppable layers).
+By construction, exactly a ρ fraction of layers can take δi
+t = 0
+on non-refresh steps, and k controls how many consecutive
+tokens are generated before the next full refresh.
+c) Unified layer update.: Let xi−1
+t
+be the input activation
+to layer i at token step t, and let f i(·) denote the original full
+layer transformation. The LoRA-Drop update is
+xi
+t = δi
+t f i(xi−1
+t
+) + (1 −δi
+t)
+ xi
+t−1 + α W i
+L xi−1
+t
+
+,
+(4)
+where xi
+t is the layer output at time t. In LoRA mode (δi
+t = 0),
+the layer output is approximated by reusing the cached hidden
+state from the previous token at the same layer, xi
+t−1, plus a
+low-rank LoRA correction applied to the current layer input
+xi−1
+t
+. On refresh steps and for non-droppable layers (δi
+t = 1),
+LoRA-Drop reduces to the standard full computation.
+C. LoRA-Drop Inference Algorithm
+Algorithm 1 formalizes the decoding process under LoRA-
+Drop inference strategy. Each new token generation step decides
+whether to invoke the full layer computation or its LoRA
+surrogate according to the drop-layer list L and the given
+activation period k ∈1, ..., ∆. As explained in the algorithm,
+LoRA-Drop alternates between periodic full-model refresh
+steps and lightweight LoRA-only updates: at every decoding
+step j, if j mod k = 0, all layers execute a standard forward
+pass to refresh hidden states and KV-caches, whereas for
+
+
+4
+intermediate steps, layers whose indices belong to the drop-
+layer list L apply a low-rank LoRA update based on the
+previous hidden state, while the remaining layers continue
+to perform full forward computation. Specifically, decoding
+proceeds token by token. For each newly generated token
+position j, the model iterates through all transformer layers
+in order. If the current step corresponds to a refresh point
+(j mod k = 0), the full network is evaluated, ensuring that
+all hidden representations and internal states are recomputed
+exactly. Otherwise, for layers included in L, the computation
+is approximated using a LoRA-only residual update added
+to the cached hidden state from the previous token, while
+layers outside L continue to execute their standard forward
+functions. The resulting top-layer representation is then used to
+predict the next token, and the process repeats until the desired
+output length is reached. This approach preserves compatibility
+with KV caching since both update paths maintain consistent
+hidden-state dimensionality.
+Algorithm 1 LoRA-Drop Inference
+1: Input: Token sequence S = {t1, . . . , tT }, model layers
+{Li}n
+i=1, LoRA modules {W i
+L}n
+i=1, activation period k,
+Drop-layer list L
+2: Output: Generated m-token sequence {ˆtT +1, . . . ˆtT +m}
+3: for j ∈{T + 1, ..., T + m} do
+4:
+for each layer Li : i = 1, 2, . . . , n do
+5:
+if j mod k = 0 then
+6:
+Full forward pass with all layers are active: xi
+j =
+f i(xi−1
+j
+)
+7:
+else if i ∈L then
+8:
+LoRA mode: xi
+j = xi
+j−1 + αW i
+Lxi−1
+j
+9:
+else
+10:
+Full forward pass with all layers are active: xi
+j =
+f i(xi−1
+j
+)
+11:
+end if
+12:
+end for
+13:
+Predict next the token ˆtj
+14: end for
+D. Computational Analysis
+We analyze LoRA-Drop during autoregressive decoding. Let
+the model have n transformer layers and let L be the set of
+droppable layers with |L| = ρn, where ρ ∈[0, 1] is the fraction
+of droppable layers. LoRA-Drop performs an exact refresh step
+once every k+1 tokens; the remaining k steps use LoRA-mode
+in layers L while always-on layers remain fully active.
+a) Decode-time layer cost decomposes into projection
++ attention-to-cache.: Let L denote the KV-cache length at
+a given decode step (prompt length plus generated tokens
+so far). For a standard transformer layer at decode time, the
+dominant work consists of: (i) dense projections and MLP
+blocks (typically Θ(d2)), and (ii) attending the current query
+to the cached keys/values (typically Θ(dL)). We therefore write
+the per-layer full cost as
+Cfull(L) = Ad2 + BdL,
+(5)
+where constants A, B
+>
+0 absorb architectural factors
+(heads, MLP expansion, implementation details, etc.). Crucially,
+Cfull(L) grows linearly in cache length L via the attention-to-
+cache term.
+In LoRA-mode, a droppable layer replaces the full compu-
+tation with a low-rank surrogate update, whose dominant cost
+is the LoRA matvec/matmul:
+CLoRA = Θ(rd),
+r ≪d,
+(6)
+which is independent of L (it does not attend to the cache and
+does not compute full projections/MLP for that layer).
+b) Cycle-average per-token compute.: Let Cbase(L) =
+n Cfull(L) be the baseline per-token decode cost (all layers
+full). Under LoRA-Drop, each period of length k+1 contains
+one refresh step (all layers full) and k LoRA-steps (droppable
+layers use LoRA-mode). Thus the cycle-average per-token cost
+is
+Cavg(L) = (1 −ρ)n Cfull(L)
+|
+{z
+}
+always-on layers
++ ρn
+
+1
+k + 1Cfull(L) +
+k
+k + 1CLoRA
+
+|
+{z
+}
+droppable layers
+= n Cfull(L)
+
+(1 −ρ) +
+ρ
+k + 1 +
+ρk
+k + 1 γ(L)
+
+,
+(7)
+where we define the relative surrogate ratio
+γ(L) ≜
+CLoRA
+Cfull(L) = Θ
+
+r
+Ad + BL
+
+.
+(8)
+Equation (8) shows that γ(L) decreases as L grows: LoRA-
+mode becomes relatively cheaper for longer contexts because
+it eliminates the Θ(dL) attention-to-cache work in the dropped
+layers.
+c) Closed-form speedup with long-context scaling.:
+Define
+the
+idealized
+compute
+speedup
+as
+S(L)
+≜
+Cbase(L)/Cavg(L). Using (7) we obtain
+S(L) =
+1
+(1 −ρ) +
+ρ
+k+1 +
+ρk
+k+1 γ(L)
+.
+(9)
+Meaningful simplified cases.
+• Long-context limit (L →∞). Since γ(L) →0 as L
+increases, the speedup approaches
+S∞≜
+lim
+L→∞S(L) =
+1
+(1 −ρ) +
+ρ
+k+1
+=
+k + 1
+(k + 1) −ρk .
+(10)
+This yields a tight, interpretable ceiling controlled only
+by (ρ, k).
+• Short-context / projection-dominated regime. When L
+is small, Cfull(L) ≈Ad2 and γ(L) ≈Θ(r/d), recovering
+the familiar low-rank ratio.
+• Diminishing returns in k. From (9), the marginal gain of
+increasing k decays as Θ(1/(k+1)2) (holding ρ and γ(L)
+fixed), i.e., gains saturate quickly once refresh overhead
+ρ/(k + 1) becomes small.
+d) Tail-latency characterization (p95 token latency).:
+LoRA-Drop induces a periodic bimodal per-token latency:
+refresh tokens (every k+1 steps) are slower than LoRA-steps.
+Let τref(L) and τlora(L) denote the per-token wall-clock time of
+refresh and LoRA-steps, respectively (each includes all layers
+for that step). Then the fraction of slow tokens is exactly
+
+
+5
+1/(k + 1), implying the token-latency quantiles are determined
+by this frequency. In particular,
+τp(L) =
+(
+τref(L),
+if
+1
+k+1 > 1 −p,
+τlora(L),
+otherwise.
+(11)
+For example, the 95th-percentile token latency satisfies
+τ0.95(L) = τref(L) whenever k < 19, and τ0.95(L) = τlora(L)
+when k ≥19. This makes explicit how k controls not only
+average throughput but also tail latency in serving settings.
+E. Integration and Fine-Tuning
+LoRA-Drop can be seamlessly integrated into existing
+pretrained models by inserting LoRA modules in the desired
+subset of layers and performing a few rounds of continual
+fine-tuning on a small corpus. This process adapts the low-rank
+parameters {Ai, Bi} while freezing the original model weights,
+preserving pretrained knowledge. The method thus enables
+post-hoc acceleration of any transformer-based LLM without
+altering its architecture or requiring full retraining.
+III. EXPERIMENTS
+We evaluate the effectiveness of LoRA-Drop across multiple
+open-weight large language models (LLMs) and standard
+reasoning, knowledge, and commonsense benchmarks. Our
+experiments aim to answer three key questions: (1) Can LoRA-
+Drop accelerate inference while preserving accuracy across
+diverse model families and sizes? (2) How does the selective
+activation of full layers affect performance on complex versus
+simple reasoning tasks? (3) What trade-offs emerge between
+drop ratio, latency, and accuracy?
+A. Experimental Setup
+a) Models.: We apply LoRA-Drop to four widely used
+autoregressive LLMs: LLaMA 2-7B [28], LLaMA 3-8B
+[29], Qwen 2.5-7B, and Qwen 2.5-14B [30]. Each model
+is equipped with LoRA modules inserted in all intermediate
+transformer blocks, following the formulation in Section II. For
+stability and domain generalization, the LoRA-Drop versions of
+these models underwent a short stage of continual pretraining
+over approximately 15 billion tokens drawn from the publicly
+available RefinedWeb corpus [31]. During this phase, only the
+LoRA parameters {Ai, Bi} were updated, while the original
+model weights were frozen.
+b) Datasets.: We conduct evaluations across both general-
+domain and code reasoning tasks. For general natural language
+understanding, we employ the LM-Eval Harness suite [32],
+covering: MMLU (multi-task knowledge), HellaSwag (HS:
+commonsense reasoning), WinoGrande (coreference), ARC-
+c and ARC-e (science QA), OpenBookQA (OB), PIQA
+(physical reasoning), and RACE (reading comprehension;
+denoted as RA). To assess generative reasoning, we additionally
+evaluate on the HumanEval dataset [33], which measures code
+synthesis accuracy under strict functional correctness.
+c) Baselines.: Each LoRA-Drop variant is compared
+against its original full model (without layer skipping or
+LoRA modules) and against dynamic-depth baselines such as
+Unified Layer Skipping [18] and FlexiDepth [19]. We report
+both performance metrics (accuracy, Pass@1) and efficiency
+metrics (tokens/sec, relative FLOPs, and memory footprint). We
+focus our empirical comparisons on the closest methodological
+baselines—i.e., depth/activation scheduling via layer skipping
+(e.g., Unified Layer Skipping and FlexiDepth)—because they
+share the same core knob as LoRA-Drop: selectively reducing
+per-token computation by deactivating a subset of layers
+during decoding. In contrast, other acceleration families such
+as speculative decoding, quantization, and KV-cache evic-
+tion/compression are largely orthogonal to our design and
+introduce additional confounding factors (e.g., draft-model
+selection and acceptance criteria, quantization calibration and
+kernel availability, or cache-management heuristics and memory
+allocators) that can dominate results unless each method is
+extensively tuned under the same serving stack and hardware-
+specific kernels. A fair, apples-to-apples comparison would
+therefore require substantial engineering and hyperparameter
+sweeps across multiple systems implementations, which is
+outside the scope of this work. Importantly, these methods are
+complementary to LoRA-Drop and can be combined; we leave
+systematic cross-family benchmarking and composition studies
+to future work.
+d) Implementation Details.: All experiments are per-
+formed on NVIDIA A100 and V100 GPUs with Scaled
+Dot-Product Attention (SDPA) and mixed-precision (BF16)
+inference. We employ sequence lengths of 2048 for text
+benchmarks and 1024 for HumanEval. Each model uses a fixed
+LoRA rank r = 16 and scaling α = 16, unless otherwise stated.
+We vary the drop ratio ρ ∈{0.25, 0.5, 0.75} to control how
+frequently the full layers are activated, following the unified
+update rule in Equation (4). The LM-Eval Harness version
+0.4.2 is used with deterministic generation (temperature = 0)
+for a significant part of evaluations.
+We quantify how LoRA-Drop reduces the KV cache
+footprint during autoregressive decoding as a function of the
+drop-ratio (fraction of skippable intermediate layers replaced
+by LoRA) and the temporal window k (number of consecutive
+tokens for which dropped layers refrain from updating KV).
+For each model (LLaMA2-7B, LLaMA3-8B, Qwen2.5-7B,
+Qwen2.5-14B), we read architectural specifications (number
+of layers, hidden size, attention heads, and KV heads) from
+Hugging Face configurations when available and otherwise use
+standard fallbacks. We assume fp16/bf16 KV tensors, and that
+the first three layers and the final layer remain always active
+(thus always updating KV). Among the remaining layers, a
+fraction of 1 −ρ updates KV-cache for every token, while
+a fraction drop-ratio refreshes KV once every k + 1 tokens;
+this preserves causal consistency while amortizing KV growth.
+The plots in Fig. 3 report percentage KV savings relative to
+the full-model baseline when generating N = 32,768 tokens.
+We observe: (i) savings grow near-linearly with the drop-ratio;
+(ii) larger k yields higher amortized savings via fewer KV
+refreshes; and (iii) absolute baselines differ across families due
+to GQA (e.g., 8 KV heads in LLaMA3/Qwen2.5 vs. 32 in
+
+
+6
+TABLE I
+EVALUATION OF LORA-DROP, UNIFIED LAYER SKIPPING [18], AND FLEXIDEPTH [19] UNDER TEMPORAL LAYER SKIPPING. FOR EACH MODEL, WE
+REPORT ZERO-SHOT ACCURACY ON ARC-EASY (ARC-E), LAMBADA, PIQA, WINOGRANDE (WG), MMLU (5-SHOT), HELLASWAG (HS), AND
+HUMANEVAL. LORA-DROP OPERATES BY SKIPPING A SUBSET OF INTERMEDIATE LAYERS FOR THE NEXT k = 3 GENERATED TOKENS: FOR A DROP RATIO
+OF ρ=0.5, ONLY HALF OF THE LAYERS ARE COMPUTED WHILE THE OTHERS REUSE THEIR PREVIOUS ACTIVATIONS UPDATED THROUGH LORA MODULES.
+THE FIRST THREE AND LAST LAYERS REMAIN ACTIVE ACROSS ALL STEPS. THE LAST COLUMN REPORTS THE RELATIVE INFERENCE SPEEDUP COMPARED
+TO THE BASELINE FULL MODEL.
+Model
+ARC-E
+LAMBADA
+PIQA
+WinoG.
+MMLU (5)
+HS
+HumanEval
+Avg.
+Speedup (×)
+LLaMA2-7B
+Full (baseline)
+75.2
+68.2
+78.8
+69.2
+45.3
+77.6
+38.1
+64.6
+1.00
+Unified Layer Skipping
+74.3
+67.1
+77.9
+68.4
+44.5
+76.5
+37.6
+63.8
+1.42
+FlexiDepth
+74.8
+67.6
+78.3
+68.7
+44.9
+77.1
+37.8
+64.2
+1.55
+LoRA-Drop (25%)
+75.3
+68.4
+78.9
+69.3
+45.6
+77.8
+38.2
+64.8
+1.37
+LoRA-Drop (50%)
+75.0
+68.1
+78.6
+69.0
+45.2
+77.4
+38.0
+64.5
+1.68
+LoRA-Drop (75%)
+73.4
+66.7
+76.9
+67.5
+43.1
+75.2
+37.1
+62.8
+2.35
+Qwen2.5-7B
+Full (baseline)
+77.1
+70.5
+79.8
+71.4
+47.0
+79.9
+39.5
+66.5
+1.00
+Unified Layer Skipping
+76.3
+69.7
+79.0
+70.7
+46.2
+79.0
+39.0
+65.7
+1.38
+FlexiDepth
+76.7
+70.0
+79.3
+70.9
+46.5
+79.3
+39.2
+66.0
+1.52
+LoRA-Drop (25%)
+77.2
+70.6
+79.7
+71.6
+47.2
+80.0
+39.5
+66.5
+1.39
+LoRA-Drop (50%)
+77.0
+70.3
+79.5
+71.3
+46.9
+79.7
+39.3
+66.3
+1.73
+LoRA-Drop (75%)
+74.9
+68.2
+77.3
+69.1
+44.5
+77.0
+37.9
+64.1
+2.42
+LLaMA3-8B
+Full (baseline)
+78.0
+72.6
+80.3
+73.8
+48.1
+80.4
+40.7
+67.7
+1.00
+Unified Layer Skipping
+77.2
+71.7
+79.5
+73.0
+47.2
+79.5
+40.0
+66.9
+1.36
+FlexiDepth
+77.5
+72.1
+79.8
+73.3
+47.6
+79.8
+40.3
+67.2
+1.50
+LoRA-Drop (25%)
+78.1
+72.7
+80.4
+73.8
+48.3
+80.5
+40.8
+67.8
+1.34
+LoRA-Drop (50%)
+77.9
+72.4
+80.1
+73.6
+48.0
+80.2
+40.5
+67.5
+1.70
+LoRA-Drop (75%)
+75.8
+70.2
+77.8
+71.4
+45.5
+77.4
+39.1
+65.3
+2.38
+Qwen2.5-14B
+Full (baseline)
+80.1
+74.8
+81.0
+75.5
+50.2
+81.2
+42.3
+69.3
+1.00
+Unified Layer Skipping
+79.3
+74.0
+80.2
+74.7
+49.3
+80.3
+41.8
+68.5
+1.34
+FlexiDepth
+79.6
+74.3
+80.5
+75.0
+49.6
+80.6
+42.0
+68.8
+1.49
+LoRA-Drop (25%)
+80.2
+74.9
+81.1
+75.6
+50.3
+81.3
+42.4
+69.4
+1.35
+LoRA-Drop (50%)
+80.0
+74.6
+80.9
+75.4
+50.1
+81.0
+42.2
+69.1
+1.68
+LoRA-Drop (75%)
+77.8
+72.1
+78.6
+73.0
+47.2
+78.3
+40.5
+66.8
+2.60
+LLaMA2), but percentage trends are consistent. As a concrete
+reference, with ρ = 0.5 and k = 3, the expected savings is
+approximately L−4
+L
+× 0.5 × 3
+4, where L is the total number of
+layers; empirically, this aligns with the curves in Fig. 3.
+To evaluate the robustness of LoRA-Drop under diverse
+reasoning, coding, and multilingual scenarios, we conducted
+controlled experiments on three families of models (LLaMA2-
+7B, Qwen2.5-7B, and LLaMA3-8B) using representative bench-
+marks from each category. For reasoning, we used GSM8K,
+MATH, and BBH; for code generation, HumanEval and MBPP
+(Pass@1/10); and for long-form and multilingual understand-
+ing, LongBench, Needle-in-a-Haystack, XNLI, and XCOPA.
+Across all models, the configuration (ρ=0.5, k=3) consistently
+remained within the safe zone (∆≤1 pp) across every metric,
+indicating that temporal layer skipping with periodic refresh
+preserves the reasoning and compositional capacity of LLMs.
+Even on more computation-intensive tasks such as GSM8K
+and MATH, LoRA-Drop required only infrequent full-layer
+refreshes (k≤3) to maintain stability, while providing 1.6–1.8×
+speedups and up to 40% reduction in KV-cache memory.
+Interestingly, long-form and multilingual tasks exhibited the
+lowest sensitivity to ρ, k variation, suggesting that contextual
+redundancy in extended text sequences and cross-lingual
+features benefit from LoRA-Drop’s lightweight intermediate
+representations. Overall, these results confirm that LoRA-Drop
+generalizes robustly beyond short-form benchmarks, offering
+practical acceleration with minimal degradation in reasoning
+accuracy or generative fidelity.
+B. On the impact of Drop Ratio p and Window size k
+a) Goal.: We study the trade-off between accuracy, speed,
+latency, and memory as a function of the drop ratio ρ ∈
+{0.0, 0.25, 0.5, 0.75} and the temporal window k ∈{1, 2, 3, 5}.
+At a given decoding step, a fraction ρ of intermediate layers
+(excluding the first three and the last) reuse their previous
+activations and are updated by LoRA modules for the next k
+tokens, while the remaining fraction 1 −p (plus the always-
+active layers) are computed fully every token. We seek the
+Pareto front and identify a safe zone (≤0.5% accuracy gap
+from baseline) where significant speed and KV-cache savings
+are realized with negligible loss.
+b) Setup.:
+Unless otherwise noted: sequence length
+=
+4096, batch size =
+1, mixed precision (bf16), KV
+caching enabled, LoRA rank r=16, scaling α=16, and LoRA
+applied to intermediate attention and MLP blocks. Accu-
+racy is the averaged zero-shot score over MMLU, HEL-
+
+
+7
+(a) LLaMA2-7B
+(b) Qwen2.5-7B
+(c) LLaMA3-8B
+(d) Qwen2.5-14B
+Fig. 3. KV-cache savings vs. drop-ratio and temporal window k (2×2 grid). Each curve shows the estimated percentage reduction in KV memory relative
+to the full-model baseline when generating N = 32k tokens, for k ∈{1, 2, 3, 4, 5}. LoRA-Drop skips a fraction (drop-ratio) of intermediate layers for k
+consecutive tokens, reusing their previous activations with lightweight LoRA updates, while the first three and last layers always update KV. Savings increase
+with both drop-ratio and k; models with fewer KV heads (GQA) have lower absolute baselines but follow the same percentage trend.
+TABLE II
+REASONING, CODE, LONG-FORM & MULTILINGUAL COMPARISON FOR LORA-DROP AT ρ=0.5, k=3. METRICS ARE ACCURACY (%) EXCEPT
+HUMANEVAL/MBPP (PASS@1/10, %); LONGBENCH IS AVERAGED F1/EM (NORMALIZED), NEEDLE IS RECALL@1K (%). THE LAST COLUMN REPORTS
+THE largest k AT ρ=0.5 THAT KEEPS THE AVERAGE DROP WITHIN ∆≤1 PERCENTAGE POINT (PP).
+Model
+Variant
+Reasoning
+Code
+Long-form
+Multilingual
+Min k @ ρ=0.5
+(∆≤1 pp)
+GSM8K
+MATH
+BBH
+HumanEval P@1
+MBPP P@1
+MBPP P@10
+LongBench
+Needle
+XNLI
+XCOPA
+LLaMA2-7B
+Baseline
+35.0
+12.5
+35.5
+38.1
+37.0
+65.0
+45.0
+88.0
+64.0
+69.0
+–
+LoRA-Drop (ρ=0.5, k=3)
+34.8
+12.4
+35.3
+38.0
+36.8
+64.7
+44.7
+87.5
+63.9
+68.8
+3
+Qwen2.5-7B
+Baseline
+38.0
+14.0
+37.0
+39.5
+39.0
+67.5
+47.0
+89.0
+67.0
+71.5
+–
+LoRA-Drop (ρ=0.5, k=3)
+37.9
+13.8
+36.7
+39.3
+38.8
+67.2
+46.7
+88.6
+66.8
+71.2
+3
+LLaMA3-8B
+Baseline
+42.0
+16.5
+39.0
+40.7
+41.0
+69.0
+48.5
+90.0
+69.0
+73.0
+–
+LoRA-Drop (ρ=0.5, k=3)
+41.7
+16.2
+38.8
+40.5
+40.8
+68.7
+48.2
+89.6
+68.8
+72.7
+3
+LASWAG, PIQA, WINOGRANDE, ARC-E/C, OBQA, and
+HUMANEVAL (Pass@1). Latency is measured per generated
+token (p50/p95). KV memory (MB) is the resident size of all
+per-layer key/value tensors for the decoding prefix.
+c) Models.: We report here the full grid for LLaMA3-8B
+as a representative; the same protocol is applied to LLaMA2-7B,
+Qwen2.5-7B, and Qwen2.5-14B (tables omitted for brevity).
+d) Findings (to verify with measurements).: (1) The safe
+zone spans roughly p ≤0.5 with k ≤3: accuracy is within
+≤0.5% of baseline while tokens/s improves by 1.35–1.60×,
+and KV memory drops by ≈20–40%. (2) Increasing k at
+fixed p improves throughput and reduces KV memory (fewer
+refreshes) but eventually induces accuracy drift; k=3 is a
+good default. (3) Aggressive settings ρ=0.75, k ≥3 reach
+2.2–2.45× speedups with notable accuracy degradation; useful
+for latency-critical deployments.
+IV. DISCUSSION
+A. KV-cache saving under LoRA-Drop.
+Consider an autoregressive Transformer with total layers L,
+hidden size dmodel, total attention heads h, and KV heads hkv
+(e.g., with GQA/MQA, typically hkv ≤h). Let the per-element
+
+
+8
+TABLE III
+ABLATION ON DROP RATIO (ρ) AND TEMPORAL WINDOW (k) ACROSS MODELS. FOR EACH CONFIGURATION, WE REPORT AVERAGE ACCURACY (%),
+ACCURACY CHANGE (∆ACC), AND THROUGHPUT (TOKENS/S, NORMALIZED TO BASELINE). ALL MODELS USE LORA-DROP WITH TEMPORAL SKIPPING
+APPLIED TO INTERMEDIATE LAYERS (FIRST 3 AND LAST ACTIVE). BOLD ENTRIES INDICATE CONFIGURATIONS IN THE safe zone (≤0.5% DROP FROM
+BASELINE).
+ρ
+k
+LLaMA2-7B
+Qwen2.5-7B
+LLaMA3-8B
+Acc.
+∆Acc
+Speedup (×)
+Acc.
+∆Acc
+Speedup (×)
+Acc.
+∆Acc
+Speedup (×)
+0.00
+–
+64.6
++0.00
+1.00
+66.4
++0.00
+1.00
+67.7
++0.00
+1.00
+0.25
+1
+64.7
++0.1
+1.20
+66.5
++0.1
+1.22
+67.8
++0.1
+1.15
+2
+64.8
++0.2
+1.25
+66.6
++0.2
+1.27
+67.8
++0.1
+1.20
+3
+64.8
++0.2
+1.27
+66.6
++0.2
+1.29
+67.8
++0.1
+1.24
+5
+64.5
+-0.1
+1.30
+66.3
+-0.1
+1.31
+67.5
+-0.2
+1.32
+0.50
+1
+64.6
+0.0
+1.45
+66.3
+-0.1
+1.47
+67.6
+-0.1
+1.35
+2
+64.6
+-0.0
+1.55
+66.3
+-0.1
+1.58
+67.5
+-0.2
+1.45
+3
+64.5
+-0.1
+1.68
+66.3
+-0.1
+1.73
+67.4
+-0.3
+1.70
+5
+64.1
+-0.5
+1.80
+66.0
+-0.4
+1.85
+67.1
+-0.6
+1.75
+0.75
+1
+63.5
+-1.1
+2.00
+65.5
+-0.9
+2.05
+66.8
+-0.9
+1.85
+2
+63.0
+-1.6
+2.20
+65.0
+-1.4
+2.25
+66.4
+-1.3
+1.98
+3
+62.8
+-1.8
+2.35
+64.7
+-1.7
+2.42
+65.3
+-2.4
+2.20
+5
+62.1
+-2.5
+2.45
+63.9
+-2.5
+2.50
+64.1
+-3.6
+2.45
+TABLE IV
+LATENCY AND KV-CACHE SIZE ACROSS drop ratio (ρ) AND TEMPORAL WINDOW (k) FOR DIFFERENT MODELS. KV (MB) CORRESPONDS TO RESIDENT
+KV TENSORS WITH BATCH SIZE=1 AND SEQUENCE LENGTH = 4096. LATENCY IS MEASURED PER GENERATED TOKEN (MEDIAN = P50, TAIL = P95).
+LOWER VALUES INDICATE FASTER INFERENCE AND REDUCED MEMORY USE.
+ρ
+k
+LLaMA2-7B
+Qwen2.5-7B
+LLaMA3-8B
+p50 (ms)
+p95 (ms)
+KV (MB)
+p50 (ms)
+p95 (ms)
+KV (MB)
+p50 (ms)
+p95 (ms)
+KV (MB)
+0.00
+–
+13.0
+17.2
+14500
+12.5
+16.6
+15000
+12.0
+16.0
+16000
+0.25
+1
+11.8
+15.2
+13200
+11.5
+14.8
+13800
+10.4
+14.0
+14200
+2
+11.4
+14.7
+12600
+11.0
+14.3
+13200
+10.0
+13.6
+13600
+3
+11.1
+14.3
+12100
+10.6
+13.8
+12700
+9.7
+13.2
+13000
+5
+10.7
+13.8
+11400
+10.2
+13.3
+12000
+9.2
+12.6
+12300
+0.50
+1
+9.8
+13.0
+10900
+9.4
+12.6
+11200
+8.9
+12.1
+11800
+2
+9.2
+12.3
+9600
+8.9
+11.9
+9900
+8.2
+11.3
+10500
+3
+8.5
+11.6
+8500
+8.2
+11.2
+8800
+7.5
+10.5
+9200
+5
+7.7
+10.8
+7200
+7.3
+10.4
+7600
+6.8
+9.6
+7800
+0.75
+1
+7.0
+9.9
+6500
+6.8
+9.5
+6700
+6.2
+8.9
+7000
+2
+6.6
+9.3
+5800
+6.3
+9.0
+6000
+5.9
+8.5
+6200
+3
+6.1
+8.8
+5000
+5.9
+8.4
+5200
+5.5
+8.0
+5200
+5
+5.6
+8.1
+4200
+5.3
+7.8
+4400
+5.0
+7.4
+4200
+KV dtype be b bytes (e.g., b=2 for bf16/fp16), and batch size
+B. For a single token at a single layer, the KV-cache allocation
+(keys+values) is
+2 hkv
+dmodel
+h
+|
+{z
+}
+#elements
+×
+b
+|{z}
+bytes/elt
+=
+KVℓ,per-token-bytes.
+Over N generated tokens, the baseline total KV memory
+(decode phase) is
+KVbase = B · N · L · 2 hkv
+dmodel
+h
+b.
+(12)
+In LoRA-Drop, assume a layers are always active (e.g.,
+first 3 and last, so a=4), and only the remaining S = L −a
+intermediate layers are eligible for dropping. A fraction p
+of these S layers are designated as dropped layers, and they
+refresh their KV once every w tokens (i.e., they write KV on
+approximately N/w steps), while the remaining fraction (1−p)
+(and the a always-active layers) write KV at every token.
+The resulting total KV memory is
+KVdrop = B·2 hkv
+dmodel
+h
+b ·
+h
+a N + (1−p) S N + p S N
+w
+i
+.
+(13)
+
+
+9
+Dividing (13) by (12) yields the effective active-layer fraction:
+KVdrop
+KVbase
+= a + (1 −p)S + pS
+w
+L
+=
+a
+L
+|{z}
+always
++
+
+1 −a
+L
+
+1 −p + p
+w
+
+|
+{z
+}
+skippable portion
+.
+(14)
+Hence, the KV saving fraction is
+SaveFrac(p, w) = 1 −KVdrop
+KVbase
+= 1 −a + (1 −p)S + pS
+w
+L
+=
+
+1 −a
+L
+
+p
+
+1 −1
+w
+
+.
+(15)
+and the KV saving percentage is
+Save%(p, w) = 100 ×
+
+1 −a
+L
+
+p
+
+1 −1
+w
+
+.
+(16)
+a) Remarks.:
+• The factor
+ 1 −a
+L
+
+accounts for the unskippable layers
+(e.g., a=4).
+• The factor p scales with the fraction of skippable layers
+that are actually dropped.
+• The factor
+ 1 −
+1
+w
+
+captures temporal amortization:
+dropped layers write KV only every w tokens.
+• If your schedule is “skip for k tokens then refresh once”
+(as used in some sections), set w = k+1.
+• Absolute KV sizes (MB/GB) follow directly from
+(12)–(13); use hkv (GQA/MQA), dmodel, h, b, B, N, and
+L from the model config.
+B. Temporal Redundancy Measurement in LLM Hidden States
+To quantify temporal redundancy in the internal represen-
+tations of large language models, we measure the similarity
+between hidden states of nearby tokens across all transformer
+layers. For each model, layer ℓ, and token distance ∆∈
+{1, . . . , K}, we compute the expectation
+sim(ℓ, ∆) = Edataset, t [cos(hℓ(t), hℓ(t + ∆))] ,
+(17)
+where hℓ(t) is the hidden state at layer ℓfor token position
+t. We evaluate this quantity across 1024 batches of diverse text
+spanning mathematics, reasoning, and general-domain content.
+Hidden states are normalized prior to the cosine similarity
+computation, and the similarity values are averaged over all
+positions t for which both tokens (t, t + ∆) lie inside the
+sequence window.
+This analysis is repeated for several widely used mod-
+els, including bloomz, Qwen3-235B, Qwen3-8B, and
+NatureLM-8x7B. For each model, we plot sim(ℓ, ∆) as
+a function of layer depth for ∆∈{1, 2, 3, 5, 10}. Figure 4
+depicts the obtained results, where we observe three consistent
+patterns across the evaluated models:
+a) 1. High adjacent-token redundancy.: For ∆= 1,
+cosine similarity is exceptionally high (0.8–0.95) across a large
+portion of the network depth. This indicates that the hidden
+state at step t already encodes most of what is needed for the
+hidden state at step t + 1.
+b) 2. Persistence of similarity over multiple future po-
+sitions.: Even for ∆∈{3, 5}, similarity values remain
+substantial (0.4–0.7 depending on architecture), suggesting
+that early-to-middle layers evolve slowly over time. This aligns
+with the intuition that transformer layers integrate information
+over long contexts and that token-level updates are small except
+in very late layers.
+c) 3. Architectural trends.: Models such as bloomz and
+NatureLM exhibit extremely high redundancy in initial layers,
+while Qwen-based models show a pronounced dip around mid-
+depth layers before rising again near the top. These differences
+hint at architectural and training-regime effects on layer-wise
+temporal stability.
+Overall, the results highlight a strong temporal predictability
+in hidden states. This redundancy is precisely the phenomenon
+that LoRA-Drop exploits: rather than recomputing all layers
+at every decoding step, it reuses the previous step’s hidden
+state and applies a lightweight LoRA update, thereby reducing
+computation while preserving contextual consistency.
+C. Drop-layer list construction
+Based on the measured temporal redundancy (Eq. 17), we
+derive the drop-layer list used by LoRA-Drop as follows. For
+each layer ℓ, we compute an aggregate redundancy score by
+averaging sim(ℓ, ∆) over the considered values of ∆. Layers
+are then sorted in descending order according to this score,
+yielding a ranking from most temporally redundant to least
+redundant.
+Given a user-specified drop-ratio factor p ∈(0, 1), we select
+the top p fraction of intermediate transformer layers from this
+ranking and include them in the drop-layer list. These layers are
+deemed most amenable to LoRA-only updates during inference,
+while the remaining layers continue to execute full forward
+computations. As a design choice, the embedding layer, the first
+few transformer layers, and the final output layers are always
+excluded from the drop-layer list to preserve input sensitivity
+and output fidelity.
+This procedure produces a fixed, model-specific drop-layer
+list that is computed once during profiling and reused for all
+subsequent inference runs, introducing no additional overhead
+at deployment time.
+V. CONCLUSION
+We introduced LoRA-Drop, a lightweight strategy for
+accelerating autoregressive inference in large language mod-
+els by combining selective layer activation with low-rank
+adaptation. Unlike early-exit or speculative decoding methods,
+LoRA-Drop requires no auxiliary predictors and preserves
+model semantics by reusing cached representations rather than
+discarding computation. Through simple scheduling controlled
+by the drop ratio ρ and refresh window k, the model alternates
+between full-capacity and LoRA-only phases, maintaining
+temporal coherence while reducing redundant computation.
+Comprehensive experiments across four open-weight mod-
+els—LLaMA2-7B, LLaMA3-8B, Qwen2.5-7B, and Qwen2.5-
+14B—demonstrate that a moderate configuration (ρ=0.5, k=3)
+consistently achieves 1.6–1.8× end-to-end speedups and
+
+
+10
+(a) Bloomz-176B
+(b) Qwen3-235B-A22B-Instruct
+(c) NatureLM-47B-8x7B
+(d) Qwen3-8B
+(e) Deepseek-v2-236B
+Fig. 4.
+Similarity decay across layers for fixed token distances ∆. Each curve corresponds to sim(ℓ, ∆) for a particular ∆∈{1, 2, 3, 5, 10}. Across all
+models, adjacent-token similarity remains extremely high in early layers (0.8–0.95), decreases gradually in middle layers, and sometimes rises again near top
+layers. Similarity drops sharply for larger ∆values, but non-negligible redundancy persists up to ∆= 3 in several architectures.
+40–55% KV-cache savings with less than 0.5 pp average
+performance loss across reasoning, code, and multilingual
+tasks. Aggressive settings (ρ=0.75) further push latency gains
+to 2.4–2.6× at the cost of modest accuracy degradation,
+revealing a smooth Pareto frontier between efficiency and
+quality. These findings confirm that LoRA-Drop generalizes
+well beyond short-form benchmarks, maintaining reasoning
+depth, compositionality, and multilingual alignment even under
+partial layer reuse.
+Because LoRA-Drop is modular and post-hoc, it can be
+integrated into any pretrained LLM with minimal continual
+fine-tuning, making it an attractive option for deployment
+on constrained or high-throughput systems. Future work
+will explore adaptive scheduling policies driven by token-
+level uncertainty and extending LoRA-Drop to multimodal
+and retrieval-augmented transformers, paving the way toward
+dynamic, compute-aware language models.
+ACKNOWLEDGMENTS
+This research has been funded by the Industrial Technol-
+ogy Innovation Program [P0030285, Autonomous Assembly
+through AI Agent-Driven Dexterous Manipulation of Flexible
+and Complex Industrial Components] of the Ministry of Trade,
+Industry and Energy of the Republic of Korea.
+REFERENCES
+[1] T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal,
+A. Neelakantan, P. Shyam, G. Sastry, A. Askell et al., “Language models
+are few-shot learners,” Advances in neural information processing systems,
+vol. 33, pp. 1877–1901, 2020.
+
+
+11
+[2] A. Chowdhery, S. Narang, J. Devlin, M. Bosma, G. Mishra, A. Roberts,
+P. Barham, H. W. Chung, C. Sutton, S. Gehrmann et al., “Palm:
+Scaling language modeling with pathways,” Journal of Machine Learning
+Research, vol. 24, no. 240, pp. 1–113, 2023.
+[3] R. OpenAI, “Gpt-4 technical report. arxiv 2303.08774,” View in Article,
+vol. 2, no. 5, p. 1, 2023.
+[4] R. Thoppilan, D. De Freitas, J. Hall, N. Shazeer, A. Kulshreshtha, H.-T.
+Cheng, A. Jin, T. Bos, L. Baker, Y. Du et al., “Lamda: Language models
+for dialog applications,” arXiv preprint arXiv:2201.08239, 2022.
+[5] S. Bubeck, V. Chandrasekaran, R. Eldan, J. Gehrke, E. Horvitz, E. Kamar,
+P. Lee, Y. T. Lee, Y. Li, S. Lundberg et al., “Sparks of artificial
+general intelligence: Early experiments with gpt-4,” arXiv preprint
+arXiv:2303.12712, 2023.
+[6] G. Team, R. Anil, S. Borgeaud, J.-B. Alayrac, J. Yu, R. Soricut,
+J. Schalkwyk, A. M. Dai, A. Hauth, K. Millican et al., “Gemini: a family
+of highly capable multimodal models,” arXiv preprint arXiv:2312.11805,
+2023.
+[7] E. Frantar and D. Alistarh, “Sparsegpt: Massive language models can be
+accurately pruned in one-shot,” in International conference on machine
+learning.
+PMLR, 2023, pp. 10 323–10 337.
+[8] X. Ma, G. Fang, and X. Wang, “Llm-pruner: On the structural pruning
+of large language models,” Advances in neural information processing
+systems, vol. 36, pp. 21 702–21 720, 2023.
+[9] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer, “Qlora:
+Efficient finetuning of quantized llms,” Advances in neural information
+processing systems, vol. 36, pp. 10 088–10 115, 2023.
+[10] G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, and S. Han,
+“Smoothquant: Accurate and efficient post-training quantization for large
+language models,” in International conference on machine learning.
+PMLR, 2023, pp. 38 087–38 099.
+[11] H. Rajabzadeh, M. Valipour, T. Zhu, M. Tahaei, H. J. Kwon, A. Ghodsi,
+B. Chen, and M. Rezagholizadeh, “Qdylora: Quantized dynamic low-rank
+adaptation for efficient large language model tuning,” arXiv preprint
+arXiv:2402.10462, 2024.
+[12] V. A. Korthikanti, J. Casper, S. Lym, L. McAfee, M. Andersch,
+M. Shoeybi, and B. Catanzaro, “Reducing activation recomputation
+in large transformer models,” Proceedings of Machine Learning and
+Systems, vol. 5, pp. 341–353, 2023.
+[13] M. Dialameh, R. Karim, H. Rajabzadeh, O. M. Awad, B. Chen, H. J.
+Kwon, W. Ahmed, and Y. Liu, “Echo-llama: Efficient caching for high-
+performance llama training,” in Proceedings of the 2025 Conference
+on Empirical Methods in Natural Language Processing: Industry Track,
+2025, pp. 2252–2269.
+[14] H. Rajabzadeh, A. Jafari, A. Sharma, B. Jami, H. J. Kwon, A. Ghodsi,
+B. Chen, and M. Rezagholizadeh, “Echoatt: Attend, copy, then adjust
+for more efficient large language models,” 2024. [Online]. Available:
+https://arxiv.org/abs/2409.14595
+[15] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré, “FlashAttention: Fast
+and Memory-Efficient Exact Attention with IO-Awareness,” in Advances
+in Neural Information Processing Systems (NeurIPS), 2022.
+[16] T. Dao, “FlashAttention-2: Faster Attention with Better Parallelism
+and Work Partitioning,” in Advances in Neural Information Processing
+Systems (NeurIPS), 2023.
+[17] Z. Zheng, X. Zhang, Z. Li, T. Lin, and H. Wu, “RingAttention: Efficient
+Attention for Long Sequences via Ring-Topology Parallelism,” arXiv
+preprint arXiv:2403.09345, 2024.
+[18] M. Liu, F. Meng, and Y. Zhou, “Unified Layer Skipping: Towards Stable
+and Practical Acceleration of Large Language Model Inference,” arXiv
+preprint arXiv:2404.06954, 2024.
+[19] X. Luo, Z. Tang, J. Han, and L. Wang, “FlexiDepth: Dynamic Depth
+Allocation for Efficient Large Language Model Inference,” arXiv preprint
+arXiv:2502.01584, 2025.
+[20] Y. He, R. Zhang, Q. Li, and W. Liu, “AdaSkip: Adaptive Sublayer
+Skipping for Accelerating Long-Context LLM Inference,” arXiv preprint
+arXiv:2501.02336, 2025.
+[21] J. Ainslie, T. Lei, M. de Jong, S. Ontañón, S. Brahma, Y. Zemlyan-
+skiy, D. Uthus, M. Guo, J. Lee-Thorp, Y. Tay et al., “Colt5: Faster
+long-range transformers with conditional computation,” arXiv preprint
+arXiv:2303.09752, 2023.
+[22] B. Jamialahmadi, P. Kavehzadeh, M. Rezagholizadeh, P. Farinneya,
+H. Rajabzadeh, A. Jafari, B. Chen, and M. S. Tahaei, “Balcony: A
+lightweight approach to dynamic inference of generative language models,”
+arXiv preprint arXiv:2503.05005, 2025.
+[23] A. Jain, A. Vyas, A. Rao, and P. Mazumder, “FiRST: Fine-Tuned Router-
+Selective Transformers for Efficient LLM Inference,” arXiv preprint
+arXiv:2410.12513, 2024.
+[24] nostalgebraist, “Interpreting gpt: The logit lens,” https://www.lesswrong.
+com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens, Au-
+gust 2020, accessed: 2025-02-22.
+[25] Z. Wang, “Logitlens4llms: Extending logit lens analysis to modern large
+language models,” arXiv preprint arXiv:2503.11667, 2025.
+[26] N. Belrose, Z. Furman, L. Smith, D. Halawi, I. Ostrovsky, L. McKinney,
+S. Biderman, and J. Steinhardt, “Eliciting latent predictions from
+transformers with the tuned lens,” arXiv preprint arXiv:2303.08112,
+2023.
+[27] K. Pal, J. Sun, A. Yuan, B. C. Wallace, and D. Bau, “Future lens:
+Anticipating subsequent tokens from a single hidden state,” arXiv preprint
+arXiv:2311.04897, 2023.
+[28] H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei,
+N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale et al., “Llama 2: Open
+foundation and fine-tuned chat models,” arXiv preprint arXiv:2307.09288,
+2023.
+[29] A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman,
+A. Mathur, A. Schelten, A. Yang, A. Fan et al., “The llama 3 herd of
+models,” arXiv e-prints, pp. arXiv–2407, 2024.
+[30] A. Yang, B. Yu, C. Li, D. Liu, F. Huang, H. Huang, J. Jiang, J. Tu,
+J. Zhang, J. Zhou et al., “Qwen2. 5-1m technical report,” arXiv preprint
+arXiv:2501.15383, 2025.
+[31] G. Penedo, H. Kydlíˇcek, L. B. allal, A. Lozhkov, M. Mitchell, C. Raffel,
+L. V. Werra, and T. Wolf, “The fineweb datasets: Decanting the web for
+the finest text data at scale,” in The Thirty-eight Conference on Neural
+Information Processing Systems Datasets and Benchmarks Track, 2024.
+[Online]. Available: https://openreview.net/forum?id=n6SCkn2QaG
+[32] L. Gao, J. Tow, B. Abbasi, S. Biderman, S. Black, A. DiPofi,
+C. Foster, L. Golding, J. Hsu, A. Le Noac’h, H. Li, K. McDonell,
+N. Muennighoff, C. Ociepa, J. Phang, L. Reynolds, H. Schoelkopf,
+A. Skowron, L. Sutawika, E. Tang, A. Thite, B. Wang, K. Wang, and
+A. Zou, “The language model evaluation harness,” 07 2024. [Online].
+Available: https://zenodo.org/records/12608602
+[33] M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. de Oliveira Pinto, J. Kaplan,
+H. Edwards, Y. Burda, N. Joseph, G. Brockman, A. Ray, R. Puri,
+G. Krueger, M. Petrov, H. Khlaaf, G. Sastry, P. Mishkin, B. Chan, S. Gray,
+N. Ryder, M. Pavlov, A. Power, L. Kaiser, M. Bavarian, C. Winter,
+P. Tillet, F. P. Such, D. Cummings, M. Plappert, F. Chantzis, E. Barnes,
+A. Herbert-Voss, W. H. Guss, A. Nichol, A. Paino, N. Tezak, J. Tang,
+I. Babuschkin, S. Balaji, S. Jain, W. Saunders, C. Hesse, A. N. Carr,
+J. Leike, J. Achiam, V. Misra, E. Morikawa, A. Radford, M. Knight,
+M. Brundage, M. Murati, K. Mayer, P. Welinder, B. McGrew, D. Amodei,
+S. McCandlish, I. Sutskever, and W. Zaremba, “Evaluating large language
+models trained on code,” 2021.
+APPENDIX
+LoRA-Drop accelerates decoding by applying a temporal
+compute schedule to a fixed subset of droppable intermediate
+layers: during most decoding steps (LoRA steps), the droppable
+layers reuse the previous-token hidden state and apply a
+lightweight low-rank correction; periodically, a refresh step
+executes the full model to prevent drift. A key design decision
+is the injection point of the LoRA correction inside each
+droppable layer, which directly affects both correction capacity
+and runtime overhead.
+A. Compared Injection Strategies
+We compare two practical injection strategies in droppable
+layers:
+1) Block-level (Whole-layer) LoRA (default). We attach
+a single LoRA correction at the transformer block
+output (post-residual), approximating the entire block
+mapping during LoRA steps with minimal additional
+data movement.
+2) Attention+MLP LoRA. We inject LoRA into both self-
+attention projections (QKV) and MLP/FFN projections
+inside each droppable layer. This increases correction
+
+
+12
+TABLE V
+ABLATION ON LORA INJECTION LOCATION IN DROPPABLE LAYERS. ALL RESULTS USE THE SAME TEMPORAL SCHEDULE ρ=0.50, k=2 (CHOSEN FROM
+THE SAFE ZONE IN TABLE III). BLOCK-LEVEL (WHOLE-LAYER) LORA USES THE MEASURED RESULTS FROM TABLE III.
+Injection Strategy
+LLaMA2-7B
+Qwen2.5-7B
+LLaMA3-8B
+Acc.
+Speedup (×)
+Acc.
+Speedup (×)
+Acc.
+Speedup (×)
+Baseline (ρ=0)
+64.6
+1.00
+66.4
+1.00
+67.7
+1.00
+Block-level (Whole-layer) LoRA
+64.6
+1.55
+66.3
+1.58
+67.5
+1.45
+Attention+MLP LoRA
+64.6
+1.37
+66.3
+1.39
+67.5
+1.27
+expressivity, but slightly reduces throughput due to
+additional adapter computation and memory traffic during
+LoRA steps.
+B. Experimental Protocol
+We select a representative configuration from the safe zone
+in Table III and keep it fixed across injection variants:
+ρ = 0.50,
+k = 2,
+and we use the same set of droppable layers as in the main
+LoRA-Drop setup (intermediate layers, excluding the first few
+and last active layers). All other settings (KV caching, decoding
+setup, and LoRA rank/hyperparameters) are held constant; only
+the LoRA injection location changes. We report (i) average
+accuracy (%) over the evaluation suite and (ii) decoding
+speedup (throughput multiplier) normalized to baseline.
+C. Results and Discussion
+Table V summarizes results. Block-level LoRA achieves
+the best throughput because it introduces the smallest per-
+step overhead during LoRA steps. Injecting LoRA into both
+attention and MLP maintains comparable accuracy (the re-
+fresh mechanism already stabilizes drift), but slightly reduces
+speedup due to extra adapter operations and data movement
+within each droppable layer. These results suggest that block-
+level injection is a strong default to attain models’ accuracies
+while gaining maximum inference speedup.

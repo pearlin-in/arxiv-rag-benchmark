@@ -1,0 +1,2214 @@
+Pioneering 4-Bit FP Quantization for Diffusion Models: Mixup-Sign
+Quantization and Timestep-Aware Fine-Tuning
+Maosen Zhao1∗, Pengtao Chen1∗, Chong Yu2, Yan Wen1, Xudong Tan1, Tao Chen1†
+1 School of Information Science and Technology, Fudan University
+2 Academy for Engineering and Technology, Fudan University
+20307130202@fudan.edu.cn, eetchen@fudan.edu.cn
+Abstract
+Model quantization reduces the bit-width of weights and
+activations, improving memory efficiency and inference
+speed in diffusion models. However, achieving 4-bit quan-
+tization remains challenging. Existing methods, primarily
+based on integer quantization and post-training quantiza-
+tion fine-tuning, struggle with inconsistent performance. In-
+spired by the success of floating-point (FP) quantization in
+large language models, we explore low-bit FP quantization
+for diffusion models and identify key challenges: the fail-
+ure of signed FP quantization to handle asymmetric activa-
+tion distributions, the insufficient consideration of temporal
+complexity in the denoising process during fine-tuning, and
+the misalignment between fine-tuning loss and quantization
+error. To address these challenges, we propose the mixup-
+sign floating-point quantization (MSFP) framework, first in-
+troducing unsigned FP quantization in model quantization,
+along with timestep-aware LoRA (TALoRA) and denoising-
+factor loss alignment (DFA), which ensure precise and sta-
+ble fine-tuning. Extensive experiments show that we are the
+first to achieve superior performance in 4-bit FP quantiza-
+tion for diffusion models, outperforming existing PTQ fine-
+tuning methods in 4-bit INT quantization.
+1. Introduction
+Despite the impressive performance of diffusion models
+(DMs) in image generation [33, 44], their computational
+and memory demands, particularly for high-resolution
+outputs, pose significant challenges for deployment on
+resource-constrained edge devices, highlighting the need
+for model compression to address these limitations. Model
+quantization, a key technique within model compression,
+reduces the bit-width of model weights and activations, typ-
+ically stored in 32-bit format, to lower precision.
+This
+reduction lowers memory usage and accelerates inference
+†Corresponding author.
+∗Equal contribution.
+speed.
+By decreasing the bit-width, quantization im-
+proves both temporal and memory efficiency in mainstream
+models, maintaining robust performance, particularly in
+resource-constrained environments [13, 18, 21].
+The current quantization methods for diffusion models
+can be broadly categorized into two primary approaches.
+The first, post-training quantization (PTQ), optimizes the
+quantization parameters after the model has been trained,
+typically by minimizing the quantization error [19, 35].
+While PTQ is effective for 4-bit quantization of weights,
+it is limited by its reliance on 8-bit quantization for
+activations, as further reduction in activation bit-width
+leads to significant performance degradation. In contrast,
+quantization-aware training (QAT) integrates quantization
+into the training process, enabling the model to learn with 4-
+bit precision from scratch [20]. Although QAT can achieve
+high-performance 4-bit models, it incurs substantial compu-
+tational overhead, rendering it less practical for many real-
+world applications [6, 15].
+To achieve fully quantized 4-bit diffusion models with
+minimal overhead, fine-tuning has emerged as a promis-
+ing solution.
+This approach leverages pre-trained mod-
+els and adjusts a small subset of parameters to narrow
+the performance gap between the quantized model and its
+full-precision counterpart.
+While some studies have ex-
+plored fine-tuning for 4-bit quantization in diffusion mod-
+els [8, 42], these methods often fail to achieve consistent
+performance under standard configurations (e.g., quantizing
+all layers but not some). Consequently, developing a uni-
+versally effective and scalable fine-tuning method for 4-bit
+quantization in diffusion models remains an open challenge.
+To be noticed, existing quantization methods for diffu-
+sion models primarily rely on integer (INT) quantization,
+which has long been the dominant approach.
+However,
+recent developments have demonstrated the considerable
+potential of floating-point (FP) quantization.
+Compared
+to INT quantization, FP quantization offers greater flex-
+ibility in modeling complex weight and activation distri-
+butions [30], leading to improved performance in visual
+1
+arXiv:2505.21591v1  [cs.LG]  27 May 2025
+
+
+tasks at 8-bit precision
+[17, 39], and remarkable results
+in large language models under 4-bit precision [25, 43].
+Moreover, FP quantization provides significant advantages
+in inference acceleration, with NVIDIA H100 achieving a
+1.45× speedup with FP8 quantization, outperforming INT8
+[32, 45]. Despite these advantages, the application of low-
+bit FP quantization in diffusion models remains largely un-
+explored, presenting a promising avenue for future research.
+In summary, to address the challenges in achieving 4-
+bit diffusion models, we propose a baseline method using
+a search-based signed FP quantization framework [2, 25]
+combined with single-LoRA fine-tuning, aiming to realize
+4-bit FP quantized diffusion models. Through this explo-
+ration, we uncover several findings that are significant for
+both diffusion model quantization and FP quantization: (1)
+There exists many layers which exhibit asymmetric dis-
+tributions, due to the nonlinear activation function SiLU.
+The application of traditional signed FP quantization with a
+symmetric distribution leads to significant precision loss in
+the sub-zero area, causing substantial performance degrada-
+tion after quantization. (2) Fine-tuning is conducted based
+on the denoising process, which is regarded as a complex
+task involving the restoration from outlines to details [40].
+However, current methods typically apply a single LoRA
+to fine-tune severely degraded models across all timesteps,
+which leads to suboptimal learning at certain timesteps. (3)
+Predicted noise plays a varying role at different timesteps
+during denoising, which is the key to diffusion models.
+Arising from the neglect of this variation across timesteps,
+we identify a mismatch between the impact of quantization
+and the loss function in current methods, which undermines
+the effectiveness of fine-tuning.
+Facing the challenges in achieving 4-bit FP quantization,
+we propose constructive strategies: (1) To handle different
+distribution effectively, we propose a mixup-sign floating-
+point quantization (MSFP) framework, where unsigned FP
+quantization with an added zero point leads to a more com-
+patible distribution of discrete points with the anomalous
+distributions in activations and signed FP quantization con-
+tinues to exhibit strong representation capacity on other dis-
+tributions. (2) Realizing that the current single-LoRA fine-
+tuning approach is in lack of flexibility across timesteps,
+we introduce timestep-aware LoRA (TALoRA), incorporat-
+ing multiple LoRAs and a timestep-aware router to dynam-
+ically select the appropriate LoRA for each timestep in the
+denoising process. (3) To further improve the effectiveness
+of fine-tuning, we introduce a denoising-factor loss align-
+ment (DFA), ensuring the loss function, and the guidance
+of the fine-tuning, are consistent with the actual quantiza-
+tion deterioration across timesteps.
+In summary, our contributions are as follows:
+(i) We are the first to identify that signed FP quanti-
+zation struggles with asymmetric activations, which
+arise from the nonlinear behavior of activation func-
+tions. To address this, we introduce the MSFP frame-
+work, which is also the first effective application of
+unsigned FP quantization in quantization, offering a
+novel approach for achieving low-bit quantization.
+(ii) For the fine-tuning of low-bit diffusion models, which
+is based on the denoising process, we precisely define
+it as a multi-task process across timesteps and intro-
+duce an efficient TALoRA module. Furthermore, we
+improve the alignment of loss function with quantiza-
+tion error via DFA strategy, enabling stable and reli-
+able fine-tuning to achieve low-bit diffusion models.
+(iii) We focus on identifying and eliminating three ma-
+jor barriers to effective low-bit FP quantization
+in diffusion models.
+Extensive experiments on
+DDIM and LDM demonstrate that our work achieves
+SOTA results for 4-bit quantization. The proposed
+MSFP, TALoRA and DFA have greatly advanced the
+progress of low-bit quantization in diffusion models.
+2. Related Work
+2.1. Diffusion Model Quantization
+There are two main approaches in the quantization of
+diffusion models: QAT [6, 14] and PTQ [31].
+QAT is
+particularly effective for low-bit quantization while it re-
+trains the model from scratch, consuming extensive com-
+putational resources and time [20]. In contrast, PTQ of-
+fers greater time efficiency, making it more practical for
+large models in real-world applications. Recent advance-
+ments in PTQ have concentrated on optimizing calibration
+datasets to enhance reconstruction accuracy [9, 19, 27, 35]
+and mitigating quantization errors stemming from the tem-
+poral and structural properties of diffusion models [3, 19,
+36, 38]. To further achieve fully 4-bit quantization, fine-
+tuning techniques has been introduced in PTQ-based quan-
+tization.
+EfficientDM [8] develops a LoRA-based fine-
+tuning framework, while QuEST [42] focuses on optimiz-
+ing quantization-unfriendly activations. Both works stag-
+nate in addressing data distribution during fine-tuning, fail-
+ing to account for the specific challenges involved in fine-
+tuning within the context of diffusion model quantization.
+Meanwhile, recent advancements in FP quantization have
+made significant strides in model quantization [17, 25],
+highlighting its potential for diffusion models. While ex-
+isting low-bit quantization methods perform well for linear
+models, applying FP quantization to convolutional diffu-
+sion models remains more challenging. To date, only one
+study has explored 8-bit activation quantization in diffusion
+models using a basic search-based approach [2], with no re-
+search addressing lower-bit quantization. This underscores
+both the challenges and the untapped potential of achieving
+4-bit FP quantization for diffusion models.
+2
+
+
+6
+4
+2
+0
+2
+4
+6
+Value Range
+1
+5
+10
+log(Frequency)
+(a)
+down2.attn1.q
+0
+1
+2
+3
+4
+5
+6
+Value Range
+1
+5
+10
+log(Frequency)
+(b)
+Value 
+ -0.278
+up0.block1.Res_conv2
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3
+0.4
+Value Range
+1
+5
+10
+log(Frequency)
+(c)
+Value 
+ -0.278
+mid.block1.Res_conv2
+Figure 1. The activation distributions in NALs and AALs, results on the CelebA dataset. (a) The paradigm of NALs with symmetric
+activations. (b) The typical paradigm of AALs with asymmetric activations, where unsigned FP quantization is more suitable. (c) The
+infrequent paradigm of AALs with relatively symmetric activations, where either signed or unsigned FP quantization could be applicable.
+2.2. Parameter-Efficient Fine-Tuning
+Parameter-efficient fine-tuning (PEFT) has emerged as an
+effective alternative to full model fine-tuning, focusing on
+adjusting only a subset of parameters while keeping the ma-
+jority frozen, thereby reducing storage overhead. Low-rank
+adapters (LoRA) [12], originally developed for large lan-
+guage models, have become one of the most widely used
+PEFT methods. Leveraging LoRA’s strong transferability,
+QLoRA [5] can be effectively applied to fine-tune low-bit
+diffusion models.
+However, previous LoRA-based fine-
+tuning is suboptimal in practice. In this paper, we make
+a further exploration on this and incorporate timestep-level
+adaptation inspired by MoELoRA [7], enhancing perfor-
+mance of low-bit quantized DMs.
+3. Challenges & Exploration
+3.1. Preliminary
+Diffusion Models. The diffusion model is a new genera-
+tion framework that completes learning by adding noise and
+completes generation in a denoising manner. As for the for-
+ward process, the noise is injected into ground-truth images
+x0 at random timesteps. This enables the DMs to learn the
+distributions of noise through noisy images xt, which can
+be obtained as follows [11]:
+  \ bolds y
+m
+b o l {x}_{t}=\sqrt {\overline {\alpha }_{t}}\boldsymbol {x}_{0}+\sqrt {1-\overline {\alpha }_{t}}\boldsymbol {\varepsilon }. 
+(1)
+Here ε represents a standard Gaussian noise and αt is the
+accumulated noise intensity, calculated by:
+  \
+ov
+erl
+ine {\alpha } _{t}=\prod ^{t}_{i=1}\alpha _{i}, 
+(2)
+where αs governs the noise intensity under each timestep.
+Once the DMs are well-trained, the Gaussian noise image
+will be inputted to the DMs, and undergo the iterative de-
+noising process. Specifically, the noise can be predicted
+by DMs and used to obtain the image xt under timestep
+t, which could range from T to 0, with the objective of ob-
+taining the image xt−1 in a superior quality:
+  \b o
+l
+dsy
+m
+bo l { x}
+_{ t -1
+} =\ dfra c 
+{
+1 }{\sqrt {\alpha _{t}}}\left ( \boldsymbol {x}_{t}-\dfrac {1-\alpha _{t}}{\sqrt {1-\overline {\alpha }_{t}}}\cdot \boldsymbol {\varepsilon } _{\theta }\left ( \boldsymbol {x}_{t},t\right ) \right ) +\sigma _{t}\boldsymbol {\delta }, \label {equation3} 
+(3)
+where εθ (xt, t) is the predicted noise at timestep t and δ
+is a newly added noise with the factor σt to ensure diverse
+results. Here we define a denoising factor γt, which is for-
+mulated as:
+  \
+g
+amm
+a _ {t
+}= \ df
+rac {1}{\sqrt {\alpha _{t}}}\cdot \dfrac {1-\alpha _{t}}{\sqrt {1-\overline {\alpha }_{t}}}. 
+(4)
+According to Equation 3, γt indicates the impact of the
+prediction noise under timestep t. The greater the factor γt,
+the stronger the predicted noise effect in the denoising.
+Model Quantization.
+The fundamental paradigm of
+model quantization is the process of transforming a con-
+tinuous data distribution into a finite set of discrete points.
+Consequently, the quality of the quantized model is inextri-
+cably related to the distribution of discrete points. Accord-
+ing to the discrete point type, quantization is defined as two
+categories, widely-used INT quantization and emerging FP
+quantization. Analogous to the process of INT quantization,
+a floating-point vector x can be quantized as follows:
+ \ wide
+h
+at
+ { \ bo ld s
+y
+m bol {x}}=Clip\begin {pmatrix} \lfloor \dfrac {\boldsymbol {x}}{s}\rceil +z, l, u \end {pmatrix}\cdot s. \label {5} 
+(5)
+Here ⌊⌉is the rounding operation. l and u are the min-
+imum and maximum quantization thresholds while scaling
+factor s and zero-point z together constitute the quantiza-
+tion parameters. As shown in Equation 5, INT quantization
+results in an evenly spaced distribution of discrete points.
+While INT quantization is straightforward to implement, it
+may be too simplistic for continuous distributions that have
+significant variations in density, where evenly spaced inter-
+vals in INT quantization are not effective. On the contrary,
+3
+
+
+4bit
+5bit
+6bit
+7bit
+8bit
+Activation Bit-width
+0.0
+1.0
+2.0
+3.0
+4.0
+Normalized MSE with xt (FP32)
+Representation Capacity
+High
+Low
+model.up[0].block[1].conv2
+model.down[2].attn[1].q
+Figure 2. Effect of bit-width reduction on
+activation representation capacity in AALs
+(blue) and NALs (orange) under signed FP
+quantization, evaluated on CelebA dataset.
+0
+20
+40
+60
+80
+100
+Denoising Step
+10
+3
+10
+2
+10
+1
+Loss
+Original MSE Loss
+Aligned MSE Loss
+Performance Deterioration Metric
+10
+6
+10
+5
+10
+4
+Performance Deterioration
+Figure 3. Two loss, and performance degrada-
+tion between the quantized and full-precision
+models across steps. Compared with metric,
+the original loss shows an inverse trend, while
+the aligned loss remains consistent.
+0
+10
+20
+30
+40
+50
+60
+70
+80
+Layer Index
+1
+10
+Normalized MSE
+sign + zp
+sign
+unsign + zp
+unsign
+Figure 4.
+The MSE of activations before
+and after quantization across all AALs under
+four different strategies, normalized against
+the baseline of signed FP quantization with-
+out zero point (purple).
+the discrete points under FP quantization are not uniformly
+spaced in distribution, as shown below [23]:
+  f=\le ft (
+ 
+- 1 \r
+i g ht
+ ) ^ { s }2
+^{
+p
+-b}\left ( 1+\dfrac {d_{1}}{2}+\dfrac {d_{2}}{2^{2}}+\ldots \dfrac {d_{m}}{2^{m}}\right ) , \label {equation6} 
+(6)
+where s is the sign bit, di is the m-bit mantissa, p is the
+e-bit exponent and b is the bias that serves as both scaling
+factor and threshold in INT quantization. Previous studies
+in FP quantization rely on signed FP quantization, where
+s is set to 1. For an n-bit FP quantization, the bit-width
+is distributed across the mantissa, exponent, and sign bit,
+with the condition m + e + s = n. The different combi-
+nations of m and e allow FP quantization to represent data
+in multiple formats with a fixed number of bits, denoted as
+EiMj, where i-bit exponent and j-bit mantissa are speci-
+fied. A larger j results in higher precision within each inter-
+val, while a larger i expands the range of covered intervals.
+There appears to be an inherent suitability of FP quanti-
+zation for DMs, as the majority of weights and activations
+follow a normal distribution symmetric around value =
+0. This aligns well with the unevenly spaced distribution,
+where discrete points are dense in the small-value region
+and sparse in the large-value region, in FP quantization [45].
+Additionally, the flexible formatting mechanism allows FP
+quantization to better accommodate complex distribution
+scenarios.
+3.2. Barriers to Effective Low-Bit FP Quantization
+in Diffusion Models
+In order to implement high-performing 4-bit diffusion
+models, we implemented FP quantization that is more com-
+patible with the data distribution of diffusion models, with
+the search-based strategy in previous work [25].
+Build-
+ing on this, we deployed a LoRA-based fine-tuning strat-
+egy to address the performance degradation caused by 4-bit
+quantization. Despite this, we find that the performance
+of the 4-bit FP diffusion model remains satisfactory and
+we identify two main issues that we are facing: (1) For
+FP quantization, although FP quantization works well at 8
+bits, it experiences a sharp performance degradation at 4
+bits. How to improve the ability of FP quantization to rep-
+resent data under low-bit quantization? (2) For standard
+post-training LoRA-based fine-tuning, exhibits instability
+and suboptimal results when applied to low-bit quantized
+diffusion models. How can we make LoRA more efficient
+and accurate in learning the loss information at different
+denoising timesteps? In the following parts, we will explore
+the underlying causes of these two issues and the feasible
+strategies to address them.
+Observation 1: Previous signed FP quantization fails
+to achieve effective low-bit quantization in Activation-
+Anomalous Layers.
+In diffusion models, we observed that the nonlinear ac-
+tivation layer SiLU, defined as SiLU (x) =
+x
+1 + e−x , is
+commonly situated between layers.
+SiLU causes the abnormal activations for the subsequent
+layer. As depicted in Panel (b) of Figure 1, all values be-
+low 0 are compressed into the range of [−0.278, 0). In this
+paper, we refer to layers with such asymmetric activations
+as Anomalous-Activation-Distribution Layers (AALs) and
+the other layers as Normal-Activation-Distribution Layers
+(NALs). Mainstream signed FP quantization typically sets
+the maximum threshold of the quantizer high to accurately
+represent normal positive activations.
+However, this ap-
+proach results in a significant precision loss when dealing
+with values below 0. Figure 2 illustrates the representation
+capacity of FP signed quantization in both NALs and AALs
+under different bit widths. When the bit width drops be-
+low 6 bits, AALs suffer more severe performance degrada-
+tion compared to NALs, which ultimately leads to the fail-
+ure in low-bit FP quantization. This phenomenon suggests
+that mitigating the performance decline in AALs is a critical
+step towards improving low-bit FP quantization in diffusion
+models.
+4
+
+
+Observation 2: The single-LoRA-based strategy is
+overly simplistic for fine-tuning quantized diffusion
+models across different timesteps.
+Previous work has focused on adapting LoRA for the
+quantization of diffusion models but has not fully explored
+LoRA’s performance in the context of denoising. Consid-
+ering that the denoising process of diffusion models starts
+with recovering outlines and progresses to restoring details,
+we question whether the single-LoRA fine-tuning strategy
+can handle this complexity. In Table 1, we compare the
+baseline model, which uses a single-LoRA strategy for fine-
+tuning, with two alternative strategies. The second strategy
+assigns a separate LoRA for the first and last 50 timesteps,
+resulting in a significant improvement over the baseline.
+In contrast, the third strategy also introduces a dual-LoRA
+strategy, it randomly selects one for each timestep, result-
+ing in much worse performance. These results suggest that
+applying multiple LoRAs, allocated in a structured manner
+across timesteps, enhances model performance, while disor-
+dered selection of LoRAs could lead to suboptimal results.
+This motivates us to approach the fine-tuning of quantized
+diffusion models as a multi-task process and assign multiple
+LoRAs across different timesteps with a rational approach
+in allocation.
+Observation 3: The MSE of the predicted noise of full-
+precision and quantized models does not reflect the ac-
+tual impact of quantization at different timesteps.
+In fine-tuning, a commonly used loss function calculates
+the MSE between the noise predictions of the full-precision
+and quantized diffusion models, using denoised images
+from the full-precision model at the previous timestep as
+inputs:
+  
+L_ { \bo ldsy mb o l { \var epsi lon } _{\theta }}^{t}= \left \| \boldsymbol {\varepsilon } _{\theta }\left ( \boldsymbol {x}_{t},t\right ) -\widehat {\boldsymbol {\varepsilon } }_{\theta }\left ( \boldsymbol {x}_{t},t\right ) \right \| ^{2}. 
+(7)
+By observing the variation in this loss during single-
+LoRA fine-tuning (see Figure 3), we identify an unexpected
+trend: the loss increases progressively faster as denoising
+advances. This contradicts the principle of denoising, where
+image quality should improve with each step, and the im-
+pact of predicted noise should diminish over time. By the
+final step, the impact of quantization on model performance
+should be negligible, as the predicted noise no longer affects
+the input. However, the loss is at its maximum, indicating
+that quantization error is most significant at this stage, con-
+tradicting the expectation that its influence should diminish
+over time.
+To highlight the discrepancy between the loss and ac-
+tual quantization errors, we define the performance gap at
+each step as the difference in denoising quality between
+the quantized and full-precision models, as the ultimate
+goal of denoising is to yield high-quality images. We in-
+put the previous output image xt from the full-precision
+model and calculate the performance gap between the de-
+Method
+Bits (W/A) FID ↓
+FP
+32/32
+6.49
+Single-LoRA
+4/4
+19.41
+Dual-LoRA (Split Steps in Half)
+4/4
+17.07
+Dual-LoRA (Random Allocation)
+4/4
+41.96
+Table 1. The impact of the number of LoRAs and their allocation
+across timesteps on the performance of the fine-tuning. The results
+is evaluated by 4-bit quantization on CelebA dataset.
+noised image xt−1 from the full-precision model and the
+denoised image bxt−1 from the quantized model, measured
+by MSE(xt−1, bxt−1). As shown in Figure 3, this mis-
+alignment between the loss and the actual performance gap
+leads to deviations in LoRA’s learning. This necessitates
+aligning our loss function with the denoising process dur-
+ing fine-tuning.
+4. Methodology
+In this section, we explore the issues identified in Sec-
+tion 3.2 and propose corresponding solutions. As illustrated
+in Figure 5, we introduce a mixup-sign FP quantization
+framework to address the diverse activation distributions in
+the first stage. During fine-tuning, the timestep-aware rout-
+ing mechanism and denoising-factor loss alignment work in
+tandem to enable high-quality learning, ultimately enabling
+the realization of optimized 4-bit FP diffusion models.
+4.1. Mixup-Sign Floating Point Quantization
+To address the challenges of low-bit FP quantization fail-
+ure in AALs, we leverage FP quantization by allocating
+more discrete points to areas with high data concentration.
+Motivated by the half-normal distribution of activations in
+AALs, we introduce unsigned floating-point quantization.
+However, as shown in Equation 6, when using unsigned FP
+quantization with s set to 0, we round all data in the sub-
+zero range to zero, losing important negative information.
+To address this, we introduce a zero point in the range of [-
+0.278, 0) to recover most sub-zero activations. The updated
+quantization formula becomes:
+  f_{un s ign}= \lef
+t
+ ( -
+1 \ ri
+gh t ) ^{
+s}
+2
+^ {p-b}\left ( 1+\dfrac {d_{1}}{2}+\dfrac {d_{2}}{2^{2}}+\ldots \dfrac {d_{m}}{2^{m}}\right ) +z, \label {figure3} 
+(8)
+where s is set to 0 and z is the newly added zero point. By
+freeing the 1-bit sign bit, which is ineffective in signed FP
+quantization, and using it as additional exponent / mantissa
+bit width, we fully utilize the representation capacity. As
+illustrated in Figure 4, unsigned FP quantization with a zero
+point significantly improves representation in over 95% of
+AALs, compared to traditional signed FP quantization.
+5
+
+
+Step T
+Step 1
+…
+Denoising Process
+Shared
+Router
+🔥
+…
+Lora Hub
+🔥
+Top1
+❌
+❌
+Gaussian Noise
+Full-Precision Model
+MSFP Quantized Model
+MSE
+❄
+❄
+Shared
+Router
+🔥
+🔥
+Top 1
+❌
+❌
+×Layer
+DF Alignment
+Step T
+Iteration
+🔥Trainable
+❄
+Frozen
+Forward
+Backward
+T
+Shared Router
+Denoising-Factor Alignment
+Step t
+Time_emb
+MLP
+[1, ]
+[1, d]
+[1, y×h]
+STE
+[1, y, h]
+Forked from the pretrained diffusion model
+Lora
+Layer
+Allocation Matrix
+Step t
+MSE
+*
+Loss
+0
+Step
+𝛼
+Solver
+…
+Lora Hub
+🔥
+Top1
+❌
+❌
+Full-Precision Model
+MSFP Quantized Model
+MSE
+❄
+❄
+Shared
+Router
+🔥
+LoRA Hub
+🔥
+Top 1
+❌
+❌
+×Layer
+Step 1
+…
+Denoised Sample
+1
+Add
+Flow
+MSFP Quantization
+Activation
+AAL
+0
+0
+Normal
+Distribution
+Anomalous
+Distribution
+Signed
+Quantization
+NAL
+Mixup-Sign
+Quantization
+Best(
+,
+)
+DF Alignment
+1
+𝛼!
+$ 1 −𝛼!
+1 −𝛼&!
+t
+LoRA Hub
+Figure 5. The pipeline of our proposed method. UNets are applied to the Mixup-Sign Floating-Point Quantization (MSFP), where dis-
+tinct floating-point quantization schemes are employed for Anomalous-Activation-Distribution Layers (AALs) and Normal-Activation-
+Distribution Layers (NALs). During the fine-tuning stage, multiple LoRA modules are introduced, and a timestep-aware routing mecha-
+nism is used for dynamic LoRA allocation across different timesteps. Additionally, a denoising-factor alignment technique is employed to
+align the loss function with quantization-induced performance degradation.
+However, there are rare cases where performance slightly
+goes worse due to the diversity of anomalous distributions.
+Panel (c) of Figure 1 shows that in such cases, the activa-
+tion distribution may resemble a normal distribution, where
+signed FP quantization might perform better. Figure 4 fur-
+ther indicates that introducing a zero point into signed FP
+quantization is unnecessary, offering minimal improvement
+in a few cases.
+Given the strong performance of unsigned FP quantiza-
+tion with a zero point and the diversity of AALs, we pro-
+pose a mixup-sign FP quantization framework. During the
+search-based initialization phase, we use signed FP quanti-
+zation for NALs and introduce both unsigned FP quantiza-
+tion with a zero point and signed FP quantization for AALs.
+This approach addresses AAL challenges in low-bit quanti-
+zation while minimizing computational overhead by adding
+the zero point only to unsigned FP quantization.
+4.2. Timestep-Aware Router for LoRA Allocation
+In Section 3.2, we observe that a single LoRA cannot
+fully capture all the information across timesteps due to the
+diverse generative characteristics at different timesteps. We
+also find that a reasonable allocation of different LoRAs for
+timesteps will be beneficial to fine-tuning. In this section,
+we introduce a timestep-aware LoRA allocation method
+that dynamically assigns optimal LoRA to each timestep,
+maximizing fine-tuning effectiveness.
+Our method relies on a learnable router (illustrated in
+Figure 5), a module shared across all timesteps. It takes
+the timestep as input and outputs selection probabilities for
+each LoRA across UNet layers.
+For each timestep, the
+LoRA with the highest probability corresponding to the
+router’s output is inserted into the quantized model for fine-
+tuning or inference. In a router network, the main compo-
+nents are a time embedding layer and an MLP layer. The
+time embedding layer, derived from a pre-trained diffusion
+model, converts the scalar into a d-dimensional embedding.
+The MLP layer then maps the embedding to a LoRA al-
+location distribution, where y is the number of quantized
+layers and h is the size of the LoRA Hub. Using an STE
+method [1], this distribution is converted into 0/1 proba-
+bilities to allocate suitable LoRAs to the diffusion model’s
+quantized layers.
+4.3. Denoising Factor Aligned Loss
+To address the mismatch between the actual performance
+gap and the loss used during quantization, we review the
+denoising principle depicted in Equation 3 and pinpoint the
+cause of the mismatch: the time-step-dependent constraint
+on the predicted noise is not sufficiently accounted for dur-
+ing the denoising process. Therefore, we implement a mod-
+ification to the loss function based on predicted noise:
+  L ^{ t }=
+\gamma _{t}\cdot L_{\boldsymbol {\varepsilon } _{\theta }}^{t}. 
+(9)
+6
+
+
+By introducing γt, which accurately reflects the utiliza-
+tion of the predicted noise at each time step, we achieve a
+preliminary alignment between the loss and the actual quan-
+tization error, as shown in Figure 3. This facilitates more
+accurate fine-tuning, leading to better performance recov-
+ery in the low-bit diffusion model.
+5. Experiment
+5.1. Experimental Setup
+Models and Metrics. To verify the effectiveness of the
+proposed method, we evaluate it with two widely adopted
+diffusion paradigms: DDIM [37] and LDM [33]. For DDIM
+experiments, we evaluate on CIFAR-10 [16] and CelebA
+[28]. For LDM, we test unconditional generation on LSUN-
+Bedroom [44] and LSUN-Church [44] and conditional gen-
+eration on ImageNet [4]. The performance of the diffusion
+models is evaluated with Inception Score (IS) [34], Fr´echet
+Inception Distance (FID) [10] and Sliding FID (sFID) [34].
+All metrics are evaluated based on 50k samples generated
+by the DDIM solver [37].
+Quantization Detail.
+We employ standard layer-wise
+quantization for both weights and activations. Except for
+the input and output layers, which are typically set to 8-bit,
+all other convolution and linear layers are quantized to the
+target bit-width. Furthermore, we generate 256 samples for
+the calibration set based on Q-Diffusion [19] for bias initial-
+ization and use the method from [2] to obtain the optimal
+quantization parameters.
+Baseline.
+We compare two main types of quantiza-
+tion methods: PTQ methods (Q-Diffusion [19] and EDA-
+DM [41]) and fine-tuning methods (EfficientDM [8] and
+QuEST [42]). Since these fine-tuning methods involve spe-
+cial settings like non-full-layer quantization, we standard-
+ize the settings of EfficientDM in a consistent manner and
+procure other standardized results from DilateQuant [26].
+Comparison with special settings is provided in Appendix.
+5.2. Quantization Performance
+Unconditional Generation. Table 2 presents the results
+of unconditional image generation across multiple datasets.
+With 6-bit quantization, our method achieves nearly identi-
+cal performance to full precision. Our 4-bit quantized mod-
+els achieve SOTA results in all tasks, significantly outper-
+forming previous baseline methods. Notably, on CIFAR-
+10, our 4-bit quantized model results in an FID score that
+is only 1.84 worse than full precision, an almost negligi-
+ble degradation, while previous methods struggle with 4-bit
+quantization. Compared to the fine-tuning method [8], our
+4-bit quantized models improve FID by 32.38, 24.15, and
+9.63 on three datasets, respectively, and still maintain re-
+markable IS. Additionally, we provide the performance of
+4-bit and 6-bit quantized models on CelebA in Appendix.
+Task
+Method
+Prec.
+(W/A)
+FID ↓
+IS ↑
+CIFAR-10
+32x32
+DDIM
+steps = 100
+FP
+32/32
+4.26
+9.03
+Q-Diffusion
+6/6
+9.19
+8.76
+EDA-DM
+6/6
+26.68
+9.35
+EfficientDM
+6/6
+25.03
+8.08
+Ours (h=2)
+6/6
+4.26
+9.04
+Ours (h=4)
+6/6
+4.23
+9.06
+Q-Diffusion
+4/4
+N/A
+N/A
+EDA-DM
+4/4
+120.24
+4.42
+EfficientDM
+4/4
+38.40
+7.32
+Ours (h=2)
+4/4
+6.02
+8.79
+Ours (h=4)
+4/4
+6.10
+8.90
+LSUN
+(Bedroom)
+256x256
+LDM-4
+steps = 100
+eta = 1.0
+FP
+32/32
+3.02
+2.29
+Q-Diffusion
+6/6
+10.10
+2.11
+EDA-DM
+6/6
+10.56
+2.12
+QuEST
+6/6
+10.10
+2.20
+EfficientDM
+6/6
+12.95
+2.57
+Ours (h=2)
+6/6
+8.42
+2.49
+Ours (h=4)
+6/6
+8.40
+2.49
+Q-Diffusion
+4/4
+N/A
+N/A
+EDA-DM
+4/4
+N/A
+N/A
+QuEST
+4/4
+N/A
+N/A
+EfficientDM
+4/4
+36.36
+2.69
+Ours (h=2)
+4/4
+12.21
+2.47
+Ours (h=4)
+4/4
+12.34
+2.48
+LSUN
+(Church)
+256x256
+LDM-8
+steps = 100
+eta = 0.0
+FP
+32/32
+4.06
+2.70
+Q-Diffusion
+6/6
+10.90
+2.47
+EDA-DM
+6/6
+10.76
+2.43
+QuEST
+6/6
+6.83
+2.65
+EfficientDM
+6/6
+7.45
+2.80
+Ours (h=2)
+6/6
+6.24
+2.73
+Ours (h=4)
+6/6
+6.38
+2.73
+Q-Diffusion
+4/4
+N/A
+N/A
+EDA-DM
+4/4
+N/A
+N/A
+QuEST
+4/4
+13.03
+2.63
+EfficientDM
+4/4
+18.40
+2.97
+Ours (h=2)
+4/4
+8.81
+2.70
+Ours (h=4)
+4/4
+8.77
+2.71
+Table 2. Quantization performance of unconditional generation.
+‘Prec. (W/A)’ denotes the quantization bit-width. ‘N/A’ denotes
+failed image generation. h denotes the size of LoRA Hub.
+Conditional Generation. Table 3 presents the results of
+our conditional generation experiments on ImageNet. We
+observe that FID is not always a reliable metric in this con-
+text, as an unexpected trend emerges: as the bit-width of the
+quantized model decreases, the FID score improves, which
+contradicts the expected trend. Therefore, our discussion
+of the ImageNet results focuses on other evaluation met-
+rics. As shown by the IS and sFID, our method achieves
+7
+
+
+Full
+Precision
+W6A6
+W4A4
+Figure 6. A visual comparison of generation results using our
+method across different quantization bit-widths, with the LSUN-
+Church dataset as an example.
+performance comparable to that of the full-precision model
+with 6-bit quantization. Even with 4-bit quantization, we
+achieve SOTA results in terms of sFID, improving by 7.00
+over the previous best method, EfficientDM [8]. Further-
+more, our method significantly outperforms two other fine-
+tuning methods in the IS metric. Visual evaluations further
+confirm that the generated images maintain high quality, ex-
+hibiting clear and coherent content, as shown in Figure 6.
+More visualization results will be presented in Appendix.
+Method
+Prec. (W/A)
+sFID ↓
+FID ↓
+IS ↑
+FP
+32/32
+7.67
+11.69
+364.72
+EDA-DM
+6/6
+8.02
+11.52
+360.77
+QuEST
+6/6
+9.36
+8.45
+310.12
+EfficientDM
+6/6
+6.88
+9.54
+351.79
+Ours (h=2)
+6/6
+7.43
+10.10
+349.91
+Ours (h=4)
+6/6
+6.65
+10.10
+351.79
+EDA-DM
+4/4
+36.66
+20.02
+204.93
+QuEST
+4/4
+29.27
+38.43
+69.58
+EfficientDM
+4/4
+14.42
+12.73
+139.45
+Ours (h=2)
+4/4
+7.42
+6.50
+190.74
+Ours (h=4)
+4/4
+8.23
+7.43
+177.40
+Table 3. Quantization performance of conditional generation for
+fully-quantized LDM-4 models on ImageNet 256×256 with 20
+steps. ‘Prec. (W/A)’ denotes the quantization bit-width. h de-
+notes the size of LoRA Hub.
+5.3. Ablation Study
+The ablation experiments are conducted on the 4-bit
+quantization using the CelebA dataset, which is challeng-
+ing for low-bit quantization, further demonstrating the ef-
+fectiveness of our approach. The baseline uses signed FP
+quantization combined with single LoRA fine-tuning. As
+shown in Table 4, all three proposed modules lead to sig-
+nificant performance improvements, with their combination
+Method
+Prec.
+(W/A)
+FID ↓
+MSFP
+TALoRA
+DFA
+%
+%
+%
+4/4
+16.02
+!
+%
+%
+4/4
+9.60
+%
+!
+%
+4/4
+10.66
+!
+%
+!
+4/4
+8.39
+!
+!
+%
+4/4
+8.79
+!
+!
+!
+4/4
+7.69
+Table 4. Ablation study on different modules we proposed. Testing
+on CelebA dataset with h = 2 LoRA Hub size.
+yielding a synergistic effect. The baseline FID score is 9.53
+higher than that of the full-precision model (6.49). By ap-
+plying our technique, we reduce the FID by 8.18 compared
+to the baseline. More interesting is that we visualize the
+LoRA allocation distribution learned by the router as shown
+in Figure 7.
+We find that the distribution of the router-
+learned allocation over timesteps is consistent with the find-
+ing that the diffusion model focuses on contour generation
+early and on detail generation later [40].
+CIFAR-10
+CelebA-HQ
+ImageNet
+LSUN-Bedroom
+CelebA
+LoRA 1
+LoRA 2
+Denoising Process
+𝑇
+1
+Figure 7. Distribution of LoRA allocations over timesteps ob-
+tained after router training on different datasets, when h = 2.
+6. Conclusion
+In this paper, we focus on exploring low-bit FP quanti-
+zation for diffusion models. For model initialization, we
+innovatively introduce unsigned FP quantization with zero
+point to address AALs. For the fine-tuning based on the de-
+noising process, we formulate it as a multi-task procedure.
+We introduce multiple LoRAs along with a router for their
+allocation at different timesteps, and further align the loss
+function, originally based on estimated noise, with the ac-
+tual quantization error. We introduce unsigned FP quantiza-
+tion and achieve 4-bit FP quantized diffusion models. Our
+FP PTQ-based fine-tuning method sets a new precedent for
+4-bit diffusion models, offering insight into the deployment
+of low-bit diffusion models in the future.
+8
+
+
+7. Acknowledgments
+This work is supported by Shanghai Science and
+Technology
+Commission
+Explorer
+Program
+Project
+(24TS1401300),
+National
+Key
+Research
+and
+Devel-
+opment
+Program
+of
+China
+(No.2022ZD0160101).
+The
+computations
+in
+this
+research
+were
+performed
+using
+the
+CFFF
+platform
+of
+Fudan
+University.
+References
+[1] Yoshua Bengio, Nicholas L´eonard, and Aaron Courville.
+Estimating or propagating gradients through stochastic
+neurons for conditional computation.
+arXiv preprint
+arXiv:1308.3432, 2013. 6
+[2] Cheng Chen, Christina Giannoula, and Andreas Moshovos.
+Low-bitwidth floating point quantization for efficient high-
+quality diffusion models. arXiv preprint arXiv:2408.06995,
+2024. 2, 7, 1
+[3] Huanpeng Chu, Wei Wu, Chengjie Zang, and Kun Yuan.
+Qncd: Quantization noise correction for diffusion models.
+In Proceedings of the 32nd ACM International Conference
+on Multimedia, pages 10995–11003, 2024. 2
+[4] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+and Li Fei-Fei. Imagenet: A large-scale hierarchical image
+database. In 2009 IEEE conference on computer vision and
+pattern recognition, pages 248–255. Ieee, 2009. 7, 4
+[5] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke
+Zettlemoyer. Qlora: efficient finetuning of quantized llms
+(2023).
+arXiv preprint arXiv:2305.14314, 52:3982–3992,
+2023. 3, 2
+[6] Steven K Esser, Jeffrey L McKinstry, Deepika Bablani,
+Rathinakumar Appuswamy, and Dharmendra S Modha.
+Learned step size quantization. In International Conference
+on Learning Representations, 2019. 1, 2
+[7] Wenfeng Feng, Chuzhan Hao, Yuewei Zhang, Yu Han, and
+Hao Wang.
+Mixture-of-loras: An efficient multitask tun-
+ing method for large language models. In Proceedings of
+the 2024 Joint International Conference on Computational
+Linguistics, Language Resources and Evaluation (LREC-
+COLING 2024), pages 11371–11380, 2024. 3
+[8] Yefei He, Jing Liu, Weijia Wu, Hong Zhou, and Bo-
+han Zhuang.
+Efficientdm:
+Efficient quantization-aware
+fine-tuning of low-bit diffusion models.
+arXiv preprint
+arXiv:2310.03270, 2023. 1, 2, 7, 8, 4
+[9] Yefei He, Luping Liu, Jing Liu, Weijia Wu, Hong Zhou, and
+Bohan Zhuang. Ptqd: Accurate post-training quantization
+for diffusion models. Advances in Neural Information Pro-
+cessing Systems, 36, 2024. 2
+[10] Martin Heusel, Hubert Ramsauer, Thomas Unterthiner,
+Bernhard Nessler, and Sepp Hochreiter. Gans trained by a
+two time-scale update rule converge to a local nash equilib-
+rium. Advances in neural information processing systems,
+30, 2017. 7
+[11] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising dif-
+fusion probabilistic models. Advances in neural information
+processing systems, 33:6840–6851, 2020. 3
+[12] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+Lora: Low-rank adaptation of large language models. arXiv
+preprint arXiv:2106.09685, 2021. 3
+[13] Wei Huang, Xingyu Zheng, Xudong Ma, Haotong Qin,
+Chengtao Lv, Hong Chen, Jie Luo, Xiaojuan Qi, Xianglong
+Liu, and Michele Magno.
+An empirical study of llama3
+quantization: From llms to mllms. Visual Intelligence, 2(1):
+36, 2024. 1
+[14] Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu,
+Matthew Tang, Andrew Howard, Hartwig Adam, and Dmitry
+Kalenichenko. Quantization and training of neural networks
+for efficient integer-arithmetic-only inference. In Proceed-
+ings of the IEEE conference on computer vision and pattern
+recognition, pages 2704–2713, 2018. 2
+[15] Raghuraman Krishnamoorthi.
+Quantizing deep convolu-
+tional networks for efficient inference: A whitepaper. arXiv
+preprint arXiv:1806.08342, 2018. 1
+[16] Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple
+layers of features from tiny images. 2009. 7
+[17] Andrey Kuzmin, Mart Van Baalen, Yuwei Ren, Markus
+Nagel, Jorn Peters, and Tijmen Blankevoort.
+Fp8 quanti-
+zation: The power of the exponent. Advances in Neural In-
+formation Processing Systems, 35:14651–14662, 2022. 2
+[18] Min Li, Zihao Huang, Lin Chen, Junxing Ren, Miao Jiang,
+Fengfa Li, Jitao Fu, and Chenghua Gao. Contemporary ad-
+vances in neural network quantization: A survey. In 2024 In-
+ternational Joint Conference on Neural Networks (IJCNN),
+pages 1–10. IEEE, 2024. 1
+[19] Xiuyu Li, Yijiang Liu, Long Lian, Huanrui Yang, Zhen
+Dong, Daniel Kang, Shanghang Zhang, and Kurt Keutzer.
+Q-diffusion: Quantizing diffusion models. In Proceedings
+of the IEEE/CVF International Conference on Computer Vi-
+sion, pages 17535–17545, 2023. 1, 2, 7
+[20] Yanjing Li, Sheng Xu, Xianbin Cao, Xiao Sun, and
+Baochang Zhang. Q-dm: An efficient low-bit quantized dif-
+fusion model. Advances in Neural Information Processing
+Systems, 36, 2024. 1, 2
+[21] Tailin Liang, John Glossner, Lei Wang, Shaobo Shi, and Xi-
+aotong Zhang.
+Pruning and quantization for deep neural
+network acceleration: A survey. Neurocomputing, 461:370–
+403, 2021. 1
+[22] Tsung-Yi Lin, Michael Maire, Serge Belongie, James Hays,
+Pietro Perona, Deva Ramanan, Piotr Doll´ar, and C Lawrence
+Zitnick. Microsoft coco: Common objects in context. In
+Computer Vision–ECCV 2014: 13th European Conference,
+Zurich, Switzerland, September 6-12, 2014, Proceedings,
+Part V 13, pages 740–755. Springer, 2014. 4
+[23] Fangxin Liu, Wenbo Zhao, Zhezhi He, Yanzhi Wang,
+Zongwu Wang, Changzhi Dai, Xiaoyao Liang, and Li Jiang.
+Improving neural network efficiency via post-training quan-
+tization with adaptive floating-point.
+In Proceedings of
+the IEEE/CVF international conference on computer vision,
+pages 5281–5290, 2021. 4
+[24] Luping Liu, Yi Ren, Zhijie Lin, and Zhou Zhao.
+Pseudo
+numerical methods for diffusion models on manifolds. arXiv
+preprint arXiv:2202.09778, 2022. 4
+9
+
+
+[25] Shih-yang Liu, Zechun Liu, Xijie Huang, Pingcheng Dong,
+and Kwang-Ting Cheng. Llm-fp4: 4-bit floating-point quan-
+tized transformers. arXiv preprint arXiv:2310.16836, 2023.
+2, 4, 1
+[26] Xuewen Liu, Zhikai Li, and Qingyi Gu. Dilatequant: Accu-
+rate and efficient diffusion quantization via weight dilation.
+arXiv preprint arXiv:2409.14307, 2024. 7
+[27] Xuewen Liu, Zhikai Li, Junrui Xiao, and Qingyi Gu. En-
+hanced distribution alignment for post-training quantization
+of diffusion models. arXiv preprint arXiv:2401.04585, 2024.
+2
+[28] Ziwei Liu, Ping Luo, Xiaogang Wang, and Xiaoou Tang.
+Deep learning face attributes in the wild. In Proceedings of
+the IEEE international conference on computer vision, pages
+3730–3738, 2015. 7, 4
+[29] Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan
+Li, and Jun Zhu. Dpm-solver: A fast ode solver for diffusion
+probabilistic model sampling in around 10 steps. Advances
+in Neural Information Processing Systems, 35:5775–5787,
+2022. 4
+[30] Paulius Micikevicius, Dusan Stosic, Neil Burgess, Mar-
+ius Cornea, Pradeep Dubey, Richard Grisenthwaite, Sang-
+won Ha, Alexander Heinecke, Patrick Judd, John Kamalu,
+et al.
+Fp8 formats for deep learning.
+arXiv preprint
+arXiv:2209.05433, 2022. 1, 2
+[31] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Chris-
+tos Louizos, and Tijmen Blankevoort. Up or down? adap-
+tive rounding for post-training quantization. In International
+Conference on Machine Learning, pages 7197–7206. PMLR,
+2020. 2
+[32] NVIDIA.
+Blackwell platform sets new llm inference
+records in mlperf inference v4.1,
+2024.
+Available
+at:
+https://developer.nvidia.com/blog/nvidia-blackwell-
+platform-sets-new-llm-inference-records-in-mlperf-
+inference-v4-1, Accessed: 2024-11-14. 2
+[33] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+Patrick Esser, and Bj¨orn Ommer.
+High-resolution image
+synthesis with latent diffusion models.
+In Proceedings of
+the IEEE/CVF conference on computer vision and pattern
+recognition, pages 10684–10695, 2022. 1, 7
+[34] Tim Salimans, Ian Goodfellow, Wojciech Zaremba, Vicki
+Cheung, Alec Radford, and Xi Chen. Improved techniques
+for training gans. Advances in neural information processing
+systems, 29, 2016. 7
+[35] Yuzhang Shang, Zhihang Yuan, Bin Xie, Bingzhe Wu, and
+Yan Yan. Post-training quantization on diffusion models. In
+Proceedings of the IEEE/CVF conference on computer vi-
+sion and pattern recognition, pages 1972–1981, 2023. 1, 2
+[36] Junhyuk So, Jungwon Lee, Daehyun Ahn, Hyungjun Kim,
+and Eunhyeok Park. Temporal dynamic quantization for dif-
+fusion models. Advances in Neural Information Processing
+Systems, 36, 2024. 2
+[37] Jiaming
+Song,
+Chenlin
+Meng,
+and
+Stefano
+Ermon.
+Denoising diffusion implicit models.
+arXiv preprint
+arXiv:2010.02502, 2020. 7
+[38] Haojun Sun, Chen Tang, Zhi Wang, Yuan Meng, Xinzhu Ma,
+Wenwu Zhu, et al. Tmpq-dm: Joint timestep reduction and
+quantization precision selection for efficient diffusion mod-
+els. arXiv preprint arXiv:2404.09532, 2024. 2
+[39] Mart van Baalen, Andrey Kuzmin, Suparna S Nair, Yuwei
+Ren, Eric Mahurin, Chirag Patel, Sundar Subramanian,
+Sanghyuk Lee, Markus Nagel, Joseph Soriaga, et al. Fp8 ver-
+sus int8 for efficient deep learning inference. arXiv preprint
+arXiv:2303.17951, 2023. 2
+[40] Binxu Wang and John J Vastola. Diffusion models gener-
+ate images like painters: an analytical theory of outline first,
+details later. arXiv preprint arXiv:2303.02490, 2023. 2, 8, 4
+[41] Changyuan Wang, Ziwei Wang, Xiuwei Xu, Yansong
+Tang, Jie Zhou, and Jiwen Lu.
+Towards accurate data-
+free quantization for diffusion models.
+arXiv preprint
+arXiv:2305.18723, 2(5), 2023. 7, 2
+[42] Haoxuan Wang, Yuzhang Shang, Zhihang Yuan, Junyi Wu,
+Junchi Yan, and Yan Yan. Quest: Low-bit diffusion model
+quantization via efficient selective finetuning. arXiv preprint
+arXiv:2402.03666, 2024. 1, 2, 7, 4
+[43] Jie Wang, Huanxi Liu, Dawei Feng, Jie Ding, and Bo Ding.
+Fp4-quantization: Lossless 4bit quantization for large lan-
+guage models. In 2024 IEEE International Conference on
+Joint Cloud Computing (JCC), pages 61–67. IEEE, 2024. 2
+[44] Fisher Yu, Ari Seff, Yinda Zhang, Shuran Song, Thomas
+Funkhouser, and Jianxiong Xiao. Lsun: Construction of a
+large-scale image dataset using deep learning with humans
+in the loop. arXiv preprint arXiv:1506.03365, 2015. 1, 7
+[45] Yijia Zhang, Lingran Zhao, Shijie Cao, Sicheng Zhang,
+Wenqiang Wang, Ting Cao, Fan Yang, Mao Yang, Shang-
+hang Zhang, and Ningyi Xu. Integer or floating point? new
+outlooks for low-bit quantization on large language models.
+In 2024 IEEE International Conference on Multimedia and
+Expo (ICME), pages 1–6. IEEE, 2024. 2, 4
+10
+
+
+Pioneering 4-Bit FP Quantization for Diffusion Models: Mixup-Sign
+Quantization and Timestep-Aware Fine-Tuning
+Supplementary Material
+A. Supplementary Material Overview
+In this supplementary material, we provide additional ex-
+planations and experimental results referenced in the main
+paper. The content is organized as follows:
+• Methodology of Mixup-Sign Quantization in Appendix
+B.
+• More Implementation Details in Appendix C.
+• FP vs. INT in Post-Training Quantization in Appendix D.
+• Comprehensive Analysis of TALoRA Performance in
+Appendix E.
+• Supplementary Performance Evaluation in Appendix F.
+• Extensive Comparison with EfficientDM and QUEST in
+Appendix G.
+• Additional Visualization Results in Appendix H.
+B. Methodology of Mixup-Sign Quantization
+We implement the proposed MSFP strategy using a
+search-based method [2, 25], wherein the quantization pa-
+rameters are determined by minimizing the MSE between
+the distributions before and after quantization.
+To clarify, the quantization parameters for the signed FP
+quantization include the format, bias b, and sign bit s set to
+1, whereas the quantization parameters for the unsigned FP
+quantization include the format, bias b, sign bit s set to 0,
+and zero point zp. All quantization parameters are assigned
+a search space during initialization.
+As mentioned in the main text, the bias b serves as a
+threshold in FP quantization:
+  maxv a l = 2^{ 2
+^
+{ x }
+-1
+-b}\cdot \left ( 1-\dfrac {1}{2^{y}}\right ) 
+(10)
+The maximum value, denoted as maxval, is determined
+by the format (e.g.,ExMy) abd the bias b, and represents
+the maximum discrete value achievable in FP quantization.
+Notably, maxval and b are directly correlated, and for con-
+venience, we will refer to maxval in subsequent discus-
+sions as the equivalent to the bias b.
+In the MSFP strategy, initialization is divided into two
+parts:
+weight initialization and activation initialization.
+During initialization, we determine the optimal quantiza-
+tion parameter settings, and the process is outlined in Algo-
+rithm 1: In the first stage, the search for signed FP quan-
+tization parameters is applicable to all cases. In the sec-
+ond stage, the search for unsigned FP quantization param-
+eters is specifically applied to the activation initialization
+Algorithm 1 Initialization of Quantization Parameters
+1: Input: format options, maxval options, (zp options),
+(unsigned format options)
+2: Output: format, maxval, (zp)
+3:
+4: #10000 is huge enough
+5: min mse = 10000
+6: s = 1
+7: for f in format options do
+8:
+for prev m in maxval options do
+9:
+prev mse = calculate mse(f, prev m, s)
+10:
+if prev mse < min mse then
+11:
+min mse = prev mse
+12:
+format = f
+13:
+maxval = prev m
+14:
+end if
+15:
+end for
+16: end for
+17:
+18: #only for unsigned FP quantization
+19: s = 0
+20: for f in unsigned format options do
+21:
+for prev m in maxval options do
+22:
+for prev zp in zp options do
+23:
+prev mse =
+calculate mse(f, prev m, prev zp, s)
+24:
+if prev mse < min mse then
+25:
+min mse = prev mse
+26:
+format = f
+27:
+maxval = prev m
+28:
+zp = prev zp
+29:
+end if
+30:
+end for
+31:
+end for
+32: end for
+of the Anomalous-Activation-Distribution Layers (AALs)
+mentioned in the main text.
+Additionally, due to the significant variability in the
+search space for maxval, which depends on the differing
+distributions of the data, therefore, prior to initiating the
+search for quantizer parameters, the first step involves per-
+forming several random forward passes to capture the max-
+imum value observed for each quantizer. This value is then
+used as the initial maxval 0.
+Weight Initialization. For weight initialization, since
+the distribution of weights typically approximates a nor-
+mal distribution (as shown in Figure 8), we deploy signed
+FP quantization. In the search for the format of signed
+1
+
+
+Search Space
+Bits (W/A)
+FID ↓
+[0,maxval 0]
+6/32
+10.14
+[0,2maxval 0]
+6/32
+10.26
+[0.6maxval 0,2maxval 0]
+6/32
+9.36
+[0.7maxval 0,2maxval 0]
+6/32
+6.46
+[0.8maxval 0,2maxval 0]
+6/32
+5.58
+[0.9maxval 0,2maxval 0]
+6/32
+5.13
+[maxval 0,2maxval 0]
+6/32
+5.83
+Table 5. The impact of different maxval search spaces in weight
+initialization on the DDIM model performance on CelebA dataset.
+FP quantization, we define a search space of size 4 for
+4-bit, 6-bit, and 8-bit representations, encompassing the
+most expressive data formats for each bit-width while strik-
+ing a balance between computational overhead and perfor-
+mance [17, 30, 39].
+For the search of maxval in weights, we extend the pre-
+vious search range of range(0, maxval 0, 0.001) to ex-
+plore a more refined and reasonable search space. On the
+one hand, considering that large-value weights are relatively
+few but have a significant impact, we set the lower bound
+of the search to a value slightly smaller than maxval 0 to
+avoid excessive loss of essential large-value weights. On
+the other hand, setting the upper bound to maxval 0 may
+not guarantee the minimization of MSE. As inferred from
+the representation of FP quantization, any quantizer with
+its maxval larger than 2 × maxval 0 cannot result in a
+smaller MSE, so we set the upper bound of the search to
+2×maxval 0. As shown in Table 5, our exploration across
+different search spaces demonstrates the effectiveness of the
+redefined search space of maxval.
+Activation Initialization. For activation initialization,
+based on the analysis in the main text, we employ signed
+FP quantization for NALs with distribution approximately
+following a normal distribution, and adopt a mixup-sign FP
+quantization strategy for AALs with asymmetric distribu-
+tions. Unlike weight initialization, where weights remain
+static, activation initialization needs to account for potential
+activation distributions. To ensure that the activations used
+for initialization are representative, we introduce a calibra-
+tion dataset [19, 35], as is common in INT quantization.
+Given the increased complexity and randomness of acti-
+vation distributions, we include all possible formats for dif-
+ferent bit-widths within the search space for format. No-
+tably, for n-bit unsigned FP quantization with the ExMy
+format, the condition x + y + s = n applies, where s = 0,
+distinguishing its format from that of signed FP quantiza-
+tion, which includes s set to 1 under the same bit-width.
+Accordingly, the search range for maxval is adjusted to
+linspace(0, maxval 0, 100), preventing excessive compu-
+tational overhead. Lastly, for the zero point zp introduced
+in unsigned FP quantization, since the minimum value of
+the distribution is constrained by SiLU to approximately -
+0.278, assigning zp a search space of linsapce(−0.3, 0, 6)
+is sufficient.
+C. More Implementation Details
+FP PTQ Configuration. Following the procedure out-
+lined in Appendix B, we deploy our MSFP strategy for both
+weights and activations. The initialization of maxval 0 is
+achieved by generating 2000 images through random for-
+ward passes.
+Subsequently, a calibration dataset is con-
+structed based on the output of the full-precision model, fol-
+lowing the approach of Q-Diffusion [19]. Specifically, 256
+samples are used for the DDIM model, while 128 samples
+are used for the LDM model.
+For weight initialization, the search spaces for maxval
+and format are presented in Table 6. For activation initial-
+ization, the search spaces for maxval, fomrat and zp are
+thoroughly discussed and provided in Appendix B.
+Bit
+Search Space
+(maxval)
+Search Space
+(format)
+4
+[0.8maxval 0,2maxval 0]
+[E3M0,E2M1,E1M2,E0M3]
+6
+[0.9maxval 0,2maxval 0]
+[E4M1,E3M2,E2M3,E1M4]
+8
+[0.9maxval 0,2maxval 0]
+[E5M2,E4M3,E3M4,E2M5]
+Table 6. Search spaces for different quantization parameters under
+different bit-widths in weight initialization.
+Fine-tuning Configuration.
+For the noise estimation
+U-Net, all quantized layers, except for the input and out-
+put layers, are quantized and equipped with QLoRA-based
+TALoRAs [5]. Each TALoRA is initialized with a rank of
+32. The selection of different TALoRAs at each timestep
+is managed by a router, which is implemented as a linear
+layer. The input channels of the router match the channel
+count of the timestep embedding in the diffusion model.
+Adam optimizers are assigned to both the TALoRAs and
+the router, with a learning rate of 1e-4 for both components.
+Fine-tuning is performed for 160 epochs with a batch size
+of 16 on DDIM models and 320 epochs with a batch size of
+8 on LDM models. Notably, the batch size for the ImageNet
+dataset is reduced to 4.
+D. FP vs. INT in Post-Training Quantization
+Table 7 presents a performance comparison between the
+6-bit model initialized with MSFP and several 6-bit models
+based on traditional INT quantization [6, 19, 35, 41]. As
+shown, even without fine-tuning, our approach significantly
+outperforms existing SOTA methods in handling 6-bit quan-
+tization for diffusion models. This highlights that FP quan-
+tization is a more effective choice for handling low-bit ac-
+tivation quantization in diffusion models, a task that is both
+2
+
+
+0.6
+0.4
+0.2
+0.0
+0.2
+0.4
+0.6
+Weight Value
+0
+1
+2
+3
+4
+log(Frequency)
+(a)
+down.2.attn.1.q.weight
+4
+2
+0
+2
+4
+Weight Value
+0
+1
+2
+3
+4
+5
+log(Frequency)
+(b)
+up.0.block.1.conv2.weight
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3
+Weight Value
+0
+1
+2
+3
+4
+5
+log(Frequency)
+(c)
+mid.block_1.conv2.weight
+0.4
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3
+0.4
+Weight Value
+0
+1
+2
+3
+log(Frequency)
+(d)
+up.2.attn.1.q.weight
+0.4
+0.2
+0.0
+0.2
+0.4
+Weight Value
+0
+1
+2
+3
+4
+log(Frequency)
+(e)
+up.2.block.0.nin_shortcut.weight
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3
+Weight Value
+0
+1
+2
+3
+4
+log(Frequency)
+(f)
+up.3.upsample.conv.weight
+Figure 8. The weight distribution of certain layers in the DDIM model on CelebA dataset.
+Task
+Method
+Prec.
+(W/A)
+FID ↓
+IS ↑
+CelebA
+64x64
+DDIM
+steps = 100
+FP
+32/32
+6.49
+2.61
+LSQ
+6/6
+78.37
+1.94
+PTQ4DM
+6/6
+24.96
+2.13
+Q-Diffusion
+6/6
+23.37
+2.16
+ADP-DM
+6/6
+16.86
+2.30
+Ours(MSFP)
+6/6
+9.51
+2.78
+Table 7. Quantization performance of unconditional generation. In
+this case, ’Ours’ refers to the method that deploys only the MSFP
+strategy without any fine-tuning. ‘Prec. (W/A)’ denotes the quan-
+tization bit-width.
+challenging and crucial, compared to INT-based methods.
+E. Comprehensive Analysis of TALoRA Per-
+formance
+E.1. TALoRA Outperforms Rank-Scaled LoRA
+In our approach, we introduce multiple TALoRAs for the
+majority of quantized layers, which leads to an increase in
+the model size. Some may question whether the observed
+performance improvement is simply due to the larger mem-
+ory footprint of the LoRAs.
+However, in practice, only
+one TALoRA is active at each timestep, which differs fun-
+damentally from using a larger-rank LoRA, as the latter
+would result in higher training and inference costs. Further-
+more, Table 8 presents the results of fine-tuning with two
+TALoRAs (rank=32) and a single QLoRA (rank=64). Our
+method achieves even better performance, demonstrating
+that our timestep-aware fine-tuning strategy effectively re-
+covers the performance lost during quantization in diffusion
+models, with lower overhead and enhanced performance.
+Method
+Rank
+Bits(W/A)
+FID↓
+FP
+/
+32/32
+6.49
+single-LoRA
+64
+4/4
+7.75
+TALoRA(h=2)
+32
+4/4
+7.69
+Table 8. Comparison between TALoRA and rank-scaled LoRA in
+fine-tuning 4-bit DDIM models on CelebA dataset. ’Rank’ refers
+to the LoRA rank.
+E.2. Impact of TALoRA Quantity
+As illustrated in Figure 9, when deploying four TALo-
+RAs, the distributions of LoRA allocation across different
+timesteps exhibits a strong regularity: in most cases, regard-
+less of the dataset, the majority of timesteps utilize only
+two LoRAs. This suggests that fine-tuning low-bit diffu-
+3
+
+
+T
+1
+Denoising Process
+LoRA 1
+LoRA 2
+LoRA 3
+LoRA 4
+CIFAR-10
+CelebA
+ImageNet
+LSUN-Bedroom
+Figure 9. Distribution of LoRA allocations over timesteps ob-
+tained after router training on different datasets, when h = 4.
+sion models predominantly follows a two-stage task pattern,
+which aligns with the motivation behind introducing TALo-
+RAs—viewing the denoising process as a progression from
+restoring coarse structures to refining intricate details [40].
+Experimental results in the main text further demon-
+strates that deploying four TALoRAs does not yield better
+results compared to deploying two TALoRAs. In fact, in
+most cases, the latter achieves superior results on 4-bit dif-
+fusion models. This aligns with our earlier analysis: two
+TALoRAs are sufficient to handle the fine-tuning task effec-
+tively, while the introduction of additional TALoRAs could
+reduce the training opportunities for the most impactful Lo-
+RAs, ultimately compromising fine-tuning performance.
+F. Supplementary Performance Evaluation
+To further validate the effectiveness of our approach, we
+conduct supplementary experiments. For the DDIM model,
+where prior methods have struggled, our approach is eval-
+uated on the CelebA dataset [28]—a more complex dataset
+with higher image resolutions corresponding to a more in-
+tricate DDIM model. As shown in Table 9, our method
+achieves cutting-edge performance under both 4-bit and 6-
+bit settings. Notably, our 4-bit diffusion model exhibits per-
+formance on FID and IS metrics comparable to full preci-
+sion, and our method even outperforms the full-precision
+model under the 6-bit setting.
+For the LDM model, we further evaluate it on the Im-
+ageNet dataset [4] using two advanced sampling methods,
+PLMS [24] and DPM-Solver [29], which are more sophisti-
+cated and computationally demanding during fine-tuning.
+Table 10 demonstrates that our method maintains robust
+performance under both 4-bit and 6-bit quantization set-
+tings, achieving SOTA results on the more reliable sFID and
+IS metrics in ImageNet.
+Furthermore, we apply our method to the task of quantiz-
+ing text-to-image diffusion models, specifically deploying it
+on Stable Diffusion with the MS-COCO dataset [22]. Our
+approach also delivers highly satisfactory results, with de-
+tailed visualizations provided in Appendix H.
+Task
+Method
+Prec.
+(W/A)
+FID ↓
+IS ↑
+CelebA
+64x64
+DDIM
+steps = 100
+FP
+32/32
+6.49
+2.61
+Q-Diffusion
+6/6
+23.37
+2.16
+ADP-DM
+6/6
+16.86
+2.30
+Ours(h=2)
+6/6
+5.38
+2.67
+Ours(h=4)
+6/6
+5.36
+2.66
+Q-Diffusion
+4/4
+N/A
+N/A
+ADP-DM
+4/4
+N/A
+N/A
+Ours(h=2)
+4/4
+7.69
+2.59
+Ours(h=4)
+4/4
+7.84
+2.60
+Table 9. Quantization performance of unconditional generation.
+‘Prec. (W/A)’ denotes the quantization bit-width. ‘N/A’ denotes
+failed image generation. h denotes the size of LoRA Hub.
+Task
+Method
+Prec.
+(W/A)
+sFID ↓
+FID ↓
+IS ↑
+LDM-4
+PLMS
+steps = 20
+FP
+32/32
+7.08
+11.71
+379.19
+EDA-DM
+6/6
+6.59
+11.27
+363.00
+EfficientDM
+6/6
+9.36
+9.85
+325.13
+Ours(h=2)
+6/6
+5.63
+10.35
+363.79
+Ours(h=4)
+6/6
+5.33
+10.25
+364.27
+EDA-DM
+4/4
+32.63
+17.56
+203.15
+EfficientDM
+4/4
+9.89
+14.78
+103.34
+Ours(h=2)
+4/4
+7.39
+7.27
+196.32
+Ours(h=4)
+4/4
+7.83
+7.83
+193.11
+LDM-4
+DPM-
+Solver
+steps = 20
+FP
+32/32
+6.85
+11.44
+373.12
+EDA-DM
+6/6
+7.95
+11.14
+357.16
+EfficientDM
+6/6
+9.30
+8.54
+336.11
+Ours(h=2)
+6/6
+6.86
+9.61
+363.71
+Ours(h=4)
+6/6
+6.88
+9.59
+364.30
+EDA-DM
+4/4
+39.40
+30.86
+138.01
+EfficientDM
+4/4
+13.82
+14.36
+109.52
+Ours(h=2)
+4/4
+12.61
+8.46
+257.33
+Ours(h=4)
+4/4
+14.56
+9.64
+238.07
+Table 10. Quantization performance of conditional generation for
+fully-quantized LDM-4 models on ImageNet 256×256 with 20
+steps, using PLMS and DPM-Solver as sampling methods. ‘Prec.
+(W/A)’ denotes the quantization bit-width. h denotes the size of
+LoRA Hub.
+G. Extensive Comparison with EfficientDM
+and QUEST
+As mentioned in the main text,
+prior fine-tuning-
+based methods, such as EfficientDM [8] and Quest [42],
+adopt specialized experimental setups.
+EfficientDM re-
+tains all skip connection layers and the op layers within
+Upsample blocks in full precision. These layers consti-
+4
+
+
+Task
+Settings
+Method
+Prec.
+(W/A)
+FID ↓
+LSUN-
+Church
+256 × 256
+LDM-8
+steps = 100
+eta = 0.0
+-
+FP
+32/32
+4.06
+Partial
+Quantization
+EfficientDM
+4/4
+13.68
+Ours(h=2)
+4/4
+7.95
+Full
+Quantization
+EfficientDM
+4/4
+18.40
+Ours(h=2)
+4/4
+8.81
+Channel-wise
+for Activation
+QuEST
+4/4
+11.76
+Ours(h=2)
+4/4
+-
+Layer-wise
+for Activation
+QuEST
+4/4
+13.03
+Ours(h=2)
+4/4
+8.81
+Table 11. Comparison with EfficientDM and QuEST under spe-
+cific settings. ‘Prec. (W/A)’ denotes the quantization bit-width. h
+denotes the size of LoRA Hub.
+tute a significant portion of the model, and their quanti-
+zation significantly affects performance. Therefore, in our
+comparative experiments, we apply standard quantization to
+these layers. In contrast, Quest adopts a different strategy
+by modifying the quantization granularity for activations.
+Specifically, in low-bit quantization, channel-wise quanti-
+zation of weights is a common approach. However, Quest
+extends this to activations, introducing substantial compu-
+tational overhead compared to the mainstream layer-wise
+quantization. To ensure a fair comparison, we employ con-
+ventional layer-wise quantization for activations.
+For a comprehensive evaluation, we align our method
+with the specific settings of EfficientDM and consider the
+implications of Quest’s setup.
+As shown in Table 11,
+under EfficientDM’s configuration, our 4-bit LDM model
+achieves significantly better results on the Church dataset,
+with an FID score that is 6.39 lower than EfficientDM’s.
+However, we choose not to replicate Quest’s specific set-
+tings for two key reasons. First, despite using the more ef-
+ficient layer-wise quantization for both weights and activa-
+tions, our method already surpasses Quest’s performance.
+Specifically, under the 4-bit setting, our method achieves
+an FID of 8.81, compared to Quest’s 11.76, which re-
+lies on computationally expensive channel-wise quantiza-
+tion for both. Second, our approach relies on FP quantiza-
+tion, and incorporating channel-wise quantization necessi-
+tates search-based initialization for every channel, which is
+computationally infeasible.
+H. Additional Visualization Results
+5
+
+
+Full-precision(W32A32) 
+Ours(h=2) 
+Ours(h=4) 
+Figure 10. Visualization of random samples from 4-bit LDM-4 on LSUN-Bedroom across different LoRA Hub sizes h.
+Full-precision(W32A32) 
+Ours(W6A6) 
+Ours(W4A4) 
+Figure 11. Visualization of random samples from quantized LDM-4 on ImageNet. The size of LoRA Hub is 2.
+6
+
+
+Closeup of a brown bear sitting in 
+a grassy area.
+A group of three stuffed animal 
+teddy bears.
+A kitchen with a refrigerator, 
+stove and oven with cabinets.
+A stop sign put upside down on a 
+metal pole. 
+Full-precision
+Ours (h=2)
+Figure 12. Comparison of text-to-image outputs from 6-bit quantized and full-precision Stable Diffusion models. h denotes the size of
+LoRA Hub.
+7

@@ -1,0 +1,4453 @@
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous
+Collaborative Fine-Tuning of LLMs
+Wenzhi Fang 1 Dong-Jun Han 2 Liangqi Yuan 1 Seyyedali Hosseinalipour 3 Christopher G. Brinton 1
+Abstract
+Fine-tuning large language models (LLMs) on
+resource-constrained clients remains a challeng-
+ing problem.
+Recent works have fused low-
+rank adaptation (LoRA) techniques with feder-
+ated fine-tuning to mitigate challenges associated
+with client model sizes and data scarcity. Still,
+the heterogeneity of resources remains a critical
+bottleneck: while higher-rank modules generally
+enhance performance, varying client capabilities
+constrain LoRA’s feasible rank range. Existing
+approaches attempting to resolve this issue either
+lack analytical justification or impose additional
+computational overhead, leaving a wide gap for
+efficient and theoretically-grounded solutions. To
+address these challenges, we propose federated
+sketching LoRA (FSLoRA), which leverages a
+sketching mechanism to enable clients to selec-
+tively update submatrices of global LoRA mod-
+ules maintained by the server. By adjusting the
+sketching ratios, which determine the ranks of
+the submatrices on the clients, FSLoRA flexibly
+adapts to client-specific communication and com-
+putational constraints. We provide a rigorous con-
+vergence analysis of FSLoRA that characterizes
+how the sketching ratios affect the convergence
+rate. Through extensive experiments, we demon-
+strate that FSLoRA outperforms baselines and
+significantly improves training efficiency while
+preserving stable convergence.
+1. Introduction
+Lightweight client-side large language models (LLMs) have
+recently gained significant attention as a promising comple-
+ment to cloud-based LLMs (Fan et al., 2024). They align
+1Purdue
+University
+2Yonsei
+University
+3University
+at
+Buffalo-SUNY.
+Correspondence
+to:
+Wenzhi
+Fang
+<fang375@purdue.edu>.
+Proceedings of the 43 rd International Conference on Machine
+Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026
+by the author(s).
+with the typical paradigm of LLMs: starting from a base
+model pre-trained on large-scale datasets to learn general
+linguistic patterns, semantics, and context, and then undergo-
+ing fine-tuning on task-specific data to enhance performance
+on specialized or domain-specific applications. However,
+an LLM fine-tuned on a single client often achieves unsat-
+isfactory performance due to the limited data. Federated
+learning (FL) (McMahan et al., 2017; Yao et al., 2024) has
+been investigated as a potential solution here, enabling the
+model to be fine-tuned across a group of distributed clients
+within the same task domain, without any raw data sharing.
+However, federated LLM fine-tuning is costly in both com-
+putation and communication due to the massive parameter
+volume. Importantly, many parameter-efficient fine-tuning
+methods have been proposed (Lester et al., 2021; Li & Liang,
+2021; Hu et al., 2021) to reduce the model adaptation cost.
+Among them, low-rank adaptation (LoRA) (Hu et al., 2021)
+stands out as a particularly effective approach due to its flex-
+ibility. In particular, LoRA enables efficient fine-tuning by
+approximating weight updates ∆W through a low-rank de-
+composition ∆W = BA, where matrices B and A contain
+significantly fewer trainable parameters than the original
+weight matrix. Building on this foundation, recent works
+incorporated LoRA with federated averaging (FedAvg) to
+support collaborative LLM fine-tuning (Zhang et al., 2024;
+Ye et al., 2024; Zou et al., 2025), significantly reducing the
+fine-tuning cost by cutting down the number of parameters
+that need to be synchronized across distributed clients.
+Challenges. While incorporating LoRA into federated LLM
+fine-tuning reduces the number of trainable parameters,
+computation and communication costs are still forced to
+increase with the LoRA rank. This poses challenges when
+complex tasks demand higher-rank LoRA modules, particu-
+larly on resource-constrained clients. Furthermore, the het-
+erogeneity in resource availability across distributed clients
+makes a uniform rank adopted in federated LoRA inefficient:
+a fixed rank r may be too large for some constrained clients,
+while being too small for more powerful ones, resulting in
+underutilized resources. Consequently, an approach that
+further reduces computation and communication overhead
+while adapting LoRA ranks to heterogeneous client capabil-
+ities is highly desirable. Although some existing approaches
+1
+arXiv:2501.19389v4  [cs.LG]  23 May 2026
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+(Cho et al., 2024; Bai et al., 2024; Wang et al., 2024) have
+attempted to provide a solution, they either lack theoretical
+justification or impose additional computational overhead,
+leaving a gap for an efficient and theoretically-grounded so-
+lution. A detailed discussion of these limitations is provided
+in Section 2.2. Overall, a comprehensive approach that pre-
+serves the analytical and practical benefits of LoRA while
+allowing heterogeneous collaborative fine-tuning under tight
+client resource constraints remains elusive.
+1.1. Contributions
+Motivated by these limitations, this work develops a method-
+ology for efficient federated LLM fine-tuning that (i) retains
+the flexibility of LoRA, (ii) provides theoretical convergence
+guarantees, and (iii) addresses the challenges posed by het-
+erogeneous and constrained resources across distributed
+clients. As depicted in Figure 1, our key idea is to in-
+troduce a sketching-based LoRA update to the local fine-
+tuning, which allows clients to selectively update a subset of
+columns and rows of the LoRA modules during each round,
+reducing the computation and communication consumption.
+Additionally, our method customizes the fine-tuning pro-
+cess by adjusting the sparsity level of the sketching matrix,
+i.e., the size of the updated submatrices for each client in
+each iteration. As we will see, the impact of the introduced
+sketching mechanism on the overall optimization landscape
+requires careful modeling consideration, posing additional
+challenges for the theoretical analysis that we address in this
+work.
+In summary, we make the following contributions:
+• We propose federated sketching LoRA (FSLoRA), which
+leverages a sketching mechanism to enable clients to se-
+lectively update submatrices of global LoRA modules
+maintained by the server. By adjusting the sketching ra-
+tios, which determine the ranks of the submatrices on
+clients, FSLoRA effectively adapts to client-specific com-
+munication and computational constraints.
+• We present a rigorous convergence analysis of FSLoRA
+under non-uniform submatrix updates across clients (i.e.,
+heterogeneous LoRA configurations), revealing how the
+sketching ratios (i.e., resource heterogeneity) affect the
+convergence rate through scaled smoothness constants.
+Our analysis establishes convergence under arbitrary
+sketching ratios and recovers the convergence rate of Fe-
+dAvg in the limiting case.
+• We conduct extensive experiments across multiple
+datasets and LLM models with diverse parameter settings,
+demonstrating FSLoRA’s superior performance compared
+to various baselines in accuracy, training efficiency, and
+resource utilization. Our ablation studies further validate
+Figure 1. An illustration of our proposed methodology where
+the server maintains a pair of global LoRA modules while the
+clients adaptively update submatrices of the global LoRA modules
+through sketching in each round.
+the effectiveness of the sketching mechanism and the abil-
+ity of clients to exploit larger global ranks under FSLoRA.
+1.2. Related Works
+Collaborative fine-tuning via federated LoRA: Federated
+LoRA is an efficient approach for collaborative LLM fine-
+tuning among distributed clients (Yao et al., 2024; Sun et al.,
+2024; Guo et al., 2025; Chen et al., 2025; Guo et al., 2024).
+Building on this foundation, Kuo et al. (2024) proposed in-
+tegrating communication compression with federated LoRA
+to further reduce communication overhead. Meanwhile, Bai
+et al. (2024); Cho et al. (2024); Byun & Lee (2024); Wang
+et al. (2024); Koo et al. (2024) explored the challenges of
+resource heterogeneity across distributed clients and intro-
+duced heterogeneous LoRA as a solution. However, the
+approaches proposed in (Cho et al., 2024; Koo et al., 2024;
+Byun & Lee, 2024; Bai et al., 2024) lack a theoretical foun-
+dation. Moreover, the FlexLoRA method introduced in (Bai
+et al., 2024) incurs additional computational overhead due
+to its reliance on singular value decomposition (SVD). Fur-
+thermore, the FLoRA algorithm proposed in (Wang et al.,
+2024) requires the clients to merge the LoRA modules into
+the base model, thereby compromising the inherent flexibil-
+ity of LoRA. Overall, there is still a lack of a systematic and
+theoretically grounded solution that can effectively tackle
+heterogeneous collaborative LLM fine-tuning.
+Enhancing adaptability via higher-rank LoRA modules:
+The foundational study by Hu et al. (2021) demonstrated
+that small ranks can be sufficient for certain tasks; how-
+ever, they also acknowledge that small rank LoRA modules
+may not work universally, especially when the downstream
+task differs significantly from pretraining. Following this,
+2
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+several works explored the effect of increasing the rank
+in LoRA modules. In a centralized setup, Kalajdzievski
+(2023) and Shuttleworth et al. (2024) showed that higher-
+rank LoRA models can closely approximate full fine-tuning
+under rsLoRA. In a federated LLM fine-tuning regime,
+Bai et al. (2024) demonstrated improved performance with
+larger ranks under FlexLoRA. Similarly, Cho et al. (2024)
+reported that, with proper overfitting control, HeteroLoRA
+can also benefit from larger ranks. Orthogonal to these rank-
+scaling approaches, Uni-LoRA (Li et al., 2026) reduces
+the trainable parameter space by reconstructing LoRA pa-
+rameters from a projected low-dimensional subspace, high-
+lighting another direction for improving LoRA efficiency.
+Overall, while small ranks may suffice for simpler tasks
+or strong base models, higher-rank modules are necessary
+to compensate for limited backbone capability, such as in
+lightweight LLMs, and to enable effective adaptation to
+more complex downstream tasks.
+Sketching-based optimization: Sketching is an efficient
+technique for mitigating the complexity of high-dimensional
+optimization, with its earliest applications in least-squares
+regression (Sarlos, 2006; Wang et al., 2022). Beyond this,
+gradient sketching has been employed to construct precon-
+ditioners for gradient descent methods (Gower & Richt´arik,
+2015). Building on these foundations, recent work has
+applied sketching to distributed optimization. In particu-
+lar, Charalambides & Mazumdar (2024) proposed hybrid
+local-global sketching for distributed least-squares, while
+Demidovich et al. (2023) developed a distributed sparsified
+training framework based on sketching. Shrivastava et al.
+(2024) demonstrated that sketching substantially reduces
+communication in distributed training of overparameterized
+deep models without sacrificing accuracy. More recently,
+Nicolas et al. (2026) investigated sketching-based differen-
+tial privacy and demonstrated its compatibility with secure
+aggregation. Despite these advances, sketching strategies
+tailored to structured low-rank adaptation modules such as
+LoRA remain largely unexplored.
+2. Problem Background
+2.1. LoRA-based Federated LLM Fine-tuning
+The federated LoRA fine-tuning problem can be formulated
+as
+min
+B,A f(B, A) := 1
+N
+N
+X
+i=1
+fi(B, A)
+fi(B, A) := Eξ∼Di [ℓ(W0 + BA, ξ)] ,
+(1)
+where W0 denotes the frozen base model, B ∈Rm×r, A ∈
+Rr×n are LoRA modules, N denotes the number of clients,
+ξ denotes a data sample, and Di is the local dataset on client
+i. ℓ, fi, and f are the sample loss function, the local loss for
+client i, and the global loss, respectively.
+Problem (1) aligns with the conventional federated opti-
+mization formulation, which thus can be solved using the
+FedAvg algorithm. Based on the FedAvg framework, Zhang
+et al. (2024) developed federated LoRA, which applies a
+uniform rank r across all clients, overlooking resource het-
+erogeneity. This one-size-fits-all approach leads to resource
+mismatches, where computationally constrained clients may
+struggle, while more powerful clients remain underutilized
+with a fixed rank.
+2.2. Aren’t the Existing Solutions Good Enough?
+To address this issue, researchers have proposed heteroge-
+neous federated LoRA approaches, where clients maintain
+non-uniform LoRA modules with varying ranks. They also
+introduce mechanisms to overcome the challenges of di-
+rectly aggregating matrices with different dimensions. How-
+ever, these methods often lack theoretical foundation or
+incur additional computational and memory overhead.
+HeteroLoRA (Cho et al., 2024) lets the server pad the
+updates from the clients with smaller ranks to match the
+size of the largest rank during aggregation. During model
+dissemination, clients receive a truncated version of the
+global LoRA modules from the server. Although easy to
+implement, HeteroLoRA is primarily heuristic in nature and
+lacks a rigorous theoretical foundation, potentially limiting
+its performance, as we will see in Section 5.
+FlexLoRA (Bai et al., 2024) requires the server to collect
+the individual LoRA matrices Bi and Ai from the clients
+and then computes their product BiAi. To support the
+initialization of non-uniform LoRA modules, the server ap-
+plies truncated SVD to the averaged product 1
+N
+PN
+i=1 BiAi.
+However, this approach introduces extra computational and
+memory overhead on the server due to truncated SVD, and
+the associated error can limit the performance as demon-
+strated in Section 5.
+FLoRA (Wang et al., 2024) introduces a stacking mecha-
+nism where the server concatenates LoRA modules from
+the clients. The concatenated matrices are then sent back
+to the clients, which compute their product and merge it
+into the base model before initializing new LoRA modules
+for the next fine-tuning round. However, this approach
+increases communication complexity linearly with the num-
+ber of clients, imposes higher computation and memory
+demands on the clients, and compromises LoRA’s flexibility
+to support multiple adapters for different tasks.
+More detailed comparisons on computation, memory, and
+communication are presented in Appendix A. In summary,
+a theoretically-grounded solution that preserves LoRA’s
+benefits while effectively addressing resource heterogeneity
+across distributed clients remains lacking.
+3
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+3. Federated Sketching LoRA
+Motivated by the limitations of existing methods, we pro-
+pose a reformulation for federated LoRA. Building on this
+foundation, we develop FSLoRA, a heterogeneous LoRA
+algorithm that preserves LoRA’s flexibility while accommo-
+dating client resource heterogeneity.
+3.1. Our Formulation
+We propose a sketching-based LoRA formulation for col-
+laborative LLM fine-tuning as follows:
+min
+B,A f S(B, A) := 1
+N
+N
+X
+i=1
+f S
+i (B, A)
+f S
+i (B, A) := ES∼Si;ξ∼Di [ℓ(W0 + BSA, ξ)] ,
+(2)
+where B ∈Rm×r, A ∈Rr×n are LoRA modules, f S
+i is the
+local loss function at client i with sketching, and S denotes
+a sketching matrix randomly sampled from the diagonal ma-
+trix set Si = S(r, ki). The set S(r, ki) comprises diagonal
+matrices of size r × r with exactly ki non-zero entries. The
+formal definition of S(r, k) is provided below:
+Definition 3.1 (Random-k sketching). A random-k diago-
+nal matrix set is defined as:
+S(r, k)=
+(
+S|S= r
+k
+X
+j∈I
+eje⊤
+j , I ⊆{1, . . . , r}, |I|=k
+)
+,
+where e1, . . . , er ∈Rr are standard unit basis vectors and
+index set I is a random subset of [r] := {1, 2, . . . , r} sam-
+pled uniformly from all subsets of [r] with cardinality k.
+With S being a matrix sampled from Si, we have BSA =
+r
+ki
+P
+j∈Ii Beje⊤
+j A, where Ii corresponds to the index set
+of non-zero diagonal entries of S. Bej extracts the j-th
+column of B while e⊤
+j A extracts the j-th row of A. In
+other words, only ki columns and rows in the LoRA mod-
+ules B and A are activated by the sketching matrix in the
+loss ℓ(W0 + BSA, ξ) at client i. On the other hand, the
+sketching matrix S satisfies ES∼Si[S] = Ir where Ir is
+a r-dimensional identity matrix. Based upon this prop-
+erty, W0 + BSA can be treated as an unbiased estimate of
+W0 + BA.
+Intuition: A larger rank allows LoRA modules to be more
+expressive, leading to better performance (Bai et al., 2024;
+Kalajdzievski, 2023; Shuttleworth et al., 2024). However,
+resource-constrained clients cannot afford the computational
+or communication demands of large-rank modules. Our
+formulation (2) leverages the sketching matrix to balance
+the expressiveness of high-rank LoRA modules with the
+resource constraints of different clients. With the sketching
+mechanism introduced, the local gradients with respect to
+the LoRA modules on the clients will exhibit structured
+sparsity. By adjusting the sketching ratio ki/r, we can
+tailor the sparsity of the gradient to match the capabilities of
+each client, ensuring affordable training while maintaining
+performance across heterogeneous systems, as elaborated
+in the following subsection. Overall, compared to (1), our
+formulation offers a more flexible framework, tailored to
+address the diverse capabilities of heterogeneous clients.
+3.2. Sparsity in the Gradients
+In this subsection, we analyze the gradient structure of
+LoRA modules and highlight the gradients’ sparsity proper-
+ties under a given sketching matrix. To begin, we present the
+gradient expressions for the LoRA modules in the following
+lemma. The proof is provided in Appendix J.2.
+Lemma 3.2 (Gradient Formulation). For a given sketching
+matrix S, the gradients of ℓ(W0 + BSA, ξ) with respect to
+B and A take the following form
+∇Bℓ(W0 + BSA, ξ) = ∇ℓ(W0 + BSA, ξ)A⊤S⊤
+∇Aℓ(W0 + BSA, ξ) = S⊤B⊤∇ℓ(W0 + BSA, ξ),
+(3)
+where ∇Bℓ(W0 + BSA, ξ), ∇Aℓ(W0 + BSA, ξ), and
+∇ℓ(W0 + BSA, ξ) denote the gradients of ℓ(W0 +
+BSA, ξ) to B, A, and W0 + BSA, respectively.
+In particular, a random-k diagonal sketching matrix se-
+lectively samples k rows or columns of a matrix through
+left product or right product, respectively.
+With S be-
+ing a random-k diagonal matrix, the gradients of ℓ(W0 +
+BSA, ξ) with respect to LoRA modules B and A, as shown
+in (3), naturally become structurally sparse matrices. This
+sparsity reduces computational and memory overhead dur-
+ing training, enabling faster gradient computation and pa-
+rameter updates, while alleviating communication overhead
+across distributed clients by transmitting only non-zero ele-
+ments.
+Remark 3.3 (Sparsity Level Control). A key advantage of
+our formulation is its flexible control over the sparsity level
+of local gradients, achieved by configuring the parameter ki
+of the sketching matrix set Si = S(r, ki). This mechanism
+allows each client to tailor its local updates according to
+its communication and computation resource constraints,
+ensuring efficient and scalable fine-tuning in heterogeneous
+federated systems. Lowering ki helps resource-constrained
+clients reduce computation and communication overhead,
+while more capable clients can increase ki to conduct more
+informative local updates.
+Remark 3.4 (Justification for the Choice of Random-k
+Sketching). We adopt Random-k sketching because it is
+unbiased, induces structured sparsity, and exhibits strong
+empirical performance (see Section 5). In contrast, identify-
+ing an appropriate metric for quantifying the importance of
+individual LoRA rows or columns remains an open problem,
+4
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+even in the centralized LoRA setting. This lack of a princi-
+pled importance measure prevents the reliable development
+of Top-k-style or importance-based sketching strategies.
+We empirically evaluate several heuristic importance-based
+sketching variants and find that they consistently underper-
+form Random-k sketching. Detailed theoretical intuition
+and empirical results can be found in Appendix B.
+3.3. FSLoRA Algorithm
+Based on the formulation in (2), we propose a resource-
+adaptive algorithm, termed FSLoRA. In each round, FS-
+LoRA enables each client to update only a client-specific
+pair of submatrices from the global LoRA modules B and
+A. The server maintains the global LoRA modules B and A
+and periodically updates them by aggregating sparse local
+updates from distributed clients. The per-round FSLoRA
+procedure is detailed below.
+• Sketch Sampling & Broadcast. The server begins by
+sampling sketching matrices {St
+i ∼Si}N
+i=1 for all clients,
+where Si represents the set of possible sketching matrices
+for client i. These sketches are then sent to the correspond-
+ing clients. Additionally, the server broadcasts the current
+global LoRA modules [Bt; At] to all clients. Note that
+the communication load introduced by transmitting the
+sketching matrix is negligible compared to global LoRA
+modules, as it involves only binary sketching indices.
+• Local Sparse Training. Clients initialize local LoRA
+modules from the global model and perform sketch-
+guided updates using St
+i, given by:
+Bt,h+1
+i
+At,h+1
+i
+
+=
+Bt,h
+i
+At,h
+i
+
+−γ
+∆Bt,h
+i (St
+i)⊤
+(St
+i)⊤∆At,h
+i
+
+,
+(4)
+where γ denotes the learning rate and [∆Bt,h
+i ; ∆At,h
+i ] is
+a shorthand representation for:
+
+∆Bt,h
+i
+∆At,h
+i
+
+=
+
+∇ℓ(W0 + Bt,h
+i St
+iAt,h
+i , ξt,h
+i
+)(At,h
+i )⊤
+(Bt,h
+i )⊤∇ℓ(W0 + Bt,h
+i St
+iAt,h
+i , ξt,h
+i
+)
+
+.
+The update direction in (4) corresponds to the negative
+stochastic gradient of ℓ(W0 + BSA, ξ) with respect to
+[B; A] for a given sketch St
+i, as established in Lemma
+3.2. The total update for client i in one round of training,
+consisting of H local steps, can be expressed as follows:
+Bt,H
+i
+−Bt,0
+i
+At,H
+i
+−At,0
+i
+
+=
+
+γ
+PH−1
+h=0 ∆Bt,h
+i
+
+(St
+i)⊤
+γ(St
+i)⊤PH−1
+h=0 ∆At,h
+i
+
+
+.
+From the above equation, we see that only the columns
+of B and the rows of A corresponding to the nonzero
+entries of St
+i are updated during the t-th round at client
+i. In essence, St
+i selectively activates specific columns
+of B and rows of A for each round. Afterward, clients
+transmit these nonzero columns and rows of the sparse
+local updates to the server.
+• Sparse Update Reconstruction & Aggregation. Using
+the sketch information, the server reconstructs the full-
+size sparse updates from the received columns and rows
+via zero padding, and aggregates them to update the global
+LoRA modules:
+Bt+1
+At+1
+
+=
+Bt
+At
+
++ 1
+N
+N
+X
+i=1
+Bt,H
+i
+−Bt,0
+i
+At,H
+i
+−At,0
+i
+
+.
+(5)
+Algorithm 1 summarizes the procedure of FSLoRA under
+full participation, while the extension to partial participation
+is provided in Appendix E.
+Intuitively, Random-k sketching ensures uniform expected
+exposure of all columns and rows of the global LoRA mod-
+ules to each client, closely mirroring the behavior of vanilla
+Federated LoRA. As training progresses, every component
+in the global LoRA is sampled with sufficient frequency in
+expectation, and thus adequately optimized. The conver-
+gence of FSLoRA and the impact of Random-k sketching
+on convergence are analyzed in Section 4.
+Remark 3.5 (Computation, memory, and communication).
+Compared to vanilla Federated LoRA (Zhang et al., 2024),
+FSLoRA introduces only lightweight additional operations,
+including Random-k sketch sampling, sketch index broad-
+casting, and zero padding. Consequently, FSLoRA incurs
+negligible additional overhead at the server, while maintain-
+ing comparable or lower overall complexity than existing
+heterogeneous LoRA baselines (Bai et al., 2024; Wang et al.,
+2024). More detailed server- and client-side comparisons
+with baselines are provided in Appendix A.
+Remark 3.6 (Aggregation). Existing works on federated
+LoRA primarily adopt two aggregation strategies: (1) aggre-
+gating the LoRA modules as [B; A] (e.g., vanilla Federated
+LoRA (Zhang et al., 2024)), and (2) aggregating the product
+BA (e.g., FlexLoRA (Bai et al., 2024)). Both methods have
+demonstrated effectiveness, as evidenced by their promising
+performance in prior studies. In this work, we adopt the
+former, as it introduces minimal overhead and retains the
+simplicity of LoRA. Additionally, we prove that FSLoRA
+is compatible with secure aggregation in Appendix D.
+3.4. Comparison with Communication Compression
+Although both the sketching approach in FSLoRA and com-
+munication compression (Kuo et al., 2024) reduce commu-
+nication overhead, the sketching approach fundamentally
+differs from traditional compression techniques. Compres-
+sion methods focus solely on reducing the transmission
+load, leaving the gradient computation and model updates
+unchanged from the vanilla Federated LoRA. FSLoRA goes
+beyond communication savings by also reducing gradient
+computation and model update overhead through sparse
+5
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Algorithm 1 Federated Sketching LoRA (FSLoRA)
+Require: Base model W0, LoRA modules B0 and A0,
+learning rate γ, and sketching set {Si}N
+i=1
+1: for t = 0, 1, . . . , T −1 do
+2:
+Server samples sketching matrices {St
+i ∼Si}N
+i=1
+and sends them back to the clients
+3:
+Server broadcasts the current global LoRA modules
+to the clients
+4:
+for h = 0, 1, . . . , H−1 do
+5:
+Clients update the local LoRA modules via (4)
+6:
+end for
+7:
+Clients upload the non-zero columns of (Bt,H
+i
+−Bt,0
+i )
+and the non-zero rows (At,H
+i
+−At,0
+i )
+8:
+Server updates the global LoRA modules via (5)
+9: end for
+training. Notably, these two methods are orthogonal and
+can be combined to achieve greater efficiency. We validate
+the effectiveness of this combination in Appendix G.5.
+4. Analysis
+Our theoretical analysis focuses on the full-participation
+setting in order to isolate and clearly characterize the effect
+of the sketching mechanism. As sketching is independent
+of client sampling, the impact of partial participation on
+FSLoRA is analogous to that on FedAvg. Accordingly, ex-
+tending our analysis from full to partial participation follows
+standard techniques in FL (Yang et al., 2021).
+We conduct our analysis under the following notations and
+assumptions.
+Notations: We define ˜ℓ(B, A, ξ; S) = ℓ(W0 + BSA, ξ)
+and ˜fi(B, A; S) = Eξ∼Di [ℓ(W0 + BSA, ξ)] for a given
+S and f S
+i (B, A) = ES∼Si[ ˜fi(B, A; S)].
+We denote
+X = [B; A] and rewrite f(B, A), fi(B, A), f S(B, A),
+f S
+i (B, A), ˜fi(B, A; S), and ˜ℓ(B, A, ξ; S) as f(X), fi(X),
+f S(X), f S
+i (X), ˜fi(X; S), and ˜ℓ(X, ξ; S) respectively. Ad-
+ditionally, we use ∥·∥to represent the Frobenius norm.
+Assumption 4.1. During fine-tuning, the iterates remain in
+a bounded region C. For each client i, fi(X) is differentiable
+and L-smooth on C, i.e., there exists a positive constant L
+such that for any X, Y ∈C,
+∥∇fi(X) −∇fi(Y)∥≤L∥X −Y∥,
+∀i.
+Assumption 4.2. ∇X˜ℓ(X, ξ; S) is an unbiased estimate of
+∇Xf S
+i (X) and its variance is bounded as
+E∥∇X˜ℓ(X, ξ; S) −∇Xf S
+i (X)∥2 ≤ρ∥∇Xf S
+i (X)∥2 + σ2
+where the expectation is computed over ξ ∼Di and S ∼Si.
+Assumption 4.3. The gradient dissimilarity between the
+global loss f S(X) and each local loss f S
+i (X) satisfies
+∇Xf S
+i (X)−∇Xf S(X)
+2 ≤ch∥∇Xf S(X)∥2+δ2
+h,
+where ch ≥0 and f S(X) = 1
+N
+PN
+i=1 f S
+i (X).
+Assumption 4.1 is standard in optimization literature (Bot-
+tou et al., 2018; Fang et al., 2024). Assumptions 4.2 and 4.3
+are commonly adopted in FL to bound sampling randomness
+and data heterogeneity (Fang et al., 2022; Yi et al., 2022).
+We further discuss Assumption 4.1 and provide an empiri-
+cal validation for Assumptions 4.2 and 4.3 in Appendix C,
+showing that these assumptions are reasonable within the
+LLM fine-tuning scenario. Building on these assumptions,
+we analyze the convergence behavior of FSLoRA and the
+results are summarized in the following theorem.
+Theorem 4.4 (Convergence of FSLoRA). Suppose that
+Assumptions 4.1-4.3 hold, then there exists a learning rate
+γ ≤min
+n
+N
+24ρ(ch+1)H ¯L,
+1
+8√
+eLL(ρ+1)(ch+1) H , 1
+H
+o
+such that the iterates {Xt} generated by FSLoRA satisfy
+1
+T
+T −1
+X
+t=0
+E
+∇Xf S(Xt)
+2 ≤8
+q
+¯LF0σ2ρ
+√
+NTH
++10(eLL)
+1
+3
+F0σρ
+T
+ 2
+3
++ 4F0
+T ,
+(6)
+where σ2
+ρ = σ2 + 3(ρ + 1)σ2
+h, ¯L =
+
+1
+N
+PN
+i=1
+r
+ki
+
+L, eL =
+
+1
+N
+PN
+i=1
+r2
+k2
+i
+
+L and F0 = f S(X0)−f ∗with f ∗denoting
+the lower bound of f S(X).
+Technical highlights of Theorem 4.4: A key step in the
+proof of Theorem 4.4 is characterizing the impact of the
+sketching mechanism on the optimization landscape. Our
+analysis reveals how the sketching operation modifies the
+smoothness properties of the objective, introducing scaled
+smoothness constants,
+r
+ki L and r2
+k2
+i L, which directly influ-
+ence the convergence behavior. Further details are presented
+in Appendix J.3.
+Discussion: Theorem 4.4 establishes an upper bound on
+the convergence rate of the proposed FSLoRA algorithm.
+The parameters ¯L and eL provide insight into how client
+resource heterogeneity influences the convergence. When
+clients possess sufficient computational resources, they can
+adopt larger ranks for their local LoRA modules (i.e., larger
+ki), which leads to faster convergence of FSLoRA (i.e.,
+smaller ¯L and ˜L). This effect is also empirically validated
+in Section 5. Moreover, the derived upper bound vanishes
+as T →∞for any ki > 0, implying that FSLoRA con-
+verges to a stationary point under general sketching ratios.
+6
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 1. Testing accuracy over 3 independent runs for fine-tuning the RoBERTa model on the GLUE benchmark. FSLoRA achieves a
+notable improvement in average performance compared to the baselines.
+Method
+GPU hours
+QNLI
+MRPC
+CoLA
+MNLI
+RTE
+SST-2
+QQP
+Avg.
+Base model
+-
+49.5
+52.0
+30.9
+32.6
+47.3
+50.9
+63.2
+46.6
+HeteroLoRA
+10.7h
+87.5 ±0.5
+84.4 ±0.9
+75.3 ±1.2
+66.3 ±0.8
+69.0 ±1.7
+89.5 ±0.0
+85.3 ±0.1
+79.6
+FlexLoRA
+12.6h
+88.5 ±0.2
+81.2 ±0.4
+77.5 ±1.2
+63.0 ±0.5
+62.2 ±1.9
+92.8 ±0.4
+87.4 ±0.1
+78.9
+FLoRA
+12.3h
+87.2 ±0.3
+78.1 ±0.7
+77.4 ±1.7
+74.6 ±0.5
+54.4 ±2.1
+93.4 ±0.1
+87.1 ±0.3
+78.9
+RAVAN
+12.3h
+83.4 ±1.1
+76.2 ±1.6
+71.8 ±1.4
+66.3 ±3.6
+63.1 ±2.8
+92.1 ±0.9
+83.4 ±1.7
+76.6
+FSLoRA
+10.9h
+88.0 ±0.3
+87.3 ±0.2
+82.2 ±0.5
+76.4 ±0.2
+69.8 ±1.2
+93.5 ±0.1
+85.8 ±0.1
+83.3
+Table 2. Testing accuracy over 3 independent runs for fine-tuning the LLaMA-3.2-3B-Instruct on the commonsense reasoning benchmark.
+FSLoRA demonstrates consistent performance improvement across these tasks compared to baselines.
+Method
+GPU hours
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+Base model
+-
+51.5
+61.4
+47.2
+55.8
+52.4
+21.3
+54.4
+4.6
+43.6
+HeteroLoRA
+43.7h
+73.4 ±0.3
+86.6 ±0.2
+65.8 ±0.5
+73.0 ±0.5
+71.4 ±0.3
+80.9 ±0.7
+73.8 ±0.3
+72.0 ±0.3
+74.6
+FlexLoRA
+68.3h
+74.2 ±0.3
+86.7 ±0.6
+68.6 ±0.8
+79.4 ±0.7
+75.8 ±0.4
+81.0 ±0.3
+75.9 ±0.4
+77.9 ±0.3
+77.4
+FLoRA
+49.8h
+68.3 ±0.6
+83.1 ±0.5
+65.8 ±0.9
+77.2 ±0.5
+74.2 ±0.3
+80.5 ±0.6
+76.1 ±0.5
+71.5 ±0.5
+74.6
+RAVAN
+51.2h
+71.9 ±0.9
+81.6 ±1.3
+65.7 ±3.2
+76.7 ±1.4
+75.6 ±1.5
+77.1 ±1.2
+74.8 ±0.6
+73.8 ±0.6
+74.7
+FSLoRA
+44.3h
+76.1 ±0.4
+87.2 ±0.5
+69.3 ±0.7
+82.2 ±1.1
+80.7 ±0.6
+84.0 ±0.2
+76.8 ±0.0
+79.1 ±0.2
+79.4
+This highlights the robustness of FSLoRA to heterogeneous
+client resource constraints. In particular, as the sketching
+ratio ki/r →1(i.e., ¯L = L), the decay rate of the dominat-
+ing term (i.e., the first term on the right-hand-side of (6))
+recovers the convergence rate of FedAvg (Yu et al., 2019;
+Karimireddy et al., 2020). This demonstrates the tightness
+of our analysis and shows that FSLoRA retains the conver-
+gence guarantees of vanilla Federated LoRA in the limiting
+case.
+Remark 4.5 (Analysis Extension to Importance-Based
+Sketching). To this end, we provide a theoretically grounded
+framework for heterogeneous LoRA fine-tuning. Although
+our algorithm and analysis are based on Random-k sketch-
+ing, the framework naturally extends to importance-based
+sketching when a reliable importance metric is available.
+We investigate this extension in Appendix J.5.
+5. Experiments
+Our experiments focus on RoBERTa (125M) (Liu, 2019)
+and LLaMA-3.2-3B-Instruct models (Dubey et al., 2024),
+which represent typical model sizes suitable for client-side
+deployment, as well as the LLaMA-7B to reflect large-
+scale scenarios. For RoBERTa and LLaMA-3.2-3B-Instruct
+models, we fine-tune and evaluate them on the GLUE
+(Wang, 2018) and commonsense reasoning benchmarks
+(Hu et al., 2023), respectively. Similar to (Zhang et al.,
+2024; Wang et al., 2024), we adopt Dirichlet-based parti-
+tioning for dataset splits. The number of clients is set to
+20 in the main manuscript and increased to 50 and 100 in
+Appendix E. Further details are provided in the Appendix
+I. The implementation code for this project is available at
+https://github.com/wenzhifang/Federate
+d-Sketching-LoRA-Implementation.
+5.1. Main Results Under Heterogeneous LoRA Setup
+Performance comparison with baselines: We consider
+four state-of-the-art baselines: three representative meth-
+ods discussed in Section 2.2, and RAVAN (Raje et al.,
+2026), a recent federated LoRA fine-tuning method that
+addresses resource heterogeneity through partial LoRA
+head selection/freezing. We also report the model’s ac-
+curacy before fine-tuning (i.e., the base model). For FS-
+LoRA, the rank of the global LoRA modules is fixed to
+r = 64, while the sketching ratio for client i is sampled from
+{0.125, 0.25, 0.5, 0.75}. For fair comparison, the same rank
+configuration is applied to all baseline methods. Tables 1
+and 2 present the performance of FSLoRA and the base-
+lines. Across both benchmarks, FSLoRA consistently out-
+performs the base model in a wide margin, confirming the
+necessity of collaborative LLM fine-tuning. On the GLUE
+benchmark with RoBERTa, FSLoRA achieves the highest
+average accuracy among all methods. On the more chal-
+lenging commonsense reasoning benchmark with LLaMA,
+FSLoRA still delivers the best overall performance. Notably,
+FSLoRA maintains computational efficiency comparable
+to HeteroLoRA in terms of GPU hours, highlighting its
+advantage in heterogeneous LoRA fine-tuning.
+Evaluation under broader heterogeneity, increased num-
+ber of clients, and other models: In Appendix E, we ex-
+tend our evaluation to 50 and 100 clients under partial client
+participation, incorporating greater diversity in clients’ com-
+7
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+2
+4
+8
+16
+64
+Rank (r)
+84
+86
+88
+Testing Accuracy (%)
+(a) QNLI
+2
+4
+8
+16
+64
+Rank (r)
+82
+84
+86
+(b) MRPC
+2
+4
+8
+16
+64
+Rank (r)
+78
+80
+82
+(c) COLA
+2
+4
+8
+16
+64
+Rank (r)
+70
+72
+74
+76
+(d) MNLI
+2
+4
+8
+16
+64
+Rank (r)
+92.5
+93.0
+93.5
+94.0
+(e) SST2
+w/o Sketching (Federated LoRA)
+Sketching (FSLoRA)
+Figure 2. Comparison between FSLoRA with and without sketching (the latter equivalent to Federated LoRA) where the upload budget
+for clients is set to 100× the size of the global LoRA modules at each rank. FSLoRA obtains a better performance, validating its
+communication efficiency.
+2
+4
+8
+16
+64
+Rank (r)
+70
+72
+74
+76
+78
+80
+Testing Accuracy (%)
+w/o Sketching (Federated LoRA)
+Sketching (FSLoRA)
+(a) Comparison of FSLoRA with and with-
+out sketching, with an upload budget 80×
+the size of the global LoRA modules.
+0
+50
+100
+150
+200
+Communication Round
+62
+64
+66
+68
+70
+72
+74
+76
+78
+80
+Testing Accuracy (%)
+r = 8,
+ki/r = 1.000
+r = 16, ki/r = 0.500
+r = 32, ki/r = 0.250
+r = 64, ki/r = 0.125
+(b) Impact of the rank of global LoRA mod-
+ules on FSLoRA, given a fixed rank ki for
+the updated submatrices at the clients.
+0
+50
+100
+150
+200
+Communication Round
+64
+66
+68
+70
+72
+74
+76
+78
+80
+Testing Accuracy (%)
+r = 64, ki/r = 0.125
+r = 64, ki/r = 0.500
+r = 64, ki/r = 1.000
+150
+200
+79.0
+79.5
+80.0
+(c) Impact of the sketching ratio on FS-
+LoRA’s performance under a fixed rank
+r = 64 for the global LoRA modules.
+Figure 3. Fine-tuning the LLaMA-3.2-3B-Instruct model on the commonsense reasoning benchmark. The results are averaged over eight
+tasks, illustrating FSLoRA’s ability to maintain strong performance while adapting to different rank and sketching configurations.
+munication and computation capabilities, as well as varying
+levels of data heterogeneity. In Appendix F, we further
+assess the effectiveness of our method on Qwen2.5-1.5B-
+Instruct and LLaMA-7B models.
+5.2. Ablation Study
+Impact of sketching: In Figures 2 and 3(a), we compare
+the performance of FSLoRA with and without sketching on
+fine-tuning RoBERTa and LLaMA-3.2-3B-Instruct, respec-
+tively. Note that FSLoRA without sketching is equivalent to
+the vanilla Federated LoRA. For FSLoRA with sketching,
+we apply a uniform sketching ratio of ki/r = 0.5 across
+all clients. The upload budget for each client is set to 100
+and 80 times the size of the full global LoRA modules at
+the corresponding rank for the RoBERTa and the LLaMA-
+3.2-3B-Instruct models, respectively. As shown in Figures 2
+and 3(a), both FSLoRA with and without sketching achieve
+higher accuracy when the rank r increases due to the avail-
+ability of more tunable parameters. In addition, FSLoRA
+consistently outperforms its non-sketched counterpart across
+all the ranks and datasets. The use of sketching increases
+the communication frequency for clients under the same
+communication budget, thereby facilitating the optimization
+process and enhancing fine-tuning efficiency.
+Impact of the global rank: In Figure 3(b), we investigate
+the impact of the rank of the global LoRA modules on FS-
+LoRA’s performance. We vary the rank of the global LoRA
+modules while keeping the rank of submatrices updated
+by the clients to be consistent (i.e., ki = 8). This ensures
+that the communication and computational resources on
+the client side remain unchanged. As illustrated in Figure
+3(b), FSLoRA maintains stable convergence across all the
+configurations. Moreover, FSLoRA demonstrates improved
+performance as the global rank increases. This observation
+confirms that the proposed sketching mechanism enables
+resource-constrained systems to reap the benefits of a higher
+global rank, striking an effective balance between efficiency
+and performance.
+Impact of sketching ratio: We investigate the impact of
+the sketching ratio on FSLoRA’s performance by maintain-
+ing a constant global LoRA rank r = 64 while varying the
+sketching ratio ki/r in the range {0.125, 0.5, 1}. As shown
+in Figure 3(c), there is a slight performance degradation as
+the sketching ratio decreases, which is consistent with our
+theoretical analysis. This also reflects an tradeoff: while a
+larger sketching ratio improves convergence and accuracy, a
+smaller ratio reduces both computational and communica-
+tion overhead. Notably, the observed degradation remains
+minor, highlighting FSLoRA’s ability to maintain strong
+8
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+performance even under constrained resources. This demon-
+strates its effectiveness in balancing efficiency and accuracy,
+making it well-suited for resource-limited scenarios.
+Further experiments: Results with more clients under
+broader heterogeneity, as well as with other models, are
+reported in Appendix E and Appendix F, respectively. Ap-
+pendix G.1 provides detailed per-task comparisons on the
+commonsense reasoning benchmark corresponding to Fig-
+ures 3(a) and 3(b). The impact of varying the number of
+local updates H is studied in Appendix G.2, while the em-
+pirical extension to dynamic sketching ratios is presented
+in Appendix G.3. Finally, Appendix G.5 demonstrates the
+synergistic effect of integrating compression with sketching.
+6. Conclusion
+We proposed FSLoRA, a novel collaborative LLM fine-
+tuning framework that introduces a sketching mechanism to
+enhance training efficiency in resource-constrained systems.
+By maintaining large-rank LoRA modules on the server and
+allowing clients to selectively update submatrices based on
+the sketching ratios, FSLoRA effectively adapts to hetero-
+geneous communication and computational constraints. We
+provided a rigorous convergence analysis of FSLoRA that
+characterizes how the sketching ratios (i.e., resource hetero-
+geneity) affect the convergence rate. Finally, we confirmed
+the effectiveness of FSLoRA through extensive experiments
+across multiple datasets and models.
+Limitations
+One limitation of our work is that, although we provide
+theory and extensive experiments, the analysis focuses on
+a standard federated setting and does not yet cover more
+realistic system effects such as asynchronous participation,
+unstable connections, client stragglers, and latency fluctua-
+tions. In addition, we focus on random-k sketching because
+it is unbiased and theoretically tractable; more adaptive
+sketching strategies may be interesting future work if re-
+liable importance measures for LoRA components can be
+developed.
+Impact Statement
+This paper makes contributions to collaborative LLM fine-
+tuning by developing a resource-adaptive algorithm for
+resource-constrained distributed LLM systems. The focus
+of this work is on the technical advancement of LLM fine-
+tuning algorithms. While this research has potential societal
+impacts, it primarily addresses technical challenges and
+does not necessitate a specific discussion on societal conse-
+quences.
+Acknowledgments
+This work was supported in part by the National Sci-
+ence Foundation (NSF) under Grants CNS-2146171, CNS-
+2212565, and ECCS-2543754; by the Office of Naval Re-
+search (ONR) under Grant N00014-22-1-2305; by the Air
+Force Office of Scientific Research (AFOSR) under Grant
+FA9550-24-1-0083; and by the National Research Founda-
+tion of Korea (NRF) grant funded by the Korea government
+(MSIT) (No. RS-2026-25470983).
+References
+Bai, J., Chen, D., Qian, B., Yao, L., and Li, Y.
+Fed-
+erated fine-tuning of large language models under het-
+erogeneous tasks and client resources. arXiv preprint
+arXiv:2402.11505, 2024.
+Bisk, Y., Zellers, R., Gao, J., Choi, Y., et al. Piqa: Reasoning
+about physical commonsense in natural language. In Pro-
+ceedings of the AAAI conference on artificial intelligence,
+volume 34, pp. 7432–7439, 2020.
+Bottou, L., Curtis, F. E., and Nocedal, J. Optimization
+methods for large-scale machine learning. SIAM review,
+60(2):223–311, 2018.
+Byun, Y. and Lee, J. Towards federated low-rank adapta-
+tion of language models with rank heterogeneity. arXiv
+preprint arXiv:2406.17477, 2024.
+Charalambides, N. and Mazumdar, A.
+Distributed hy-
+brid sketching for l2-embeddings.
+arXiv preprint
+arXiv:2412.20301, 2024.
+Chen, S., Guo, Y., Ju, Y., Dalal, H., Zhu, Z., and Khisti,
+A. Robust federated finetuning of llms via alternating
+optimization of lora. arXiv preprint arXiv:2502.01755,
+2025.
+Cho, Y. J., Liu, L., Xu, Z., Fahrezi, A., and Joshi, G. Het-
+erogeneous LoRA for federated fine-tuning of on-device
+foundation models. arXiv preprint arXiv:2401.06432,
+2024.
+Clark, C., Lee, K., Chang, M.-W., Kwiatkowski, T., Collins,
+M., and Toutanova, K. Boolq: Exploring the surprising
+difficulty of natural yes/no questions. arXiv preprint
+arXiv:1905.10044, 2019.
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,
+Schoenick, C., and Tafjord, O. Think you have solved
+question answering? try arc, the ai2 reasoning challenge.
+arXiv preprint arXiv:1803.05457, 2018.
+Demidovich, Y., Malinovsky, G., Shulgin, E., and Richt´arik,
+P.
+Mast: Model-agnostic sparsified training.
+arXiv
+preprint arXiv:2311.16086, 2023.
+9
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+A., et al. The llama 3 herd of models. arXiv preprint
+arXiv:2407.21783, 2024.
+Fan, D., Messmer, B., and Jaggi, M. On-device collabora-
+tive language modeling via a mixture of generalists and
+specialists. arXiv preprint arXiv:2409.13931, 2024.
+Fang, W., Yu, Z., Jiang, Y., Shi, Y., Jones, C. N., and Zhou,
+Y. Communication-efficient stochastic zeroth-order op-
+timization for federated learning. IEEE Transactions on
+Signal Processing, 70:5058–5073, 2022.
+Fang, W., Han, D.-J., Chen, E., Wang, S., and Brinton, C. G.
+Hierarchical federated learning with multi-timescale gra-
+dient correction. arXiv preprint arXiv:2409.18448, 2024.
+Gower, R. M. and Richt´arik, P. Randomized iterative meth-
+ods for linear systems. SIAM Journal on Matrix Analysis
+and Applications, 36(4):1660–1690, 2015.
+Guo, P., Zeng, S., Wang, Y., Fan, H., Wang, F., and Qu, L.
+Selective aggregation for low-rank adaptation in federated
+learning. arXiv preprint arXiv:2410.01463, 2024.
+Guo, P., Zeng, S., Wang, Y., Fan, H., Wang, F., and Qu, L.
+Selective aggregation for low-rank adaptation in federated
+learning. arXiv preprint arXiv:2410.01463, 2025.
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y.,
+Wang, S., Wang, L., and Chen, W. LoRA: Low-rank
+adaptation of large language models.
+arXiv preprint
+arXiv:2106.09685, 2021.
+Hu, Z., Wang, L., Lan, Y., Xu, W., Lim, E.-P., Bing, L.,
+Xu, X., Poria, S., and Lee, R. K.-W. LLM-adapters:
+An adapter family for parameter-efficient fine-tuning of
+large language models. arXiv preprint arXiv:2304.01933,
+2023.
+Kalajdzievski, D. A rank stabilization scaling factor for fine-
+tuning with LoRA. arXiv preprint arXiv:2312.03732,
+2023.
+Karimireddy, S. P., Kale, S., Mohri, M., Reddi, S., Stich, S.,
+and Suresh, A. T. Scaffold: Stochastic controlled averag-
+ing for federated learning. In International conference on
+machine learning, pp. 5132–5143. PMLR, 2020.
+Koloskova, A., Loizou, N., Boreiri, S., Jaggi, M., and Stich,
+S. A unified theory of decentralized sgd with changing
+topology and local updates. In International conference
+on machine learning, pp. 5381–5393. PMLR, 2020.
+Koo, J., Jang, M., and Ok, J. Towards robust and efficient
+federated low-rank adaptation with heterogeneous clients.
+arXiv preprint arXiv:2410.22815, 2024.
+Kuo, K., Raje, A., Rajesh, K., and Smith, V.
+Feder-
+ated LoRA with sparse communication. arXiv preprint
+arXiv:2406.05233, 2024.
+Lester, B., Al-Rfou, R., and Constant, N. The power of scale
+for parameter-efficient prompt tuning. arXiv preprint
+arXiv:2104.08691, 2021.
+Li, K., Han, S., Su, Q., Li, W., Cai, Z., and Ji, S. Uni-
+lora: One vector is all you need. Advances in Neural
+Information Processing Systems, 38:43816–43841, 2026.
+Li, X. L. and Liang, P. Prefix-tuning: Optimizing continuous
+prompts for generation. arXiv preprint arXiv:2101.00190,
+2021.
+Liu, Y. Roberta: A robustly optimized bert pretraining
+approach. arXiv preprint arXiv:1907.11692, 364, 2019.
+McMahan, B., Moore, E., Ramage, D., Hampson, S., and
+y Arcas, B. A. Communication-efficient learning of deep
+networks from decentralized data. In Artificial intelli-
+gence and statistics, pp. 1273–1282. PMLR, 2017.
+Mihaylov, T., Clark, P., Khot, T., and Sabharwal, A. Can
+a suit of armor conduct electricity?
+a new dataset
+for open book question answering.
+arXiv preprint
+arXiv:1809.02789, 2018.
+Nicolas, J., Maouche, M., Mokhtar, S. B., and Coates, M.
+Dome: Improving signal-to-noise in stochastic gradi-
+ent descent via sharp-direction subspace filtering. arXiv
+preprint arXiv:2507.03545, 2026.
+Raje, A., Askin, B., Jhunjhunwala, D., and Joshi, G. Ravan:
+Multi-head low-rank adaptation for federated fine-tuning.
+Advances in Neural Information Processing Systems, 38:
+48564–48592, 2026.
+Sakaguchi, K., Bras, R. L., Bhagavatula, C., and Choi, Y.
+Winogrande: An adversarial winograd schema challenge
+at scale. Communications of the ACM, 64(9):99–106,
+2021.
+Sap, M., Rashkin, H., Chen, D., LeBras, R., and Choi, Y.
+Socialiqa: Commonsense reasoning about social interac-
+tions. arXiv preprint arXiv:1904.09728, 2019.
+Sarlos, T. Improved approximation algorithms for large
+matrices via random projections. In 2006 47th annual
+IEEE symposium on foundations of computer science
+(FOCS’06), pp. 143–152. IEEE, 2006.
+Shrivastava, M., Isik, B., Li, Q., Koyejo, S., and Banerjee,
+A. Sketching for distributed deep learning: A sharper
+analysis. Advances in Neural Information Processing
+Systems, 37:6417–6447, 2024.
+10
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Shuttleworth, R., Andreas, J., Torralba, A., and Sharma,
+P. LoRA vs full fine-tuning: An illusion of equivalence.
+arXiv preprint arXiv:2410.21228, 2024.
+Sun, Y., Li, Z., Li, Y., and Ding, B. Improving LoRA in
+privacy-preserving federated learning. arXiv preprint
+arXiv:2403.12313, 2024.
+Wang, A. Glue: A multi-task benchmark and analysis plat-
+form for natural language understanding. arXiv preprint
+arXiv:1804.07461, 2018.
+Wang, J., Liu, Q., Liang, H., Joshi, G., and Poor, H. V. Tack-
+ling the objective inconsistency problem in heterogeneous
+federated optimization. Advances in neural information
+processing systems, 33:7611–7623, 2020.
+Wang, J., Liu, Q., Liang, H., Joshi, G., and Poor, H. V. A
+novel framework for the analysis and design of heteroge-
+neous federated learning. IEEE Transactions on Signal
+Processing, 69:5234–5249, 2021.
+Wang, R., Ouyang, Y., and Xu, W. Iterative double sketch-
+ing for faster least-squares optimization. In International
+Conference on Machine Learning, pp. 22935–22963.
+PMLR, 2022.
+Wang, Z., Shen, Z., He, Y., Sun, G., Wang, H., Lyu, L.,
+and Li, A. FLoRA: Federated fine-tuning large language
+models with heterogeneous low-rank adaptations. arXiv
+preprint arXiv:2409.05976, 2024.
+Yang, H., Fang, M., and Liu, J. Achieving linear speedup
+with partial worker participation in non-iid federated
+learning. arXiv preprint arXiv:2101.11203, 2021.
+Yao, Y., Zhang, J., Wu, J., Huang, C., Xia, Y., Yu, T., Zhang,
+R., Kim, S., Rossi, R., Li, A., et al. Federated large
+language models: Current progress and future directions.
+arXiv preprint arXiv:2409.15723, 2024.
+Ye, R., Wang, W., Chai, J., Li, D., Li, Z., Xu, Y., Du, Y.,
+Wang, Y., and Chen, S. Openfedllm: Training large lan-
+guage models on decentralized private data via federated
+learning. In Proceedings of the 30th ACM SIGKDD Con-
+ference on Knowledge Discovery and Data Mining, pp.
+6137–6147, 2024.
+Yi, X., Zhang, S., Yang, T., and Johansson, K. H. Zeroth-
+order algorithms for stochastic distributed nonconvex op-
+timization. Automatica, 142:110353, 2022.
+Yu, H., Yang, S., and Zhu, S. Parallel restarted sgd with
+faster convergence and less communication: Demystify-
+ing why model averaging works for deep learning. In
+Proceedings of the AAAI conference on artificial intelli-
+gence, volume 33, pp. 5693–5700, 2019.
+Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi,
+Y. Hellaswag: Can a machine really finish your sentence?
+arXiv preprint arXiv:1905.07830, 2019.
+Zhang, J., Vahidian, S., Kuo, M., Li, C., Zhang, R., Yu,
+T., Wang, G., and Chen, Y. Towards building the fed-
+eratedgpt: Federated instruction tuning.
+In ICASSP
+2024-2024 IEEE International Conference on Acoustics,
+Speech and Signal Processing (ICASSP), pp. 6915–6919.
+IEEE, 2024.
+Zou, Y., Wang, Z., Shi, Y., and Zhou, Y. Joint rank op-
+timization and bandwidth allocation for heterogeneous
+federated lora fine-tuning. IEEE Transactions on Vehicu-
+lar Technology, 2025.
+11
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Appendix
+A Comparison of Computation, Memory, and Communication
+13
+B
+Justification for Random-k Sketching
+14
+C Justification for the Assumptions in the Convergence Analysis
+15
+D Compatibility of FSLoRA with Secure Aggregation
+16
+E
+Evaluation under Broader Heterogeneity and Increased Number of Clients with Partial Participation
+16
+E.1
+Increasing Resource Heterogeneity and the Number of Clients . . . . . . . . . . . . . . . . . . . . . . .
+17
+E.2
+Further Increasing the Number of Clients
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+E.3
+Varying the Level of Data Heterogeneity . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+F
+Experiments on Qwen2.5-1.5B-Instruct and LLaMA-7B
+18
+G Further Experiments
+19
+G.1
+Further Details on the Ablation Study
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+G.2
+Impact of Local Updates . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+G.3
+Dynamic Sketching Ratios . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+G.4
+Comparison with FFA-LoRA . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+21
+G.5
+Integration of Sketching and Top-k Compression
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+22
+H LoRA structure over training
+23
+I
+Implementation Details
+23
+I.1
+Details on Hyperparameters
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+23
+I.2
+Details on Datasets . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+24
+I.2.1
+GLUE Benchmark . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+24
+I.2.2
+Commonsense Reasoning Benchmark . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+J
+Proof of the Theoretical Results
+26
+J.1
+Preliminaries
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+J.2
+Proof of Lemma 3.2 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+27
+J.3
+Proof of Theorem 4.4 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+28
+J.4
+Proof of Proposition J.5 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+31
+J.5
+Extension to Importance-Based Sketching . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+32
+12
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+A. Comparison of Computation, Memory, and Communication
+Computation and memory. Let P and q denote the memory cost of the full model and the global LoRA module (rank r),
+respectively. The computational cost is expressed with the big O notation. Forward and backward computations, as well as
+activation memory, are omitted as they are identical across all the considered methods. The results are summarized in Tables
+3 and 4, where m and n denote the shape of the base model, ki denotes the LoRA rank for client i, H denotes the number of
+iterations per round, and N is the number of clients. Additionally, the results for the vanilla Federated LoRA, denoted as
+FedLoRA, are reported under the case of homogeneous LoRA ranks, i,e., ki = r.
+Table 3. Client-side computation load and memory usage comparison.
+Method
+Memory
+Computation (per round)
+FedLoRA
+P + q
+O(Hr(m + n))
+HeteroLoRA
+P + ki
+r q
+O(Hki(m + n))
+FlexLoRA
+P + ki
+r q
+O(Hki(m + n))
+FLoRA
+P + max
+nPN
+i=1
+ki
+r q, P
+o
+O
+
+Hki(m + n)) + (PN
+i=1 ki)mn + mn
+
+FSLoRA
+P + ki
+r q
+O(Hki(m + n))
+Table 4. Server-side computation load and memory usage comparison.
+Method
+Memory
+Computation (per round)
+FedLoRA
+Nq
+O(N(m + n)r)
+HeteroLoRA
+PN
+i=1
+ki
+r q
+O(N(m + n)r)
+FlexLoRA
+max
+nPN
+i=1
+ki
+r q, 2P
+o
+O
+
+(PN
+i=1 ki)mn + Nmn + min{m, n}mn
+
+FLoRA
+PN
+i=1
+ki
+r q
+O
+
+(PN
+i=1 ki)(m + n)
+
+FSLoRA
+PN
+i=1
+ki
+r q
+O(N(m + n)r)
+As shown in Tables 3 and 4, FSLoRA matches HetLoRA in both computation and memory cost. FLoRA introduces
+additional client-side overhead due to merging LoRA modules. FlexLoRA incurs extra server-side costs from conducting
+SVD on the full model. In summary, FSLoRA guarantees convergence with minimum overhead.
+Communication. We detailed the communication load for baselines and our methods in Table 5, where q denotes the
+communication cost of a global LoRA module with rank r, ki denotes the local LoRA rank for client i, m and n denote the
+shape of the base model, and N denotes the number of clients.
+Table 5. Communication complexity, assuming float 32 parameters and binary sketching indices.
+FedLoRA
+HeteroLoRA
+FlexLoRA
+FLoRA
+FSLoRA
+Uplink
+q
+ki
+r q
+ki
+r q
+ki
+r q
+ki
+r q
+Downlink
+q
+q
+q
+PN
+i=1
+ki
+r q
+q(1 +
+Nr
+32mn)
+For the uplink, all four heterogeneous LoRA algorithms incur the same communication overhead for transmitting updated
+local LoRA modules, which is lower than that of FedLoRA. For the downlink, FLoRA requires broadcasting the stacked
+LoRA modules, while HeteroLoRA and FlexLoRA broadcast the updated global LoRA modules. FSLoRA, on the other
+hand, broadcasts both the global LoRA modules and additional sketching matrices. The extra communication introduced by
+the sketching matrices is negligible compared to that of the global LoRA modules, as it consists only of binary sketching
+indices (i.e., the diagonal elements of the sketching matrix). For instance, in the case of the LLaMA-3.2-3B-Instruct
+model under our experimental LoRA configuration, the global LoRA modules contain 66,060,288 parameters, equivalent to
+approximately 252 MB when using float32. With a global rank of r = 64, the sketching indices require only 64 bits per
+client, covering all LoRA layers. Even with 100 clients, the total sketching overhead is merely 0.78 KB, which accounts for
+only 0.0003% of the global LoRA modules.
+13
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Resource-Efficient Implementation Details. We uses a sparse full-rank formulation for analysis in Section 3, but the
+implementation can be written equivalently in dense local form with submatrix. Consider
+l(W0 + BSA),
+BSA = r
+k
+X
+j∈I
+Beje⊤
+j A,
+(7)
+where I = {j1, . . . , jk} is the selected index set. Let EI = [ej1, . . . , ejk], ˆB = BEI, and ˆA = E⊤
+I A, then ˆB and ˆA are
+exactly the selected local submatrices in dense form, and
+BSA = r
+k
+ˆB ˆA.
+Hence, updating the sparse full-rank parameters is equivalent to updating the dense local submatrices with loss
+l(W0 + r
+k
+ˆB ˆA).
+(8)
+The forward passes in (8) and (7) are identical, and the gradients on the selected entries are also identical because both
+parameterizations refer to the same variables through indexing. In other words, FSLoRA can be implemented in a dense form
+with submatrix, which does not require clients to maintain identical fixed-rank local LoRA adapters in the implementation.
+B. Justification for Random-k Sketching
+FSLoRA is built upon Random-k diagonal sketching due to two key properties:
+• Submatrix selection. Given a sparse diagonal matrix Si, we have
+BSiA =
+X
+j∈Ii
+sjbja⊤
+j = [bj]j∈Ii diag{sj}j∈Ii[a⊤
+j ]j∈Ii,
+(9)
+where Ii corresponds to the index set of non-zero diagonal entries of Si and bj and a⊤
+j denote the j-th column of module
+B and the j-th row of module A, respectively. In other words, with Random-k sketching, only a subset of B’s columns
+and A’s rows are activated for client i. The sparse diagonal structure effectively reduces local training cost for each client.
+• Unbiasedness for convergence. When Si is a Random-k diagonal matrix with ki nonzero diagonal entries sj =
+r
+ki , we
+have
+E[BSiA] = BA.
+(10)
+This unbiasedness is critical for our convergence analysis.
+Random-k sketching is easy to implement, which ensures uniform expected exposure of all columns and rows of the global
+LoRA modules to each client, closely mirroring the behavior of the standard LoRA. As training progresses, every component
+in the global LoRA is repeatedly sampled and thus sufficiently optimized in expectation. In particular, we theoretically and
+empirically validated its effectiveness in Sections 4 and 5.
+In contrast, identifying a principled metric to quantify the importance of individual LoRA rows or columns remains an open
+problem, even in the centralized LoRA setting. This limitation hinders the reliable development of Top-k or importance-
+based sketching strategies. Existing approaches typically rely on performing an SVD of the composite matrix BA (e.g.,
+BA = UΣV⊤) and defining importance scores for the columns of U and the rows of V⊤. However, this departs from our
+intended setting, as we operate directly in the original B and A parameter space.
+In addition, we empirically compare Random-k sketching with several heuristic importance-based sketching strategies, as a
+rigorous importance metric is currently unavailable. Specifically, we consider two heuristic importance scores for each LoRA
+component bja⊤
+j : (i) the spectral norm ∥bj∥2 · ∥aj∥2 inspired by matrix analysis, and (ii) a simpler magnitude-based metric
+∥bj∥2 + ∥aj∥2. Using these scores, we sample (sketch) ki components from {bja⊤
+j }r
+j=1 with probabilities proportional to
+the corresponding importance scores.
+The results are reported in Table 6. We observe that Random-k sketching consistently outperforms these heuristic importance-
+based alternatives. A potential reason is that these importance measures do not reliably capture the true contribution of
+14
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+individual components. As a result, importance-based sketching may systematically under-sample certain components
+that are critical for optimization but poorly reflected by such heuristics, leading to biased training. On the other hand,
+Random-k sketching provides uniform expected exposure of all rank-one components throughout training, which prevents
+under-training of any individual column or row. While more principled importance-based sketching strategies may further
+improve performance and remain an interesting direction for future work, our current empirical evidence favors Random-k
+sketching.
+Table 6. Accuracy comparison of Random-k sketching and importance-based sketching under the commonsense reasoning benchmark
+with the LLaMA-3.2-3B-Instruct model. The experimental settings are the same as those in Table 2. Random-k sketching achieves better
+performance.
+Importance metric
+ARC-c
+ARC-e
+BoolQ
+HSwag
+OBQA
+PIQA
+SIQA
+Wino
+Avg.
+Spectral Norm: ∥a∥2∥b∥2
+73.4
+86.2
+60.5
+77.9
+75.8
+81.6
+74.6
+73.1
+75.4
+Magnitude Sum: ∥a∥2 + ∥b∥2
+72.1
+86.5
+57.4
+75.3
+73.5
+81.3
+72.6
+69.9
+73.6
+Random-k
+75.8
+86.7
+69.7
+81.4
+80.4
+83.9
+76.2
+78.8
+79.1
+Notably, although our algorithm and analysis are based on Random-k sketching, the framework naturally extends to
+importance-based sketching when a reliable importance metric is available. We theoretically discussed this extension in
+Appendix J.5.
+C. Justification for the Assumptions in the Convergence Analysis
+Smoothness. Assumption 4.1, although global L-smoothness may be difficult to guarantee for the LoRA fine-tuning
+objective, it is reasonable to assume local L-smoothness within the neighborhood explored during fine-tuning. Since LoRA
+updates are typically low-rank and initialized near zero, the optimization trajectory often remains in a local region around
+the pretrained model, where the loss function can be approximated as smooth.
+Variance and Data Heterogeneity. In the context of LLM fine-tuning, both the magnitude of stochastic gradients and
+gradients in LLM fine-tuning are in a mild range since:
+• Transformer-based LLMs use LayerNorm and scaled softmax attention, which stabilize activations and suppress gradient
+spikes.
+• Fine-tuning starts from a well-pretrained model already near a local minimum, leading to smaller gradients.
+• The fine-tuning dataset does not typically contain strong contradictory signals to what the model already knows, resulting
+in a relatively flat loss surface.
+To further support this empirically, we report the statistics of the expected norm of the stochastic gradients E∥∇X˜ℓ(X, ξ; S)∥
+over approximately 4500 samples for 4 representative clients with different sketching ratios. The table below reports the
+minimum and maximum expected norm among 30 randomly sampled model states X = [B; A].
+Table 7. Statistics of the expected norm of stochastic gradients across clients.
+Client ID
+Number of samples
+Rank
+Min
+Max
+1
+4580
+4
+0.1286
+0.9499
+2
+4216
+19
+0.1284
+0.7069
+3
+4873
+9
+0.1237
+0.5774
+4
+5124
+32
+0.1499
+0.8066
+As we can see from Table 7, the expected norm, i.e., Eξ∼Di,S∼Si∥∇X˜ℓ(X, ξ; S)∥, is in a moderate range. Notably, the
+variance is upper-bounded by the expected squared gradient norm:
+Eξ∼Di,S∼Si∥∇X˜ℓ(X, ξ; S) −∇Xf S
+i (X)∥2 ≤Eξ∼Di,S∼Si∥∇X˜ℓ(X, ξ; S)∥2.
+Therefore, it is generally not hard to find a σ and ρ to make Assumption 4.2 hold.
+15
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+On the other hand, we have
+∇Xf S
+i (X)−∇Xf S(X)
+2
+≤2
+∇Xf S
+i (X)
+2 + 2
+∇Xf S(X)
+2
+≤2
+∇Xf S
+i (X)
+2 + 2 1
+N
+N
+X
+i=1
+∇Xf S
+i (X)
+2
+≤2Eξ∼Di,S∼Si∥∇X˜ℓ(X, ξ; S)∥2 + 2 1
+N
+N
+X
+i=1
+Eξ∼Di,S∼Si∥∇X˜ℓ(X, ξ; S)∥2,
+(11)
+where the first inequality follows Cauchy-Schwarz inequality, while the last inequality follows Jensen’s inequality. Thus, the
+deviation can be controlled by the expected gradient norm, which we empirically found to be moderate (see Table 7). Hence,
+it is reasonable to impose an upper bound on
+∇Xf S
+i (X)−∇Xf S(X)
+2 as in Assumption 4.3.
+D. Compatibility of FSLoRA with Secure Aggregation
+The aggregation of FSLoRA is compatible with secure aggregation. Taking the aggregation of module B as an example, we
+illustrate this below.
+In FSLoRA, client updates are sparse matrices with non-zero values only in columns indexed by Ii ⊂[r], size |Ii| = ki.
+With secure aggregation, each client apply additive masking:
+˜Bi = ∆Bi + Ri,
+(12)
+where mask Ri satisfies supp(Ri) ⊆(u, v) : u ∈[m], v ∈Ii and PN
+i=1 Ri = 0. That is, the mask has non-zero entries
+only in the client’s active columns, and all masks together sum to zero to preserve correctness. Such masks can be constructed
+following the classical protocol: for each pair of clients (i, j), define a random matrix
+Mij = −Mji ∈Rm×r,
+supp(Mij) ⊆(u, v) | u ∈[m], v ∈Ii ∩Ij,
+(13)
+and then construct its total mask
+Ri =
+X
+j>i
+Mij −
+X
+j<i
+Mji.
+(14)
+During uploading, client i sends the masked ki non-zero columns of ˜Bi, and then the server adds the corresponding padding
+and averages them as:
+N
+X
+i=1
+˜Bi =
+N
+X
+i=1
+(∆Bi + Ri) =
+N
+X
+i=1
+∆Bi,
+(15)
+which matches the aggregation of module B in (5). The aggregation of module B in FSLoRA is thus compatible with secure
+aggregation.
+We can draw the same conclusion for module A under the same derivation.
+E. Evaluation under Broader Heterogeneity and Increased Number of Clients with Partial
+Participation
+To accommodate a larger number of clients, we extend FSLoRA (Algorithm 1) to support partial client participation.
+Specifically, at each round, the server samples a subset of clients, distributes the current global LoRA modules to them, and
+aggregates only the updates from these clients. The detailed algorithm procedure is summarized in Algorithm 2.
+Our theoretical analysis focuses on the full-participation setting to isolate the effect of the sketching mechanism. Since
+sketching is independent of client sampling, partial participation affects FSLoRA in the same manner as FedAvg. Extending
+the analysis therefore follows standard techniques widely studied in the FL literature (Yang et al., 2021; Wang et al., 2020),
+and we empirically validate FSLoRA in this setting.
+Throughout this section, we fix the partial participation size to M = 10, i.e., 10 clients are sampled in each round.
+16
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Algorithm 2 Federated Sketching LoRA (FSLoRA) with Partial Participation
+Require: Base model W0, LoRA modules B0 and A0, learning rate γ, sketching sets {Si}N
+i=1, client sampling size M
+1: for t = 0, 1, . . . , T −1 do
+2:
+Server samples a participating client set Ct ⊆{1, . . . , N} with |Ct| = M
+3:
+Server samples sketching matrices {St
+i ∼Si}i∈Ct and sends them to participating clients
+4:
+Server broadcasts the current global LoRA modules (Bt, At) to all i ∈Ct
+5:
+for all clients i ∈Ct in parallel do
+6:
+Initialize local LoRA modules: Bt,0
+i
+←Bt, At,0
+i
+←At
+7:
+for h = 0, 1, . . . , H−1 do
+8:
+Client i updates local LoRA modules:
+
+Bt,h+1
+i
+; At,h+1
+i
+
+←
+
+Bt,h
+i ; At,h
+i
+
+−γ
+
+∆Bt,h
+i (St
+i)⊤; (St
+i)⊤∆At,h
+i
+
+9:
+end for
+10:
+Client i uploads the non-zero columns of (Bt,H
+i
+−Bt,0
+i ) and the non-zero rows of (At,H
+i
+−At,0
+i )
+11:
+end for
+12:
+Server updates the global LoRA modules:
+Bt+1; At+1
+←
+Bt; At
++
+1
+M
+P
+i∈Ct
+
+Bt,H
+i
+−Bt,0
+i ; At,H
+i
+−At,0
+i
+
+.
+13: end for
+E.1. Increasing Resource Heterogeneity and the Number of Clients
+We extend our experiments on LLaMA-3.2-3B-Instruct with the commonsense reasoning benchmark to 50 clients. We
+adopt Dirichlet-based partitioning for dataset splits. Specifically, the commonsense reasoning benchmark includes 8 tasks,
+and we partitioned them based on the Dirichlet distribution to construct task heterogeneity among 50 clients. The Dirichlet
+concentration parameter is set to α = 0.1. We simulate client resource heterogeneity via different LoRA rank distributions
+(beyond the limited sketching ratio considered in Section 5). More capable clients are assigned higher ranks, reflecting
+varying compute capacities. We consider two different rank distributions: normal and heavy-tail distributions in the range
+[4, 64].
+Normal distribution: Ranks are sampled from a normal distribution with mean µ = a+b
+2
+and standard deviation σ = b−a
+6 ,
+where a = 4 and b = 64. This models a balanced distribution of client capabilities centered around the middle of the range.
+Heavy-tail distribution: We sample ranks using an inverse log-normal distribution.
+Specifically, we draw xi ∼
+LogNormal(µ, σ) with µ = log
+  a+b
+4
+
+and σ = 1.0, then set ki = 1/xi and apply min-max normalization to scale
+values into the range [a, b]. This results in a heavy-tailed distribution where most clients receive low ranks, reflecting a
+scenario with many low-capability clients and a few high-capability ones.
+Table 8. Accuracy comparison under different client heterogeneity settings. FSLoRA outperforms baseline methods across both normal
+and heavy-tail LoRA rank distributions.
+Rank setup
+Method
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+Normal
+HeteroLoRA
+73.38
+85.82
+62.17
+71.23
+77.40
+80.14
+74.72
+72.53
+74.67
+FlexLoRA
+74.23
+87.84
+68.37
+79.77
+76.00
+82.97
+75.90
+78.13
+77.90
+FLoRA
+68.17
+83.75
+64.93
+75.67
+71.40
+77.20
+71.24
+70.09
+72.81
+FSLoRA
+75.77
+86.95
+69.67
+81.53
+80.60
+84.06
+76.20
+78.85
+79.20
+Heavy-tail
+HeteroLoRA
+72.44
+86.78
+63.60
+73.10
+72.00
+81.34
+71.65
+68.75
+73.71
+FlexLoRA
+73.04
+86.70
+62.23
+75.57
+78.00
+81.12
+74.77
+73.32
+75.59
+FLoRA
+67.92
+81.90
+64.90
+72.77
+74.00
+80.41
+75.28
+70.24
+73.43
+FSLoRA
+75.77
+86.70
+69.67
+81.40
+80.40
+83.90
+76.15
+78.77
+79.10
+As shown in Table 8, FSLoRA outperforms other methods under both heterogeneity settings. As we move from normal to
+heavy-tail, where more clients are low-resource, overall performance decreases for all methods. However, FSLoRA exhibits
+the smallest drop, demonstrating stronger robustness to extreme client heterogeneity.
+In Figure 4, we compare the convergence behavior of FSLoRA and three baseline methods under the aforementioned
+two types of client heterogeneity. Under the normal distribution, FlexLoRA exhibits fast initial progress but falls behind
+FSLoRA in final accuracy, likely due to approximation errors introduced by truncated SVD. This issue is exacerbated in the
+heavy-tail distribution, where low-rank clients dominate and SVD truncation causes greater distortion, further degrading
+FlexLoRA’s performance. Similarly, HeteroLoRA’s reliance on zero-padding reduces optimization efficiency, preventing it
+17
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+0
+50
+100
+150
+200
+Communication Round
+65
+70
+75
+80
+Testing Accuracy (%)
+(a) Normal Distribution
+0
+50
+100
+150
+200
+Communication Round
+65
+70
+75
+80
+(b) Heavy-Tail Distribution
+FSLoRA
+FlexLoRA
+FLoRA
+HeteroLoRA
+Figure 4. Convergence behavior of FSLoRA and baselines on the commonsense reasoning benchmark with the LLaMA-3.2-3B-Instruct
+model. Notably, FSLoRA’s per-round communication cost is at most equal to the baselines (as detailed in Appendix A). Testing accuracy
+is averaged over eight tasks.
+from achieving higher accuracy. FLoRA fails to show steady improvement as communication progresses. One potential
+reason is that frequent model merging and random reinitialization of LoRA modules in each round disrupt the convergence
+continuity. In contrast, FSLoRA demonstrates robust and stable convergence across both scenarios, achieving the highest
+overall accuracy.
+E.2. Further Increasing the Number of Clients
+We further evaluated the performance of FSLoRA by increasing the number of clients to 100. The results are presented in
+Table 9. In this setting, local ranks follow a heavy-tailed distribution as described in the previous subsection, and all other
+experimental configurations remain unchanged. As shown in the table, FSLoRA maintains its advantage in terms of the
+average performance when scaling to more clients.
+Table 9. Accuracy comparison when the number of clients is N = 100. FSLoRA maintains its advantage in terms of the average accuracy.
+Method
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+HeteroLoRA
+71.76
+86.24
+62.57
+68.07
+76.60
+79.38
+74.10
+69.69
+73.55
+FlexLoRA
+73.38
+87.54
+69.03
+75.27
+78.60
+80.47
+74.16
+73.80
+76.53
+FLoRA
+69.97
+83.25
+67.10
+71.67
+73.60
+78.94
+72.21
+70.80
+73.44
+FSLoRA
+74.40
+87.54
+70.13
+79.90
+79.40
+83.57
+76.51
+78.93
+78.80
+E.3. Varying the Level of Data Heterogeneity
+In Table 10, we investigate the impact of the degree of data heterogeneity on performance. We increase the heterogeneity by
+decreasing the Dirichlet concentration parameter from α = 1 to α = 0.1. The local ranks follow the heavy-tail distribution
+described in the previous subsection, and all other experimental configurations remain consistent with Appendix E.1. As
+observed from Table 10, the performance of all methods degrades as heterogeneity increases. FSLoRA consistently achieves
+higher accuracy.
+F. Experiments on Qwen2.5-1.5B-Instruct and LLaMA-7B
+We further extended our evaluation to the Qwen model. Specifically, we fine-tuned Qwen2.5-1.5B-Instruct on the com-
+monsense reasoning benchmark using the same setup as in Table 2. As shown in Table 11, FSLoRA achieves competitive
+performance compared with the heterogeneous LoRA baselines, suggesting its effective across different model architectures.
+18
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 10. Accuracy comparison under different data heterogeneity settings. FSLoRA maintains its advantage over the baselines as the
+data heterogeneity increases. The number of clients is set to 50.
+Data setup
+Method
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+Dir(1)
+HeteroLoRA
+72.18
+86.11
+62.57
+73.10
+77.60
+79.82
+74.26
+69.46
+74.39
+FlexLoRA
+74.06
+87.25
+65.67
+74.90
+78.80
+81.01
+74.16
+74.27
+76.27
+FLoRA
+70.14
+83.29
+67.27
+71.60
+73.60
+78.73
+72.16
+70.96
+73.47
+FSLoRA
+75.85
+87.50
+70.93
+81.47
+81.00
+82.86
+76.66
+78.53
+79.35
+Dir(0.1)
+HeteroLoRA
+72.44
+86.78
+63.60
+73.10
+72.00
+81.34
+71.65
+68.75
+73.71
+FlexLoRA
+73.04
+86.70
+62.23
+75.57
+78.00
+81.12
+74.77
+73.32
+75.59
+FLoRA
+67.92
+81.90
+64.90
+72.77
+74.00
+80.41
+75.28
+70.24
+73.43
+FSLoRA
+75.77
+86.70
+69.67
+81.40
+80.40
+83.90
+76.15
+78.77
+79.10
+Table 11. Performance comparison on the Qwen2.5-1.5B-Instruct commonsense reasoning benchmark. FSLoRA consistently outperforms
+the baselines, demonstrating robust effectiveness across model architectures.
+Method
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+HeteroLoRA
+70.36
+86.53
+65.50
+68.55
+79.01
+74.93
+68.25
+68.04
+72.65
+FlexLoRA
+73.41
+88.07
+63.32
+71.30
+76.44
+78.02
+70.94
+68.56
+73.76
+FLoRA
+70.28
+84.51
+60.90
+68.82
+69.58
+73.45
+67.53
+66.27
+70.17
+FSLoRA
+75.82
+88.16
+65.08
+74.93
+79.82
+80.72
+72.62
+71.29
+76.06
+Although our primary focus is on models suitable for client-side deployment, such as RoBERTa and LLaMA-3.2-3B-Instruct
+models, we also include experiments on the larger LLaMA-7B model to demonstrate the scalability of FSLoRA in more
+complex models. Specifically, we fine-tune the LLaMA-7B model on the Wizard, Dolly-15k, and Alpaca datasets and
+evaluate it on 1444 MMLU samples (available at: https://github.com/ATP-1010/FederatedLLM). For Wizard and Dolly-15k,
+we adopt the same heterogeneous data partitioning as (Wang et al., 2024). Since the Alpaca dataset lacks a clear task or
+domain structure, we apply a uniform random partitioning strategy to distribute the data across clients. We tune the q proj
+and v proj modules and set the local LoRA ranks ki =[64, 32, 16, 16, 8, 8, 4, 4, 4, 4] for 10 clients. The parameter settings
+are aligned with those in (Wang et al., 2024). As shown in Table 12, FSLoRA achieves the highest average performance
+across all three datasets compared to baselines. These results demonstrate FSLoRA’s potential for effective fine-tuning with
+the large-scale LLaMA-7B model under heterogeneous client settings.
+G. Further Experiments
+In this section, we provide additional results, including detailed per-task comparisons from the commonsense reasoning
+benchmark corresponding to Figures 3(a) and 3(b). In addition, we further investigate the impact of the number of
+local updates H on the convergence, the robustness of FSLoRA under dynamic sketching ratio, and the integration of
+communication compression and sketching.
+G.1. Further Details on the Ablation Study
+Impact of sketching: In Figure 5, we compare the performance of FSLoRA with and without sketching on eight tasks from
+the commonsense reasoning benchmark using the LLaMA-3.2-3B-Instruct model. Notably, FSLoRA without sketching is
+equivalent to the vanilla Federated LoRA. For FSLoRA with sketching, we apply a uniform sketching ratio of ki/r = 0.5
+across all distributed clients. The uploading budget for each client is set to 200 times the size of the full global LoRA
+modules at the corresponding rank. It is clear that FSLoRA with sketching consistently outperforms its non-sketched
+counterpart across these eight tasks, demonstrating the effectiveness of sketching in improving performance.
+Impact of the global rank: In Figure 6, we present the impact of the rank of the global LoRA modules on FSLoRA’s
+performance across eight tasks from the commonsense reasoning benchmark. We consider four configurations: 1) r =
+8, ki/r = 1, 2) r = 16, ki/r = 0.5, 3) r = 32, ki/r = 0.25, and 4) r = 64, ki/r = 0.125. The rank of submatrices
+updated by the clients at each iteration remains consistent across all configurations (i.e., ki = 8), ensuring that the
+communication and computational resources on the client side are kept fixed for all cases. In the ARC-Easy task, performance
+decreases as the rank increases to 64, potentially due to overfitting. In general, FSLoRA shows improved performance as the
+rank increases.
+19
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 12. Performance comparison on the LLaMA-7B model across Wizard, Dolly-15k, and Alpaca datasets. FSLoRA achieves the
+highest average performance, validating its scalability to larger and more complex models.
+Method
+Wizard
+Dolly-15k
+Alpaca
+Avg
+HeteroLoRA
+27.15
+26.70
+28.74
+27.53
+FlexLoRA
+28.25
+35.60
+30.40
+31.42
+FLoRA
+27.91
+28.50
+29.54
+28.65
+FSLoRA
+30.33
+40.79
+30.68
+33.93
+2
+4
+8
+16
+64
+Rank (r)
+68
+70
+72
+74
+76
+Testing Accuracy (%)
+(a) ARC-Challenge
+2
+4
+8
+16
+64
+Rank (r)
+85
+86
+87
+88
+(b) ARC-Easy
+2
+4
+8
+16
+64
+Rank (r)
+64
+66
+68
+70
+(c) BoolQ
+2
+4
+8
+16
+64
+Rank (r)
+50
+60
+70
+80
+(d) HellaSwag
+2
+4
+8
+16
+64
+Rank (r)
+74
+76
+78
+80
+Testing Accuracy (%)
+(e) OBQA
+2
+4
+8
+16
+64
+Rank (r)
+80
+82
+84
+(f) PIQA
+2
+4
+8
+16
+64
+Rank (r)
+72
+74
+76
+(g) SIQA
+2
+4
+8
+16
+64
+Rank (r)
+67.5
+70.0
+72.5
+75.0
+77.5
+(h) WinoGrande
+w/o Sketching (Federated LoRA)
+Sketching (FSLoRA)
+Figure 5. Comparison of FSLoRA with and without sketching, with an upload budget 200× the global LoRA module size at each
+rank. This is based on the commonsense reasoning benchmark and the LLaMA-3.2-3B-Instruct model. We observe that the sketching
+mechanism improves performance across all considered tasks. The average accuracy of the eight tasks is shown in Figure 3(a).
+G.2. Impact of Local Updates
+Based on the commonsense reasoning benchmark and the LLaMA-3.2-3B-Instruct model, we evaluated the convergence
+behavior of FSLoRA under varying numbers of local updates (i.e., H). The experimental results are presented in Figure 7.
+In the low-to-moderate regime of local updates (i.e., H ∈10, 20, 100), FSLoRA demonstrates a clear acceleration in
+convergence as H increases. For example, moving from H = 10 to H = 20 substantially reduces the number of
+communication rounds required to reach the same level of testing accuracy, while further increasing H to 100 yields even
+faster progress toward convergence. This observation indicates that a moderate increase in local updates allows clients to
+improve communication efficiency. However, when the number of local updates is pushed beyond this range (e.g., H = 200),
+no additional convergence gain is observed. These findings align well with our theoretical analysis in Section 4, which
+shows that FSLoRA can achieve a convergence speedup under certain conditions on H.
+G.3. Dynamic Sketching Ratios
+While our primary focus is on developing a heterogeneous federated LoRA method under a standard static setup, following
+prior works (Wang et al., 2024; Cho et al., 2024; Bai et al., 2024), the proposed FSLoRA algorithm can be naturally
+extended to dynamic, time-varying resource environments. The modification is straightforward: we allow the sparsity
+levels, corresponding to the sketching ratios of FSLoRA, of the matrices in the sketching set Si in Algorithm 1 to become
+time-varying, while keeping the remaining steps unchanged.
+We empirically validate the effectiveness of FLoRA under this dynamic setting. In the simulation, we group clients into three
+20
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+0
+50
+100
+150
+200
+Communication Round
+65
+70
+75
+Testing Accuracy (%)
+(a) ARC-Challenge
+0
+50
+100
+150
+200
+Communication Round
+82
+84
+86
+88
+(b) ARC-Easy
+0
+50
+100
+150
+200
+Communication Round
+62.5
+65.0
+67.5
+70.0
+(c) BoolQ
+0
+50
+100
+150
+200
+Communication Round
+50
+60
+70
+80
+(d) HellaSwag
+0
+50
+100
+150
+200
+Communication Round
+65
+70
+75
+80
+Testing Accuracy (%)
+(e) OBQA
+0
+50
+100
+150
+200
+Communication Round
+75
+80
+(f) PIQA
+0
+50
+100
+150
+200
+Communication Round
+60
+65
+70
+75
+(g) SIQA
+0
+50
+100
+150
+200
+Communication Round
+50
+60
+70
+80
+(h) WinoGrande
+r = 8, ki/r = 1.000
+r = 16, ki/r = 0.500
+r = 32, ki/r = 0.250
+r = 64, ki/r = 0.125
+Figure 6. Impact of the rank of global LoRA modules on FSLoRA, given a fixed rank for the updated submatrices at the clients. This is
+based on the commonsense reasoning benchmark and the LLaMA-3.2-3B-Instruct model. Overall, FSLoRA demonstrates improved
+performance as the global rank increases. The average accuracy of the eight tasks is shown in Figure 3(b).
+50
+100
+150
+200
+Communication Round
+62
+64
+66
+68
+70
+72
+74
+76
+78
+80
+Testing Accuracy (%)
+H = 10
+H = 20
+H = 100
+H = 200
+Figure 7. Impact of the number of local updates on FSLoRA’s convergence. This is based on the commonsense reasoning benchmark and
+the LLaMA-3.2-3B-Instruct model. In a certain range, i.e., from 10 to 100, FSLoRA achieves a fast convergence as H increases.
+capability levels low, medium, and high, assigned sketching ratio ranges [0.125, 0.25], [0.25, 0.5], and [0.5, 1.0], respectively,
+to balance local training latencies across groups. Within each range, the sketching ratios are allowed to vary dynamically.
+The results, reported in Table 13, show that FSLoRA maintains comparable performance when moving from the static to the
+dynamic case, demonstrating its robustness under time-varying sketching ratios.
+G.4. Comparison with FFA-LoRA
+FFA-LoRA (Sun et al., 2024) freezes the LoRA matrix A and tunes only matrix B, which reduces training cost. However,
+FFA-LoRA requires all clients to use the same LoRA rank as the server, and therefore does not apply to our targeted
+heterogeneous-rank setting, where clients may use different local ranks. Hence, we compare the proposed FSLoRA with
+FFA-LoRA under the homogeneous setting based on Llama-3.2-3B. Since FFA-LoRA requires the client rank to be the
+same as the server rank, while FSLoRA allows different local and global ranks, we carefully configured the local/global
+rank combinations so that FSLoRA, FFA-LoRA, and FedLoRA (i.e., vanilla federated LoRA) have the same number of
+locally trainable parameters for a fair comparison.
+21
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 13. The performance of FSLoRA under static and dynamic sketching ratios. This is based on the commonsense reasoning benchmark
+and the LLaMA-3.2-3B-Instruct model. FSLoRA maintains comparable performance when moving from the static to the dynamic case.
+Ratios
+ARC-c
+ARC-e
+BoolQ
+HSwag
+OBQA
+PIQA
+SIQA
+Wino
+Avg.
+Static
+76.1
+87.1
+70.0
+81.7
+81.4
+82.6
+76.4
+78.9
+79.3
+Dynamic
+75.5
+87.7
+69.2
+81.3
+81.2
+82.2
+76.0
+78.8
+79.0
+Table 14. Comparison with FFA-LoRA under the homogeneous-rank setting on Llama-3.2-3B
+Method
+ARC-c
+ARC-e
+BoolQ
+HellaSwag
+OBQA
+PIQA
+SIQA
+WinoGrande
+Avg.
+FFA-LoRA, k = 8; r = 8
+68.17
+84.47
+64.07
+64.20
+69.20
+78.51
+67.40
+63.30
+69.92
+FedLoRA, k = 4; r = 4
+74.66
+87.33
+67.57
+77.53
+77.26
+81.50
+75.49
+75.93
+77.16
+FSLoRA, k = 4; r = 8
+75.00
+87.75
+68.90
+77.70
+77.60
+82.32
+75.69
+76.16
+77.64
+As shown in Table 14, FSLoRA outperforms FFA-LoRA under the same local budget in the homogeneous setting. The
+potential reason is that freezing one LoRA factor limits the expressive power of the adaptation module. In contrast, FSLoRA
+randomly selects partial rows and columns for training in each round, so that all rows and columns are trained with
+approximately uniform exposure across clients over the course of training.
+G.5. Integration of Sketching and Top-k Compression
+Building on the commonsense reasoning benchmark and the LLaMA-3.2-3B-Instruct model, we further explore the
+integration of two orthogonal techniques, sketching and top-k compression, to further reduce the uplink communication
+overhead of clients in FSLoRA.
+100
+200
+300
+400
+500
+600
+Communication Overhead (MB)
+60
+63
+66
+69
+72
+75
+78
+Testing Accuracy (%)
+top-k & ki/r = 0.125
+top-k & ki/r = 0.250
+top-k & ki/r = 0.500
+top-k & ki/r = 1.000
+Figure 8. Testing accuracy versus communication overhead using float 32 precision. Lower sketching ratios achieve higher accuracy at
+the same communication cost, demonstrating that combining sketching with top-k compression leads to more communication-efficient
+training.
+Specifically, with sketching, each client activates and updates submatrices of the global LoRA weights, [bj]j∈Ii, [a⊤
+j ]j∈Ii,
+which are selected at the beginning of each round:
+BSiA =
+X
+j∈Ii
+r
+ki
+bja⊤
+j = r
+ki
+[bj]j∈Ii[a⊤
+j ]j∈Ii,
+(16)
+where bj and a⊤
+j denote the j-th column of module B and the j-th row of module A, respectively. By limiting updates to
+submatrices [bj]j∈Ii and [a⊤
+j ]j∈Ii, FSLoRA reduces communication and computation. To further reduce communication
+cost, we can apply Top-k compression to the uploading stage. For instance, instead of sending the full ∆[bj]j∈Ii, each
+client transmits the compressed update Topk(∆[bj]j∈Ii). Sketching selects the update submatrix at the beginning of each
+round, while compression further reduces its transmission cost at the uploading stage. These two techniques operate at
+different stages and can jointly improve communication efficiency.
+22
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 15. Stable-rank dynamics of the server-side global LoRA update at layer 15 of Llama-3.2-3B with global rank r = 32.
+L15, q proj
+Rounds
+20
+40
+60
+80
+100
+120
+140
+160
+180
+200
+HeterLoRA
+1.158
+1.115
+1.097
+1.098
+1.102
+1.105
+1.107
+1.112
+1.121
+1.124
+FlexLoRA
+1.348
+1.308
+1.109
+1.030
+1.016
+1.008
+1.009
+1.006
+1.005
+1.002
+FSLoRA
+1.493
+1.694
+1.781
+1.870
+1.958
+2.047
+2.102
+2.124
+2.131
+2.137
+L15, down proj
+Rounds
+20
+40
+60
+80
+100
+120
+140
+160
+180
+200
+HeterLoRA
+1.402
+1.327
+1.423
+1.532
+1.665
+1.790
+1.911
+2.009
+2.105
+2.183
+FlexLoRA
+1.243
+1.167
+1.093
+1.028
+1.012
+1.006
+1.007
+1.006
+1.005
+1.002
+FSLoRA
+1.608
+1.859
+2.032
+2.153
+2.272
+2.421
+2.493
+2.517
+2.531
+2.536
+In our setup, the compression ratio is fixed at 0.5 for all methods, while the sketching ratio ki/r varies over
+{0.125, 0.25, 0.5, 1}. Notably, FSLoRA with sketching ratio ki/r = 1 corresponds to the vanilla Federated LoRA (i.e.,
+without sketching). Figure 8 plots testing accuracy versus communication overhead, where the x-axis represents the amount
+of data uploaded per client (in MB), assuming parameters are stored in float 32 precision. The results clearly show that
+integrating sketching with top-k compression further improves communication efficiency: methods with lower sketching
+ratios consistently achieve higher accuracy under the same communication budget, highlighting the potential of FSLoRA for
+scalable and communication-efficient collaborative LLM fine-tuning.
+H. LoRA structure over training
+To characterize the learned LoRA structure, we compare the stable-rank dynamics of the LoRA adapter under the proposed
+FSLoRA and representative baselines. Specifically, we analyze the stable rank of the server-side global LoRA update on
+Llama-3.2-3B under the same heavy-tail setting as in Table 8. The stable rank is defined as
+srank(∆Wt) = ∥∆Wt∥2
+F
+∥∆Wt∥2
+2
+,
+∆Wt = BtAt.
+(17)
+For representative illustration, we report a middle layer (L15, q proj and down proj) with global rank r = 32.
+As we can see from Table 15, the stable-rank trajectories differ markedly across methods. FlexLoRA quickly collapses
+toward rank 1, while FSLoRA maintains a richer higher-rank adaptation structure throughout training.
+I. Implementation Details
+I.1. Details on Hyperparameters
+Unless stated otherwise, the hyperparameters used in this work are as follows.
+23
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 16. The hyperparameters for RoBERTa & GLUE and LLaMA-3.2-3B-Instruct & commonsense reasoning benchmarks.
+Hyperparameter
+RoBERTa & GLUE
+LLaMA-3.2-3B-Instruct & commonsense reasoning
+Dirichlet parameter
+0.1
+0.1
+Batch size
+16
+16
+LoRA dropout rate
+0.1
+0.1
+Learning rate, γ
+5e-4
+3e-4
+Communication round, T
+200
+200
+Local iteration number, H
+50
+20
+Target module
+[“query”, “value”, “classification head”]
+[“q proj”, “k proj”, “v proj”, “up proj”, “down proj”]
+I.2. Details on Datasets
+I.2.1. GLUE BENCHMARK
+GLUE is a widely recognized benchmark designed to assess the natural language understanding capabilities of language
+models (Wang, 2018).
+• CoLA focuses on whether a given sentence is acceptable according to linguistic rules. It evaluates a model’s ability to
+recognize well-formed sentences.
+▷Input: A single sentence.
+✩Output: A label indicating whether the sentence is acceptable or unacceptable.
+• SST-2 is designed for sentiment classification on movie reviews or short texts. It tests whether a model can correctly
+identify positive or negative sentiment in a given sentence.
+▷Input: A single sentence.
+✩Output: A label indicating positive or negative sentiment.
+• MRPC checks if two sentences are paraphrases of each other, i.e., if they mean the same thing.
+▷Input: Two sentences (‘sentence1’ and ‘sentence2’).
+✩Output: A label indicating either equivalent or not equivalent.
+• QQP tests a model’s ability to determine if two questions ask the same thing.
+▷Input: Two questions.
+✩Output: A label indicating duplicate or not duplicate.
+• MNLI tests whether a given hypothesis is entailed, contradicted, or neutral with respect to a premise.
+▷Input: A premise (first sentence) and a hypothesis (second sentence).
+✩Output: A label indicating entailment, contradiction, or neutral.
+• QNLI aims to determine if a context sentence correctly answers a given question.
+▷Input: A question and a sentence.
+✩Output: A label indicating the sentence answers the question or it does not.
+• RTE provides pairs of sentences to see if one implies the other.
+▷Input: Two sentences (‘sentence1’ and ‘sentence2’)
+✩Output: A label indicating whether the meaning of one sentence is entailed from the other one.
+24
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Table 17. The prompt template of the commonsense reasoning datasets (Hu et al., 2023).
+Dataset
+Input Template
+ARC-c/e
+Please choose the correct answer to the question: [QUESTION]
+Answer1: [ANSWER 1]
+Answer2: [ANSWER 2]
+Answer3: [ANSWER 3]
+Answer4: [ANSWER 4]
+Answer format: answer1/answer2/answer3/answer4
+the correct answer is [ANSWER]
+BoolQ
+Please answer the following question with true or false, question: [QUESTION]
+Answer format: true/false
+the correct answer is [ANSWER]
+HellaSwag
+Please choose the correct ending to complete the given sentence: [ACTIVITY LABEL]: [CONTEXT]
+Ending1: [ENDING 1]
+Ending2: [ENDING 2]
+Ending3: [ENDING 3]
+Ending4: [ENDING 4]
+Answer format: ending1/ending2/ending3/ending4
+the correct answer is [ANSWER]
+OBQA
+Please choose the correct answer to the question: [QUESTION]
+Answer1: [ANSWER 1]
+Answer2: [ANSWER 2]
+Answer3: [ANSWER 3]
+Answer4: [ANSWER 4]
+Answer format: answer1/answer2/answer3/answer4
+the correct answer is [ANSWER]
+PIQA
+Please choose the correct solution to the question: [QUESTION]
+Solution1: [SOLUTION 1]
+Solution2: [SOLUTION 2]
+Answer format: solution1/solution2
+the correct answer is [ANSWER]
+SIQA
+Please choose the correct answer to the question: [QUESTION]
+Answer1: [ANSWER 1]
+Answer2: [ANSWER 2]
+Answer3: [ANSWER 3]
+Answer format: answer1/answer2/answer3
+the correct answer is [ANSWER]
+WinoGrande
+Please choose the correct answer to fill in the blank to complete the given sentence: [SENTENCE]
+Option1: [OPTION 1]
+Option2: [OPTION 2]
+the correct answer is [ANSWER]
+25
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+I.2.2. COMMONSENSE REASONING BENCHMARK
+The training set of the commonsense reasoning benchmark is a mixture of multiple datasets including about 170K training
+samples from ARC-c/e (Clark et al., 2018), BoolQ (Clark et al., 2019), HellaSwag (Zellers et al., 2019), OBQA (Mihaylov
+et al., 2018), PIQA (Bisk et al., 2020), SIQA (Sap et al., 2019), and WinoGrande (Sakaguchi et al., 2021) datasets.
+• ARC-c/e contains the challenge and easy question set from the ARC dataset of genuine grade-school level, multiple-choice
+science questions.
+• BoolQ is a question-answering dataset with yes/no questions derived from natural, real-world scenarios.
+• HellaSwag includes questions for commonsense natural language inference, where a context and multiple endings are
+given, requiring the most coherent ending to be selected.
+• OBQA involves multi-step problem-solving that combines commonsense knowledge, reasoning, and comprehension of
+accompanying textual information.
+• PIQA focuses on questions requiring physical commonsense to solve. Each question offers two answer choices.
+• SIQA targets reasoning about human actions and their social implication.
+• WinoGrande is designed as a binary-choice fill-in-the-blank task, this dataset evaluates the ability to resolve ambiguous
+sentences through commonsense reasoning.
+The input template, i.e., prompt format for these datasets is detailed in Table 17.
+J. Proof of the Theoretical Results
+J.1. Preliminaries
+Before presenting the proof of the main results, we first introduce some preliminary facts that will be used later. Throughout
+this work, ∥· ∥denotes the Frobenius norm when applied to a matrix and the ℓ2 norm when applied to a vector.
+Lemma J.1. Suppose a sequence of independent random matrices {Pi}N
+i=1 satisfy E[Pi] = 0, ∀i. Then,
+E
+
+1
+N
+N
+X
+i=1
+Pi
+
+2
+=
+1
+N 2
+N
+X
+i=1
+E ∥Pi∥2 .
+(18)
+Lemma J.2.
+(Wang et al., 2021,
+Lemma 2) Suppose a sequence of random matrices {Pi}N
+i=1
+satisfy
+E [Pi | Pi−1,Pi−2, . . . , P1] = 0, ∀i. Then,
+E
+
+
+
+N
+X
+i=1
+Pi
+
+2
+=
+N
+X
+i=1
+E
+h
+∥Pi∥2i
+.
+(19)
+Lemma J.3. (Koloskova et al., 2020, Lemma 17) For any a0 ≥0, b ≥0, c ≥0, d > 0, there exist a constant η ≤1
+d such
+that
+a0
+Tη + bη + cη2 ≤2
+a0b
+T
+ 1
+2
++ 2c
+1
+3
+a0
+T
+ 2
+3 + da0
+T .
+(20)
+Lemma J.4 (Random sketching bounds). Let S be a random diagonal sketching matrix of the form
+S = r
+k
+X
+j∈I
+ej e⊤
+j ,
+(21)
+where e1, . . . , er ∈Rr are standard unit basis vectors and I ⊆{1, . . . , r} is chosen uniformly at random with |I| = k.
+Then for any matrix X, we have
+∥X S∥2 ≤r2
+k2 ∥X∥2,
+(22)
+26
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+and in expectation we have
+ES
+h
+∥X S∥2i
+≤r
+k ∥X∥2.
+(23)
+Proof. Since S is diagonal with exactly k diagonal entries equal to r
+k and the rest zero, its largest eigenvalue is r
+k. Squaring
+gives
+S S⊤= S2 ⪯r2
+k2 I,
+(24)
+Equivalently,
+x⊤ S S⊤
+x ≤r2
+k2 ∥x∥2, ∀x.
+(25)
+Setting x = xj to be the j-th column of X and summing over j implies
+∥X S∥2 =
+X
+j
+∥S⊤xj∥2 =
+X
+j
+x⊤
+j (S S⊤) xj ≤r2
+k2
+X
+j
+∥xj∥2 = r2
+k2 ∥X∥2,
+(26)
+which proves (22).
+For the expected bound (23), note that each diagonal index j ∈{1, . . . , r} is included in I with probability k
+r . Hence the
+expectation of S2 satisfies
+ES
+
+S2
+= r2
+k2 E
+hX
+j∈I
+ej e⊤
+j
+i
+= r2
+k2
+k
+r I = r
+k I.
+(27)
+Thus for any vector x,
+ES
+h
+∥S⊤x∥2i
+= ES
+h
+x⊤S S⊤x
+i
+= x⊤
+E[S2]
+
+x = r
+k ∥x∥2.
+(28)
+Summing over columns of X again establishes
+ES
+
+∥X S∥2
+=
+X
+j
+ES
+
+∥S⊤xj∥2
+=
+X
+j
+x⊤
+j
+
+E[S2]
+
+xj = r
+k ∥X∥2.
+(29)
+This completes the proof of Lemma J.4.
+J.2. Proof of Lemma 3.2
+From the chain rule for matrix calculus, we know that:
+∇Yg(XY) = X⊤∇g(XY), ∇Xg(XY) = ∇g(XY)Y⊤,
+(30)
+where ∇g(XY) denotes the gradient of g to XY. Applying this to ℓ(W0 + BSA, ξ), we proceed as follows:
+To compute the gradient with respect to B, set X = B and Y = SA:
+∇Bℓ(W0 + BSA, ξ) = ∇ℓ(W0 + BSA, ξ)(SA)⊤.
+(31)
+Similarly, to compute the gradient with respect to A, set X = BS and Y = A:
+∇Aℓ(W0 + BSA, ξ) = S⊤B⊤∇ℓ(W0 + BSA, ξ).
+(32)
+27
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+J.3. Proof of Theorem 4.4
+The proof of Theorem 4.4 relies on the following proposition.
+Proposition J.5. Under Assumption 4.1, ˜fi(X; S) = fi(BS, A), S ∈Si, f S
+i (X) = ES∼Si[ ˜fi(X; S)], and f S(X) =
+1
+N
+PN
+i=1 f S
+i (X) are smooth with parameters L r2
+k2
+i , L r
+ki , and
+
+1
+N
+PN
+i=1
+r
+ki
+
+L, respectively.
+The proof of Proposition J.5 is deferred to Appendix J.4. With this proposition, we are ready to prove Theorem 4.4.
+In FSLoRA, the update direction in (4) corresponds to the negative stochastic gradient of ℓ(W0 + BSA, ξ) with respect
+to [B; A] for a given sketch St
+i. We have defined ˜ℓ(X, ξ; S) = ℓ(W0 + BSA, ξ). The iterative equation for the proposed
+FSLoRA algorithm thus can be written as
+Xt+1 = Xt −γ 1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇X˜ℓ(Xt,h
+i , ξt,h
+i
+; St
+i),
+(33)
+where gt,h
+i
+denotes the stochastic gradient ∇X˜ℓ(Xt,h
+i , ξt,h
+i
+; St
+i). Based on the smoothness of f S(X), i.e., Proposition J.5,
+we have
+E[f S(Xt+1)] ≤E[f S(Xt)] −E
+*
+∇Xf S(Xt), γ 1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+gt,h
+i
++
+|
+{z
+}
+T1
++γ2 ¯L
+2
+E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+gt,h
+i
+
+2
+|
+{z
+}
+T2
+,
+(34)
+where ¯L =
+
+1
+N
+PN
+i=1
+r
+ki
+
+L.
+For T1, we have
+T1 = −HE
+*
+∇Xf S(Xt), γ
+1
+NH
+N
+X
+i=1
+H−1
+X
+h=0
+gt,h
+i
++
+= −HE
+*
+∇Xf S(Xt), γ
+1
+NH
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
++
+= −γH
+2 E
+∇Xf S(Xt)
+2 −γH
+2 E
+
+1
+NH
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
++ γH
+2 E
+∇Xf S(Xt) −
+1
+NH
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
+≤−γH
+2 E
+∇Xf S(Xt)
+2 −γH
+2 E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
++ γ
+2
+H−1
+X
+h=0
+E
+
+1
+N
+N
+X
+i=1
+∇Xf S
+i (Xt) −1
+N
+N
+X
+i=1
+∇Xf S
+i (Xt,h
+i )
+
+2
+≤−γH
+2 E
+∇Xf S(Xt)
+2 −γ
+2H E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
++ γHL2
+2
+1
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+E
+Xt,h
+i
+−Xt
+2
+,
+(35)
+where the last inequalities follow Jensen’s inequality and Proposition J.5.
+28
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+For T2, we have
+T2 =E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+(gt,h
+i
+∓∇Xf S
+i (Xt,h
+i ))
+
+2
+≤2
+N 2
+N
+X
+i=1
+E
+
+H−1
+X
+h=0
+(gt,h
+i
+−∇Xf S
+i (Xt,h
+i ))
+
+2
++ 2E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
+,
+(36)
+where the inequality follows the fact that E[PH−1
+h=0 (gt,h
+i
+−∇Xf S
+i (Xt,h
+i ))] = 0 and the independence between clients.
+Furthermore, we bound the first term on the right-hand side of the above inequality as
+E
+
+H−1
+X
+h=0
+(gt,h
+i
+−∇Xf S
+i (Xt,h
+i ))
+
+2
+=
+H−1
+X
+h=0
+E
+gt,h
+i
+−∇Xf S
+i (Xt,h
+i )
+
+2
+≤Hσ2 + ρ
+H−1
+X
+h=0
+E
+∇Xf S
+i (Xt,h
+i )
+
+2
+,
+where the equality follows Lemma J.2 and the inequality follows Assumption 4.2. For
+∇Xf S
+i (Xt,h
+i )
+
+2
+, utilizing Assump-
+tion 4.3 and Proposition J.5, we have
+∇Xf S
+i (Xt,h
+i )
+
+2
+=
+∇Xf S
+i (Xt,h
+i ) ∓∇Xf S
+i (Xt) ∓∇Xf S(Xt)
+
+2
+≤3
+∇Xf S
+i (Xt,h
+i ) −∇Xf S
+i (Xt)
+
+2
++ 3
+∇Xf S
+i (Xt) −∇Xf S(Xt)
+2 + 3
+∇Xf S(Xt)
+2
+≤3 r2
+k2
+i
+L2 Xt,h
+i
+−Xt
+2
++ 3(ch + 1)∥∇Xf S(Xt)∥2+3ρδ2
+h.
+(37)
+Combining the above three inequalities gives rise to
+T2 ≤2H
+N (σ2 + 3ρδ2
+h) + 2E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
++ 6ρ(ch + 1)H
+N
+E∥∇Xf S(Xt)∥2
++ 6ρHL2
+N
+T3,
+(38)
+where T3 =
+1
+NH
+PN
+i=1
+r2
+k2
+i
+PH−1
+h=0 E
+Xt,h
+i
+−Xt
+2
+. Combining (34), (35), and (38) yields
+E[f S(Xt+1)] ≤E[f S(Xt)] −(γH
+2
+−3γ2ρ(ch + 1)H
+N
+¯L)E
+∇Xf S(Xt)
+2 + γ2 ¯LH
+N (σ2 + 3ρσ2
+h)
+−( γ
+2H −γ2 ¯L)E
+
+1
+N
+N
+X
+i=1
+H−1
+X
+h=0
+∇Xf S
+i (Xt,h
+i )
+
+2
++ (γHL2
+2
++ 3γ2ρ¯LL2 H
+N )T3,
+(39)
+where ¯L =
+
+1
+N
+PN
+i=1
+r
+ki
+
+L. Let γ ≤min{
+N
+24ρ(ch+1)H ¯L,
+1
+2H ¯L,
+N
+6ρ¯L}, we have
+E[f S(Xt+1)] ≤E[f S(Xt)] −3γH
+8
+E
+∇Xf S(Xt)
+2 + γ2 ¯LH
+N (σ2 + 3ρσ2
+h) + 5γ
+8 HL2T3.
+(40)
+29
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+For T3, we have
+T3 = 1
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+E
+γ
+h−1
+X
+τ=0
+gt,τ
+i
+
+2
+=γ2
+1
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+E
+
+h−1
+X
+τ=0
+(gt,τ
+i
+∓∇Xf S
+i (Xt,τ
+i ))
+
+2
+≤2γ2
+1
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+h−1
+X
+τ=0
+E
+gt,τ
+i
+−∇Xf S
+i (Xt,τ
+i )
+2 + 2γ2
+1
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+h
+h−1
+X
+τ=0
+E
+∇Xf S
+i (Xt,τ
+i )
+2
+≤2γ2Hσ2
+ 
+1
+N
+N
+X
+i=1
+r2
+k2
+i
+!
++ 2ργ2
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+h−1
+X
+τ=0
+E
+∇Xf S
+i (Xt,τ
+i )
+2
++ 2γ2
+NH
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+h
+h−1
+X
+τ=0
+E
+∇Xf S
+i (Xt,τ
+i )
+2
+≤2γ2Hσ2
+ 
+1
+N
+N
+X
+i=1
+r2
+k2
+i
+!
++ 2(ρ + 1)γ2H
+N
+N
+X
+i=1
+r2
+k2
+i
+H−1
+X
+h=0
+E
+∇Xf S
+i (Xt,τ
+i )
+2 .
+(41)
+Plugging inequality (37) into inequality (41) yeilds
+T3 ≤2γ2H
+ 
+1
+N
+N
+X
+i=1
+r2
+k2
+i
+!
+σ2 + 6(ρ + 1)γ2H2
+ 
+1
+N
+N
+X
+i=1
+r2
+k2
+i
+!
+σ2
+h
++ 6(ρ + 1)γ2L2H2T3 + 6(ρ + 1)
+ 
+1
+N
+N
+X
+i=1
+r2
+k2
+i
+!
+(ch + 1)γ2H2E
+∇Xf S(Xt)
+2 .
+(42)
+Denote κ = 1
+N
+PN
+i=1
+r2
+k2
+i , we simplify the above inequality as
+(1 −6(ρ + 1)γ2L2H2)T3 ≤2κγ2H2(σ2
+g + 3(ρ + 1)σ2
+h) + 6κ(ρ + 1)(ch + 1)γ2H2E
+∇Xf S(Xt)
+2 .
+Let γ ≤
+1
+√
+12(ρ+1)HL, we get the bound for T3
+T3 ≤4κγ2H2(σ2 + 3(ρ + 1)σ2
+h) + 12κ(ρ + 1)(ch + 1)γ2H2E
+∇Xf S(Xt)
+2 .
+(43)
+Plugging the bound for T3 into inequality (40) gives rise to
+E[f S(Xt+1)] ≤E[f S(Xt)] −(3γH
+8
+−5γH
+8
+L2  12κ(ρ + 1)(ch + 1)γ2H2)
+
+E
+∇Xf S(Xt)
+2
++ γ2 ¯LH
+N (σ2 + 3ρσ2
+h) + 5γ
+8 HL2 · 4κγ2H2(σ2 + 3(ρ + 1)σ2
+h).
+(44)
+Let γ ≤
+1
+8√
+κ(ρ+1)(ch+1)HL, we obtain
+E[f S(Xt+1)] ≤E[f S(Xt)] −γH
+4 E
+∇Xf S(Xt)
+2 + γ2 ¯LH
+N σ2
+ρ + 5
+2κγ3H3L2σ2
+ρ,
+(45)
+where σ2
+ρ = σ2 + 3(ρ + 1)σ2
+h.
+Telescoping the above inequality from t = 0 to T −1, we have
+1
+T
+T −1
+X
+t=0
+E
+∇Xf S(Xt)
+2 ≤4f S(X0) −f ∗
+γTH
++ γ 4¯L
+N σ2
+ρ + 10γ2H2eLLσ2
+ρ,
+(46)
+30
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+where f ∗denotes the lower bound of f S(X) and eL = κL.
+Applying Lemma J.3 to the above inequality and letting d = H, it follows that there exists a learning rate
+γ ≤min{
+N
+24ρ(ch + 1)H ¯L,
+1
+8
+q
+eLL(ρ + 1)(ch + 1)H
+, 1
+H }
+such that
+1
+T
+T −1
+X
+t=0
+E
+∇Xf S(Xt)
+2 ≤8
+q
+¯LF0σ2ρ
+√
+NTH
++ 10(eLL)
+1
+3
+F0σρ
+T
+ 2
+3
++ 4F0
+T .
+(47)
+This completes the proof of Theorem 4.4.
+J.4. Proof of Proposition J.5
+i) For illustration, we need to recover X to [B; A] in this proof. According to the definition of ˜fi(X; S) and fi(B, A), we
+have
+˜fi(X; S) = ˜fi(B, A; S)
+(48)
+=Eξ∼Di [ℓ(W0 + BSA, ξ)]
+=fi(BS, A).
+(49)
+As fi(B, A) is L-smooth, we have
+fi(BS + ∆BS, A + ∆A) ≤fi(BS, A) +
+∇BSfi(BS, A)
+∇Afi(BS, A)
+
+,
+∆BS
+∆A
+
++ L
+2
+
+∆BS
+∆A
+
+2
+.
+(50)
+According to (48) and (49), we have ˜fi(B+∆B, A+∆A; S) = fi(BS+∆BS, A+∆A) and ˜fi(B, A; S) = fi(BS, A).
+Combining these with (50) gives rise to
+˜fi(B + ∆B, A + ∆A; S) ≤˜fi(B, A; S) +
+∇BSfi(BS, A)
+∇Afi(BS, A)
+
+,
+∆BS
+∆A
+
++ L
+2
+
+∆BS
+∆A
+
+2
+.
+(51)
+We denote
+L(W0 + BSA) = ˜fi(B, A; S) = Eξ∼Di [ℓ(W0 + BSA, ξ)] .
+(52)
+Note that ∇BSfi(BS, A) = ∇L(W0 + BSA)A⊤and ∇Afi(BS, A) = S⊤B⊤∇L(W0 + BSA). We thus have
+∇BSfi(BS; A)
+∇Afi(BS; A)
+
+,
+∆BS
+∆A
+
+=
+ ∇L(W0 + BSA)A⊤
+S⊤B⊤∇L(W0 + BSA)
+
+,
+∆BS
+∆A
+
+=
+∇L(W0 + BSA)A⊤S⊤
+S⊤B⊤∇L(W0 + BSA)
+
+,
+∆B
+∆A
+
+=
+∇B ˜fi(B, A; S)
+∇A ˜fi(B, A; S)
+
+,
+∆B
+∆A
+
+,
+(53)
+where the last equality follows the fact that ˜fi(B, A; S) = L(W0 + BSA) defined in (52) and
+∇B ˜fi(B, A; S)
+∇A ˜fi(B, A; S)
+
+=
+∇L(W0 + BSA)A⊤S⊤
+S⊤B⊤∇L(W0 + BSA)
+
+.
+(54)
+Plugging (53) into (51) gives rise to
+˜fi(B + ∆B, A + ∆A; S) ≤˜fi(B, A; S) +
+
+∇B ˜fi(B, A; S)
+∇A ˜fi(B, A; S)
+
+,
+∆B
+∆A
+
++ L
+2
+
+∆BS
+∆A
+
+2
+.
+(55)
+31
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+In particular,
+
+∆BS
+∆A
+
+2
+= ∥∆BS∥2 + ∥∆A∥2. From (22), we know ∥∆BS∥2 ≤
+r2
+k2
+i ∥∆B∥2. Therefore, we have
+
+∆BS
+∆A
+
+2
+= r2
+k2
+i
+
+∆B
+∆A
+
+2
+. As a result, ˜fi(B, A; S) (i.e., ˜fi(X, S)) is L r2
+k2
+i -smooth.
+ii) Note that f S
+i (X) = ES∼Si[ ˜fi(X, S)]. Therefore, we further take expectation for (55) over S ∼Si, leading to
+f S
+i (B + ∆B, A + ∆A) ≤f S
+i (B, A) +
+∇Bf S
+i (B, A)
+∇Af S
+i (B, A)
+
+,
+∆B
+∆A
+
++ L
+2 ES∼Si
+
+∆BS
+∆A
+
+2
+.
+(56)
+In particular, ES∼Si
+
+∆BS
+∆A
+
+2
+= ES∼Si∥∆BS∥2 + ∥∆A∥2. From (23), we know ES∼Si∥∆BS∥2 ≤
+r
+ki ∥∆B∥2. In
+other words, ES∼Si
+
+
+∆BS
+∆A
+
+2
+≤
+r
+ki
+
+
+∆B
+∆A
+
+2
+. We thus claim that f S
+i (B, A) (i.e., f S
+i (X)) is L r
+ki -smooth.
+iii) Finally, for f S(X) = 1
+N
+PN
+i=1 f S
+i (X), we have
+∇f S(X) = 1
+N
+N
+X
+i=1
+∇f S
+i (X).
+(57)
+Since f S
+i (X) is L r
+ki -smooth, we thus have
+∥∇f S
+i (X) −∇f S
+i (Y)∥≤L r
+ki
+∥X −Y∥,
+∀X, Y.
+(58)
+To find the Lipschitz constant of f S(X), we analyze the difference between the gradients at two points X and Y:
+∥∇f S(X) −∇f S(Y)∥=
+
+1
+N
+N
+X
+i=1
+ ∇f S
+i (X) −∇f S
+i (Y)
+
+
+≤1
+N
+N
+X
+i=1
+∇f S
+i (X) −∇f S
+i (Y)
+
+≤
+ 
+1
+N
+N
+X
+i=1
+r
+ki
+L
+!
+∥X −Y∥.
+(59)
+Therefore, f S(X) is
+
+1
+N
+PN
+i=1
+r
+ki L
+
+-smooth.
+J.5. Extension to Importance-Based Sketching
+In this work, we provide a theoretically grounded framework for heterogeneous LoRA fine-tuning. Although our algorithm
+and analysis are based on Random-k sketching, the framework can be extended to importance-based sketching when reliable
+importance scores for the rows and columns of the global LoRA modules are available.
+Without loss of generality, we assume that each column-row pair (bi, ai) of B and A is associated with a static importance
+weight wi, for i = 1, . . . , r, where w1 ≥w2 ≥· · · ≥wr. This assumption is reasonable because permuting the column-row
+pairs does not change the product BA, as long as the same permutation is applied to both B and A. Consequently, the
+global LoRA modules can always be reordered so that the components are indexed in descending order of importance prior
+to sketching in each training round.
+With the aforementioned importance scores, we sample k indices from {1, . . . , r} without replacement according to the
+weights {
+wi
+Pr
+j=1 wj }r
+i=1, and denote the selected index set by I. The diagonal entries of the sketching matrix S are defined as
+si =
+( 1
+πi ,
+i ∈I,
+0,
+i /∈I,
+where
+πi =
+kwi
+Pr
+j=1 wj
+.
+(60)
+32
+
+
+Federated Sketching LoRA: A Flexible Framework for Heterogeneous Collaborative Fine-Tuning of LLMs
+Here, πi denotes the marginal probability that index i is selected. With this construction, the sketch remains unbiased:
+E[BSA] = B E[S] A = BA.
+The sparsity of the stochastic sketching matrix can be controlled by the choice of k.
+Consequently, the convergence analysis for Random-k sketching extends directly to the importance-based setting, with the
+sketch-dependent quantities modified to reflect the non-uniform sampling probabilities. In particular, Lemma J.4 is updated
+as follows.
+Lemma J.6. Let S be a stochastic diagonal sketching matrix defined in (60). Then for any matrix X, we have
+∥X S∥2 ≤
+ Pr
+j=1 wj
+kwr
+!2
+∥X∥2
+and
+ES
+h
+∥X S∥2i
+≤
+Pr
+j=1 wj
+kwr
+∥X∥2.
+(61)
+Building on Lemma J.6, the smoothness characterization in Proposition J.5 is correspondingly updated as follows.
+Proposition J.7. Let Si denote the set of sketching matrices, where each matrix is defined as in (60) and has ki non-
+zero diagonal entries. Under Assumption 4.1, ˜fi(X; S) = fi(BS, A), f S
+i (X) = ES∼Si[ ˜fi(X; S)], and f S(X) =
+1
+N
+PN
+i=1 f S
+i (X) are smooth with parameters L
+ Pr
+j=1 wj
+kwr
+2
+, L
+Pr
+j=1 wj
+kwr
+, and
+
+1
+N
+PN
+i=1
+Pr
+j=1 wj
+kwr
+
+L, respectively.
+With Proposition J.7, we can obtain a convergence bound analogous to Theorem 4.4, in which the sketching-dependent
+coefficients r
+ki and r2
+k2
+i are replaced by
+Pr
+j=1 wj
+kiwr
+and
+ Pr
+j=1 wj
+kiwr
+2
+, respectively.
+Theorem J.8. Suppose that Assumptions 4.1-4.3 hold, then there exists a learning rate such that the iterates {Xt} generated
+by FSLoRA satisfy
+1
+T
+T −1
+X
+t=0
+E
+∇Xf S(Xt)
+2 ≤8
+q
+¯L′F0σ2ρ
+√
+NTH
++ 10(eL′L)
+1
+3
+F0σρ
+T
+ 2
+3
++ 4F0
+T ,
+(62)
+where σ2
+ρ = σ2 + 3(ρ + 1)σ2
+h, ¯L′ =
+
+1
+N
+PN
+i=1
+Pr
+j=1 wj
+kiwr
+
+L, eL′ =
+
+1
+N
+PN
+i=1
+ Pr
+j=1 wj
+kiwr
+2
+L and F0 = f S(X0) −f ∗
+with f ∗denoting the lower bound of f S(X).
+The proofs of Lemma J.6 and Proposition J.7, and Theorem J.8 follow those of Lemma J.4, Proposition J.5, and Theorem 4.4,
+respectively, with the modified sketching constants incorporated accordingly. This completes the extension to the importance-
+aware sketching.
+33

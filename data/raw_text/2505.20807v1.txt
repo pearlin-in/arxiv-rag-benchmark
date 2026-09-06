@@ -1,0 +1,3263 @@
+arXiv:2505.20807v1  [cs.LG]  27 May 2025
+Simple yet Effective Graph Distillation via Clustering
+Technical Report
+Yurui Lai
+Hong Kong Baptist University
+Hong Kong, China
+csyrlai@comp.hkbu.edu.hk
+Taiyan Zhang
+Shanghaitech University
+Shanghai, China
+zhangty2022@shanghaitech.edu.cn
+Renchi Yang
+Hong Kong Baptist University
+Hong Kong, China
+renchi@hkbu.edu.hk
+Abstract
+Despite plentiful successes achieved by graph representation learn-
+ing in various domains, the training of graph neural networks (GNNs)
+still remains tenaciously challenging due to the tremendous com-
+putational overhead needed for sizable graphs in practice. Recently,
+graph data distillation (GDD), which seeks to distill large graphs
+into compact and informative ones, has emerged as a promising
+technique to enable efficient GNN training. However, most exist-
+ing GDD works rely on heuristics that align model gradients or
+representation distributions on condensed and original graphs, lead-
+ing to compromised result quality, expensive training for distilling
+large graphs, or both. Motivated by this, this paper presents an
+efficient and effective GDD approach, ClustGDD. Under the hood,
+ClustGDD resorts to synthesizing the condensed graph and node
+attributes through fast and theoretically-grounded clustering that
+minimizes the within-cluster sum of squares and maximizes the ho-
+mophily on the original graph. The fundamental idea is inspired
+by our empirical and theoretical findings unveiling the connec-
+tion between clustering and empirical condensation quality using
+Fréchet Inception Distance, a well-known quality metric for syn-
+thetic images. Furthermore, to mitigate the adverse effects caused
+by the homophily-based clustering, ClustGDD refines the nodal at-
+tributes of the condensed graph with a small augmentation learned
+via class-aware graph sampling and consistency loss. Our exten-
+sive experiments exhibit that GNNs trained over condensed graphs
+output by ClustGDD consistently achieve superior or comparable
+performance to state-of-the-art GDD methods in terms of node
+classification on five benchmark datasets, while being orders of
+magnitude faster.
+CCS Concepts
+• Information systems →Clustering; • Computing method-
+ologies →Supervised learning by classification; • Mathematics of
+computing →Graph algorithms.
+Keywords
+graph data distillation, graph neural networks, clustering
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+KDD’25, Toronto,ON, Canada
+© 2025 ACM.
+ACM ISBN 978-1-4503-XXXX-X/18/06
+https://doi.org/XXXXXXX.XXXXXXX
+ACM Reference Format:
+Yurui Lai, Taiyan Zhang, and Renchi Yang. 2025. Simple yet Effective Graph
+Distillation via Clustering: Technical Report. In . ACM, New York, NY, USA,
+17 pages. https://doi.org/XXXXXXX.XXXXXXX
+1
+Introduction
+In the past decade, Graph Neural Networks (GNNs) have emerged
+as a powerful model for learning on graph-structured data and
+found extensive practical applications in various fields, including
+molecular chemistry [22, 46], bioinformatics [11, 42], transportation
+[5, 23], finance [3, 58], recommendation systems [2, 12, 49], etc.
+Despite the remarkable success achieved, training GNN models over
+large-scale graphs with millions of nodes/edges, still remains highly
+challenging due to the expensive message passing operations [17, 60]
+therein, which demand tremendous computational resources and
+incur significant time costs [19, 48].
+In recent years, inspired by the success of dataset distillation [28,
+38] in computer vision, a series of graph data distillation (GDD, a.k.a.,
+graph condensation) [9, 14, 15, 25, 32, 34, 50, 54, 59], techniques have
+been proposed for expediting GNN training. In particular, GDD
+aims to distill a compact yet informative graph G′ from the original
+large graph G as its surrogate to train the GNN models, such that
+the models trained on G′ can achieve comparable performance to
+those on G. In doing so, we can circumvent the significant expense
+required for model training on G and enable efficient inference [13],
+unlearning [29], graph continual learning [33], hyperparameter
+search [6], and broader applicability of GNNs.
+As reviewed in [15, 51], a major category of existing works
+focuses on optimizing heuristic objectives that are not directly
+correlated with the condensation quality, e.g., aligning the model
+gradients [25, 34, 54], distributions of node representations in each
+GNN layer [31], long-term training trajectories [33, 59], eigenbasis
+of graph structures [32], or performance of models (e.g., node clas-
+sification loss) [44, 53] between the original graph G and synthetic
+graph G′. However, such complex optimizations lead to intensive
+computations in the course of condensation, rendering them im-
+practical for the distillation of large graphs that pervade the real
+world. For instance, on the well-known Reddit graph with around
+233 thousand nodes [18], these approaches [25, 34, 59] consume
+hours to generate the condensed graph, while the training of GNNs
+on the entire G merely takes a few minutes. Recently, several at-
+tempts [14, 24, 44] have been made towards enhancing condensa-
+tion efficiency. Jin et al. [24] propose a one-step scheme to curtail
+the steps needed for gradient matching, while Wang et al. [44] trans-
+form the bi-level optimization architecture for GDD as a kernel ridge
+regression (KRR) task so as to avert iteratively training GNNs. More-
+over, Gao et al. [14] introduces a training-free GDD framework
+1
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+that reduces the costly node distribution matching to a tractable
+class partition problem. Unfortunately, these methods trade effec-
+tiveness for higher efficiency, and hence, produce compromised
+condensation quality.
+To overcome the aforementioned deficiencies, this paper presents
+ClustGDD (Clustering-based Graph Data Distillation), an effective
+and efficient solution for GDD via two simple steps: clustering and
+attribute refinement. ClustGDD takes inspiration from our empirical
+observation that Fréchet Inception Distance (FID) [8], a prominent
+metric for measuring the quality of synthetic images created by
+generative models with real images, can also accurately evaluate the
+condensation quality (i.e., node classification performance of GNNs)
+of real graphs without ground-truth node labels. In particular, on a
+condensed graph G′ with a low FID, GNN models trained on G′
+always yield a high prediction accuracy in node classification, as
+illustrated in Fig. 1. Our theoretical analysis further unveils that
+mapping node clusters of G with the minimum within-cluster sum
+of squares (WCSS) of node representations as synthetic nodes can
+generate G′ with a bounded and optimized FID. This motivates us
+to construct condensed graphs with high quality through proper
+clustering of nodes in G.
+Specifically, we first develop a clustering method in ClustGDD
+that seeks to minimize the WCSS of node representations, which
+can be framed as a standard 𝐾-Means task. As such, the key then
+lies in the construction of node representations, such that nodes in
+G with the same ground-truth class labels are close, whereas those
+in distinct classes are distant. Doing so facilitates not only the min-
+imization of the WCSS via 𝐾-Means clustering for a lower FID, but
+also the accurate classification of the corresponding nodes. Using
+the homophily assumption [61] for graphs, ClustGDD generates the
+above-mentioned node embeddings for clustering by optimizing
+the graph Laplacian smoothing (GLS) [7] and training a linear layer
+with label supervision. Based thereon, condensed graph topology,
+synthetic node attributes, and labels, can be easily derived. On top of
+that, in order to mitigate the heterophilic over-smoothing issue caused
+by this homophily-based clustering, ClustGDD additionally includes
+a lightweight module CAAR (Class-Aware Attribute Refinement).
+More concretely, CAAR refines the synthetic node attributes by in-
+jecting class-relevant features learned on class-specific graphs from
+G′ using our carefully-designed sampling technique. Such a small
+augmentation enlarges the attribute distance of heterophilic nodes
+(i.e., nodes with distinct class labels), thereby effectively alleviating
+the over-smoothing problem in node representations.
+In summary, our contributions in this paper are as follows:
+• We are the first to extend the FID for image data to assess the GDD
+quality and validate its empirical effectiveness. We establish the
+theoretical connection between clustering and FID optimization,
+which inspires the design of effective GDD.
+• Methodologically, we propose ClustGDD, an effective and effi-
+cient GDD solution that leverages a simple clustering approach
+aiming at optimizing the WCSS and homophily for graph synthe-
+sis, followed by a module CAAR focusing on a slight refinement
+of the synthetic node attributes.
+• Empirically, we conduct extensive experiments on multiple bench-
+mark datasets to demonstrate the superior condensation effec-
+tiveness and efficiency of ClustGDD over existing GDD methods.
+2
+Preliminaries
+2.1
+Symbols and Terminology
+Let G = (V, E, 𝑿) be an attributed graph, where V is a set of
+𝑁= |V| nodes, E is a set of 𝑀= |E| edges, and 𝑿∈R𝑁×𝑑
+symbolizes the node attribute matrix. For each edge 𝑒𝑖,𝑗∈E, we
+say 𝑣𝑖and 𝑣𝑗are neighbors to each other and use N (𝑣𝑖) to denote
+the set of neighbors of 𝑣𝑖, whose degree is 𝑑(𝑣𝑖) = |N (𝑣𝑖)|. Each
+node 𝑣𝑖∈V is associated with a 𝑑-dimensional attribute vector 𝑿𝑖.
+The adjacency matrix of G is denoted as 𝑨∈{0, 1}𝑁×𝑁, wherein
+𝑨𝑖,𝑗= 𝑨𝑗,𝑖= 1 if (𝑣𝑖, 𝑣𝑗) ∈E, and 0 otherwise. The degree matrix
+of G is represented by 𝑫, whose 𝑖-th diagonal entry 𝑫𝑖,𝑖:= 𝑑(𝑣𝑖).
+Accordingly, the normalized adjacency matrix of G is represented
+by ˜𝑨= 𝑫−1/2𝑨𝑫−1/2 and 𝑰−˜𝑨is known as its graph Laplacian.
+We use tr(·) to denote the trace of a matrix.
+Homophily Ratio. Given a set of 𝐾classes Y (𝐾:= |Y|) and the
+class label 𝑦𝑖∈Y for each node 𝑣𝑖∈V, the homophily ratio [61]
+of G is calculated by Ω(G) = |{(𝑣𝑖,𝑣𝑗)∈E:𝑦𝑖=𝑦𝑗}|
+𝑚
+, which quantifies
+the fraction of homophilic edges that connect nodes of the same
+classes [61]. The label matrix of G is denoted as 𝒀∈{0, 1}𝑁×𝐾,
+wherein 𝒀𝑖,𝑗= 1 if 𝑦𝑖= 𝑗and 0 otherwise.
+Fréchet Inception Distance. Fréchet Inception Distance (FID) [8]
+is originally used to measure the discrepancy between two multi-
+variate normal distributions and is later adopted as the standard
+metric for assessing the quality of synthetic images from genera-
+tive models [20]. Let 𝝁org and 𝝁syn be the mean of the Inception
+embeddings of real and synthetic images, respectively, and 𝚺org,
+𝚺syn be their respective covariances between features. The FID is
+expressed in closed form as
+FID = ∥𝝁org −𝝁syn∥2
+2 + tr
+
+𝚺org + 𝚺syn −2(𝚺org𝚺syn)
+1
+2
+
+,
+(1)
+where the first term calculates the average distance between two
+embedding spaces to represent the overall distribution shift, while
+the second term involves the trace of the covariance matrices and
+the geometric mean of the covariance matrices, measuring the
+difference in the shape and spread of the feature distributions of
+original and synthetic graphs. A lower FID value indicates better
+synthetic quality, and the generative model is perfect when Φ = 0.
+Graph Laplacian Smoothing. Given graph G, graph Laplacian
+smoothing (GLS) [7] is to optimize 𝒁such that
+min
+𝒁
+(1 −𝛼) · ∥𝒁−𝑿∥2
+𝐹+ 𝛼
+∑︁
+(𝑣𝑖,𝑣𝑗) ∈E
+
+𝒁𝑖
+√︁
+𝑑(𝑣𝑖)
+−
+𝒁𝑗
+√︁
+𝑑(𝑣𝑗)
+
+2
+𝐹
+.
+(2)
+Therein, the fitting term ∥𝒁−𝑿∥2
+𝐹in Eq. (2) seeks to make the node
+features 𝒁close to the initial attributes 𝑿, while the graph Laplacian
+regularization term Í
+(𝑣𝑖,𝑣𝑗)∈E
+
+𝒁𝑖
+√
+𝑑(𝑣𝑖) −
+𝒁𝑗
+√
+𝑑(𝑣𝑗)
+
+2
+𝐹
+forces feature
+vectors of two adjacent nodes in G to be similar. The hyperparame-
+ter 𝛼∈[0, 1] controls the smoothness of 𝒁over G. As revealed in
+recent studies [37, 62], after removing non-linear operations and lin-
+ear transformations, graph convolutional operations in most GNN
+models [4, 16, 26, 52] essentially are to optimize the GLS objective
+in Eq. (2).
+2
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Figure 1: Classification accuracy v.s. FID under various condensation ratios.
+2.2
+Graph Data Distillation (GDD)
+Given an input graph G = (V, E, 𝑿), GDD is to distill from G a
+condensed graph G′ with a set 𝑽′ = {𝑢1,𝑢2, . . . ,𝑢𝑛} of 𝑛(𝑛≪
+𝑁) nodes, a set E′ of 𝑚(𝑚≪𝑀) edges, and synthetic attribute
+vectors 𝑿′ ∈R𝑛×𝑑for 𝑛nodes, and the adjacent matrix 𝑨′ ∈
+{0, 1}𝑛×𝑛. Each node 𝑢𝑖∈G′ is associated with a synthetic class
+label 𝑦𝑖∈Y and the label matrix of G′ is symbolized by 𝒀′ ∈
+R𝑛×𝐾. In the meantime, GNNs trained on the condensed graph G′
+should achieve comparable performance to those on the original
+graph G. Let L(·, ·) be an inaccuracy metric for node classification
+tasks. In mathematical terms, the optimization goal of GDD can be
+formulated as follows [34]:
+min
+L(GNN𝚯G′ (𝑨, 𝑿), 𝒀)
+𝑠.𝑡.
+𝚯G′ = arg min
+𝚯
+L(GNN𝚯(𝑨′, 𝑿′), 𝒀′),
+where GNN𝚯(·) denotes a GNN model parameterized with 𝚯and
+𝚯G′ are the model parameters obtained via training the GNN over
+the condensed graph G′. To get detailed information of representa-
+tive types of GDD, please check Appendix A.
+3
+Condensation Quality Analysis
+In this section, we first extend FID to assess the quality of condensed
+graphs by GDD methods and validate its empirical effectiveness
+on real datasets. Next, we conduct a theoretical analysis of FID to
+pinpoint a design principle for effective GDD.
+3.1
+FID as Condensation Quality Metric
+Given the original graph G and the condensed graph G′, we propose
+to evaluate the condensation quality of G′ via the FID of node
+representations 𝑯and 𝑯′ learned by GNNs (e.g., GCN) over G and
+G′. Specifically, we define
+𝝁org = 1
+𝑁
+∑︁
+𝑣𝑖∈G
+𝑯𝑖and 𝝁syn = 1
+𝑛
+∑︁
+𝑢𝑖∈G′
+𝑯′
+𝑖.
+(3)
+Let ˆ𝑯and ˆ𝑯′ represent the centered versions of 𝑯and 𝑯′, respec-
+tively. The covariance matrices 𝚺org and 𝚺syn of 𝑯and 𝑯′ then
+can be formulated as
+𝚺org = 1
+𝑁
+ˆ𝑯⊤ˆ𝑯and 𝚺syn = 1
+𝑛
+ˆ𝑯′⊤ˆ𝑯′.
+(4)
+The FID of 𝑯and 𝑯′ can thus be computed as per Eq. (1).
+Accordingly, the first term ∥𝝁org −𝝁syn∥2
+2 in the FID quantifies
+the dissimilarity of these two node representations, reflecting how
+much on average the condensed graph G′ resembles G and captures
+the key structural and attribute characteristics therein. On the other
+hand, recall that a larger covariance value in 𝚺org or 𝚺syn indicates
+a wider spread of feature values, while off-diagonal elements repre-
+sent correlations between different feature dimensions. The second
+term Tr
+
+𝚺org + 𝚺syn −2(𝚺org𝚺syn)
+1
+2
+
+is thus the difference in the
+spread of individual feature dimensions of 𝑯and 𝑯′ and correla-
+tions between them, measuring how different the “shape” of the
+feature distributions underlying G and G′ are. Intuitively, a lower
+FID connotes a closer match between these two data distributions,
+and hence, a higher condensation quality of 𝑯′.
+Empirical Study. To verify the empirical effectiveness of FID in
+measuring the condensation quality, we experimentally evaluate
+the GNN performance on the condensed graphs G′ obtained via var-
+ious GDD approaches over real graph datasets in downstream tasks
+(i.e., node classification) and their corresponding FID values.1 Fig. 1
+plots the classification accuracies and FID scores of the Random [47],
+Kcenter [41], and Herding [47] coreset methods, as well as GDD
+approaches including GCond [25], SFGC [59], CSCR [34], GDEM [32],
+and our proposed ClustGDD on Citeseer, Cora, arXiv, and Flickr.
+Each method is represented by three bubbles, which correspond to
+their results under three different condensation ratios commonly
+used in previous works [25]. It can be observed from Fig. 1 that in
+almost all cases, a method with a low FID will yield high accuracy
+in the downstream node classification tasks, implying a linear corre-
+lation between the FID of G′ and the GNN model performance over
+it. In turn, FID can serve as a precise quality metric for condensed
+graphs practically, even without ground-truth labels.
+3.2
+Theoretical Inspiration
+Ideally, a high-quality condensed graph G′ should minimize the
+first term ∥𝝁org −𝝁syn∥2
+2 in the FID, meaning that
+∑︁
+𝑢𝑖∈G′
+𝑯′
+𝑖≈
+∑︁
+𝑣𝑖∈G
+𝑛
+𝑁· 𝑯𝑖.
+Intuitively, the minimization can be attained when the representa-
+tion 𝑯′
+𝑖of each node 𝑢𝑖∈G′ is a weighted summation of the repre-
+sentations of a subset 𝐶𝑖of nodes in G, i.e., 𝑯′
+𝑖= Í
+𝑣𝑗∈𝐶𝑖𝑤𝑗· 𝑯𝑗,
+such that ∪𝑛
+𝑖=1𝐶𝑖= V and 𝐶𝑖∩𝐶𝑗= ∅∀𝑖≠𝑗, 1 ≤𝑖, 𝑗≤𝑛. As such,
+each node 𝑢𝑖in G′ is a supernode merged from the nodes inside a
+cluster 𝐶𝑖. Along this line, a simple and straightforward approach
+to constructing the condensed graph G′ is to partition the input
+graph G into 𝑛disjoint clusters {𝐶1, . . . ,𝐶𝑛}.
+Theorem 3.1. ∥𝝁org −𝝁syn∥2
+2 ≤
+1
+𝑁2
+Í𝑛
+𝑖=1
+
+𝑁
+𝑛−|𝐶𝑖|
+2
+.
+1In practice, we normalize the representations to control the range of FID values.
+3
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+𝐶1
+𝐶2
+𝐶3
+𝐶4
+𝑢1
+𝑢2
+𝑢3
+𝑢4
+𝒢
+𝒢′
+Figure 2: Example of a balanced clustering of G.
+When we let 𝑢𝑖’s representation be the averaged embeddings of
+the nodes inside cluster 𝐶𝑖, i.e., 𝑯′
+𝑖= Í
+𝑣𝑗∈𝐶𝑖
+𝑯𝑗
+|𝐶𝑖| , our Theorem 3.1
+reveals that the first term ∥𝝁org −𝝁syn∥2
+2 in the FID can be bounded
+by
+1
+𝑁2
+Í𝑛
+𝑖=1
+
+𝑁
+𝑛−|𝐶𝑖|
+2
+. Since Í𝑛
+𝑖=1 |𝐶𝑖| = 𝑁, the mean cluster size
+is thus 𝑁
+𝑛. This upper bound is essentially the variance of the sizes
+of 𝑛clusters {𝐶1, . . . ,𝐶𝑛} scaled by 1
+𝑁. In particular, ∥𝝁org −𝝁syn∥2
+2
+is minimized, i.e., ∥𝝁org −𝝁syn∥2
+2 ≈0, when the size of every cluster
+𝐶𝑖is approximately 𝑁
+𝑛.
+Theorem 3.2. Let 𝑐max = max
+1≤𝑖≤𝑛|𝐶𝑖| and 𝑐min = min
+1≤𝑖≤𝑛|𝐶𝑖|. Then,
+Tr
+
+𝚺org + 𝚺syn −2(𝚺org𝚺syn)
+1
+2
+
+≤1
+𝑁
+Í𝑛
+𝑖=1
+Í
+𝑣𝑗∈𝐶𝑖∥𝑯𝑗−𝑯′
+𝑖∥2
+2 +
+𝑛𝑐max
+𝑁
+· ∥𝝁org −𝝁syn∥2
+2 +
+𝑐max
+𝑐min +
+𝑁
+𝑛𝑐min
+
+· Tr(𝚺org) holds.
+As for the second term Tr
+
+𝚺org + 𝚺syn −2(𝚺org𝚺syn)
+1
+2
+
+in the
+FID, Theorem 3.2 states that its upper bound is positively correlated
+with 1
+𝑁
+Í𝑛
+𝑖=1
+Í
+𝑣𝑗∈𝐶𝑖∥𝑯𝑗−𝑯′
+𝑖∥2
+2, the first term in FID (i.e., ∥𝝁org −
+𝝁syn∥2
+2), and Tr(𝚺org). Notice that ∥𝝁org −𝝁syn∥2
+2 can be bounded
+by Theorem 3.1, and Tr(𝚺org) is solely determined by the input
+graph G, and hence, can be regarded as a constant. Therefore, we
+can reduce the second term Tr
+
+𝚺org + 𝚺syn −2(𝚺org𝚺syn)
+1
+2
+
+and
+further the FID, by minimizing 1
+𝑁
+Í𝑛
+𝑖=1
+Í
+𝑣𝑗∈𝐶𝑖∥𝑯𝑗−𝑯′
+𝑖∥2
+2, which
+is essentially the WCSS, i.e., the variance of feature representations
+within each cluster.
+In a nutshell, the foregoing analyses suggest a promising way
+to construct the condensed graph G′ with a bounded and low FID
+through partitioning the original node set V of G into clusters,
+particularly with balanced sizes and small WCSS, as the 𝑛synthetic
+nodes in G′. For the proofs of the theorems, please refer to the
+Appendix E for details.
+4
+Methodology
+In this section, we present ClustGDD for distilling G as G′. We
+first elaborate on our clustering method for creating the condensed
+graph structure 𝑨′, synthetic attribute matrix 𝑿′, and node la-
+bels 𝒀′ in Section 4.1. In Section 4.2, we further pinpoint the de-
+fects of 𝑿′ generated by the clustering and delineate a class-aware
+scheme CAAR for refining 𝑿′. To facilitate a better comprehension
+of ClustGDD, we present its overall framework in Fig. 3.
+.
+𝑿
+𝑨
+GLS
+Pre-Training
+𝒁
+.
+.
+𝑯
+Clustering
+.
+෩𝑪
+𝒀
+.
+𝑿′
+𝑨′
+𝑨′{𝒚}
+𝓛𝒐𝒓𝐠
+𝒁′{𝒚}
+Refinement-
+Training 
+𝑾′
+𝓛𝒐𝒓𝒈+ 𝛾𝓛𝒔𝒚𝒏+ 𝛽𝓛𝒄𝒔𝒕
+𝒀′
+𝒀′
+𝒀
+Constructing
+𝓖′, 𝑨′{𝒚}
+GLS
+Clustering-based Condensation
+Class-Aware Attribute Refinement
+Input: 𝓖
+𝚫
+Downstream
+Tasks
+Output: 𝓖′
+𝑾
+Figure 3: An overview of ClustGDD.
+4.1
+Clustering-based Condensation
+Let {𝐶1, . . . ,𝐶𝑛} be a partition of 𝑛clusters of G and each synthetic
+node 𝑣𝑖in G′ be merged from the cluster 𝐶𝑖, i.e.,
+𝑯′
+𝑖=
+∑︁
+𝑣𝑗∈𝐶𝑖
+𝑯𝑗
+|𝐶𝑖|
+(5)
+According to our analysis in Section 3.2, a low FID between G and
+G′ can be obtained with clusters {𝐶1, . . . ,𝐶𝑛} that optimize
+min
+𝐶1,𝐶2,...,𝐶𝑛
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2
+(6)
+and meanwhile minimize the cluster size variance Í𝑛
+𝑖=1
+
+𝑁
+𝑛−|𝐶𝑖|
+2
+.
+However, the latter optimization objective is likely to group nodes
+with various class labels into𝐶𝑖(i.e., the synthetic node𝑢𝑖) when the
+ground-truth classes in G are imbalanced, which is often the case
+in practice. As exemplified in Fig. 2, this will render some synthetic
+nodes with distinct synthetic class labels in G′ overly distant (e.g.,
+𝑢2 and 𝑢4) or close (e.g., 𝑢3 and 𝑢4), and thus, result in degraded
+condensation quality. Instead, an ideal cluster𝐶𝑖(i.e., synthetic node
+𝑢𝑖) should comprise original nodes associated with the same ground-
+truth label, which requires the representations of nodes within 𝐶𝑖
+or the same ground-truth class to be highly similar. By generating
+such node representations, each term Í
+𝑣𝑗∈𝐶𝑖∥𝑯𝑗−𝑯′
+𝑖∥2
+2 in our
+objective in Eq.(6) can be implicitly minimized.
+Clustering via Optimizing the WCSS and Homophily. Given
+node representations 𝑯of G, the minimization of the WCSS in
+Eq.(6) can be efficiently solved using 𝐾-Means algorithm [35]. Next,
+we elucidate the construction of 𝑯and how we can enforce nodes
+with the same class labels to be close in 𝑯.
+Lemma 4.1. The closed-form solution to the GLS optimization
+problem in Eq. (2) is Í∞
+𝑡=0 (1 −𝛼)𝛼𝑡˜𝑨𝑡𝑿.
+As pinpointed in Section 2.1, the representation learning in most
+GNNs can be unified into a framework optimizing the GLS problem
+in Eq. (2) or its variants. As per the result in Lemma 4.1, we then
+construct 𝑯by Eq. (7) as 𝒁is the closed-form solution to Eq. (2)
+when 𝑇→∞.
+𝑯= 𝒁𝑾where 𝒁=
+𝑇
+∑︁
+𝑡=0
+(1 −𝛼)𝛼𝑡˜𝑨𝑡𝑿.
+(7)
+4
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Particularly, the weights 𝑾∈R𝑑×𝐾are learned by minimizing the
+following cross-entropy loss:
+L𝑜𝑟𝑔= −1
+𝑁
+𝑁
+∑︁
+𝑖=1
+𝐾
+∑︁
+𝑦=1
+𝒀𝑖,𝑦· log(𝑷𝑖,𝑦)
+(8)
+with the label predictions 𝑷∈R𝑁×𝐾transformed from 𝑯via
+𝑷= Softmax(𝑯),
+(9)
+and ground-truth labels for the training set in a supervised fashion
+Lemma 4.2. Ω(G) = 1−
+1
+2𝑀· Í
+(𝑣𝑖,𝑣𝑗)∈E
+
+(𝑫1/2𝒀)𝑖
+√𝑑𝑖
+−(𝑫1/2𝒀)𝑗
+√
+𝑑𝑗
+
+2
+2
+.
+If we regard 𝑯as the label predictions, our Lemma 4.2 im-
+plies that the second term Í
+(𝑣𝑖,𝑣𝑗)∈E
+
+𝑯𝑖
+√
+𝑑(𝑣𝑖) −
+𝑯𝑗
+√
+𝑑(𝑣𝑗)
+
+2
+𝐹
+in GLS
+(Eq. (2)) is essentially equivalent to maximizing the homophily
+ratio of the predicted labels over the input graph G, whose true
+homophily ratio is usually assumed to be high in practice, i.e., ad-
+jacent nodes are very likely to share the same class labels. Based
+on this homophily assumption, our way of computing 𝑯in Eq. (7)
+tends to render the representations of nodes with the same class
+labels close to each other and easier to be grouped into the same
+clusters by the 𝐾-Means, thereby minimizing the WCSS in Eq. (6).
+Constructing 𝑿′, 𝑨′, and 𝒀′. Denote by 𝑪∈{0, 1}𝑁×𝑛the node-
+cluster membership matrix, where 𝑪𝑗,𝑖= 1 if node 𝑣𝑗∈𝐶𝑖and
+0 otherwise. Accordingly, we can form a sketching matrix ˜𝑪by
+normalizing 𝑪: ˜𝑪= 𝑪diag(1𝑪)−1, where ˜𝑪𝑗,𝑖=
+1
+|𝐶𝑖| if node 𝑣𝑗∈𝐶𝑖
+and 0 otherwise. By Eq. (5), 𝑯′ = ˜𝑪⊤𝑯.
+Intuitively, 𝑯′ should be built from the condensed adjacency
+matrix 𝑨′ and attribute matrix 𝑿′ using Eq. (7). Along this line, we
+can formulate the following objective function:
+min
+𝑨′,𝑿′
+
+˜𝑪⊤𝑯−
+𝑇′
+∑︁
+𝑡=0
+(1 −𝛼′)𝛼′𝑡𝑨′𝑡𝑿′𝑾′
+
+2
+𝐹
+,
+(10)
+where hyperparameters 𝑇′, 𝛼′, and weights 𝑾′ can be configured
+or learned accordingly in the GNN model trained on G′. Due to the
+scale and complexity of the input graph structures, synthesizing the
+𝑨′ such that Í𝑇′
+𝑡=0 (1 −𝛼′)𝛼′𝑡𝑨′𝑡is close to ˜𝑪Í𝑇
+𝑡=0 (1 −𝛼)𝛼𝑡˜𝑨𝑡is
+highly challenging and usually engenders substantial structural
+information loss. As a workaround, we turn to incorporate most
+features in 𝑯into 𝑿′ as follows:
+𝑿′ = ˜𝑪⊤𝒁
+(11)
+and compress ˜𝑨as 𝑨′ using 𝑨′ = ˜𝑪⊤˜𝑨˜𝑪. Additionally, the syn-
+thetic label for each node 𝑢𝑖∈G′ is constructed by
+𝒀′
+𝑖,𝑗=
+
+
+1,
+if 𝑗= arg max
+1≤ℓ∈𝐾
+𝑯′
+𝑖,ℓ;
+0,
+otherwise.
+4.2
+Class-Aware Attribute Refinement (CAAR)
+Heterophilic Over-smoothing Issue. Although the clustering
+approach in the preceding section can produce high-quality con-
+densed graphs, it strongly relies on the homophily assumption.
+Table 1: The homophilic ratio Ω(G) and ICAD of 𝑿, 𝑿′, and
+𝑿′ + 𝛽· 𝚫on real-world graph datasets.
+Dataset
+Cora
+Citeseer
+arXiv
+Reddit
+Ω(G)
+0.81
+0.74
+0.66
+0.78
+𝜙(𝑿, 𝒀)
+0.95
+0.96
+0.99
+0.99
+𝜙(𝑿′, 𝒀′)
+0.56
+0.51
+0.97
+0.82
+𝜙(𝑿′ + 𝛽· 𝚫, 𝒀′)
+0.77
+0.56
+1.00
+0.96
+𝑿
+𝒁
+𝑿′
+𝑣1
+𝑣2
+𝑣3
+𝑣4
+𝑣5
+𝑣6
+𝑣7
+𝑣8
+𝑣1
+𝑣2
+𝑣3
+𝑣4
+𝑣5
+𝑣6
+𝑣7
+𝑣8
+𝑢1
+𝑢2
+𝐶1
+𝐶2
+Figure 4: Example of the heterophilic over-smoothing issue
+However, according to the homophily ratios of real graphs in Ta-
+ble 1, even in homophilic graphs, we can observe a small moiety
+of heterophilic links, i.e., adjacent nodes with distinct ground-truth
+labels. Recall that 𝒁in 𝑿′ computed via Eq. (11) is to minimize
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+
+𝒁𝑖
+√
+𝑑(𝑣𝑖) −
+𝒁𝑗
+√
+𝑑(𝑣𝑗)
+
+2
+𝐹
+. As an aftermath, the feature vec-
+tors 𝒁of heterophilic nodes (i.e., nodes in different classes) in G
+will be made closer (i.e., over-smoothed) due to the existence of het-
+erophilic links, and after the clustering operation ˜𝑪⊤𝒁, the attribute
+distances of synthetic heterophilic node pairs in 𝑿′ are further
+reduced. A figurative example to illustrate such a heterophilic over-
+smoothing issue is presented in Fig. 4, wherein the attribute vectors
+in 𝑿′ of synthetic nodes 𝑢1 (merged from 𝐶𝑖= {𝑣1, . . . , 𝑣5}) and
+𝑢2 (merged from 𝐶2 = {𝑣6, 𝑣7, 𝑣8}) are finally similar to each other,
+making them hard to distinguish by GNNs. In sum, constructing 𝑿′
+by Eq. (11) yields over-smoothed attribute vectors and compromises
+condensation quality.
+To validate this issue, we conduct an empirical statistical analysis
+of 𝑿′ on real datasets. Given attribute vectors 𝑿, we define the inter-
+class attribute distance (ICAD) of G as follows:
+𝜙(𝑿, 𝒀) =
+1
+2 Í
+𝑥≠𝑦∥𝒀·,𝑥∥1 · ∥𝒀·,𝑦∥1
+∑︁
+𝑣𝑖,𝑣𝑗∈G,&𝑦𝑖≠𝑦𝑗
+
+𝑿𝑖
+∥𝑿𝑖∥2
+−
+𝑿𝑗
+∥𝑿𝑗∥2
+
+2
+2
+,
+where ∥𝒀·,𝑥∥1 (resp. ∥𝒀·,𝑦∥1) signifies the size of the 𝑥-th (resp.
+𝑦-th) class. 𝜙(𝑿, 𝒀) quantifies the averaged distance of attribute
+vectors 𝑿of heterophilic node pairs. In the same vein, we can define
+the ICAD of the condensed graph G′ with the synthetic attribute
+vectors 𝑿′ and label matrix 𝒀′. As reported in Table 1, we can
+observe a decrease in the ICAD on each dataset, i.e., 𝜙(𝑿′, 𝒀′) <
+𝜙(𝑿, 𝒀), which corroborates the foregoing issue of heterophilic
+over-smoothing in 𝑿′.
+Class-Specific Graph Sampling and Representations. To cope
+with the problematic 𝑿′, we propose to learn a small attribute aug-
+mentation 𝚫to inject class-relevant features into it to build a new
+attribute matrix for nodes and increase the ICAD, i.e.,
+𝑿′ + 𝛽· 𝚫,
+(12)
+5
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+where 𝛽stands for the weight of the augmentation. As displayed
+in Table 1, the ICAD of the synthetic attributes of nodes with this
+refinement (i.e., Eq. (12)) can be considerably increased, mitigating
+the heterophilic over-smoothing issue.
+Specifically, we sample 𝐾graphs {𝑨◦(𝑦)}𝐾
+𝑦=1 from the original
+graph G for the respective classes in Y, each of which aims to
+capture the key structural patterns pertinent to its respective class
+in G. To achieve this goal, for each class 𝑦∈Y, CAAR first reweight
+each edge (𝑣𝑖, 𝑣𝑗) in G by the following weighting scheme:
+𝑤(𝑣𝑖, 𝑣𝑗) = 𝑷𝑖,𝑦· 𝑷𝑗,𝑦· 𝑟(𝑣𝑖, 𝑣𝑗),
+(13)
+where 𝑷𝑖,𝑦(defined in Eq. (9)) is the predicted probability that the
+node 𝑣𝑖belongs to the𝑦-th class. As such, 𝑷𝑖,𝑦·𝑷𝑗,𝑦in Eq. (13) leads
+to a low weight𝑤(𝑣𝑖, 𝑣𝑗) for adjacent nodes (𝑣𝑖, 𝑣𝑗) that are unlikely
+to share the same class label, thereby eliminating the impact of
+heterophilic links.
+To account for the importance of each edge (𝑣𝑖, 𝑣𝑗) in the entire
+graph topology, we further introduce the well-known effective resis-
+tance [36] 𝑟(𝑣𝑖, 𝑣𝑗) for (𝑣𝑖, 𝑣𝑗) in Eq. (13). Instead of computing the
+exact 𝑟(𝑣𝑖, 𝑣𝑗) over G, CAAR approximates it on the graph e
+G con-
+structed from G with each edge (𝑣𝑖, 𝑣𝑗) reweighted by cos(𝑯𝑖, 𝑯𝑗).
+Note that this reweighting is also to lessen the negative effects of
+heterophilic links, and the approximation is due to the fact that
+the exact calculation of 𝑟(𝑣𝑖, 𝑣𝑗) for all edges is prohibitively ex-
+pensive, particularly for large graphs. More concretely, leveraging
+the Lemma 4.2 in [27], we can estimate 𝑟(𝑣𝑖, 𝑣𝑗) efficiently by the
+following equation:
+𝑟(𝑣𝑖, 𝑣𝑗) ≈1
+2
+ 
+1
+e
+𝑑(𝑣𝑖)
++
+1
+e
+𝑑(𝑣𝑗)
+!
+where e
+𝑑(𝑣𝑖) =
+∑︁
+𝑣ℓ∈N(𝑣𝑖)
+cos(𝑯𝑖, 𝑯ℓ).
+After obtaining the weight as in Eq. (13) for each edge in G,
+we sample the top-𝑀· 𝜌(𝜌∈(0, 1)) ones from E to construct
+𝑨◦(𝑦) instead of retaining all of them. This is to distill the crucial
+structural features (or homophilic structures) in G that relate to
+the class 𝑦, while purging noisy and disruptive connections (e.g.,
+heterophilic links).
+Based on the 𝐾sampled class-specific graphs {𝑨◦(𝑦)}𝐾
+𝑦=1, we
+then generate their corresponding 𝐾condensed graphs through
+𝑨′(𝑦) = ˜𝑪⊤𝑨◦(𝑦) ˜𝑪,
+(14)
+which leads to 𝐾classic-specific representation matrices for the 𝑛
+synthetic nodes in G′:
+𝑯′(𝑦) =
+𝑇′
+∑︁
+𝑡=0
+(1 −𝛼)𝛼𝑡(𝑨′(𝑦))𝑡(𝑿′ + 𝛽· 𝚫)𝑾′.
+(15)
+The task then is to learn the features 𝚫that are commonly missing in
+the 𝐾classic-specific representations {𝑯′(𝑦)}𝐾
+𝑦=1 as augmentation
+attributes.
+Training Losses. To learn 𝚫and weights 𝑾′, CAAR transforms
+each 𝑯′(𝑦) into label predictions 𝑷(𝑦) = Softmax(𝑯′(𝑦)), and
+adopt the supervision losses L𝑜𝑟𝑔, L𝑠𝑦𝑛and consistency loss func-
+tion L𝑐𝑠𝑡for training:
+L𝑜𝑟𝑔+ 𝛾· L𝑠𝑦𝑛+ 𝜆· L𝑐𝑠𝑡
+(16)
+where 𝛾and 𝜆are coefficients. L𝑜𝑟𝑔is defined as in Eq. (8) and
+L𝑠𝑦𝑛are implemented using the cross-entropy functions over G′:
+L𝑠𝑦𝑛= −1
+𝑛
+𝑛
+∑︁
+𝑖=1
+𝐾
+∑︁
+𝑦=1
+𝐾
+∑︁
+𝑘=1
+𝒀′
+𝑖,𝑘· log(𝑷′(𝑦)
+𝑖,𝑘),
+(17)
+where L𝑜𝑟𝑔measures the difference between the predicted proba-
+bility distribution 𝑷and the actual distribution 𝒀of ground-truth
+classes on G, while L𝑠𝑦𝑛calculates that on G′ with the considera-
+tion of the 𝐾label predictions {𝑷′(𝑦)}𝐾
+𝑦=1.
+Additionally, we include the following consistency loss function
+L𝑐𝑠𝑡[10] as a regularization to encourage an agreement among all
+class-specific predictions for learning a robust 𝚫.
+L𝑐𝑠𝑡=
+1
+𝑛· 𝐾
+𝑛
+∑︁
+𝑖=1
+𝐾
+∑︁
+𝑦=1
+∥𝑷(𝑦)
+𝑖
+−𝑷𝑖∥2
+2 where 𝑷= 1
+𝐾
+𝐾
+∑︁
+𝑦=1
+𝑷(𝑦) .
+(18)
+Algorithm 1: Clustering-based Graph Data Distillation
+Input: The original graph G and label matrix 𝒀
+Output: 𝑿′, 𝑨′, and 𝒀′
+1 Generate 𝒁= Í𝑇
+𝑡=0 (1 −𝛼)𝛼𝑡˜𝑨𝑡𝑿;
+2 for 𝑖= 1 to 𝐸1 do
+3
+Predict 𝒀via 𝑯= 𝑾𝒁;
+4
+Compute L𝑜𝑟𝑔by Eq. (8);
+5 Generate ˜𝑪by 𝐾-Means on 𝑯with 𝐸2 iterations;
+6 Get 𝑿′ = ˜𝑪⊤𝒁, 𝑨′ = ˜𝑪⊤˜𝑨˜𝑪;
+7 Generate 𝒀′ by taking the argmax of ˜𝑪⊤𝑯;
+8 Initialize 𝚫, update 𝑿′ by 𝑿′ = 𝑿′ + 𝛽· 𝚫;
+9 Generate {𝑨◦(𝑦)}𝐾
+𝑦=1 according to Eq. (13) ;
+10 Get {𝑨′(𝑦)}𝐾
+𝑦=1 and {𝑯′(𝑦)}𝐾
+𝑦=1 by Eq. (14) and (15);
+11 for 𝑖= 1 to 𝐸3 do
+12
+Predict 𝒀via 𝑯𝑾′ ;
+13
+Predict 𝒀′ via 𝑯
+′ (𝑦)𝑾′;
+14
+Compute L𝑜𝑟𝑔, L𝑠𝑦𝑛and L𝑐𝑠𝑡as Eq. (8), (17), (18) ;
+15 return 𝑿′, 𝑨′, 𝒀′
+5
+Pseudo-code and Time Complexity
+This section presents the algorithm of ClustGDD as detailed in
+Algorithm 1. Consider an original graph with 𝑀edges, 𝑁nodes,
+𝑑-dimensional attributes, and 𝐾classes. Let 𝑛denote the clustering
+number (i.e., synthetic node count), 𝐸1, 𝐸2, 𝐸3 denote epochs for
+pretraining, clustering, and refinement,𝑇,𝑇′ denote propagation it-
+erations in pretraining and refinement. The computational complex-
+ity of our framework includes: propagation (O 𝑀𝑑𝑇), mini-batch
+pretraining (O 𝐸1𝑁𝑑𝐾), K-means clustering (O 𝐸2𝑁𝑛𝑑)2, gener-
+ating 𝑿′, 𝑨′, and 𝒀′ (O 𝑁𝑑+ 𝑀+ 𝑁𝐾), multi-view graphs genera-
+tion (O 𝐾2𝑀+𝐾𝑀𝑙𝑜𝑔𝑀+𝐾𝑀), propagation on condensed graphs
+(O 𝐾𝑛2𝑑𝑇′), and refinement training (O 𝐸3𝑁𝐾𝑑+ 𝐸3𝐾2𝑛𝑑). As-
+suming 𝐸1, 𝐸2, 𝐸3 = O 𝐸, 𝑇,𝑇′ = O 1, 𝐾= 𝑂 1, the time com-
+plexity simplifies to O 𝐸𝑁𝑛𝑑+ 𝑛2𝑑+ 𝑀𝑑+ 𝑀log 𝑀. In fact, our
+2For large-scale datasets, the mini-batch K-means algorithm is employed with a com-
+putational complexity of O 𝐸2𝑏𝑛𝑑, where 𝑏is the batch size.
+6
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Table 2: Statistics of Datasets.
+Dataset
+𝑁
+𝑀
+𝑑
+𝐾
+Cora
+2, 708
+5, 429
+1, 433
+7
+Citeseer
+3, 327
+4, 732
+3, 703
+6
+Flickr
+89, 250
+899, 756
+128
+7
+arXiv
+169, 343
+1, 166, 243
+128
+40
+Reddit
+232, 965
+57, 307, 946
+602
+41
+method has a much lower time complexity compared to the base-
+lines, which is analyzed in Appendix B. This is the reason why
+our method has a very low time cost empirically as shown in the
+following experiments.
+6
+Experiments
+In this section, we experimentally evaluate our proposed GDD
+method ClustGDD against nine competitors over five real graphs
+in terms of node classification performance and efficiency. For
+reproducibility, the source code and datasets are available at https:
+//github.com/HKBU-LAGAS/ClustGDD.
+6.1
+Experiment Settings
+Datasets. Table 2 lists the statistics of the five real graph datasets
+used in our experiments. Cora [40], Citeseer [40], and arXiv [21] are
+the classic datasets for transductive node classification, while Flickr
+[57] and Reddit [18] are for inductive tasks.
+Baselines and Settings. We evaluate our ClustGDD against three
+classic coreset methods: Random [47], Herding [47] and K-Center
+[41], and six GDD baselines as categorized below:
+• Gradient Matching: Gcond [25], SGDD [54], and GCSR [34];
+• Trajectory Matching: SFGC [59];
+• Eigenbasis Matching: GDEM [32];
+• Performance Matching: GC-SNTK [44]
+For a fair comparison, we follow the evaluation protocol and set-
+tings (e.g., condensation ratios, GNNs, etc.) commonly adopted in
+previous works [25, 32] for all evaluated methods. We reproduce the
+performance of Gcond, SFGC, GCSR, and GDEM using the source codes,
+hyperparameter settings, and synthetic datasets provided by the re-
+spective authors. As for the rest of the baselines, we directly use the
+results reported in [34, 45]. For the interest of space, we defer the
+details of datasets, implementation, and hyper-parameter settings
+to Appendix C, and additional experiments on hyper-parameter
+analysis and visualization to Appendix D.
+6.2
+Condensation Effectiveness Evaluation
+We conduct comprehensive comparison of node classification per-
+formance across various coreset and distillation methods. We train
+GCN on the synthetic graphs and record the test accuracy for evalu-
+ation. The ratio is defined as 𝑛/𝑁for transductive datasets, and it
+is defined as 𝑛/𝑁T for the inductive ones, where 𝑁T is the number
+of training nodes.
+We can summarize several key points from the results shown
+in Table 3. Firstly, Our ClustGDD and ClustGDD-𝑿obtain overall
+highest/second-highest accuracy on most datasets, and sometimes
+higher than the results of the whole datasets. For instance, on Cite-
+seer, the average accuracy of ClustGDD on three ratios is 74.2%,
+which is 2.4% higher than original result. We suggest that the suc-
+cess of ClustGDD can be primarily attributed to two key factors:
+during the clustering phase, ClustGDD effectively integrates infor-
+mation from both the original attributes and the graph topology
+through GLS. Through pretraining and clustering, the FID between
+the condensed attributes and the original attributes is minimized.
+On the other hand, during the refinement phase, the condensed
+attributes are further improved by co-training on original and con-
+densed graphs, reducing the Heterophilic Over-smoothing Issue.
+Secondly, the results of ClustGDD are slightly better than ClustGDD-
+𝑿, indicating that the synthetic attributes capture most of the orig-
+inal graph’s key information, with the synthetic topology offering
+supplementary advantages. We also find distillation methods con-
+sistently outperform traditional methods, demonstrating the overall
+effectiveness and robustness of distillation methods.
+We present the average time costs of coreset and GDD meth-
+ods across five datasets with condensation ratios of 2.6%, 1.8%,
+0.05%, 0.10%, and 0.10%, respectively. Experimental findings re-
+veal a notable trade-off: while traditional graph distillation meth-
+ods achieve high node classification accuracy, their computational
+overhead remains prohibitive (ranging from 103 to 104 seconds).
+Conversely, coreset methods demonstrate remarkable efficiency
+(approximately 92 seconds) at the cost of diminished accuracy. Our
+proposed ClustGDD method effectively bridges this gap, achiev-
+ing state-of-the-art accuracy in merely 56.8 seconds. Detailed per-
+dataset performance metrics are available in Appendix D.
+6.3
+Cross-architecture Generalization
+To verify the generalization of our distilled graph, we use differ-
+ent GNN architectures to train on synthetic graphs and test their
+performance on the original graph, and the results are shown in
+Table 4. ClustGDD achieves the overall highest average, and the
+lowest std, showing its stability and effectiveness when datasets
+and GNNs architecture vary. For example, on the arXiv dataset,
+the average accuracy of our method is 2.8% higher than that of
+the second-place, GCSR, and the std is reduced by 1.7%. This vali-
+dates that ClustGDD has the superior generalization ability across
+GDDs. This may be because the closed-form solution of GLS in the
+clustering and refinement is more stable than other specific GNNs.
+6.4
+Ablation Study
+Varying Clustering Methods. We use different GNNs architec-
+tures to replace the closed-form solution of GLS as the backbone in
+the pretraining and refinement stages. In general, SGC and APPNP
+perform well on the Cora and Citeseer. ChebyNet shows good per-
+formance on the arXiv and Reddit datasets. MLP has the highest
+accuracy on the Flickr dataset. Our backbone consistently outper-
+forms the others across all datasets, this may be attributed to several
+key factors. Firstly, it excels at capturing the global structure of
+graphs, allowing it to model long-range dependencies and overall
+connectivity patterns effectively, which is crucial in datasets where
+important features are spread across the entire graph. Secondly,
+it assigns weighted influence to nodes based on their importance,
+enabling the model to focus more on key nodes that drive the graph
+7
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+Table 3: Node classification performance (mean accuracy (%) , ± standard deviation) and average dataset synthesis time (second)
+of ClustGDD and baselines. (best is highlighted in blue and runner-up in light-blue). The results of methods with ∗are taken
+from prior works.
+Dataset Ratio
+Coreset Methods
+GDD Methods
+Whole
+Dataset
+Random Herding K-Center
+Gcond
+SFGC
+SGDD*
+GCSR
+GC-SNTK*
+GDEM
+ClustGDD-𝑿ClustGDD
+Cora
+1.30% 62.3±1.1 68.0±0.6
+62.5±0.7
+80.6±0.8
+79.9±0.5
+79.1±1.3 79.7±1.4
+81.7±0.7
+78.7±3.1
+81.0±0.4
+80.8±0.3
+81.1±0.4
+2.60% 73.1±0.9 73.4±0.4
+73.3±0.5
+81.1±0.5
+80.7±0.3
+79.0±1.9 81.1±0.4
+81.5±0.7
+77.7±1.0
+81.6±0.6
+81.7±0.5
+5.20% 76.5±0.4 76.6±0.4
+77.0±0.4
+80.7±0.6
+80.3±0.4
+80.2±0.8 80.8±0.7
+81.3±0.2
+80.3±1.0
+82.4±0.5
+83.0±0.3
+Citeseer
+0.90% 49.7±0.7 55.8±0.6
+48.8±1.1
+72.3±0.5
+70.5±0.4
+71.5±0.9 71.1±0.9
+64.8±0.7
+72.9±0.7
+73.5±0.2
+73.5±0.2
+71.8±0.3
+1.80% 57.7±0.7 68.2±0.4
+65.2±0.6
+72.5±0.6
+71.8±0.1
+71.2±0.7 71.4±0.5
+65.9±0.2
+74.4±0.3
+74.4±0.2
+74.4±0.2
+3.60% 69.0±0.5 69.0±0.8
+69.5±0.5
+70.9±0.5
+71.1±0.5
+70.9±1.2 73.0±0.6
+66.3±0.5
+74.1±1.1
+74.5±0.5
+74.6±0.3
+arXiv
+0.05% 43.8±1.5 51.8±1.2
+48.0±1.4
+56.4±2.5
+63.3±0.7
+59.6±0.5 60.7±0.7
+64.2±0.2
+61.8±1.8
+63.7±0.4
+63.7±0.1
+71.1±0.2
+0.25% 57.0±0.7 60.5±0.7
+56.4±0.8
+60.7±2.2
+67.3±0.7
+61.7±0.3 64.4±0.3
+65.1±0.8
+61.8±0.4
+67.4±0.3
+67.5±0.1
+0.50% 58.8±0.8 60.5±0.4
+60.1±0.5
+60.9±2.0
+67.9±0.2
+58.7±0.6 66.4±0.3
+65.4±0.5
+63.3±0.5
+67.6±0.1
+67.7±0.2
+Flickr
+0.10% 42.0±0.3 40.5±0.7
+41.3±0.7
+46.3±0.6
+46.7±0.2
+46.1±0.3 46.6±0.2
+46.7±0.1
+45.7±0.6
+46.8±0.1
+46.9±0.1
+46.9±0.1
+0.50% 42.9±0.5 42.7±0.4
+43.6±0.3
+46.9±0.1
+47.2±0.1
+45.9±0.4 46.7±0.1
+46.8±0.1
+46.1±0.6
+46.8±0.1
+46.9±0.1
+1.00% 42.8±0.6 44.9±0.2
+43.9±0.5
+47.1±0.3
+46.9±0.2
+46.4±0.2 46.9±0.3
+46.5±0.2
+46.4±0.4
+46.9±0.2
+47.1±0.1
+Reddit
+0.05% 44.8±1.4 52.2±1.3
+48.5±0.7
+87.2±0.9
+78.8±1.3
+84.2±0.7 90.5±0.3
+74.3±0.5
+91.4±0.4
+89.8±0.1
+89.8±0.1
+94.1±0.0
+0.10% 60.2±1.3 61.4±1.0
+49.0±1.2
+89.1±0.8
+80.7±1.9
+90.7±0.1 91.2±0.4
+74.8±0.7
+91.5±0.4
+91.5±0.1
+91.5±0.1
+0.50% 79.3±1.0 82.1±0.2
+70.3±0.7
+90.1±0.7
+87.1±0.3
+−
+84.6±1.1
+85.2±1.2
+91.4±0.7
+91.6±0.0
+91.7±0.0
+Avg. Time
+92.4
+92.6
+92.0
+8, 150.4 104, 999.0 46, 424.8 4, 350.4
+3, 045.4
+1, 316.4
+56.7
+56.8
+Table 4: Generalization of GDD methods across GNNs.
+Dataset
+Method
+GNN Architectures
+Avg.
+Std.
+GCN
+SGC APPNP ChebyNet BernNet
+Cora
+Gcond
+81.1 81.0
+80.2
+60.8
+81.0
+76.8
+8.0
+SFGC
+80.7 80.7
+80.2
+81.8
+80.2
+80.7
+0.6
+GCSR
+81.1 81.4
+81.4
+82.3
+82.0
+81.6
+0.4
+GDEM
+77.7 77.8
+78.0
+77.3
+78.2
+77.8
+0.3
+ClustGDD 81.7 82.1
+81.7
+82.3
+82.3
+82.0
+0.3
+Citeseer
+Gcond
+72.5 71.7
+71.6
+33.5
+70.3
+63.9
+15.2
+SFGC
+71.8 71.8
+71.3
+70.3
+66.6
+70.4
+2.0
+GCSR
+71.4 71.6
+71.6
+66.0
+63.9
+68.9
+3.3
+GDEM
+74.4 74.6
+74.7
+73.1
+72.1
+73.8
+1.0
+ClustGDD 74.4 74.3
+74.6
+73.3
+73.1
+73.9
+0.6
+arXiv
+Gcond
+56.4 46.4
+58.0
+46.4
+59.1
+53.3
+5.7
+SFGC
+63.3 60.7
+55.7
+61.6
+60.2
+60.3
+2.5
+GCSR
+60.7 55.7
+58.7
+61.4
+61.3
+59.6
+2.2
+GDEM
+61.8 60.4
+59.2
+60.5
+56.8
+59.7
+1.7
+ClustGDD 63.7 61.9
+62.4
+64.0
+63.3
+63.1
+0.8
+Flickr
+Gcond
+46.3 46.3
+44.9
+41.8
+38.1
+43.5
+3.2
+SFGC
+46.7 46.5
+46.7
+46.4
+45.4
+46.3
+0.5
+GCSR
+46.6 46.5
+46.6
+46.2
+45.6
+46.3
+0.4
+GDEM
+45.7 44.5
+44.4
+44.2
+40.1
+43.8
+1.9
+ClustGDD 46.9 46.9
+46.7
+46.5
+46.4
+46.7
+0.2
+Reddit
+Gcond
+89.1 89.9
+87.5
+21.1
+87.3
+75.0
+27.0
+SFGC
+80.7 62.4
+62.6
+78.5
+75.0
+71.8
+7.8
+GCSR
+91.2 89.3
+87.2
+70.4
+85.5
+84.7
+7.4
+GDEM
+91.5 91.4
+91.0
+85.8
+82.2
+88.4
+3.8
+ClustGDD 91.5 90.7
+88.7
+87.5
+83.9
+88.5
+2.7
+dynamics and aggregate their features more meaningfully. These
+combined strengths enable the personalized PageRank backbone to
+consistently deliver superior performance across diverse datasets.
+Attribute Refinement. We then explore the impact of modules
+in CAAR. Firstly, we remove the refinement (w/o CAAR), using syn-
+thetic attributes and topology from the clustering stage to train
+Table 5: Ablation study results.
+Modules
+Cora
+Citeseer
+arXiv
+Flickr
+Reddit
+w/ MLP
+77.8±0.7 72.3±0.3 58.7±0.4 45.5±0.4 81.6±0.3
+w/ GCN
+78.9±0.5 70.9±0.7 60.9±0.3 43.6±1.1 87.7±0.4
+w/ SGC
+81.7±0.5 72.3±0.3 57.5±0.7 45.1±0.7 77.7±0.3
+w/ APPNP
+80.6±0.2 72.2±0.3 59.4±0.6 41.4±1.2 86.3±0.1
+w/ BernNet
+79.2±0.4 72.0±0.1 58.7±0.5 45.0±0.2 84.6±0.4
+w/ ChebyNet
+79.5±0.4 72.1±0.6 61.4±0.2 45.8±0.1 87.2±0.4
+w/o CAAR
+81.3±0.4 74.0±0.3 61.9±0.4 46.3±0.2 87.6±0.2
+w/o sampling 81.5±0.2 74.1±0.2 62.6±0.3 46.8±0.1 90.4±0.1
+w/o L𝑐𝑠𝑡
+81.6±0.5 74.3±0.2 63.5±0.3 46.7±0.1 91.4±0.1
+ClustGDD
+81.7±0.5 74.4±0.2 63.7±0.1 46.9±0.1 91.5±0.1
+GNNs, it leads to a decline in GNN performance across all datasets,
+especially on datasets with a higher compression ratio and class
+imbalance, such as Reddit and arXiv. Secondly, we replace the mul-
+tiple representations {𝑯′(𝑦)}𝐾
+𝑦=1 created via class-specific sampled
+graphs in CAAR by a single 𝑯′ (w/o sampling). Due to the lack of
+information from different views, the performance of GNN declines
+across all datasets, especially on large graphs such as Reddit and
+arXiv. Then, we remove the consistency loss (w/o L𝑐𝑠𝑡). It indeed
+affects the quality of the distilled graph. It’s because the consistency
+of predictions enhances the robustness of the refinement.
+6.5
+Hyper-parameter Analysis
+Next, we conduct hyper-parameter analysis in our method on arXiv
+and Reddit, evaluating the impact of various hyperparameters on
+the performance of our machine learning model in Fig. 5. First,
+we explore the propagation number 𝑇in of the pretraining stage,
+8
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+arXiv
+Reddit
+5
+10
+15
+20
+25
+30
+61.0
+62.0
+63.0
+64.0
+65.0Acc
+88.0
+89.0
+90.0
+91.0
+92.0
+Acc
+(a) Varying 𝑇
+0.5
+0.8
+0.9
+0.92
+0.95
+58.0
+60.0
+62.0
+64.0
+66.0Acc
+84.0
+86.0
+88.0
+90.0
+92.0
+Acc
+(b) Varying 𝛼
+0.01
+0.05
+0.1
+0.5
+1.0
+62.5
+63.0
+63.5
+64.0
+64.5Acc
+90.0
+90.5
+91.0
+91.5
+92.0
+Acc
+(c) Varying 𝜌
+0.1
+0.5
+1.0
+1.4
+1.5
+2.0
+3.3
+5.0
+62.0
+62.5
+63.0
+63.5
+64.0Acc
+90.0
+90.5
+91.0
+91.5
+92.0
+Acc
+(d) Varying 𝛽
+0.01
+0.0122
+0.0125
+0.0244
+0.05
+0.1
+0.125
+0.25
+0.5
+61.0
+62.0
+63.0
+64.0
+65.0Acc
+88.0
+89.0
+90.0
+91.0
+92.0
+Acc
+(e) Varying 𝛾
+0.01
+0.015
+0.05
+0.1
+0.5
+1.0
+63.2
+63.4
+63.6
+63.8
+64.0Acc
+87.5
+88.5
+89.5
+90.5
+91.5
+Acc
+(f) Varying 𝜆
+Figure 5: Hyper-parameter Analysis.
+which is critical for controlling the degree of information integra-
+tion between nodes at different distances in the graph. The model’s
+performance initially increases with 𝑇and then decreases on both
+arXiv and Reddit. This means that aggregating information from
+nearby neighbors is beneficial, while excessive message passing
+may lead to over-smoothing, resulting in a decline in performance.
+Then we tune another hyper-parameter 𝛼, 𝛼represents the weight
+between exploring neighbors and back to a starting node. A larger
+𝛼means the model is more likely to explore, leading to results that
+are influenced by the overall graph structure, which is important
+for the task on relatively larger graphs. We find that when gen-
+erating multi-view representations, a certain degree of sparsity 𝜌
+can help the model achieve optimal performance, and our method
+is relatively robust to varying levels of sparsity. We find that the
+strength of the refinement on attributes, represented by 𝛽, signifi-
+cantly affect the quality of the distilled graph attributes, thereby
+influencing the model’s performance. In refinement, we find that
+adjusting the coefficient 𝛾for the supervision loss has a greater
+impact than adjusting the coefficient 𝜆for the consistency loss. This
+suggests that the supervision loss on multi-view graphs may be
+more important.
+7
+Related Work
+Graph Data Distillation (GDD). Unlike conventional graph re-
+duction approaches, such as coreset selection, graph sparsification,
+and coarsening, GDD achieves encouraging performance due to the
+mechanism of leveraging the gradients/representation of GNNs in
+downstream tasks for graph dataset synthesis, which can be roughly
+categorized into several types. Among gradient matching, GCond
+[25], DosCond [24] align gradient signals between original and con-
+densed graphs to ensure model performance transfer. SGDD [54], and
+GCSR [34] are another two structure-aware gradient-based meth-
+ods, preserving essential topology information. However, gradient
+matching needs nested optimization, making the balance between
+high condensation costs and low condensation quality difficult.
+Training trajectory matching approaches like SFGC [59] preserve
+GNN learning consistency through long-term trajectory alignment
+but incur high computational costs in expert model training. Distri-
+bution matching methods (GCDM [31], SimGC [50]) iteratively align
+representation distributions between synthetic and original graphs,
+resulting in suboptimal efficiency. Eigen matching methods such
+as GDEM [32] maintain graph spectral properties through eigen-
+decomposition alignment, yet struggle with scalability for large
+graphs. Performance matching (GC-SNTK [44], KiDD [53]) provide
+closed-form solutions via kernel regression but suffer from pro-
+hibitive memory demands for kernel matrix storage. Gradient-free
+methods like CGC [14] employ clustering-based feature matching
+but sacrifice task-specific adaptability by avoiding gradient opti-
+mization. While existing works explore diverse graph condensation
+paradigms, they exhibit limitations in computational efficiency (tra-
+jectory/eigen decomposition costs), memory consumption (kernel
+matrices), or optimization flexibility (lack of gradient guidance).
+These bottlenecks motivate us to design an efficient, structure-
+aware, and optimization-friendly GDD method.
+Data Distillation. Dataset distillation [28, 38, 39] is a technique
+that compresses the knowledge of a large dataset into a smaller,
+synthetic dataset, enabling models to be trained with less data
+while maintaining comparable performance to models trained on
+the original dataset. It is not only applied to graph data, but also
+widely used in other fields e.g., such as visual datasets [55, 56]
+and text datasets [30, 43].For example, DaLLME [43] compresses
+two text datasets IMDB and AG-News to 0.1% via language model
+embedding, with text classification loss decreases less than 10%.
+Designing unified data distillation methods for multi-modal data
+will be a promising direction.
+8
+Conclusion
+This paper proposes a simple yet effective approach ClustGDD
+for GDD. ClustGDD achieves superior performance in condensa-
+tion effectiveness and efficiency over previous GDD solutions on
+real datasets through two major contributions: a simple clustering
+method minimizing the WCSS and a lightweight module augment-
+ing synthetic attributes with class-relevant features. As for future
+work, we intend to extend our solutions to handle graphs that are
+heterogeneous or from multiple modalities.
+Acknowledgments
+This work is supported by the National Natural Science Founda-
+tion of China (No. 62302414), the Hong Kong RGC ECS grant (No.
+22202623), and the Huawei Gift Fund.
+9
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+References
+[1] Huzihiro Araki. 1990. On an inequality of Lieb and Thirring. Letters in Mathe-
+matical Physics 19, 2 (1990), 167–170.
+[2] Fedor Borisyuk, Shihai He, Yunbo Ouyang, Morteza Ramezani, Peng Du, Xiaochen
+Hou, Chengming Jiang, Nitin Pasumarthy, Priya Bannur, Birjodh Tiwana, et al.
+2024. Lignn: Graph neural networks at linkedin. In Proceedings of the 30th ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining. 4793–4803.
+[3] Yingmei Chen, Zhongyu Wei, and Xuanjing Huang. 2018. Incorporating cor-
+poration relationship via graph convolutional neural networks for stock price
+prediction. In CIKM. 1655–1658.
+[4] Michaël Defferrard, Xavier Bresson, and Pierre Vandergheynst. 2016. Convolu-
+tional neural networks on graphs with fast localized spectral filtering. Advances
+in neural information processing systems 29 (2016).
+[5] Austin Derrow-Pinion, Jennifer She, David Wong, Oliver Lange, Todd Hester, Luis
+Perez, Marc Nunkesser, Seongjae Lee, Xueying Guo, Brett Wiltshire, et al. 2021.
+Eta prediction with graph neural networks in google maps. In CIKM. 3767–3776.
+[6] Mucong Ding, Xiaoyu Liu, Tahseen Rabbani, and Furong Huang. 2022. Faster
+hyperparameter search on graphs via calibrated dataset condensation. In NeurIPS
+2022 Workshop: New Frontiers in Graph Learning.
+[7] Xiaowen Dong, Dorina Thanou, Pascal Frossard, and Pierre Vandergheynst.
+2016. Learning Laplacian matrix in smooth graph signal representations. IEEE
+Transactions on Signal Processing 64, 23 (2016), 6160–6173.
+[8] DC Dowson and BV666017 Landau. 1982. The Fréchet distance between multivari-
+ate normal distributions. Journal of multivariate analysis 12, 3 (1982), 450–455.
+[9] Junfeng Fang, Xinglin Li, Yongduo Sui, Yuan Gao, Guibin Zhang, Kun Wang,
+Xiang Wang, and Xiangnan He. 2024. Exgc: Bridging efficiency and explainability
+in graph condensation. In Proceedings of the ACM on Web Conference 2024. 721–
+732.
+[10] Wenzheng Feng, Jie Zhang, Yuxiao Dong, Yu Han, Huanbo Luan, Qian Xu, Qiang
+Yang, Evgeny Kharlamov, and Jie Tang. 2020. Graph random neural networks for
+semi-supervised learning on graphs. Advances in neural information processing
+systems 33 (2020), 22092–22103.
+[11] Alex Fout, Jonathon Byrd, Basir Shariat, and Asa Ben-Hur. 2017. Protein inter-
+face prediction using graph convolutional networks. In Proceedings of the 31st
+International Conference on Neural Information Processing Systems. 6533–6542.
+[12] Chen Gao, Yu Zheng, Nian Li, Yinfeng Li, Yingrong Qin, Jinghua Piao, Yuhan
+Quan, Jianxin Chang, Depeng Jin, Xiangnan He, et al. 2023. A survey of graph
+neural networks for recommender systems: Challenges, methods, and directions.
+ACM Transactions on Recommender Systems 1, 1 (2023), 1–51.
+[13] Xinyi Gao, Tong Chen, Yilong Zang, Wentao Zhang, Quoc Viet Hung Nguyen,
+Kai Zheng, and Hongzhi Yin. 2024. Graph condensation for inductive node repre-
+sentation learning. In 2024 IEEE 40th International Conference on Data Engineering
+(ICDE). IEEE, 3056–3069.
+[14] Xinyi Gao, Tong Chen, Wentao Zhang, Junliang Yu, Guanhua Ye, Quoc Viet Hung
+Nguyen, and Hongzhi Yin. 2024.
+Rethinking and Accelerating Graph Con-
+densation: A Training-Free Approach with Class Partition.
+arXiv preprint
+arXiv:2405.13707 (2024).
+[15] Xinyi Gao, Junliang Yu, Tong Chen, Guanhua Ye, Wentao Zhang, and Hongzhi
+Yin. 2025. Graph condensation: A survey. IEEE Transactions on Knowledge and
+Data Engineering (2025).
+[16] Johannes Gasteiger, Aleksandar Bojchevski, and Stephan Günnemann. 2018.
+Predict then Propagate: Graph Neural Networks meet Personalized PageRank. In
+International Conference on Learning Representations.
+[17] Justin Gilmer, Samuel S Schoenholz, Patrick F Riley, Oriol Vinyals, and George E
+Dahl. 2017. Neural message passing for quantum chemistry. In International
+conference on machine learning. PMLR, 1263–1272.
+[18] Will Hamilton, Zhitao Ying, and Jure Leskovec. 2017. Inductive representation
+learning on large graphs. Advances in neural information processing systems 30
+(2017).
+[19] Mohammad Hashemi, Shengbo Gong, Juntong Ni, Wenqi Fan, B Aditya Prakash,
+and Wei Jin. 2024. A comprehensive survey on graph reduction: Sparsification,
+coarsening, and condensation. arXiv preprint arXiv:2402.03358 (2024).
+[20] Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and
+Sepp Hochreiter. 2017. Gans trained by a two time-scale update rule converge to
+a local nash equilibrium. Advances in neural information processing systems 30
+(2017).
+[21] Weihua Hu, Matthias Fey, Marinka Zitnik, Yuxiao Dong, Hongyu Ren, Bowen Liu,
+Michele Catasta, and Jure Leskovec. 2020. Open graph benchmark: Datasets for
+machine learning on graphs. Advances in neural information processing systems
+33 (2020), 22118–22133.
+[22] Dejun Jiang, Zhenxing Wu, Chang-Yu Hsieh, Guangyong Chen, Ben Liao, Zhe
+Wang, Chao Shen, Dongsheng Cao, Jian Wu, and Tingjun Hou. 2021. Could
+graph neural networks learn better molecular representation for drug discovery?
+A comparison study of descriptor-based and graph-based models. Journal of
+cheminformatics 13 (2021), 1–23.
+[23] Weiwei Jiang and Jiayun Luo. 2022. Graph neural network for traffic forecasting:
+A survey. ESA 207 (2022), 117921.
+[24] Wei Jin, Xianfeng Tang, Haoming Jiang, Zheng Li, Danqing Zhang, Jiliang Tang,
+and Bing Yin. 2022. Condensing graphs via one-step gradient matching. In
+Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery and
+Data Mining. 720–730.
+[25] Wei Jin, Lingxiao Zhao, Shichang Zhang, Yozen Liu, Jiliang Tang, and Neil
+Shah. 2021. Graph condensation for graph neural networks. arXiv preprint
+arXiv:2110.07580 (2021).
+[26] Thomas N Kipf and Max Welling. 2016. Semi-supervised classification with graph
+convolutional networks. arXiv preprint arXiv:1609.02907 (2016).
+[27] Yurui Lai, Xiaoyang Lin, Renchi Yang, and Hongtao Wang. 2024.
+Efficient
+topology-aware data augmentation for high-degree graph neural networks. In
+Proceedings of the 30th ACM SIGKDD Conference on Knowledge Discovery and
+Data Mining. 1463–1473.
+[28] Shiye Lei and Dacheng Tao. 2023. A comprehensive survey of dataset distillation.
+IEEE Transactions on Pattern Analysis and Machine Intelligence (2023).
+[29] Fan Li, Xiaoyang Wang, Dawei Cheng, Wenjie Zhang, Ying Zhang, and Xuemin
+Lin. 2024. TCGU: Data-centric Graph Unlearning based on Transferable Conden-
+sation. arXiv preprint arXiv:2410.06480 (2024).
+[30] Yongqi Li and Wenjie Li. 2021. Data distillation for text classification. arXiv
+preprint arXiv:2104.08448 (2021).
+[31] Mengyang Liu, Shanchuan Li, Xinshi Chen, and Le Song. 2022. Graph conden-
+sation via receptive field distribution matching. arXiv preprint arXiv:2206.13697
+(2022).
+[32] Yang Liu, Deyu Bo, and Chuan Shi. 2024. Graph Distillation with Eigenbasis
+Matching. In Forty-first International Conference on Machine Learning.
+[33] Yilun Liu, Ruihong Qiu, and Zi Huang. 2023. Cat: Balanced continual graph
+learning with graph condensation. In 2023 IEEE International Conference on Data
+Mining (ICDM). IEEE, 1157–1162.
+[34] Zhanyu Liu, Chaolv Zeng, and Guanjie Zheng. 2024. Graph data condensation
+via self-expressive graph structure reconstruction. In Proceedings of the 30th ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining. 1992–2002.
+[35] Stuart Lloyd. 1982. Least squares quantization in PCM. IEEE transactions on
+information theory 28, 2 (1982), 129–137.
+[36] László Lovász. 1993. Random walks on graphs. Combinatorics, Paul erdos is eighty
+2, 1-46 (1993), 4.
+[37] Yao Ma, Xiaorui Liu, Tong Zhao, Yozen Liu, Jiliang Tang, and Neil Shah. 2021. A
+unified view on graph neural networks as graph signal denoising. In Proceedings of
+the 30th ACM International Conference on Information & Knowledge Management.
+1202–1211.
+[38] Ilija Radosavovic, Piotr Dollár, Ross Girshick, Georgia Gkioxari, and Kaiming He.
+2018. Data distillation: Towards omni-supervised learning. In Proceedings of the
+IEEE conference on computer vision and pattern recognition. 4119–4128.
+[39] Noveen Sachdeva and Julian McAuley. 2023. Data distillation: A survey. arXiv
+preprint arXiv:2301.04272 (2023).
+[40] Prithviraj Sen, Galileo Namata, Mustafa Bilgic, Lise Getoor, Brian Galligher, and
+Tina Eliassi-Rad. 2008. Collective classification in network data. AI magazine 29,
+3 (2008), 93–93.
+[41] Ozan Sener and Silvio Savarese. 2017. Active learning for convolutional neural
+networks: A core-set approach. arXiv preprint arXiv:1708.00489 (2017).
+[42] Jonathan M Stokes, Kevin Yang, Kyle Swanson, Wengong Jin, Andres Cubillos-
+Ruiz, Nina M Donghia, Craig R MacNair, Shawn French, Lindsey A Carfrae, Zohar
+Bloom-Ackermann, et al. 2020. A deep learning approach to antibiotic discovery.
+Cell 180, 4 (2020), 688–702.
+[43] Yefan Tao, Luyang Kong, Andrey Kan, and Laurent Callot. 2024. Textual Dataset
+Distillation via Language Model Embedding. In Findings of the Association for
+Computational Linguistics: EMNLP 2024. 12557–12569.
+[44] Lin Wang, Wenqi Fan, Jiatong Li, Yao Ma, and Qing Li. 2024. Fast graph conden-
+sation with structure-based neural tangent kernel. In Proceedings of the ACM on
+Web Conference 2024. 4439–4448.
+[45] Lin Wang and Qing Li. 2025. Efficient Graph Condensation via Gaussian Process.
+arXiv preprint arXiv:2501.02565 (2025).
+[46] Yuyang Wang, Jianren Wang, Zhonglin Cao, and Amir Barati Farimani. 2022.
+Molecular contrastive learning of representations via graph neural networks.
+Nature Machine Intelligence 4, 3 (2022), 279–287.
+[47] Max Welling. 2009. Herding dynamical weights to learn. In Proceedings of the
+26th annual international conference on machine learning. 1121–1128.
+[48] Lirong Wu, Haitao Lin, Zhangyang Gao, Guojiang Zhao, and Stan Z. Li. 2024.
+A Teacher-Free Graph Knowledge Distillation Framework With Dual Self-
+Distillation. IEEE Transactions on Knowledge and Data Engineering 36, 9 (2024),
+4375–4385. https://doi.org/10.1109/TKDE.2024.3374773
+[49] Shiwen Wu, Fei Sun, Wentao Zhang, Xu Xie, and Bin Cui. 2022. Graph neural
+networks in recommender systems: a survey. Comput. Surveys 55, 5 (2022), 1–37.
+[50] Zhenbang Xiao, Yu Wang, Shunyu Liu, Huiqiong Wang, Mingli Song, and Tongya
+Zheng. 2024. Simple graph condensation. In Joint European Conference on Machine
+Learning and Knowledge Discovery in Databases. Springer, 53–71.
+[51] Hongjia Xu, Liangliang Zhang, Yao Ma, Sheng Zhou, Zhuonan Zheng, and Bu
+Jiajun. 2024. A survey on graph condensation. arXiv preprint arXiv:2402.02000
+(2024).
+10
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+[52] Keyulu Xu, Chengtao Li, Yonglong Tian, Tomohiro Sonobe, Ken-ichi
+Kawarabayashi, and Stefanie Jegelka. 2018. Representation learning on graphs
+with jumping knowledge networks. In International conference on machine learn-
+ing. PMLR, 5453–5462.
+[53] Zhe Xu, Yuzhong Chen, Menghai Pan, Huiyuan Chen, Mahashweta Das, Hao
+Yang, and Hanghang Tong. 2023. Kernel ridge regression-based graph dataset
+distillation. In Proceedings of the 29th ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining. 2850–2861.
+[54] Beining Yang, Kai Wang, Qingyun Sun, Cheng Ji, Xingcheng Fu, Hao Tang,
+Yang You, and Jianxin Li. 2023. Does graph distillation see like vision dataset
+counterpart? Advances in Neural Information Processing Systems 36 (2023), 53201–
+53226.
+[55] Zeyuan Yin and Zhiqiang Shen. 2024. Dataset distillation via curriculum data
+synthesis in large data era. Transactions on Machine Learning Research (2024).
+[56] Zeyuan Yin, Eric Xing, and Zhiqiang Shen. 2024. Squeeze, recover and relabel:
+Dataset condensation at imagenet scale from a new perspective. Advances in
+Neural Information Processing Systems 36 (2024).
+[57] Hanqing Zeng, Hongkuan Zhou, Ajitesh Srivastava, Rajgopal Kannan, and Viktor
+Prasanna. 2019. Graphsaint: Graph sampling based inductive learning method.
+arXiv preprint arXiv:1907.04931 (2019).
+[58] Ge Zhang, Zhao Li, Jiaming Huang, Jia Wu, Chuan Zhou, Jian Yang, and Jianliang
+Gao. 2022. efraudcom: An e-commerce fraud detection system via competitive
+graph neural networks. TOIS 40, 3 (2022), 1–29.
+[59] Xin Zheng, Miao Zhang, Chunyang Chen, Quoc Viet Hung Nguyen, Xingquan
+Zhu, and Shirui Pan. 2024. Structure-free graph condensation: From large-scale
+graphs to condensed graph-free data. Advances in Neural Information Processing
+Systems 36 (2024).
+[60] Ziang Zhou, Jieming Shi, Renchi Yang, Yuanhang Zou, and Qing Li. 2023. SlotGAT:
+slot-based message passing for heterogeneous graphs. In International Conference
+on Machine Learning. PMLR, 42644–42657.
+[61] Jiong Zhu, Yujun Yan, Lingxiao Zhao, Mark Heimann, Leman Akoglu, and Danai
+Koutra. 2020. Beyond homophily in graph neural networks: Current limitations
+and effective designs. Advances in neural information processing systems 33 (2020),
+7793–7804.
+[62] Meiqi Zhu, Xiao Wang, Chuan Shi, Houye Ji, and Peng Cui. 2021. Interpreting and
+Unifying Graph Neural Networks with An Optimization Framework. Proceedings
+of the Web Conference 2021 (2021).
+11
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+A
+A Detailed Discussion of Existing GDD Works
+We here provide a concise formalization of some representative
+GDD methods.
+Gradient matching. e.g. GCond [25] optimizes the synthetic graphs
+by minimizing the difference between the gradients of GNNs on
+original and synthetic graphs.
+min
+G′ E𝚯∼P𝚯
+" 𝐿
+∑︁
+𝑙=1
+𝐷 ∇𝚯L(GNN𝚯(A′, X′), Y′), ∇𝚯L(GNN𝚯(A, X), Y)
+#
+𝑠.𝑡.
+𝚯G′ = arg min
+𝚯
+L(GNN𝚯(𝑨′, 𝑿′), 𝒀′)
+where 𝐿is the number of matching steps. In fact, GCond involves a
+nested optimization. It optimizes the synthetic dataset within the
+inner loop and trains the GNNs on the original graph in the outer
+loop, which makes the training process very time-consuming.
+Distribution matching. GCDM [31] minimizes the distance between
+distribution of GNN each layer representations,
+min
+G′ E𝚯∼P𝚯
+" 𝑇
+∑︁
+𝑡=1
+𝐷 GNN𝚯(A′, X′), GNN𝚯(A, X)
+#
+where 𝑇is the number of GNN layers. GCDM has lower complexity
+than GCond, which only needs to calculate the distance between the
+distributions of the original graph and the synthetic graph, while
+GCond needs to calculate gradients and update the model parame-
+ters in each iteration, which is more expensive. GCDM doesn’t fully
+utilize label information and still needs alternative training on GNN
+parameter and synthetic graph, resulting in limited performance.
+Trajectory matching. SFGC [59] optimizes the synthetic graph by
+minimizing the difference between the trajectories of GNNs on
+original and synthetic graphs.
+min
+G′ E𝚯∗,𝑖
+𝑡∼P𝚯G
+h
+L𝑚𝑒𝑡𝑎−𝑡𝑡(𝚯∗
+𝑡|𝑝
+𝑡=𝑡0, ˜𝚯𝑡|𝑞
+𝑡=𝑡0)
+i
+𝑠.𝑡.
+˜𝚯∗
+G′ = arg min
+˜𝚯
+L(GNN ˜𝚯(𝑨′, 𝑿′), 𝒀′)
+where 𝚯∗
+𝑡|𝑝
+𝑡=𝑡0 are the parameters of GNN on G in the training
+interval [𝚯∗,𝑖
+𝑡0 , 𝚯∗,𝑖
+𝑡0+𝑝] and ˜𝚯𝑡|𝑞
+𝑡=𝑡0 are the parameters of GNN on
+G′ in the training interval [ ˜𝚯𝑡0, ˜𝚯𝑡0+𝑞]. Training experts to obtain
+trajectories is time-consuming, and experts may occupy a large
+amount of memory.
+Eigen matching. GDEM [32] firstly conducts singular value decom-
+position (SVD) to the original adjacency matrix 𝑨to get eigen values
+Λ ∈R𝐾and eigen-basis 𝑼∈R𝑁×𝐾. Then GDEM aims to synthetic
+𝑿′, 𝒀′ and the synthetic eigen-basis 𝑼′, which can be formalized
+as below,
+min
+G′
+𝐾
+∑︁
+𝑘=1
+𝐷 (𝑿⊤𝑼𝑘) (𝑿⊤𝑼𝑘)⊤, (𝑿′⊤𝑼′
+𝑘) (𝑿′⊤𝑼′
+𝑘)⊤ + 𝐷 𝑼′𝑼′⊤, 𝑰
++𝐷′
+ 
+𝒀⊤𝑨𝑿, 𝒀′⊤
+𝐾
+∑︁
+𝑘=1
+(1 −Λ𝑘)𝑼′
+𝑘𝑼′⊤
+𝑘𝑿′
+!
+The primary computational cost of GDEM lies in the SVD decom-
+position. As the size of the graph increases, the time required for
+SVD decomposition grows rapidly, far exceeding the time needed
+for the matching process.
+Performance matching. GC-SNTK [44] matches the performance
+of models on original and synthetic graphs by kernel ridge regression
+(KRR), which obtains the closed-form solution without bi-level
+optimization process. It can be written as:
+min
+G′ L𝑝𝑚= 1
+2 ∥KGG′ (KG′ G′ + 𝜖𝑰)−1𝒀′ −𝒀∥2
+𝐹
+where KGG′ ∈R𝑁×𝑛and KG′ G′ ∈R𝑛×𝑛are two graph kernels,
+which can be obtained by iterative aggregation on the graph. The
+high computational and space demands of KRR for graph data
+mainly stem from the quadratic cost of computing graph kernels,
+the quadratic storage requirement for the kernel matrix, and the
+cubic computation needed to invert it, making KRR challenging for
+large-scale graph datasets.
+Training free. CGC [14] is a recently proposed method for fast
+and high quality graph condensation. It utilizes SGC feature prop-
+agation to get node embedding, and uses multi-layer embedding
+combination for label prediction via MSE.
+arg min
+𝑾
+∥1
+𝐾
+𝐾
+∑︁
+𝑘=1
+˜𝑨𝑘𝑿𝑾−𝒀∥2
+2
+which has a closed form solution of 𝑾: ˆ𝑾= ( 1
+𝑇
+Í𝑇
+𝑡=1 ˜𝑨𝑡𝑿)†𝒀
+CGC doing clustering on the class-partitioned embedding 𝑯to
+get class-wise aggregation 𝑹(𝑦), then synthetic the condensed node
+embedding by 𝑯′(𝑦) = 𝑹(𝑦)𝑯(𝑦). Through on condensed embed-
+ding similarity, the condensed adjacency matrix 𝑨′ can be obtained.
+Finally, the synthetic node attribute 𝑿′ follows:
+arg min
+𝑿′
+L = ∥˜𝑨𝑇𝑿′ −𝒀∥2
+2 + 𝛼tr(𝑿′⊤𝑳′𝑿′)
+which has the closed-form solution:
+𝑿′ = (( ˜𝑨′𝑇)⊤˜𝑨′𝑇+ 𝛼𝑳′)−1( ˜𝑨′𝑇)
+⊤
+𝑯′
+.
+A notable similarity between our ClustGDD and CGC is that they
+both employ clustering to generate node attributes efficiently. How-
+ever, compared to CGC, our ClustGDD has some advantages. In terms
+of motivation, we choose clustering because we have discovered
+the inherent theoretical connection between clustering and FID, an
+indicator for measuring the quality of synthetic graphs, which is
+different from the starting point of CGC. In terms of specific imple-
+mentation, there are several key differences. First, CGC incorporates
+SGC propagation, which might miss some local information on large
+graph. Our method, on the other hand, uses the closed-form solu-
+tion of GLS on the graph to balance local and global information,
+leading to better node attributes. Second, to address the issue of het-
+erophilic over-smoothing from clustering, we refine the synthetic
+node attributes quickly and effectively. While our method sacrifices
+some speed within an acceptable range, the trade-off is well worth
+it, as we maintain a higher level of effectiveness.
+12
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Table 6: Hyperparameters of ClustGDD
+Dataset
+Ratio
+𝑇
+𝛼
+𝐸1
+𝛽
+𝜌
+𝑇′
+𝐸3
+𝛾
+𝜆
+dropout
+𝐻
+Cora
+1.3%
+5
+0.8
+80
+0.01
+0.06
+2
+2000
+7.0
+0.1
+0.6
+256
+2.6%
+5
+0.8
+80
+0.01
+0.4
+2
+2000
+7.0
+0.1
+0.6
+256
+5.2%
+20
+0.8
+80
+0.01
+0.4
+2
+2000
+7.0
+0.1
+0.6
+256
+Citeseer
+0.9%
+2
+0.8
+120
+0.01
+0.06
+1
+80
+6.0
+0.1
+0.7
+256
+1.80%
+2
+0.5
+120
+0.01
+0.21
+1
+200
+0.3
+0.1
+0.8
+128
+3.60%
+2
+0.5
+120
+0.01
+0.2
+1
+200
+5.4
+0.1
+0.7
+256
+arXiv
+0.05%
+20
+0.92
+1000
+1.4
+0.1
+10
+1000
+0.5
+0.1
+0.6
+256
+0.25%
+18
+0.91
+1000
+1.9
+0.1
+10
+1000
+1.0
+0.1
+0.6
+256
+0.50%
+20
+0.92
+1000
+1.0
+0.1
+10
+1000
+1.0
+0.1
+0.6
+256
+Flickr
+0.10%
+2
+0.8
+2000
+0.2
+0.5
+2
+2000
+5.6
+0.8
+0.6
+256
+0.50%
+2
+0.8
+2000
+0.2
+0.5
+1
+2000
+5.6
+1.0
+0.6
+256
+1.00%
+2
+0.8
+2000
+0.2
+0.5
+2
+2000
+5.6
+0.8
+0.6
+256
+Reddit
+0.05%
+10
+0.92
+800
+3.5
+0.1
+7
+600
+1.6
+0.015
+0.6
+512
+0.10%
+10
+0.92
+800
+3.3
+0.1
+7
+600
+1.0
+0.015
+0.6
+512
+0.50%
+20
+0.95
+800
+0.8
+0.1
+10
+1000
+2.1
+0.01
+0.6
+256
+B
+Time Complexity Analysis of Graph
+Distillation Methods
+We here calculate some graph distillation methods for comparison.
+For GCond[25], let 𝑇is the number of GNN layers, and 𝑟is the
+number of sampled neighbors per node. Denote the outer-loop be 𝐿𝑜
+and inner loop as 𝐿𝑖, the training epoch be 𝐸. The total complexity
+of GCond is O 𝐸𝐿𝑜𝐿𝑖𝑟𝑇𝑁𝑑2 + 𝐸𝐿𝑜𝐿𝑖𝑛2𝑑2.
+For SFGC, let the product of the number of experts 𝐿𝑛and the
+training epochs of experts 𝐸, and the number of outer-loop 𝐿𝑜
+and the inner loop be 𝐿𝑖. The total complexity is O 𝐸𝐿𝑛𝑀𝑑𝑇+
+𝐸𝐿𝑛𝑁𝑑2𝑇+ 𝐿𝑜𝐿𝑖𝑛𝑑2𝑇.
+For GCSR, denote the number of experts as 𝐿𝑛, the training epochs
+of experts as 𝐸𝑡, the number of meta matching 𝐿𝑜and GNNs training
+epochs be 𝐸𝑖, the total complexity is O 𝐸𝑡𝐿𝑛𝑟𝑇𝑁𝑑2+𝐸𝑖𝐿𝑜𝑛𝑑2𝑇+𝑛3.
+For GDEM, let the eigen basis number be 𝑁𝑘, the eigen-basis match-
+ing training epoch is 𝐸, the time complexity of GDEM can be written
+as O 𝑁𝑘𝑁2 + 𝑁𝑘𝑁𝑑+ 𝑀𝑑+ 𝑁𝑘𝐸𝑛2 + 𝑁𝑘𝐸𝑑2.
+To simplify, we abbreviate 𝐿𝑛, 𝐿𝑡, 𝐿𝑜and 𝐿𝑖as 𝐿, and 𝐸, 𝐸𝑡, 𝐸𝑖as 𝐸.
+ClustGDD has better time complexity in terms of polynomial order
+(O 𝐸𝑁𝑛𝑑+𝑛2𝑑+ 𝑀𝑑+ 𝑀log 𝑀). Compared to GCond, SFGC, GCSR,
+and GDEM, the complexity terms of ClustGDD do not include higher-
+order terms such as 𝐸𝐿, 𝐿2 or 𝑁𝑘𝑁2, which can lead to significantly
+higher computational costs as the scale of the data increases. There-
+fore, ClustGDD outperforms other algorithms in terms of efficiency
+when dealing with large-scale graph data, especially when 𝑁and
+𝑑are large.
+C
+Datasets and Implementations Details
+C.1
+Dataset Deatils
+Cora. [40] is a citation network consisting of 2,708 papers with 5,429
+citation links, where nodes represent papers and edges for citations.
+The node attributes are 1433-dimensional vectors obtained by using
+the bag-of-words representation of the abstract. It has 7 categories
+of different paper topics. Cora has a training set of 140 nodes (5.2%),
+a validation set of 500 nodes (18.5%), and a test set of 1,000 nodes
+(36.9%) for transductive node classification, with the remaining
+nodes typically used for unsupervised or semi-supervised learning.
+Citeseer. [40] is another citation network. Similar to Cora, it con-
+tains papers and citations of computer science, with 3,327 nodes and
+4,732 edges. It has 3,703-dimensional attributes and 6 topic classes.
+Citeseer includes a training set of 120 nodes (3.6%), a validation
+set of 500 nodes (15.0%), and a test set of 1,000 nodes (30.0%) for
+transductive node classification.
+arXiv. [21] is from the Open Graph Benchmark (OGB). It includes
+169,343 arXiv papers divided into 40 subjects, and 1,166,243 citations.
+It has 128-dimensional Word2Vec node attributes. The arXiv dataset
+is for transductive node classification with temporally splits. Its
+training set consisting of papers published up to 2017 (90,941 nodes,
+53.7%), the validation set consisting of papers in 2018 (29,799 nodes,
+17.6%), and the test set including papers from 2019 (48,603 nodes,
+28.7%), emphasizing temporal generalization.
+Flickr. [57] is a social network consisting of 89,250 users and 899,75
+6 interactions. In this network, nodes stand for users, edges indicate
+follower relationships, and the node attributes are 500-dimensional
+visual features extracted from the images uploaded by users. The
+nodes can be categorized into 7 classes. Flickr is randomly split
+into a training set of 44,625 nodes (50%), a validation set of 22,312
+nodes (25%), and a test set of 22,313 nodes (25%), used for evaluating
+inductive node classification task.
+Reddit. [18] is another social network, with 232,965 users and
+11,606,919 interactions. The users are grouped into 41 subReddit cat-
+egories. User activity and text are represented by 602-dimensional
+node attributes.The Reddit dataset is also randomly divided, with
+a training set of 152,410 nodes (65.4%), a validation set of 23,699
+nodes (10.2%), and a test set of 55,334 nodes (23.7%), designed for
+large-scale inductive node classification tasks.
+C.2
+Implementation Details
+We implement the GNN models and graph distillation by PyTorch
+Geometric. We collect graphs Cora, Citeseer, arXiv, Flickr and Reddit
+from as GCond. We obtain the synthetic graphs generated by GCond3,
+SFGC4, GCSR5, and GDEM6. Main experiments are conducted on a
+3https://github.com/ChandlerBang/GCond
+4https://github.com/Amanda-Zheng/SFGC
+5https://github.com/zclzcl0223/GCSR
+6https://github.com/liuyang-tian/GDEM
+13
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+Random
+Herding
+K-Center
+Gcond
+SFGC
+SGDD
+GCSR
+GC-SNTK
+GDEM
+ClustGDD
+100
+102
+104
+time (seconds)
+(a) Cora
+100
+101
+102
+103
+time (seconds)
+(b) CiteSeer
+101
+102
+103
+104
+105
+time (seconds)
+(c) arXiv
+101
+102
+103
+104
+time (seconds)
+(d) Flickr
+101
+102
+103
+104
+105
+time (seconds)
+(e) Reddit
+Figure 6: Computational time comparison
+Linux machine equipped with an Intel(R) Xeon(R) Gold 6226 CPU
+@ 2.70GHz and a 32 GB Nvidia Tesla V100 GPU.
+We set learning rate of GNNs to 0.01, the weight decay is 5𝑒−4.
+For ease of training, 𝑾and 𝑾′ are two three-layer linear layers,
+with the middle layer having a dimension of 𝐻is in {128, 256, 512}.
+The dropout is in {0.6, 0.7, 0.8}.
+We implement K-Means based on the Sklearn, the default max-
+imum number of iterations 𝐸2 for the K-means algorithm is 300.
+The algorithm will stop iterating if it converges earlier, meaning
+the change in cluster centers falls below the specified tolerance
+threshold, which is set to 1𝑒−4 by default. For large datasets arXiv
+and Reddit, we use Mini-Batch K-Means as an alternative, the batch
+size is set to 1000.
+In the distillation stage, we conduct an extensive search to iden-
+tify the optimal hyper-parameters. Specifically, we explore the fol-
+lowing ranges for each hyper-parameter: the propagation times of
+the closed-form solution of GLS in clustering𝑇are set to {2, 5, 10, 15,
+18, 20, 25}; the coefficient in the propagation 𝛼is varied across
+{0.5, 0.8, 0.9, 0.91, 0.92, 0.95, 0.98}; the number of pretraining epochs
+𝐸1 is tested with values in {80, 100, 120, 800, 1000, 2000}; the com-
+bination weight of the refinement vector 𝛽is adjusted within the
+range [0, 4]; the propagation times in the refinement stage 𝑇′ are
+set to {1, 2, 5, 7, 10}; the sampling rate in multi-view sparsification
+𝜌is varied within the range [0, 0.5]; the number of refinement
+epochs 𝐸2 is tested with values in {80, 100, 120, 800, 1000, 2000}; the
+weight of the supervision loss on the multi-view condensed graphs
+𝛾is adjusted within the range [0, 10] and the weight of the consis-
+tency loss 𝜆is adjusted within the range [0, 1]. This comprehensive
+search strategy allow us to fine-tune the model’s performance by
+systematically evaluating the impact of each hyper-parameter on
+the overall results. We record the hyper-parameters in Table 6.
+For the evaluation stage, the evaluation model is set to GCN by
+default, which has two layers with 256 hidden dimensions, and
+dropout= 0.5, learning rate= 0.01, weight decay= 1𝑒−5, the training
+epochs is 600. In the generalization test, other GNN models have
+the same hidden dimensions, number of layers, learning rate, and
+dropout as GCN.
+D
+Additional Experiments
+D.1
+Detailed Dataset Synthesis Time
+In Fig. 6, we display the time costs required for GDD by ClustGDD
+and the other four competitive baselines (i.e., Gcond, SFGC, GCSR,
+and GDEM) on all five datasets with a condensation ratio of 2.6%,
+1.8%, 0.05%, 0.10%, and 0.10%, respectively. The results for other
+condensation ratios are quantitatively similar and thus are omit-
+ted. The 𝑥-axis corresponds to different GDD methods, while the
+𝑦-axis represents the condensation time in seconds (s) in a loga-
+rithmic scale. As shown in Fig. 6, the computational time needed
+by ClustGDD is significantly (often orders of magnitude) less than
+those by the competitors on all datasets. For example, on Citeseer,
+ClustGDD takes about 5s, which stands in stark contrast to the 479s
+needed by Gcond and 4334s for SFGC. On the arXiv dataset, the
+running time of ClustGDD is around 79s, while the others are up
+to more than 10,000 seconds.
+Table 7: Statistics of original and condensed datasets.
+Cora
+Original
+GCond
+GCSR
+ClustGDD
+Nodes
+2,708
+70
+70
+70
+Edges
+5,429
+4830
+4900
+1384
+Avg Degree
+2.00
+69.0
+70.0
+19.77
+Weighted Homophily
+0.81
+0.53
+0.94
+0.77
+Storage(MB)
+14.90
+0.40
+0.40
+0.40
+arXiv
+Original
+GCond
+GCSR
+ClustGDD
+Nodes
+169,343
+90
+90
+90
+Edges
+1,166,243
+8010
+8084
+5384
+Avg Degree
+6.89
+89.00
+89.82
+59.82
+Weighted Homophily
+0.65
+0.08
+0.08
+0.58
+Storage(MB)
+100.40
+0.08
+0.08
+0.08
+Reddit
+Original
+GCond
+GCSR
+ClustGDD
+Nodes
+232,965
+153
+153
+153
+Edges
+57,307,946
+9,190
+23,409
+18,093
+Avg Degree
+245.99
+60.07
+153.00
+118.25
+Weighted Homophily
+0.78
+0.10
+0.21
+0.65
+Storage(MB)
+435.50
+0.44
+0.44
+0.44
+D.2
+Statistics of the Synthetic Graphs
+As shown in Table 7, we compare some statistics of the original
+datasets and synthetic graphs obtained by different graph distilla-
+tion methods, GCond, GCSR, and ClustGDD, including the number of
+nodes, edges, average degree, weighted homophily, and the memory
+required for storage. It should be noted that both GCond and GCSR
+provide synthetic graphs that have not been sparsified. These meth-
+ods significantly reduce the number of nodes and edges, thereby
+decreasing storage requirements. For larger datasets, such as arXiv
+and Reddit, the reduction in storage is particularly noticeable. We
+also compare the weighted homophily of different graphs, which
+is the ratio of the sum of the weights of all edges between same
+14
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+class nodes to the sum of the weights of all edges. We find that
+ClustGDD is closer to the weighted homophily of the original graph
+than GCond and GCSR, reflecting that our synthetic graph retains
+key information about the topology of the original graph.
+(a) Cora w/o prop
+(b) Cora w prop
+(c) Cora syn
+(d) arXiv w/o prop
+(e) arXiv w prop
+(f) arXiv syn
+(g) Reddit w/o prop
+(h) Reddit w prop
+(i) Reddit syn
+Figure 7: The visualization of prediction logits on non-
+propagated/propagated/synthetic attributes
+D.3
+Visualization
+Propagation and Clustering. We first employ the T-SNE algo-
+rithm to visualize the logits of node attributes that have and have
+not undergone propagation after passing through a linear layer
+during the pretraining phase, as well as the logits of the synthetic
+node attributes after being processed by the GCN. As shown in
+Fig. 7, scatters of different colors represent nodes from different
+categories. We can clearly observe that the logits obtained from
+attributes processed by propagation exhibit much clearer classi-
+fication boundaries compared to those that have not undergone
+propagation processing. Regarding the logits from the GCN on the
+synthetic graph, although they are fewer in number, they display the
+clearest classification boundaries and also exhibit diversity within
+the classes. This reflects the high quality of the synthetic nodes
+attributes.
+Synthetic Graph Visualization. Next, we visualize the synthetic
+subgraph in Fig. 8. We choose to visualize edges with weights above
+a certain threshold, with the color of the edges becoming darker as
+the weight increases. We find that the intra-class and inter-class con-
+nections of nodes in the synthetic subgraph reflect the homophily
+of the original graph, while the density of these connections indi-
+cates the density of the original graph. This demonstrates that our
+method has successfully synthetic informative graph data.
+(a) Cora
+(b) Citeseer
+(c) arXiv
+(d) Reddit
+Figure 8: The visualization synthetic graphs
+E
+Theoretical Proofs
+Proof of Lemma 3.1. Using the Cauchy–Schwarz inequality,
+we can get
+∥𝝁org −𝝁syn∥2
+2 =
+
+1
+𝑁
+∑︁
+𝑣𝑗∈G
+𝑯𝑗−1
+𝑛
+∑︁
+𝑢𝑖∈G′
+𝑯′
+𝑖
+
+2
+2
+=
+
+1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+𝑯𝑗−1
+𝑛
+∑︁
+𝑢𝑖∈G′
+𝑯′
+𝑖
+
+2
+2
+=
+
+𝑛
+∑︁
+𝑖=1
+©­
+«
+𝑯′
+𝑖
+𝑛
+−
+∑︁
+𝑣𝑗∈𝐶𝑖
+𝑯𝑗
+𝑁
+ª®
+¬
+
+2
+2
+=
+
+𝑛
+∑︁
+𝑖=1
+1
+𝑛· ©­
+«
+𝑯′
+𝑖−
+∑︁
+𝑣𝑗∈𝐶𝑖
+𝑛
+𝑁· 𝑯𝑗ª®
+¬
+
+2
+2
+≤1
+𝑛
+𝑛
+∑︁
+𝑖=1
+
+𝑯′
+𝑖−
+∑︁
+𝑣𝑗∈𝐶𝑖
+𝑛
+𝑁· 𝑯𝑗
+
+2
+2
+= 1
+𝑛
+𝑛
+∑︁
+𝑖=1
+
+∑︁
+𝑣𝑗∈𝐶𝑖
+ 1
+|𝐶𝑖| −𝑛
+𝑁
+
+· 𝑯𝑗
+
+2
+2
+.
+Since the Euclidean norm ∥· ∥2
+2 is a convex function, using Jensen’s
+Inequality leads to
+1
+𝑛
+𝑛
+∑︁
+𝑖=1
+
+∑︁
+𝑣𝑗∈𝐶𝑖
+ 1
+|𝐶𝑖| −𝑛
+𝑁
+
+𝑯𝑗
+
+2
+2
+≤1
+𝑛
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+ 1
+|𝐶𝑖| −𝑛
+𝑁
+2 𝑯𝑗
+2
+2
+= 1
+𝑛
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+ 1
+|𝐶𝑖| −𝑛
+𝑁
+2
+=
+𝑛
+∑︁
+𝑖=1
+ 1
+𝑛−|𝐶𝑖|
+𝑁
+2
+=
+1
+𝑁2
+𝑛
+∑︁
+𝑖=1
+ 𝑁
+𝑛−|𝐶𝑖|
+2
+.
+The lemma is proved.
+□
+15
+
+
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+Yurui Lai, et al.
+Proof of Lemma 3.2. First, according to the definitions in Eq. (4),
+𝚺org and 𝚺syn are symmetric and positive semi-definite. By their
+positive semi-definiteness and Araki–Lieb–Thirring inequality [1],
+we have the following upper bound:
+Tr(𝚺org) + Tr(𝚺syn) −2 Tr((𝚺org𝚺syn)
+1
+2 )
+≤Tr(𝚺org) + Tr(𝚺syn) −2 Tr(𝚺org 1
+2 𝚺syn 1
+2 )
+= Tr
+
+(𝚺org 1
+2 −𝚺syn 1
+2 )2
+= ∥𝚺org1/2 −𝚺syn1/2∥2
+𝐹
+≤∥𝚺org1/2∥2
+𝐹+ ∥𝚺syn1/2∥2
+𝐹= Tr(𝚺org) + Tr(𝚺syn).
+(19)
+Next, we need the following two lemmata.
+Lemma E.1. The following equation holds:
+Tr(𝚺org) = 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2 +
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁∥𝑯′
+𝑖−𝝁org∥2
+2
+(20)
+Lemma E.2. Í𝑛
+𝑖=1 ||𝑯′
+𝑖−𝝁org||2
+2 = 𝑛· Tr(𝚺syn) + ∥𝝁syn −𝝁org∥2
+2
+
+Combining Lemmata E.1, E.2, and Eq. (19) leads to
+Tr(𝚺org) + Tr(𝚺syn)
+= 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2 +
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁∥𝑯′
+𝑖−𝝁org∥2
+2 + Tr(𝚺syn)
+= 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2 + 𝑐max
+𝑁
+𝑛
+∑︁
+𝑖=1
+∥𝑯′
+𝑖−𝝁org∥2
+2 + Tr(𝚺syn)
+= 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2 +
+𝑛𝑐max
+𝑁
++ 1
+
+· Tr(𝚺syn)
++ 𝑛𝑐max
+𝑁
+· ∥𝝁syn −𝝁org∥2
+2.
+(21)
+From Lemma E.2, we can further derive that
+Tr(𝚺syn) ≤1
+𝑛
+𝑛
+∑︁
+𝑖=1
+∥𝑯′
+𝑖−𝝁org∥2
+2 ≤1
+𝑛·
+𝑁
+𝑐min
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁∥𝑯′
+𝑖−𝝁org∥2
+2
+≤
+𝑁
+𝑛𝑐min
+· Tr(𝚺org).
+Plugging the above inequality into Eq. (21) finishes the proof.
+□
+Proof of Lemma E.1. Recall that 𝚺org
+𝑎,𝑏represents the covari-
+ance between the dimension 𝑎and dimension 𝑏of 𝑯. Then,
+𝚺org
+𝑎,𝑏= 1
+𝑁
+𝑁
+∑︁
+𝑣𝑗∈G
+(𝑯𝑗,𝑎−𝝁org
+𝑎)(𝑯𝑗,𝑏−𝝁org
+𝑏)
+(22)
+where 𝝁org
+𝑎, 𝝁org
+𝑏
+are the means of dimension 𝑎and 𝑏respectively.
+The covariance matrix can be decomposed into an intra-cluster
+covariance matrix and an inter-cluster covariance matrix. Note that
+we have
+𝑯𝑗,𝑎= 𝑯′
+𝑖,𝑎+ (𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎),
+𝑯𝑗,𝑏= 𝑯′
+𝑖,𝑏+ (𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏),
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎) =
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏) = 0.
+Then 𝚺org
+𝑎,𝑏can be rewritten as:
+𝚺org
+𝑎,𝑏= 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+((𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎) + (𝑯′
+𝑖,𝑎−𝝁org
+𝑎))
+· ((𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏) + (𝑯′
+𝑖,𝑏−𝝁org
+𝑏))
+=
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁
+· (𝑯′
+𝑖,𝑎−𝝁org
+𝑎)(𝑯′
+𝑖,𝑏−𝝁org
+𝑏)
++ 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎)(𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏)
++ 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎)(𝑯′
+𝑖,𝑏−𝝁org
+𝑏)
++ 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏)(𝑯′
+𝑖,𝑎−𝝁org
+𝑎)
+𝚺org
+𝑎,𝑏==
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁
+· (𝑯′
+𝑖,𝑎−𝝁org
+𝑎)(𝑯′
+𝑖,𝑏−𝝁org
+𝑏)
++ 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+(𝑯𝑗,𝑎−𝑯′
+𝑖,𝑎)(𝑯𝑗,𝑏−𝑯′
+𝑖,𝑏)
+(23)
+According to Eq. (23),
+Tr(𝚺org) = 1
+𝑁
+𝑛
+∑︁
+𝑖=1
+∑︁
+𝑣𝑗∈𝐶𝑖
+∥𝑯𝑗−𝑯′
+𝑖∥2
+2 +
+𝑛
+∑︁
+𝑖=1
+|𝐶𝑖|
+𝑁∥𝑯′
+𝑖−𝝁org∥2
+2,
+which completes the proof.
+□
+Proof of Lemma E.2. According to Eq. (3), Í𝑛
+𝑖=1 ||𝑯′
+𝑖−𝝁org||2
+2
+can be expanded as
+𝑛
+∑︁
+𝑖=1
+||𝑯′
+𝑖−𝝁org||2
+2 =
+𝑛
+∑︁
+𝑖=1
+(𝑯′
+𝑖−𝝁org)⊤(𝑯′
+𝑖−𝝁org).
+Let Δ = 𝝁org −𝝁syn, we have
+𝑛
+∑︁
+𝑖=1
+(𝑯′
+𝑖−𝝁org)⊤(𝑯′
+𝑖−𝝁org)
+=
+𝑛
+∑︁
+𝑖=1
+(𝑯′
+𝑖−𝝁syn + Δ)⊤(𝑯′
+𝑖−𝝁syn + Δ)
+=
+𝑛
+∑︁
+𝑖=1
+ (𝑯′
+𝑖−𝝁syn)⊤(𝑯′
+𝑖−𝝁syn) + 2(𝑯′
+𝑖−𝝁syn)⊤Δ + Δ⊤Δ
+Since Í𝑛
+𝑖=1(𝑯′
+𝑖−𝝁syn) = 0, we have
+𝑛
+∑︁
+𝑖=1
+||𝑯′
+𝑖−𝝁org||2
+2 =
+𝑛
+∑︁
+𝑖=1
+
+∥𝑯′
+𝑖−𝝁syn∥2
+2 + ∥𝝁syn −𝝁org∥2
+2
+
+= 𝑛·
+
+Tr(𝚺syn) + ∥𝝁syn −𝝁org∥2
+2
+
+.
+The lemma then follows.
+□
+Proof of Lemma 4.1. First, the second term is equivalent to
+∑︁
+(𝑣𝑖,𝑣𝑗)∈E
+
+𝑯𝑖
+√︁
+𝑑(𝑣𝑖)
+−
+𝑯𝑗
+√︁
+𝑑(𝑣𝑗)
+
+2
+𝐹
+= Tr(𝑯⊤(𝑰−˜𝑨)𝑯).
+16
+
+
+Simple yet Effective Graph Distillation via Clustering
+KDD’25, August 3–7, 2025, Toronto,ON, Canada
+By setting its derivative w.r.t. 𝑯to zero, we obtain the optimal 𝑯
+as:
+𝜕{(1 −𝛼) · ∥𝑯−𝑿𝑾∥2
+𝐹+ 𝛼· Tr(𝑯⊤(𝑰−˜𝑨)𝑯)}
+𝜕𝑯
+= 0
+=⇒(1 −𝛼) · (𝑯−𝑿𝑾) + 𝛼(𝑰−˜𝑨)𝑯= 0
+=⇒𝑯= (1 −𝛼) ·
+
+𝑰−𝛼˜𝑨
+−1
+𝑿𝑾.
+(24)
+By the property of Neumann series, we have (𝑰−𝛼˜𝑨)−1 = Í∞
+ℓ=0 𝛼𝑡˜𝑨ℓ.
+Plugging it into Eq. (24) completes the proof.
+□
+Proof of Lemma 4.2. Recall that the definition of homophily
+ratio over graph G is the fraction of edges whose endpoints are in
+the same class. Thus,
+Ω(G) =
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+Í𝐾
+𝑘=1 𝒀𝑖,𝑘· 𝒀𝑗,𝑘
+𝑚
+= −
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+Í𝐾
+𝑘=1 𝒀2
+𝑖,𝑘−𝒀2
+𝑖,𝑘+ 𝒀2
+𝑗,𝑘−𝒀2
+𝑗,𝑘−2𝒀𝑖,𝑘· 𝒀𝑗,𝑘
+2𝑀
+=
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+Í𝐾
+𝑘=1 𝒀2
+𝑖,𝑘+ 𝒀2
+𝑗,𝑘
+2𝑚
+−
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+Í𝐾
+𝑘=1 𝒀2
+𝑖,𝑘+ 𝒀2
+𝑗,𝑘−2𝒀𝑖,𝑘· 𝒀𝑗,𝑘
+2𝑀
+= 1 −
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+Í𝐾
+𝑘=1 (𝒀𝑖,𝑘−𝒀𝑗,𝑘)2
+2𝑚
+= 1 −
+Í
+(𝑣𝑖,𝑣𝑗)∈E ∥𝒀𝑖−𝒀𝑗∥2
+2
+2𝑀
+= 1 −
+Í
+(𝑣𝑖,𝑣𝑗)∈E
+
+(𝑫1/2𝒀)𝑖
+√𝑑𝑖
+−(𝑫1/2𝒀)𝑗
+√
+𝑑𝑗
+
+2
+2
+2𝑀
+.
+which finishes the proof.
+□
+17

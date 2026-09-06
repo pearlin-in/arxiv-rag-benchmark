@@ -1,0 +1,1853 @@
+Learning effective pruning at initialization
+from iterative pruning
+Shengkai Liu1,2,∗, Yaofeng Cheng1,2,∗, Fusheng Zha1,2 , Wei Guo 1,2 ,
+Lining Sun1,2 , Zhenshan Bing3 , Chenguang Yang4 ,
+1State Key Laboratory of Robotics and Systems
+2Harbin Institute of Technology
+3Technical University of Munich 4University of Liverpool
+https://github.com/ChengYaofeng/AutoSparse.git
+Abstract
+Pruning at initialization (PaI) reduces training costs by removing weights before
+training, which becomes increasingly crucial with the growing network size. How-
+ever, current PaI methods still have a large accuracy gap with iterative pruning,
+especially at high sparsity levels. This raises an intriguing question: can we get
+inspiration from iterative pruning to improve the PaI performance? In the lottery
+ticket hypothesis, the iterative rewind pruning (IRP) finds subnetworks retroactively
+by rewinding the parameter to the original initialization in every pruning iteration,
+which means all the subnetworks are based on the initial state. Here, we hypothe-
+sise the surviving subnetworks are more important and bridge the initial feature
+and their surviving score as the PaI criterion. We employ an end-to-end neural
+network (AutoSparse) to learn this correlation, input the model’s initial features,
+output their score and then prune the lowest score parameters before training. To
+validate the accuracy and generalization of our method, we performed PaI across
+various models. Results show that our approach outperforms existing methods in
+high-sparsity settings. Notably, as the underlying logic of model pruning is con-
+sistent in different models, only one-time IRP on one model is needed (e.g., once
+IRP on ResNet-18/CIFAR-10, AutoS can be generalized to VGG-16/CIFAR-10,
+ResNet-18/TinyImageNet, et al.). As the first neural network-based PaI method,
+we conduct extensive experiments to validate the factors influencing this approach.
+These results reveal the learning tendencies of neural networks and provide new in-
+sights into our understanding and research of PaI from a practical perspective. Our
+code is available at: https://github.com/ChengYaofeng/AutoSparse.git.
+1
+Introduction
+Neural network pruning, a technique employed for several decades [1–3], involves selectively
+removing non-essential parameters from a network. This process maintains the network’s inference
+accuracy while reducing the computational demands. This is particularly beneficial in resource-
+constrained environments such as mobile devices as it allows for faster response times and reduces
+energy consumption. While model pruning is traditionally performed after training to improve
+inference speed without compromising accuracy [4–6], the growing number of parameters in neural
+network models has led to a significant increase in training resource consumption [7]. This shift has
+spurred interest in strategies for pruning networks at the early stages of training.
+Recently, the Lottery Ticket Hypothesis (LTH) [8] has revealed that it is possible to identify efficient
+subnetworks early in the training process. These subnetworks can achieve accuracy levels comparable
+∗Joint first authorship
+Preprint. Under review.
+arXiv:2408.14757v2  [cs.CV]  9 Dec 2025
+
+
+to those achieved after full training. Identifying these subnetworks early on could drastically reduce
+training time and resource usage, providing an efficient pathway to model optimization. Therefore,
+some approaches [9–12] explore pruning at initialization (PaI), direct remove weights before training
+by assessing parameter importance using features before training. However, a comparative study
+[13] has shown that these PaI methods, using handcrafted criteria to prune, often do not match the
+performance of traditional iterative pruning, particularly at high sparsity.
+The iterative pruning process of LTH [8] involves one significant step: rewind, which reinits the
+pruning subnetwork to its original initialization and then starts the next pruning iteration. We refer
+to this pruning method as Iteration Rewind Pruning (IRP), which leads to two key insights: a)
+All parameters are changed back to their initial values before further training, indicating that the
+subnetwork is closely related to their initial state. b) Each pruning cycle aims to find the best
+subnetwork based on the surviving parameters, relatively less important parameters are progressively
+pruned, resulting in the retention of parameters that represent a higher level of importance.
+This motivated us to use the parameter’s surviving iteration as parameter scores and investigate the
+correlations between this and their initialized features. We experiment with the IRP using LeNet-
+300-100 on MNIST and analyse the results. The initialized parameters and their scores are visualized
+in Fig.1. It seems the magnitude of the parameters does not have an intuitive correlation with their
+importance. We further investigate this importance using other PaI criteria (e.g. SNIP — connection
+sensitivity and GraSP — gradient flow) in Fig.1. The results are inconsistent. The above raises
+intriguing research questions: Does this surviving score from iterative pruning make sense? Due to
+the unintuitive correlation, how to build the relation initial feature with this score?
+In this paper, we propose AutoSparse, a data-driven framework to predict the above scores before
+training, which automatically learns PaI criteria from iterative pruning. The network takes initial
+features, such as initial parameters and initial gradients on the dataset as inputs, and outputs the scores
+of parameters. Parameters with the lowest scores are then pruned according to the desired sparsity
+level. Comprehensive experiments evaluate the effectiveness and generalization of our method.
+Surprisingly, we find the results outperform recent state-of-the-art methods. Notably, although we
+need iterative pruning to create a dataset, this only needs once. Similar to existing pruning methods
+[9, 10] one criterion can be applied to all models, and our experiments demonstrate the ont-time RIP
+from one model can teach the PaI criterion for all the models. As the first data-driven criterion for PaI,
+we conduct extensive experiments across various aspects (e.g., datasets, inputs, models) to explore
+its effectiveness. Different from previous theoretical methods, these findings reveal the learning
+tendencies of neural networks, which advance the understanding and further exploration of PaI from
+a practical perspective. Our contribution can be summarized as follows:
+• We propose a novel PaI parameter importance criterion through iterative rewind pruning
+and investigate its characteristics, highlighting the complexity of designing such criteria
+manually.
+• Based on the importance criterion, a novel PaI approach (AutoS) is proposed, utilizing an
+end-to-end neural network to determine which parameter to prune. This approach introduces
+a transformative way of thinking in the field by shifting from traditional human-designed
+criteria approaches to data-driven, automated pruning.
+• Extensive experiments demonstrate that AutoS can achieve high PaI accuracy, outperforming
+other baselines. This also shows that data-driven PaI methods can achieve high performance.
+• As the first data-driven PaI criterion, comprehensive ablations and analyses evaluate the
+factors influencing this approach and the results advance the understanding and exploration
+of PaI.
+2
+Related Work
+Neural network pruning encompasses a variety of methodologies characterized by diverse approaches
+[14] such as structured [15] or unstructured pruning [16, 17], global [8, 10] or layer-wise pruning
+[18, 19], and differences in pruning frequency (pruning at initialization [9] or iterative pruning [8, 11]).
+To enhance the clarity of this study, our analysis specifically concentrates on the following two parts.
+2
+
+
+After training & Before training
+Most existing pruning methods assign scores to parameters after
+training, removing those with the lowest scores [20, 21]. This approach is effective as parameter
+values stabilize after training, simplifying the assessment of their importance. The criteria typically
+include parameter magnitudes [6], impact on loss [1], and various complex coefficient [22–24].
+However, these algorithms primarily enhance inference efficiency without reducing the computational
+demands during training. The LTH [8] demonstrates that certain subnetworks, identifiable before
+training, can match the performance of a dense model. Consequently, recent research has focused on
+developing criteria to effectively identify these subnetworks at initialization. This work [25] evaluates
+that random pruning is effective when the network size and layer-wise sparsity ratios are appropriate.
+Several methods propose more universal criteria to predict parameter scores before training, such as
+connection sensitivity in SNIP [9], gradient flow in GraSP [10], and synaptic sensitivity in Synflow
+[11]. Additionally, recent findings suggest that the Ramanujan Graph criterion is also beneficial for
+pruning before training [12]. This work focuses on pruning before training.
+Pruning at Initialization & Iterative Pruning
+The LTH [8] introduces a classical iterative pruning
+process that involves training, pruning, and rewinding. This cycle is repeated until an optimal
+subnetwork is identified, characterized by a mask that signifies an efficient subnetwork specific to
+the initialized model and dataset. Despite its high accuracy, iterative pruning is resource-intensive,
+prompting recent research toward less costly alternatives, such as PaI. Techniques such as SNIP [9]
+and GraSP [10] implement pruning in a single step at initialization. In contrast, some approaches
+attempt a more labour strategy by pruning iteratively before training, allowing for cumulative data
+analysis. SNIP-it [26] iteratively tests using a small batch, utilizing feedback from this batch to refine
+the entire model. Synflow [11] iterative pruning can prevent layer collapse and proposes data-agnostic
+criteria that facilitate rapid iterations in predicting parameter scores. While PaI is faster, there is still
+a performance gap compared to iterative pruning, especially at high levels of sparsity. Our motivation
+is to minimize the performance discrepancy between PaI and iterative pruning.
+3
+Analysis of Surviving Iteration
+3.1
+Preliminary
+Pruning Formulation
+Suppose we have a neural network parameterized by θ ∈Rk with its
+corresponding pruning masks m ∈{0, 1}k. A pruned subnetwork can be generated with θ ⊙m,
+where ⊙denotes the Hadamard product. Given a target dataset D = {(xi, yi)}N
+i=1 and a desired
+sparsity level ϵ ∈[0, 1], the pruning problem can be formulated as:
+min
+m,θ L(m ⊙θ; D) = min
+m,θ
+1
+n
+n
+X
+i=1
+ℓ(m ⊙θ; (xi, yi)) ,
+s.t. θ ∈Rk, ∥m∥0 ≤ϵ,
+(1)
+where ℓis the loss function. The formulation of PaI is to select a pruning mask before training.
+Therefore, the score s of each parameter is used to define which parameter should be pruned based
+on the initialized feature as follows:
+s ←(F0; D)
+(2)
+Here, F0 is features obtained before training, e.g. the initialized parameter θ0 and the initial gradient
+on dataset g0(D).
+3.2
+Initial Features and Surviving Iteration
+Figure 2(a) illustrates the process for acquiring the importance scores of the surviving subnetworks.
+We subsequently conducted several experiments to verify the correlation between these scores and the
+initial features. Since the IRP of LTH involves pruning based on the magnitude of the parameters, we
+first visualized the initial parameters and the corresponding scores in Figure 1(a). The relationship,
+as observed, is not immediately intuitive. We then visualized the scores obtained from two other
+methods, SNIP and GraSP, in Figure 1(b). The results do not show a positive correlation. However,
+3
+
+
+Surviving Score
+0
+5
+10
+15
+20
+0.0
+0.1
+-0.1
+Parameter
+0.0
+1.0
+2.0
+3.0
+(1e-10)
+SNIP Score
+0.0
+2.0
+-2.0
+-4.0
+-6.0
+(1e-5)
+GraSP Score
+(a)
+(b)
+Figure 1: Visualization of Surviving Score. The score is obtained from IRP on LeNet-300-100
+of MNIST. (a) The correlation between surviving score and initial parameter. (b) Comparing of
+surviving score and SNIP [9] and GraSP [10].
+these methods are still effective in achieving PaI. This raises the question: Is the surviving score truly
+meaningful?
+Given the unintuitive correlation between the surviving score and the parameters, we avoided
+designing handcrafted criteria. Instead, we employed a neural network to learn the relationship
+between the initial features and the score. Surprisingly, the PaI accuracy at high levels of sparsity
+surpassed that of state-of-the-art methods. Details of the AutoS method can be found in Sec. 4.
+AutoS, an end-to-end network, uses the features before training to predict the score of each parameter,
+subsequently pruning the lowest-scoring parameters based on specified sparsity. This approach not
+only shifts theoretical exploration into practical application, making it easier to identify ways to
+improve PaI accuracy, but also provides more intuitive insights through visualization of the network’s
+learning process. This visualization can offer valuable information on what the network focuses on,
+potentially inspiring further research.
+4
+Methods
+Baseline PaI Method
+We list some previous methods following as our baseline and to show our
+motivation. For details of the replication, see Appendix.
+SNIP [9]: this method computes the influence on loss as scores. It calculates the gradient in the
+dataset for every parameter as the score S = |g(θ; D)|, and removes the parameters with the lowest
+score.
+GraSP [22]: this method thinks the gradient flow is more important, and calculates the parameter
+score with Hessian-matrix S = −θ ⊙Hg.
+NPB [27]: this method thinks the effective paths and nodes will improve the pruning performance,
+and use S = αfn + (1 −α)fp to decide the value of a parameter, where fn is effective nodes and fp
+is effective paths of each parameter.
+Random: this method removes the parameter randomly after parameter initialization before training.
+4.1
+Overview
+In this section, we will introduce how the dataset is created and the network of AutoS, as shown in
+Figure 2. Given initialized parameters θ0 and initial gradient on the dataset g0(D), an end-to-end
+network to predict the parameter’s score. Once we have obtained the importance scores, we prune
+the parameters with the lowest scores to achieve the desired sparsity. Figure 2 (b) illustrates this
+end-to-end prediction process and pseudocode can be found in Algorithm 1. The predicted score can
+be written as:
+Ssurv = AutoS (θ0, g0(D))
+(3)
+4
+
+
+1 1 1
+1 1 1
+1 1 1
+1
+1
+1
+Mask
+Initial 
+Network
+Initialization
+Iterative Rewind Pruning
+0 1 1
+1 1 0
+1 0 1
+1
+1
+1
+0 1 1
+1 0 0
+1 0 1
+0
+0
+1
+0 0 1
+1 0 0
+0 0 0
+0
+0
+1
+N iteration
+0 2 3
+3 1 0
+2 0 2
+1
+1
+3
+AutoS Dataset
+Initial 
+Gradient
+Important Scores
+Initial 
+Network
+AutoS
+Score Prediction
+Initial Features
+Concatenate
+(a) 
+(b) 
+Input
+Output
+𝑆!"
+𝑆!!
+𝑆!#
+𝑆$
+𝑆%
+𝑆&
+𝑆'
+𝑆(
+𝑆)
+𝑆*
+𝑆"
+𝑆!
+𝑔!"
+𝑔!!
+𝑔!#
+𝑔$
+𝑔%
+𝑔&
+𝑔'
+𝑔(
+𝑔)
+𝑔*
+𝑔"
+𝑔!
+𝜃!"
+𝜃!!
+𝜃!#
+𝜃$
+𝜃%
+𝜃&
+𝜃'
+𝜃(
+𝜃)
+𝜃*
+𝜃"
+𝜃!
+𝜃!"
+𝜃!!
+𝜃!#
+𝜃$
+𝜃%
+𝜃&
+𝜃'
+𝜃(
+𝜃)
+𝜃*
+𝜃"
+𝜃!
+𝜃!"
+𝜃!!
+𝜃$
+𝜃%
+𝜃'
+𝜃(
+𝜃)
+𝜃*
+𝜃"
+𝜃!"
+𝜃!!
+𝜃$
+𝜃(
+𝜃*
+𝜃"
+𝜃!"
+𝜃(
+𝜃*
+𝑔*
+𝑔"
+𝑔!
+𝑔!"
+𝑔!!
+𝑔!#
+𝜃*
+𝜃"
+𝜃!
+𝜃!"
+𝜃!!
+𝜃!#
+𝑆*
+𝑆"
+𝑆!
+𝑆!"
+𝑆!!
+𝑆!#
+Figure 2: (a) illustrates the process of obtaining the surviving score, which also serves as the
+generation process for the AutoS dataset DA. DA consists of parameters after initialization and
+gradients obtained based on the pruning dataset. (b) demonstrates how AutoS predicts these scores.
+Specifically, features from the initial network are concatenated and input into AutoS, which then
+predicts the parameter scores.
+Algorithm 1 AutoS Pruning Pipeline
+Require:
+1: Dataset D: Pruning Dataset;
+2: Network: a network parameterized by θ ∈Rk;
+3: Mask: corresponding pruning masks m ∈{0, 1}k;
+4: Target Sparsity ϵ: desired sparsity level ϵ ∈[0, 1];
+5: AutoS model: an AutoS model for PaI;
+Input: θ0: network initialize; m0: mask initialize
+6: model_eval: g0(D) ←(θ0, D);
+model eval for initial gradient
+7: Ssurv = AutoS(θ0, g0(D))
+score prediction
+8: mtarg ←(m0, Ssurv, ϵ)
+pruning mask
+9: θtarg ←(θ0, mtarg)
+pruning
+Output: Pruning Network θtarg
+4.2
+Dataset Generation and Training
+To use AutoS for predicting the importance scores of a network, we need to acquire the ground truth
+dataset DA. Figure 2 (a) illustrates this pipeline. Notably, the pruning rules of CNN and MLP are
+consistent to different models, the same as the related PaI methods [9, 10, 27] that one handcrafted
+rule can be applied to different models. Thus the datasets acquired from only one-time IRP can train
+AutoS that can be generalized to unknown models. In our approach, we employ the SNIP [9] to
+prune iteratively on ResNet-18 (CIFAR-10) once. Specifically, each parameter is assigned a binary
+mask m ∈{0, 1}k initialized to m0 = 1. We define the sparsity degree ϵ, and the number of sparse
+iterations N for the pruning process. This iterative process results in a mask mi after i(i ≤N) times
+pruning. During each pruning iteration, certain parameters are removed, and their corresponding
+mask values are updated to 0. The importance of each parameter, denoted as Ssurv, is set according
+to the number of training rounds it survives, which can be formulated as:
+Sgt
+surv = normlize
+N
+X
+i
+mi
+(4)
+5
+
+
+The pseudocode is shown as Algorithm 2. After finishing the dataset, we choose ResNet [28] models
+as the AutoS backbone and add an encode layer to match the input features, a decode layer for the
+score prediction. For full model details, see Appendix 7.
+5
+Experiment
+In this section, we evaluate the baseline PaI methods and our AutoS on CIFAR-10, CIFAR-100,
+MNIST and TinyImageNet using various network architectures. Figure 3 presents the performance
+comparison of SNIP, GraSP, random, and AutoS. For context, the performance of the dense (unpruned)
+model is also included.
+Experiment Setup:
+We used CIFAR-10 to train ResNet-18 and employed SNIP to perform a
+one-time IRP with 20 iterations to build the dataset. This dataset was then used to train AutoS
+with ResNet-18, which was subsequently used to prune various networks. Full experimental details,
+including network architecture and hyperparameters, can be found in the Appendix A and C.
+Sparsity(%)
+Sparsity(%)
+VGG-19 (CIFAR-100)
+VGG-16 (CIFAR-10)
+LeNet-300-100 (MNIST)
+ResNet-18 (CIFAR-10)
+Top1 Accuracy(%)
+Top1 Accuracy(%)
+Dense
+AutoS
+GraSP
+NPB
+SNIP
+94
+93
+92
+91
+90
+89
+88
+87
+20%
+40%
+60%
+80%
+100%
+20%
+40%
+60%
+80%
+100%
+72
+70
+68
+66
+64
+62
+60
+94
+93
+92
+91
+90
+89
+88
+87
+86
+95
+20%
+40%
+60%
+80%
+100%
+20%
+40%
+60%
+80%
+100%
+99
+98
+97
+96
+95
+94
+93
+Random
+Figure 3: Accuracy of different PaI methods prune to various sparsities.
+Analysis:
+In Figure 3, on VGG-16, AutoS outperforms SNIP by 2% accuracy on CIFAR-10.
+Similarly, on VGG-19, our method achieves 2% higher accuracy than SNIP. On ResNet-18, our
+method achieves 0.8% higher accuracy than SNIP at 95% sparsity (where only 5% of parameters
+remain) and 0.5% higher accuracy at 99% sparsity. This proves that our method is effective for
+PaI. Notably, the above AutoS is trained with the dataset created by one-time IRP on ResNet-18
+(CIFAR10). It demonstrates our model can be generalized well on unseen networks and only one-
+time IRP is needed. In our method, GraSP is strange at low-level sparsity, but it can achieve higher
+performance than SNIP and NPB at high-level sparsity, which is consistent with the evaluation
+in GraSP [10]. We also conducted AutoS on ResNet-18 with TinyImageNet in Table 1 to test the
+robustness of the large-scale dataset. AutoS performs better than SNIP and GraSP at all four sparsities.
+Different from the above small-scale datasets, the NPB outperforms AutoS, especially at 70% and
+90% sparsity. When the pruning ratio is 30% or 50%, AutoS is close to the NPB. This approves the
+effectiveness of AutoS on large-scale dataset.
+Prediction Visualization:
+To better understand what our AutoS predicts, we visualize the ground
+truth surviving scores and the predictions in Figure 4. From Figure 4 (b), we observe that AutoS learns
+from the iterative pruning process that parameter values have a strong relationship with parameter
+scores: higher absolute parameter values correspond to relatively higher scores. Furthermore,
+gradients show a less significant relationship with parameter scores. This is evident as only a small
+6
+
+
+(a) before training
+(b) after training
+Parameter
+Score
+Parameter
+0
+5
+10
+15
+20
+0.0
+0.1
+-0.1
+0.0
+0.1
+-0.1
+0.2
+0.3
+0.4
+Score
+0
+5
+10
+15
+20
+0.0
+0.4
+-0.4
+0.8
+1.2
+0.0
+0.4
+-0.4
+0.8
+Gradient
+Gradient
+Prediction Scores
+Ground Truth Scores
+Figure 4: Visualization of score prediction. (a) is the prediction results before AutoS training, (b) is
+the prediction results after AutoS training.
+Table 1: Acccuracy of different PaI methods on ResNet-18 (TingImageNet).
+Methods
+Sparsity
+30%
+50%
+70%
+90%
+SNIP
+59.88±0.52
+58.34±0.35
+57.45±0.22
+53.16±0.13
+GraSP
+57.83±0.65
+56.54±0.42
+55.43±0.17
+54.43±0.09
+NPB
+60.35±0.35
+59.35±0.34
+58.70±0.30
+56.4±0.22
+AutoS
+60.02±0.23
+59.23±0.27
+58.05±0.20
+55.32±0.15
+number of points with high gradients have high scores, and many gradients close to 0 still have large
+scores. The ground truth dataset in Figure 4 appears more disordered when considering these two
+features. A clearer understanding can be gained from the ablation experiments discussed in Section 6.
+6
+Ablations
+As our method uses a network to prune before training, we evaluate its performance across different
+datasets, backbone networks, and hyperparameters in this section. For better comparison, the default
+AutoS is presented in several tables, which is trained with ResNet-18 (CIFAR-10), SNIP-iter and
+20-iter. We annotate this experiment in bold font. All the ablation implementation details are in
+Appendix D.
+6.1
+Different Inputs
+To evaluate the effectiveness of different input features, we experiment with three types of inputs:
+1) Only Param: only use parameters as the input; 2) Only Grad: only use gradient as the input; 3)
+Param + Grad: combining both parameters and gradients as the input. We tested these approaches
+using ResNet-18 as our AutoS model and pruned ResNet-18 on CIFAR-10. The AutoS dataset is
+created using iterative SNIP (SNIP-iter). The results are shown in Table 2. The Only Para approach
+and the Only Grad approach drop a little at high level sparsity compared to the Param + Grad, with
+approximately 1% accuracy lower. This suggests that initial parameter and gradient both contribute
+to PaI and inputting more useful initial features into AutoS leads to higher accuracy.
+7
+
+
+Table 2: Different inputs of AutoS to prune
+ResNet-18 (CIFAR-10)
+Input
+70%
+90%
+95%
+99%
+Only Param
+93.07
+92.40
+91.78
+87.6
+Only Grad
+93.27
+92.53
+91.70
+87.99
+Param + Grad
+93.09
+92.63
+92.00
+88.78
+Table 3: LTH and SNIP-iter (dataset) to train
+AutoS to prune ResNet-18 (CIFAR-10)
+Method
+70%
+90%
+95%
+99%
+LTH
+93.41
+92.09
+89.96
+79.15
+SNIP-iter
+93.09
+92.63
+92.00
+88.78
+(a) Only Grad
+(b) Only Param
+Parameter
+Score
+Parameter
+0
+5
+10
+15
+20
+0.0
+0.1
+-0.1
+0.0
+0.1
+-0.1
+Score
+0
+5
+10
+15
+20
+0.0
+0.2
+-0.2
+0.4
+0.6
+0.0
+-1.0
+-0.4
+0.5
+Gradient
+Gradient
+Prediction Scores
+Ground Truth Scores
+-0.5
+Figure 5: Visualization of ablation score prediction. (a) and (b) are the prediction results of Only
+Grad and Only Param.
+For further investigation of the relation between parameter and gradient inputs, we visualize the
+results of these two ablation networks in Figure 5. It can be observed that when the feature is not input,
+there is no correspondence between it and the score. The results learned by the AutoS models with
+only Grad or Param as input are generally consistent with the results of Param + Grad shown in Figure
+4. However, the results obtained with individual inputs exhibit almost no noise and demonstrate a
+clear functional relationship with the corresponding parameters. With only Grad as input, the closer
+the absolute value of the gradient is to zero, the lower the score; as the absolute value of the gradient
+increases, the score rapidly reaches its peak and remains unchanged with further increases in gradient
+magnitude. This result indicates that as long as there is a gradient, the corresponding parameter is
+effective. This finding is consistent with other studies emphasizing the importance of parameter nodes
+[27] and parameter information transmission size [29]. Similarly, for the model with only Param as
+input, the score increases as the absolute value of the parameter increases. This also reflects why the
+LTH [8], which iteratively prunes based solely on parameter importance, can achieve an efficient
+subnetwork.
+6.2
+Different Datasets
+To evaluate the effectiveness of different IRP datasets in training AutoS, we have adopted four distinct
+aspects: 1) LTH or SNIP: IRP like LTH or IRP using SNIP to generate dataset; 2) Model: iterative
+pruning on different datasets (e.g., IRP on ResNet-18, VGG-19 et al.); 3) Iteration: using 20, 40, or
+100 iterations for generating the AutoS dataset; 4) Merge: merging different datasets to train AutoS.
+LTH or SNIP
+The different iterative pruning methods are to evaluate the best RIP method for the
+AutoS dataset. The results are shown in Table 3. The AutoS trained with SNIP-iter outperforms the
+8
+
+
+VGG-19 (CIFAR-100)
+VGG-16 (CIFAR-10)
+LeNet-300-100 (MNIST)
+ResNet-18 (CIFAR-10)
+Sparsity(%)
+Top1 Accuracy(%)
+Sparsity(%)
+Top1 Accuracy(%)
+94
+93
+92
+91
+90
+89
+88
+95
+72
+70
+68
+66
+64
+62
+60
+94
+93
+92
+91
+90
+89
+88
+87
+86
+95
+99
+98
+97
+96
+95
+94
+93
+Dense
+AutoS-ResNet18
+AutoS-LeNet
+AutoS-VGG19
+LTH
+SNIP-iter
+20%
+40%
+60%
+80%
+100%
+20%
+40%
+60%
+80%
+100%
+20%
+40%
+60%
+80%
+100%
+20%
+40%
+60%
+80%
+100%
+Figure 6: Accuracy of different ablation AutoS models and AutoS datasets DA to various sparsities.
+Table 4: Different datasets to train AutoS and different models to implement AutoS to prune ResNet-
+18 (CIFAR-10)
+AutoS Dataset
+AutoS Model
+Sparsity
+Dataset
+Model
+90%
+95%
+99%
+MNIST
+LeNet-300-100
+ResNet-18
+91.94
+91.79
+88.07
+VGG-19
+91.88
+91.60
+88.00
+CIFAR-10
+ResNet-18
+ResNet-18
+92.63
+92.00
+88.78
+VGG-19
+92.46
+91.83
+88.24
+CIFAR-100
+VGG-19
+ResNet-18
+92.71
+56.26
+37.54
+VGG-19
+92.41
+91.63
+19.40
+TinyImageNet
+ResNet-18
+ResNet-18
+92.55
+91.55
+64.04
+VGG-19
+92.21
+91.23
+60.04
+LTH (magnitude) at sparsity levels beyond 90%. We believe this is because LTH only involves a one-
+dimensional parameter feature, making it difficult for the network to effectively extract this feature.
+In contrast, SNIP-iter prunes parameters with the lowest gradient flow, capturing the relationship
+between parameters and gradients. This likely helps AutoS in effectively extracting the relation
+between the parameter and gradient from the dataset.
+Model
+To evaluate which model is more effective for training AutoS, we use LeNet-300-100
+(MNIST), ResNet-18 (CIFAR-10), and VGG-19 (CIFAR-100) to train AutoS for pruning ResNet-18
+(CIFAR-10). The results are shown in Table 4. It can be seen that ResNet-18 (CIFAR-10) slightly
+outperforms LeNet-300-100 (MNIST) by approximately 0.2-0.7%. However, the results trained with
+VGG-19 (CIFAR-100) drop significantly at 99% sparsity. This suggests that the choice of model
+used to create the AutoS dataset can significantly impact the pruning performance of AutoS. LeNet-
+300-100 has about 60,000 parameters, ResNet-18 has 11.7 million parameters, and VGG-19 has 144
+million parameters. Despite VGG-19 having the most parameters, it performs the worst. Given that
+the good performance of LeNet-300-100 on MNIST is similar to that of ResNet-18 on CIFAR-10,
+it suggests that model size may not significantly affect the AutoS dataset. When comparing the
+accuracy drop of AutoS using ResNet-18 on TinyImageNet, we conjecture that this might be due to
+the model’s suboptimal performance on its original dataset. For instance, VGG-19 achieves only 72%
+accuracy on CIFAR-100, and ResNet-18 achieves 61% on TinyImageNet. This indicates that these
+models are not ideal, and their parameters do not follow an ideal pattern to effectively guide other
+models. Consequently, the IRP from these models cannot adequately teach an ideal AutoS.
+9
+
+
+Table 5: Different iteration to train AutoS to prune ResNet-18 (CIFAR-10)
+Iterative Times
+Sparsity
+70%
+90%
+95%
+99%
+40-iter
+93.21
+92.57
+91.88
+88.66
+100-iter
+93.24
+92.20
+91.87
+88.45
+Table 6: Different iteration to train AutoS to prune ResNet-18 (CIFAR-10)
+Merge
+Sparsity
+70%
+90%
+95%
+99%
+20+40+100
+93.17
+92.74
+47.56
+10.00
+3*20
+93.17
+92.50
+91.73
+88.39
+LTH+SNIP
+92.90
+92.59
+91.70
+88.45
+We also implemente AutoS with VGG-19 and trained with the above four models to prune ResNet-18
+(CIFAR-10) models. The results are shown in Table 4. Since the input and output data have no
+special structure, different models have little influence on the pruning accuracy. We selected two
+models from Table 4 to conduct a full set of experiments for a comprehensive investigation, following
+the procedure of the main experiment. One model is AutoS-LeNet, from MNIST-LeNet-300-100
+(Dataset) and ResNet-18 (AutoS Model), to test the pruning effect on a small AutoS dataset. The
+other is AutoS-VGG19, from CIFAR-10-ResNet-18 and VGG-19 (AutoS Model), to investigate the
+different AutoS model’s effectiveness. The results are presented in Figure 6, which also includes
+pruning results from other methods (LTH and SNIP-iter).
+The performances of all AutoS methods are generally similar, with the exception that AutoS from
+LeNet-300-100 shows slightly lower performance at high sparsity levels compared to AutoS from
+ResNet-18 and VGG-19 on CIFAR-10 with VGG-16 (CIFAR-10) and VGG-19 (CIFAR-100). Addi-
+tionally, the results from LeNet-300-100 for pruning LeNet-300-100 outperform those of the other
+two methods, suggesting that the MNIST dataset may be too small, potentially leading to overfitting in
+AutoS. These results further demonstrate the generalization capability of AutoS, as all three datasets
+were created using a one-time IRP. While there is still a performance gap between AutoS and iterative
+pruning for most datasets, the performance on VGG-19 (CIFAR-100) is very close to that of iterative
+pruning in Figure 6, significantly outperforming other state-of-the-art methods, as shown in Figure 3.
+Iteration
+We further investigate the effectiveness of fine-grained parameter scores by training
+AutoS with different pruning iterations. The results are shown in Table 5. AutoS trained with
+more fine-grained datasets exhibit a slight performance drop at sparsity levels from 90% to 99%.
+This decline may be due to the scores being too densely clustered, making it difficult for AutoS to
+effectively distinguish between them.
+Merge
+We further merge different datasets to train AutoS to test whether a larger dataset can
+improve its performance. We try three approaches to merge datasets: 1) 3*20: merging three
+different 20-iteration datasets into one dataset (i.e., three-times IRP with different initial parameter);
+2) 20+40+100: merging 20, 40, and 100 iterations into one dataset; 3) LTH + SNIP: merging LTH
+and SNIP-iter datasets into one.
+The results can be found in Table 6. The results of the 3*20 and Mag+SNIP merges do not show
+significant changes. Although the subnetworks from IRP are not the same [8], this doesn’t influence
+much for AutoS. The 20+40+100 merge experiences a significant drop at 95% sparsity and fails to
+work at 99% sparsity. We conjecture this might be because merging coarse-grained datasets with
+fine-grained datasets creates ambiguities. For example, in the 20-iteration dataset, 5% of parameters
+might be scored as 1 (the score will be normalized to [0,1]), while in the 100-iteration dataset, only
+1% of parameters might be scored as 1, with the next 4% scored as 0.99, 0.98, 0.97, and 0.96,
+respectively. This discrepancy makes the merged dataset "dirty", leading to AutoS’s inability to
+learn effective predictions for fine-grained parameters, resulting in weak performance at high sparsity
+10
+
+
+levels. Merging LTH and SNIP also has little influence on the pruning accuracy. Although these two
+methods use different criteria.
+7
+Limitations
+Our method demonstrates promising results in parameter importance (PaI), with its effectiveness
+confirmed through extensive experiments, including ablation studies. However, due to computational
+limitations, our experiments were primarily conducted on the MNIST, CIFAR-10, CIFAR-100 and
+TinyImageNet, utilizing models such as LeNet-300-100, ResNet-18, VGG-16 and VGG-19. As a
+result, the performance on these datasets may not fully represent the method’s performance on other
+datasets. Furthermore, for some experimental results, we can only provide an experiential analysis
+based on our observations. The true underlying reasons require further experiments to demonstrate.
+8
+Discussion
+Our novel PaI method leverages a neural network to learn effective criteria from iterative pruning.
+Although this method surpasses some state-of-the-art baselines, it still exhibits a performance gap
+relative to iterative pruning, particularly at high levels of sparsity in Figure 6. From our comprehensive
+experiments, we infer three main aspects:
+8.1
+Datadriven for PaI
+The state of the art
+We propose using a neural network to learn the PaI criterion from iterative
+pruning, and our methods achieve state-of-the-art performance across most models. These results
+demonstrate the effectiveness of the surviving score from IRP and the generalization capabilities
+learned from this score. While previous methods have explored subnetworks obtained through LTH
+in various ways [30–32], our approach of utilizing these subnetworks to guide initialization pruning
+is novel and is being proposed for the first time in this work.
+Network learning results
+The results predicted by AutoS using only gradients or only param-
+eters as input are astonishing, as they produce nearly perfect functional curves. This consistency
+with traditional manually designed pruning methods, viewed through the lens of neural networks’
+autonomous learning, further validates their effectiveness. However, given the complexity of the
+dataset, manually designing such curves is nearly impossible. Additionally, LTH intuitively assesses
+the importance of parameters based on their absolute values in a linear manner. While this approach
+aligns with network predictions, it offers limited insights into the mechanisms of network pruning. In
+contrast, our network predicts results that approximate a logarithmic curve. If these predictions can
+be theoretically validated, it would significantly advance our understanding and exploration of neural
+networks.
+8.2
+Potential Improvements
+Datasets Quality
+Our experiments demonstrate that a poor initial network fails to learn an ideal
+data mapping relationship, which in turn makes it difficult for the AutoS dataset generated through
+IRP to train an effective AutoS model. Consequently, there is still room for improvement in the
+performance of ResNet-18 on CIFAR-10 (with an accuracy of 92%). If a more optimal dataset were
+used for IRP, it is likely that the resulting AutoS would achieve even better performance.
+Superior Input Feature
+Our experiments demonstrate that combining initial parameters with
+gradients yields better performance. Incorporating additional useful initial features as inputs could
+further enhance the accuracy of initialization pruning. For example, as noted in [32], rewinding to the
+initial state often struggles to perform well in deeper networks, but rewinding the parameters at the
+10th iteration of IRP has been shown to achieve further improvements. Additionally, the network’s
+topology can also influence the model’s accuracy. However, since these features are typically obtained
+through training, understanding how to relate them to the initial features and integrate them as inputs
+for AutoS could be an effective way to improve pruning accuracy.
+11
+
+
+9
+Conclusion
+We introduce a novel PaI method that leverages neural networks to learn from the superior strategies
+of iterative pruning, thereby enhancing pruning effectiveness. By obtaining datasets once from
+iterative pruning processes and employing these in training our PaI network, AutoS, we have achieved
+more precise results than several mainstream PaI methods. Furthermore, AutoS can generalize well
+to unknown networks without additional training. Our experiments validate the viability of deriving
+PaI strategies from iterative pruning, demonstrating significant improvements in pruning accuracy.
+Additionally, our experiments suggest that future enhancements in dataset generation, feature input,
+and network architecture could further improve PaI accuracy with AutoS. We are optimistic that our
+work will inspire and inform subsequent research in this field.
+12
+
+
+References
+[1] Yann LeCun, John Denker, and Sara Solla. Optimal brain damage. Advances in neural
+information processing systems, 2, 1989.
+[2] Russell Reed. Pruning algorithms-a survey. IEEE transactions on Neural Networks, 4(5):
+740–747, 1993.
+[3] Davis Blalock, Jose Javier Gonzalez Ortiz, Jonathan Frankle, and John Guttag. What is the state
+of neural network pruning? Proceedings of machine learning and systems, 2:129–146, 2020.
+[4] Trevor Gale, Erich Elsen, and Sara Hooker. The state of sparsity in deep neural networks. arXiv
+preprint arXiv:1902.09574, 2019.
+[5] Michael Zhu and Suyog Gupta. To prune, or not to prune: exploring the efficacy of pruning for
+model compression. arXiv preprint arXiv:1710.01878, 2017.
+[6] Song Han, Jeff Pool, John Tran, and William Dally. Learning both weights and connections for
+efficient neural network. Advances in neural information processing systems, 28, 2015.
+[7] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[8] Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable
+neural networks. International Conference on Learning Representations, 2019.
+[9] Namhoon Lee, Thalaiyasingam Ajanthan, and Philip HS Torr. Snip: Single-shot network pruning
+based on connection sensitivity. In International Conference on Learning Representations,
+2018.
+[10] Chaoqi Wang, Guodong Zhang, and Roger Grosse. Picking winning tickets before training by
+preserving gradient flow. International Conference on Learning Representations, 2020.
+[11] Hidenori Tanaka, Daniel Kunin, Daniel L Yamins, and Surya Ganguli. Pruning neural networks
+without any data by iteratively conserving synaptic flow. Advances in neural information
+processing systems, 33:6377–6389, 2020.
+[12] Duc NM Hoang and Shiwei Liu. Revisiting pruning at initialization through the lens of
+ramanujan graph. International Conference on Learning Representations, 2023.
+[13] Jonathan Frankle, Gintare Karolina Dziugaite, Daniel M Roy, and Michael Carbin. Pruning
+neural networks at initialization: Why are we missing the mark? International Conference on
+Learning Representations, 2020.
+[14] Paul Wimmer, Jens Mehnert, and Alexandru Paul Condurache. Dimensionality reduced training
+by pruning and freezing parts of a deep neural network: a survey. Artificial Intelligence Review,
+56(12):14257–14295, 2023.
+[15] Zhuang Liu, Mingjie Sun, Tinghui Zhou, Gao Huang, and Trevor Darrell. Rethinking the value
+of network pruning. International Conference on Learning Representations, 2019.
+[16] Li Hao, Asim Kadav, Igor Durdanovic, Hanan, Samet, and Hans Peter Graf. Pruning filters for
+efficient convnets,. International Conference on Learning Representations, 2017.
+[17] Huizi Mao, Song Han, Jeff Pool, Wenshuo Li, Xingyu Liu, Yu Wang, and William J Dally.
+Exploring the granularity of sparsity in convolutional neural networks. In Proceedings of the
+IEEE Conference on Computer Vision and Pattern Recognition Workshops, pages 13–20, 2017.
+[18] Decebal Constantin Mocanu, Elena Mocanu, Peter Stone, Phuong H Nguyen, Madeleine
+Gibescu, and Antonio Liotta. Scalable training of artificial neural networks with adaptive sparse
+connectivity inspired by network science. Nature communications, 9(1):2383, 2018.
+[19] Utku Evci, Trevor Gale, Jacob Menick, Pablo Samuel Castro, and Erich Elsen. Rigging the
+lottery: Making all tickets winners. In International conference on machine learning, pages
+2943–2952, 2020.
+13
+
+
+[20] Xin Dong, Shangyu Chen, and Sinno Pan. Learning to prune deep neural networks via layer-wise
+optimal brain surgeon. Advances in neural information processing systems, 30, 2017.
+[21] Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila, and Jan Kautz. Pruning convolu-
+tional neural networks for resource efficient inference. International Conference on Learning
+Representations, 2016.
+[22] Chaoqi Wang, Roger Grosse, Sanja Fidler, and Guodong Zhang. Eigendamage: Structured
+pruning in the kronecker-factored eigenbasis. In International conference on machine learning,
+pages 6566–6575. PMLR, 2019.
+[23] Ruichi Yu, Ang Li, Chun-Fu Chen, Jui-Hsin Lai, Vlad I Morariu, Xintong Han, Mingfei Gao,
+Ching-Yung Lin, and Larry S Davis. Nisp: Pruning networks using neuron importance score
+propagation. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+pages 9194–9203, 2018.
+[24] Yiwen Guo, Anbang Yao, and Yurong Chen. Dynamic network surgery for efficient dnns.
+Advances in neural information processing systems, 29, 2016.
+[25] Shiwei Liu, Tianlong Chen, Xiaohan Chen, Li Shen, Decebal Constantin Mocanu, Zhangyang
+Wang, and Mykola Pechenizkiy. The unreasonable effectiveness of random pruning: Return of
+the most naive baseline for sparse training. arXiv preprint arXiv:2202.02643, 2022.
+[26] Stijn Verdenius, Maarten Stol, and Patrick Forré. Pruning via iterative ranking of sensitivity
+statistics. arXiv preprint arXiv:2006.00896, 2020.
+[27] Hoang Pham, Shiwei Liu, Lichuan Xiang, Dung Le, Hongkai Wen, Long Tran-Thanh, et al.
+Towards data-agnostic pruning at initialization: what makes a good sparse mask? Advances in
+Neural Information Processing Systems, 36, 2024.
+[28] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+pages 770–778, 2016.
+[29] Artem Vysogorets and Julia Kempe. Connectivity matters: Neural network pruning through the
+lens of effective sparsity. Journal of Machine Learning Research, 24(99):1–23, 2023.
+[30] Ari Morcos, Haonan Yu, Michela Paganini, and Yuandong Tian. One ticket to win them all:
+generalizing lottery ticket initializations across datasets and optimizers. Advances in neural
+information processing systems, 32, 2019.
+[31] Tianlong Chen, Jonathan Frankle, Shiyu Chang, Sijia Liu, Yang Zhang, Zhangyang Wang, and
+Michael Carbin. The lottery ticket hypothesis for pre-trained bert networks. Advances in neural
+information processing systems, 33:15834–15846, 2020.
+[32] Jonathan Frankle, Gintare Karolina Dziugaite, Daniel M Roy, and Michael Carbin. Stabilizing
+the lottery ticket hypothesis. arXiv preprint arXiv:1903.01611, 2019.
+A
+Dataset Gneration Details
+We use the following combinations of networks and datasets for pruning.
+Network
+Dataset
+Appears
+LeNet-300-100
+MNIST
+Main Body
+ResNet-18 & VGG-16
+CIFAR-10
+Main Body & Appendix
+ResNet-18 & VGG-19
+CIFAR-100
+Main Body
+ResNet-18
+TinyImageNet
+Main Body
+14
+
+
+A.1
+Networks
+The network architectures are as follows:
+LeNet-300-100: this is a fully-connected network designed for the MNIST dataset. The network
+consists of two hidden layers: the first hidden layer has 300 units, and the second hidden layer has
+100 units. Both layers use ReLU activations.
+Module
+Weight
+Bias
+BatchNorm
+Activation
+Linear
+[784, 300]
+300
+✗
+RELU
+Linear
+[300, 100]
+100
+✗
+RELU
+Linear
+[100, 10]
+10
+✗
+-
+ResNet-18: this is a modified version where the first convolution layer has a filter size of 3x3, and
+the subsequent max-pooling layer has been eliminated.
+Module
+Weight
+Stride
+BatchNorm
+ReLU
+Conv
+[3, 3, 3, 64]
+2
+✓
+✓
+Conv
+[3, 3, 64, 64]
+1
+✓
+✓
+Conv
+[3, 3, 64, 64]
+1
+✓
+✓
+Conv
+[3, 3, 64, 128]
+2
+✓
+✓
+Conv
+[3, 3, 128, 128]
+1
+✓
+✓
+Conv
+[3, 3, 128, 256]
+2
+✓
+✓
+Conv
+[3, 3, 256, 256]
+2
+✓
+✓
+Conv
+[3, 3, 256, 512]
+2
+✓
+✓
+Conv
+[3, 3, 521, 521]
+2
+✓
+✓
+Average Pooling
+[1, 1, 512, 521]
+1
+✗
+✗
+Linear
+[521, 1000]
+-
+✗
+✗
+VGG-16: this is described by [8], the architecture is as follows.
+Module
+Weight
+Stride
+Bias
+BatchNorm
+ReLU
+Conv
+[3, 3, 3, 64]
+[1, 1]
+64
+✓
+✓
+Conv
+[3, 3, 64, 64]
+[1, 1]
+64
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 64, 128]
+[1, 1]
+128
+✓
+✓
+Conv
+[3, 3, 128, 128]
+[1, 1]
+128
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 128, 256]
+[1, 1]
+256
+✓
+✓
+Conv
+[3, 3, 256, 256]
+[1, 1]
+256
+✓
+✓
+Conv
+[3, 3, 256, 256]
+[1, 1]
+256
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 256, 512]
+[1, 1]
+512
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+512
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+512
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 512, 512]
+[1, 1]
+512
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+512
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+512
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Linear
+[512 * 7 * 7, 4096]
+-
+4096
+✗
+✓
+Linear
+[4096, 4096]
+-
+4096
+✗
+✓
+Linear
+[4096, 1000]
+-
+1000
+✗
+✗
+15
+
+
+VGG-19: this is the plus version of VGG-16. The first two layers have 64 channels followed by 2x2
+max pooling, the next two layers have 128 channels followed by 2x2 max pooling; the next four layers
+have 256 channels followed by 2x2 max pooling; the next four layers have 512 channels followed by
+2x2 max pooling; the next four layers have 512 channels. Each channel uses 3x3 convolutional filters.
+VGG-19 has batch normalization before each RELU activation.
+Module
+Weight
+Stride
+Bias
+BatchNorm
+ReLU
+Conv
+[3, 3, 3, 64]
+[1, 1]
+[64]
+✓
+✓
+Conv
+[3, 3, 64, 64]
+[1, 1]
+[64]
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 64, 128]
+[1, 1]
+[128]
+✓
+✓
+Conv
+[3, 3, 128, 128]
+[1, 1]
+[128]
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 128, 256]
+[1, 1]
+[256]
+✓
+✓
+Conv
+[3, 3, 256, 256]
+[1, 1]
+[256]
+✓
+✓
+Conv
+[3, 3, 256, 256]
+[1, 1]
+[256]
+✓
+✓
+Conv
+[3, 3, 256, 256]
+[1, 1]
+[256]
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 256, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+Conv
+[3, 3, 512, 512]
+[1, 1]
+[512]
+✓
+✓
+MaxPool
+-
+[2, 2]
+-
+✗
+✗
+Linear
+[512 * 7 * 7, 4096]
+-
+[4096]
+✗
+✓
+Linear
+[4096, 4096]
+-
+[4096]
+✗
+✓
+Linear
+[4096, 1000]
+-
+[1000]
+✗
+✗
+A.2
+Datasets
+• CIFAR-10 consists of 60,000 color images, each with a resolution of 32x32 pixels. These
+images are categorized into 10 different classes, with 6,000 images per class.
+• CIFAR-100 consists of 60,000 color images, each with a resolution of 32x32 pixels, divided
+into 100 different classes. Each class contains 600 images, providing a more fine-grained
+classification challenge compared to its counterpart, CIFAR-10.
+• MNIST consists of 70,000 grayscale images of handwritten digits, each with a resolution of
+28x28 pixels. It includes 60,000 training images and 10,000 test images, with labels from 0
+to 9, making it ideal for evaluating classification algorithms.
+• The TinyImageNet dataset is a subset of the ImageNet database, consisting of 200 classes
+with 500 training images and 50 validation images per class, each resized to 64x64 pixels.
+A.3
+Training and Pruning Details
+Following is the AutoS dataset generation. All the final sparsity is 0.01 (1% parameter is remained).
+LTH [8] and SNIP [9] are based on the official code of Synflow[11]2.
+Network
+Dataset
+Post-Epochs
+Opt.
+Batch
+LR
+Drop Rate & Epochs
+Weight Decay
+Prune Iter.
+LeNet-300-100
+MNIST
+100
+Adam
+128
+1.2e-3
+0.2; 60, 120
+5e-4
+20
+ResNet-18
+CIFAR-10
+160
+momentum
+128
+0.01
+0.2; 60, 120
+5e-4
+20, 40, 100
+VGG-19
+CIFAR-100
+160
+momentum
+128
+0.1
+0.1; 60, 120
+1e-4
+20
+ResNet-18
+TinyImageNet
+300
+SGD
+128
+0.1
+0.1; 150, 225
+1e-4
+20
+2https://github.com/ganguli-lab/Synaptic-Flow
+16
+
+
+B
+AutoS Training Details
+B.1
+Pseudocode
+The dataset generation process is the Algorithm 2.
+Algorithm 2 AutoS Dataset (DA) generation
+Require:
+1: Dataset D: Pruning Dataset;
+2: Network: a network parameterized by θ ∈Rk;
+3: Mask: corresponding pruning masks m ∈{0, 1}k;
+4: Target Sparsity ϵ: desired sparsity level ϵ ∈[0, 1];
+5: Pruning Criteria: a pruning criteria C for iterative pruning;
+6: iteration: pruning iterative times N.
+Input: θ0: network initialize; m0: mask initialize
+7: model_eval: g0(D) ←(θ0, D);
+model eval for initial gradient
+8: for i < N do:
+pruning iteration
+9:
+θi+1 ←model_train(θi(θ0, mi), D);
+training
+10:
+ϵi+1 = (ϵ, i)
+current sparsity
+11:
+mi+1 ←C(θi+1, ϵi+1)
+pruning
+12:
+Sgt
+surv + = mi+1
+score
+13:
+rewind
+rewind the parameter to θ0
+14: end for
+Output: DA: data: initial gradient g0(D) and initial parameter θ0; label: importance score Sgt
+surv
+B.2
+AutoS Networks and Training
+We use ResNet-18 and VGG-19 as the backbone of AutoS. We add MLP layers in front of the major
+backbone to encode input features as the following Table 7. AutoS in Table 1, 2, 4, 5, and 6 are
+implemented with ResNet-18.
+Table 7: Network backbone of AutoS
+AutoS Model
+Module
+Weight
+Bias
+BatchNorm
+ReLU
+ResNet-18
+Linear
+[2, 64]
+64
+✓
+✓
+Linear
+[64, 32 × 32 × 3]
+32 × 32 × 3
+✓
+✓
+Backbone
+ResNet-18
+Linear
+[32, 1]
+[32, 1]
+✓
+VGG-19
+Linear
+[2, 64]
+64
+✓
+✓
+Linear
+[64, 64 × 64]
+32 × 32 × 3
+✓
+✓
+Linear
+[64 × 64, 64 × 64 × 64]
+64 × 64 × 64
+✓
+✓
+Backbone
+VGG-19
+Linear
+[64, 1]
+[64, 1]
+✓
+✓
+B.3
+Learning Rate and Batch Size Ablation
+The learning rate is 0.01, batch size is 1024, epochs is 10, optimizer is Adam, loss with MSE. The
+ablation of batch size and learning rate are tested as following Table 8.
+17
+
+
+Table 8: Learning rate ablation experiments
+Batch
+LR
+95%
+99%
+128
+0.01
+91.65
+54.21
+256
+0.01
+91.72
+79.59
+512
+0.01
+91.70
+55.70
+1024
+0.01
+91.90
+79.20
+2048
+0.01
+91.75
+71.28
+4096
+0.01
+82.26
+53.49
+4096
+0.001
+91.49
+71.07
+4096
+0.0005
+91.60
+53.54
+4096
+0.0001
+83.07
+62.92
+C
+Pruning Details
+Following are all the pruning hyperparameters, all the pruning methods only pruning the neural
+network once after Kaiming Normal Initialization [28]. AutoS in Table 1, 2, 3, 4, 5, and 6.
+Network
+Dataset
+Post-Epochs
+Opt.
+Batch
+LR
+Drop Rate & Epochs
+Weight Decay
+LeNet-300-100
+MNIST
+100
+Adam
+128
+1.2e-3
+0.2; 60, 120
+5e-4
+ResNet-18
+CIFAR-10
+160
+momentum
+128
+0.01
+0.2; 60, 120
+5e-4
+VGG-19
+CIFAR-100
+160
+momentum
+128
+0.1
+0.1; 60, 120
+1e-4
+ResNet-18
+TinyImageNet
+300
+SGD
+128
+0.1
+0.1; 150, 225
+1e-4
+VGG-16
+CIFAR-10
+160
+momentum
+128
+0.1
+0.1; 60, 120;
+1e-4
+D
+Ablation Details
+D.1
+Different Inputs
+The AutoS inputs experiments Only Param and Only Grad use the following network. The input
+channel is 1.
+AutoS Model
+Module
+Weight
+Bias
+BatchNorm
+ReLU
+ResNet-18
+Linear
+[1, 64]
+64
+✓
+✓
+Linear
+[64, 32 × 32 × 3]
+32 × 32 × 3
+✓
+✓
+Backbone
+Backbone ResNet-18
+Linear
+[32, 1]
+[32, 1]
+✓
+D.2
+Different Dataset
+The training experiments of “LTH or SNIP", “model", “iteration" and “merge" are the same as dataset
+generation and pruning in Appendix A. Here, the refine learning rate is 0.01.
+E
+Experimental Resources
+All the experiments are run with two servers, the information is as follows:
+Sever
+CPU
+GPU
+RAM
+1
+Intel i9-14900K
+2×3090, 24G
+128G
+2
+2×Intel Xeon 6226R
+8×3090, 24G
+256G
+The error bars in Figure 3 and 6 are running with seed 0,1,2.
+18
+
+
+F
+Consistency of surviving score
+We conducted supplementary experiments of the AutoS dataset obtained on the MNIST dataset to
+test the consistency of important scores (given that LTH is valid across different methods, the results
+on MNIST can represent results on other datasets).
+Method: Use the same initial parameter of LeNet-300-100 on MNIST to create 2 AutoS datasets A
+and B. We use the IRP methods of Magnitude (Mag), Random (Rand), SNIP, and GraSP to generate
+A and B datasets. Assuming that we perform independent pruning on datasets A and B, obtaining
+importance scores X and Y respectively, we calculate the concordance correlation coefficient (CCC)
+to measure the consistency of the importance scores. The CCC formulation can be written as:
+ρc =
+2 · Cov(X, Y )
+σX2 + σY 2 + (µX −µY )2
+(5)
+The results are shown in Table 9, with values closer to 1 indicating greater consistency. From Table 9,
+we can see that the same initial parameters with higher CCC values, particularly in the SNIP & SNIP
+and Mag & Mag comparisons, exhibit greater consistency. This indicates that our importance scoring
+metric is robust to some extent. The results from LTH indicate that subnetworks are not unique, and
+different initial models can lead to different subnetworks, resulting in varying importance scores.
+Therefore, even though the CCC may not be very high, the criterion learned from one effective
+subnetwork can still be valuable for pruning.
+Table 9: Concordance Correlation Coefficient (CCC) of the Important Scores AutoS Dataset of
+Different Methods.
+Methods
+Same Init.
+Different Init.
+Random & Random
+-0.00106
+-0.00106
+SNIP & SNIP
+0.23642
+-0.04542
+Mag & Mag
+0.15582
+0.10285
+GraSP & GraSP
+0.08059
+0.04373
+Random & Mag
+0.00083
+-0.00413
+Random & GraSP
+0.00109
+0.00259
+Random & SNIP
+-0.00108
+-0.00245
+SNIP & Mag
+0.12314
+0.03424
+SNIP & GraSP
+-0.07117
+-0.04450
+Mag & GraSP
+-0.05968
+-0.01872
+19

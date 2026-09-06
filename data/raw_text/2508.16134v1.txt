@@ -1,0 +1,1552 @@
+CommonKV: Compressing KV Cache with Cross-layer Parameter Sharing
+Yixuan Wang1,*, Haoyu Qiao1,*, Lujun Li2, Qingfu Zhu1, Wanxiang Che1,†
+1Harbin Institute of Technology
+2Hong Kong University of Science and Technology
+{yixuanwang, car}@ir.hit.edu.cn
+Abstract
+Large Language Models (LLMs) confront significant mem-
+ory challenges due to the escalating KV cache with increasing
+sequence length. As a crucial technique, existing cross-layer
+KV cache sharing methods either necessitate modified model
+architectures with subsequent pre-training or incur significant
+performance degradation at high compression rates. To mit-
+igate these challenges, we propose CommonKV, a training-
+free method for cross-layer KV cache compression through
+adjacent parameters sharing. Inspired by the high similar-
+ity observed in cross-layer hidden states, we utilize Singular
+Value Decomposition (SVD) to achieve weight sharing across
+adjacent parameters, resulting in a more easily mergeable la-
+tent KV cache. Furthermore, we also introduce an adaptive
+budget allocation strategy. It dynamically assigns compres-
+sion budgets based on cosine similarity, ensuring that dissim-
+ilar caches are not over-compressed. Experiments across mul-
+tiple backbone models and benchmarks including LongBench
+and Ruler demonstrate that the proposed method consistently
+outperforms existing low-rank and cross-layer approaches at
+various compression ratios. Moreover, we find that the bene-
+fits of CommonKV are orthogonal to other quantization and
+eviction methods. By integrating these approaches, we can ul-
+timately achieve a 98% compression ratio without significant
+performance loss.
+1
+Introduction
+Large Language Models (Achiam et al. 2023; Yang et al.
+2025) have demonstrated significant achievements in long-
+text understanding and generation tasks (Liu et al. 2025b).
+They are widely applied in scenarios such as repository-level
+code generation (Zhang et al. 2024) and complex mathemat-
+ical reasoning (Chen et al. 2025). As a crucial technique, KV
+cache stores the keys and values tensor of past contexts in at-
+tention module, ensuring the speed of autoregressive genera-
+tion for LLMs. However, the size of the KV cache is directly
+proportional to the text length, which imposes a significant
+memory burden on GPUs (Shi et al. 2024).
+To mitigate the issues caused by KV cache during the in-
+ference phase, many studies (Zhang et al. 2023; Li et al.
+2024a,b) have focused on developing KV cache compres-
+sion techniques. Leveraging the similarity of information
+*These authors contributed equally.
+†Corresponding author.
+0.2
+0.3
+0.4
+0.5
+0.6
+Compression Ratio
+20
+25
+30
+35
+Average Score
+Average Score at Various Compression Ratio
+MiniCache
+ThinK
+Palu
+CommonKV (Ours)
+fullkv
+Figure 1: Performance of KV cache compression methods
+under various compression ratios. Proposed CommonKV
+maintains performance at 0.6 compression ratio, signifi-
+cantly outperforming existing cross-layer sharing and low-
+rank compression methods.
+between layers, cross-layer KV cache sharing emerges as a
+highly promising direction. Existing work (Wu and Tu 2024;
+Zuhri et al. 2024; Brandon et al. 2024) primarily focuses on
+optimizing the attention module structure (Wu, Wu, and Tu
+2024) to enable guaranteed cross-layer sharing. YOCO (Sun
+et al. 2024b) innovatively introduces self-decoder and cross-
+decoder structures, which significantly accelerate prefilling
+phase and reduce GPU memory demands by only caching
+once. In addition to structural enhancements, several studies
+focus on methods for directly compressing the cross-layer
+cache of existing LLMs. MiniCache (Liu et al. 2024c) effec-
+tively mitigates reconstruction error during cross-layer shar-
+ing by disentangling state vectors into magnitude and direc-
+tion components.
+While the above methods considerably alleviate the mem-
+ory pressure of LLM deployment through cross-layer shar-
+ing, several issues remain to be addressed. (1) Excessive
+implementation costs. Most existing methods involve re-
+designing the Transformer (Vaswani et al. 2017) architec-
+ture, which necessitates expensive pre-training to achieve
+the desired performance from scratch. This makes migrat-
+ing these techniques to the latest LLMs nearly impossible
+for reducing KV cache memory. (2) Performance degra-
+arXiv:2508.16134v1  [cs.LG]  22 Aug 2025
+
+
+dation at high compression rates. While some methods
+directly share key-value pairs of existing LLMs, the in-
+herent dissimilarity of KV cache makes it challenging to
+achieve high compression rates without significant perfor-
+mance degradation. As shown in Figure 1, the direct sharing
+method (e.g., MiniCache) suffers from a significant perfor-
+mance drop when the compression ratio exceeds 20%. This
+suggests the need for a more consistent representation of
+cross-layer KV cache for compression.
+In this paper, we propose CommonKV1, a training-free
+method that alleviates the aforementioned challenges by
+merging the cross-layer KV cache through weight param-
+eter sharing. Inspired by the significantly higher similarity
+of hidden states between adjacent layers compared to the
+KV cache, we aim to improve the consistency of the KV
+cache by sharing KV parameter matrices across these lay-
+ers. Specifically, we obtained partially shared cross-layer
+weights by concatenating and applying Singular Value De-
+composition (SVD) to the KV parameter matrices of ad-
+jacent layers. Compared to the original KV cache, the la-
+tent cache derived from these shared matrices is more eas-
+ily merged due to the consistent hidden state input. Fur-
+thermore, we propose an adaptive budget allocation strat-
+egy to achieve cache sharing with lower performance loss.
+It dynamically allocates compression budgets across layers
+based on cosine similarity, preventing performance degra-
+dation caused by over-compressing dissimilar caches. Un-
+like other methods that require training from scratch, Com-
+monKV achieves model conversion with only lightweight,
+offline SVD, while maintaining LLM performance at high
+compression rates.
+Experiments conducted across various models and bench-
+marks demonstrate that the proposed method exhibits sig-
+nificant advantages over other sharing and low-rank tech-
+niques, particularly at high compression rates. Leveraging
+latent cache construction and cross-layer sharing, Com-
+monKV maintains over 95% performance on mainstream
+long-text benchmarks at a 50% compression rate. Specifi-
+cally, our proposed cross-layer sharing method is orthogonal
+to existing eviction and quantization techniques. By integrat-
+ing various compression methods, we can achieve 98% KV-
+Cache compression without significant performance loss.
+Our Contribution can be summarized as follows:
+• We propose CommonKV, a training-free method for
+cross-layer KV cache sharing. It leverages shared weight
+matrices to obtain similar latent KV cache, boosting per-
+formance with cross-layer compression.
+• We propose an adaptive budget allocation algorithm
+that dynamically assigns varying compression rates to
+regions of differing similarity, mitigating performance
+degradation from KV cache sharing.
+• Extensive experiments validate the effectiveness of the
+proposed method. Besides, it is orthogonal to other com-
+pression algorithms, enabling integration for even higher
+compression rates.
+1Our code is available at https://github.com/rommel2021/
+CommonKV.
+0
+5
+10
+15
+20
+25
+30
+Layer ID
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Cos Similarity
+significant gap!
+Cos Similarity on Adjacent Layers
+Key Cache
+Value Cache
+Hidden State
+Latent Cache
+Figure 2: Cross-layer cosine similarity of key cache, value
+cache, hidden state and the proposed latent cache. We com-
+pute the average similarity between cross-layer tokens as the
+final evaluation metric. A significant difference can be ob-
+served between the hidden state and the KV cache. This is-
+sue can be improved by sharing parameters across layers.
+2
+Observations
+To identify the main challenges in current KV cache sharing
+methods, we start by statistically analyzing the inter-layer
+information similarity. We measure the cross-layer cosine
+similarity of key cache, value cache, and the hidden state
+input to each layers for Llama3.1-8B-Instruct on the Long-
+Bench (Bai et al. 2023) benchmark. As shown in Figure 2,
+we observe two distinct phenomena:
+(1) Dissimilarity of the adjacent KV cache.
+Despite re-
+cent efforts (Liu et al. 2024c; Yang et al. 2024b) to compress
+the KV cache via cross-layer sharing, it is evident from the
+Figure 2 that the key and value caches in adjacent layers
+exhibit dissimilarity with respect to cosine similarity. This
+apparent dissimilarity also explains why such direct merg-
+ing methods suffer significant performance loss at high com-
+pression rates. To enable lower-loss inter-layer sharing, we
+need to achieve a more consistent representation of key and
+value information.
+(2) Similarity of the adjacent hidden state.
+Additionally,
+we also compute the similarity between the hidden states in-
+put to each layer, which are subsequently transformed into
+the KV cache through parameter matrices WK and WV . In
+contrast to the KV cache, the hidden states across layers ex-
+hibit a high degree of consistency in terms of cosine simi-
+larity, which aligns with observations of Lee et al. (2024).
+We hypothesize that this is attributed to the residual connec-
+tions within the transformer blocks, which also potentially
+indicates the feasibility of cross-layer cache sharing.
+Motivation.
+Given the above observations, we can con-
+clude that the inconsistency of inter-layer KV cache primar-
+ily stems from the dissimilarity of the Wk and Wv matrices
+across different layers. This insight encourages us to explore
+parameter sharing for key and value matrices across differ-
+ent layers. When similar hidden states are multiplied by the
+same weight matrices, the resulting latent KV cache would
+
+
+...
+...
+(a) Cross-layer Concatenation & SVD
+(b) Cross-layer Parameter Sharing
+shared matrix
+...
+...
+...
+Figure 3: An Illustration of Cross-Layer Weight SVD De-
+composition. Through parameter sharing, we obtain a shared
+matrix Agi and layer-specific matrices Bl
+k/v for each layer.
+be more consistent, facilitating better cross-layer merging.
+We first simply validate this idea by sharing matrices across
+all layers. As shown in Figure 2, the similarity of the latent
+cache is significantly improved compared to the KV cache.
+Moreover, we observe that the cosine similarity of hidden
+states also varies across layers: lower in shallow layers and
+higher in deeper ones. This observation motivates the design
+of an adaptive budget allocation strategy to mitigate the loss
+introduced by merging.
+3
+Methodology
+In this section, we introduce CommonKV, a cross-layer KV
+cache sharing approach inspired by the observations dis-
+cussed above. For an existing large language model, we first
+perform an offline transformation (§3.1) to enable partial pa-
+rameter sharing across its layers. Subsequently, we dynami-
+cally allocate the compression budget online (§3.2) based on
+the similarity of the latent KV cache. Some implementation
+details will be elaborated in §3.3.
+3.1
+Cross-layer Parameter Sharing
+Problem Statement.
+Existing LLMs primarily employ
+Multi-Head Attention (MHA) (Vaswani et al. 2017) or
+Grouped-Query Attention (GQA) (Ainslie et al. 2023) as the
+main structures for their attention modules. The acquisition
+of the KV cache can be formalized as:
+kl
+i = xl
+iW l
+k,
+vl
+i = xl
+iW l
+v
+(1)
+Where W l
+k and W l
+v are the weight matrices corresponding
+to the l-th layer, xl
+i is the hidden state of tokeni at the l-th
+layer, and kl
+i, vl
+i denotes the corresponding cache.
+As discussed in Section 2, given the inherent similarity
+between xl
+i and xl+1
+i
+across layers, the dissimilarity in cross-
+layer KV pairs primarily stems from the differences in their
+respective weight matrices. Therefore, a straightforward ap-
+proach is to share the KV matrices across layers, aiming to
+achieve more similar projected caches.
+Cross-layer parameter sharing.
+Inspired by related work
+(Wang et al. 2024) in model compression, we employ a
+cross-layer concatenated SVD method for decomposing the
+weight matrices. As shown in Figure 3, we first concatenate
+the KV matrices of adjacent layer groups gi, which can be
+defined as:
+Wgi =
+h
+W l
+k; W l
+v; ...; W l+|gi|
+k
+; W l+|gi|
+v
+i
+(2)
+Subsequently, SVD decomposition is applied to the concate-
+nated matrix Wgi to derive the corresponding shared and
+layer-specific parameters:
+Wgi ≈UrΣrV T
+r =
+h
+Ur
+p
+Σr
+i hp
+ΣrV T
+r
+i
+= [Agi]
+h
+Bl
+k; Bl
+v; ...; Bl+|gi|
+k
+; Bl+|gi|
+v
+i
+(3)
+Where r denotes the chosen SVD rank, Agi represents the
+shared parameters for Group i, and Bl
+k/v refers to the right
+part matrix of SVD sliced according to the order in Equation
+2. Finally, we can obtain an approximate representation of
+the original parameter matrix, consisting of the product of a
+shared matrix and a specific matrix:
+W l+|gi|
+k
+≈AgiBl+|gi|
+k
+,
+W l+|gi|
+v
+≈AgiBl+|gi|
+v
+(4)
+Consistent latent KV Cache.
+By leveraging the shared
+parameter matrix, the original KV cache construction can
+be expressed as:
+kl
+i = xl
+iAgiBl
+k,
+vl
+i = xl
+iAgiBl
+v
+(5)
+Instead of caching the original key and value vectors, we
+choose to cache the more consistent latent KV representa-
+tions:
+hl
+i = xl
+iAgi
+(6)
+After pre-filling, we perform cross-layer merging on the
+obtained latent cache hl
+i through averaging, achieving KV
+cache capacity compression. During the inference phase, we
+restore the latent KV cache to the original cache for attention
+computation with RoPE (Su et al. 2024) position embed-
+dings, which is somewhat similar to the process of Multi-
+head Latent Attention (MLA) (Liu et al. 2024b).
+3.2
+Adaptive Budget Allocation
+Group score calculation.
+While parameter sharing yields
+a more consistent latent KV cache, we still observe that dif-
+ferent groups exhibit varying sensitivities to merging dur-
+ing inference. Compared to deeper layers, shallower layers
+of the cache typically show greater inter-layer differences,
+which can lead to significant performance degradation upon
+merging. This led us to allocate different budgets across
+groups to ensure the effectiveness of CommonKV.
+In practice, we use the cosine similarity between latent
+cache layers as an evaluation metric to guide dynamic bud-
+get allocation during the inference phase. The score for
+group gi can be formulated as:
+score(gi) =
+P
+t∈gi sim(hl
+t, hl+|gi|
+t
+)
+|gi|
+(7)
+
+
+RoPE
+Softmax(QK)
+Score@H
+RoPE
+Softmax(QK)
+Score@H
+...
+Attention module of layer l
+Attention module of layer l+1
+cached
+cached
+consistent latent caches
+without
+matrix fusion
+with
+matrix fusion
+Figure 4: The main architectural diagram of the proposed CommonKV. Through cross-layer parameter sharing, we can use
+shared matrices Agi to obtain the latent KV cache hl
+i for each layer. Additionally, we further reduce inference computation by
+fusing matrices Bl
+v and W l
+o.
+where t represents tokens in group gi across layers. To re-
+duce computational overhead, we only use the cosine simi-
+larity between the first and last layers within each group as
+its score. After calculating the score of each group, we selec-
+tively merge groups based on the current compression ratio.
+For instance, given a group size of 4 and a desired com-
+pression ratio of 0.5, we merge and share the top 50% most
+similar groups to meet the global compression target.
+Fisher information-based merging.
+After obtaining the
+indices of the layers to be merged based on the budget, we
+perform latent sharing through a weighted merge. Assuming
+the cache derived from more informative weights is more
+sensitive, we propose using the Fisher information (Ly et al.
+2017; Liu et al. 2021) of the corresponding layers as the
+merging weights. This can be formulated as:
+hgi = 1
+C
+X
+l∈gi
+(F(W l
+k) + F(W l
+v))hl
+i
+(8)
+where C is a normalization constant, and F(·) denotes the
+Fisher information of the corresponding weight parameters.
+Given that the key and value for each layer share a common
+latent cache, we use the sum of their Fisher information as
+weights.
+3.3
+Merging and Restoration Details
+After performing offline parameter sharing on an existing
+LLM, we leverage the similarity of the latent KV cache dur-
+ing inference to achieve inter-layer compression. To balance
+performance and speed during the inference phase, we im-
+plement some specific designs for merging and restoration.
+Position embeddings.
+Compared to original key cache,
+the latent cache hl
+t employing by CommonKV does not con-
+tain any positional information. This necessitates recalcu-
+lating the corresponding position embeddings based on the
+position ids during each decoding step. To further reduce
+computation time, we pre-calculate the position embeddings
+shared across all layers before the first layer’s computation.
+Cache merging strategies.
+To ensure generation quality,
+we follow (Chang et al. 2025)’s setting and only compress
+the KV cache conducted during prefilling phase. Although
+the KV cache for the output segment typically accounts for
+a small proportion, for a fair comparison, we calculate the
+average compression ratio of both the compressed and un-
+compressed parts as the final compression rate.
+Matrix fusion.
+As illustrated in Figure 4, while compress-
+ing KV cache memory, the proposed CommonKV intro-
+duces some computational overhead. During the reconstruc-
+tion phase, an additional two reconstruction KV matrices
+need to be computed, which impacts inference performance.
+To alleviate this issue, we offline-merged the B matrix with
+the normally computed Wo matrix.
+O = softmax(QKT
+√dk
+)V Wo
+= softmax(QKT
+√dk
+)XAgi h
+Bl+|gi|
+v
+Wo
+i
+(9)
+This matrix fusion operation can effectively reduce the com-
+putational cost of reconstructing the KV cache. Moreover,
+we provide a detailed discussion of inference latency for dif-
+ferent methods in Section 5.2.
+4
+Experiments
+4.1
+Experimental Setup.
+Evaluation Datasets.
+We evaluate CommonKV using two
+widely adopted long-context datasets: LongBench (Bai et al.
+2023) and Ruler (Hsieh et al. 2024). These datasets repre-
+sent real-world and synthetic data, respectively. The context
+window for all models was set to 8k. For Ruler, we follow
+the setup from Chang et al. (2025) and report the average
+performance across the corresponding multiple tasks. The
+compression ratio is defined as 1 −Compressed KV
+Original KV . A higher
+ratio indicates greater memory savings.
+Selected Baselines.
+The proposed CommonKV method,
+which incorporates SVD, can be considered a hybrid of low-
+rank and cross-layer sharing methods. Therefore, we primar-
+
+
+Ratio
+Method
+LongBench (Bai et al. 2023)
+Ruler (Hsieh et al. 2024)
+Avg.
+QA
+Sum.
+FShot
+Synth.
+Code
+NS
+NMK
+NMQ
+NMV
+QA
+VT
+FWE
+Llama3.1-8B-Instruct
+0.0
+Full KV
+17.20
+27.85
+68.31
+39.87
+61.15
+100.00
+100.00
+100.00
+95.80
+76.76
+99.90
+95.90
+73.55
+0.3
+MiniCache
+7.60
+18.19
+51.17
+15.01
+36.64
+11.50
+1.10
+0.60
+0.60
+43.75
+23.80
+28.50
+18.90
+ThinK
+16.52
+27.13
+67.00
+39.34
+58.28
+100.00
+99.90
+99.70
+87.75
+74.39
+99.88
+96.60
+72.34
+Palu
+18.76
+27.55
+67.40
+36.21
+54.97
+99.10
+99.90
+99.60
+91.75
+72.96
+99.96
+95.40
+72.14
+CommonKV
+17.12
+25.38
+66.54
+41.48
+58.58
+99.80
+99.00
+99.90
+96.65
+71.59
+98.88
+94.90
+72.31
+0.5
+ThinK∗
+7.97
+17.34
+50.19
+37.84
+46.58
+1.90
+1.90
+0.55
+1.10
+51.14
+1.52
+16.13
+18.57
+Palu
+17.87
+26.27
+65.97
+25.45
+38.43
+98.80
+98.60
+98.60
+94.20
+65.07
+98.00
+93.07
+68.79
+CommonKV
+16.74
+24.59
+64.62
+41.40
+57.86
+98.70
+97.20
+99.40
+95.20
+71.66
+99.20
+94.60
+71.59
+0.6
+Palu
+9.20
+16.31
+46.95
+2.62
+23.32
+99.60
+86.50
+55.25
+45.15
+39.16
+84.88
+69.00
+50.59
+CommonKV
+15.74
+23.90
+61.77
+41.30
+53.54
+98.90
+94.40
+98.50
+93.05
+58.34
+95.40
+88.80
+68.19
+Mistral-v0.2-7B-Instruct
+0.0
+Full KV
+32.30
+27.56
+64.77
+37.13
+55.17
+99.90
+98.70
+99.00
+96.50
+68.04
+99.32
+91.73
+73.07
+0.3
+MiniCache
+14.80
+19.86
+45.14
+2.46
+34.79
+31.80
+10.90
+5.50
+5.50
+35.97
+25.21
+39.93
+22.83
+ThinK
+31.59
+26.93
+63.30
+27.55
+51.39
+100.00
+97.80
+95.80
+84.75
+65.59
+99.30
+91.60
+70.72
+Palu
+31.10
+27.04
+64.40
+35.30
+50.50
+99.90
+95.50
+95.05
+93.50
+66.41
+99.20
+91.40
+71.39
+CommonKV
+31.74
+25.81
+63.26
+35.04
+55.15
+99.70
+97.40
+97.65
+95.35
+65.01
+98.28
+91.20
+71.84
+0.5
+ThinK∗
+26.79
+20.26
+52.92
+23.44
+42.59
+58.50
+41.30
+29.10
+27.85
+54.63
+21.90
+22.80
+37.71
+Palu
+30.70
+26.31
+63.25
+22.01
+45.42
+99.80
+89.30
+94.00
+92.60
+65.46
+95.70
+81.50
+68.21
+CommonKV
+30.41
+24.36
+59.62
+33.45
+53.35
+99.60
+95.60
+94.65
+94.20
+64.79
+97.88
+90.83
+70.57
+0.6
+Palu
+27.46
+25.19
+61.49
+12.81
+31.94
+99.80
+81.75
+94.85
+83.75
+59.81
+88.30
+73.17
+63.07
+CommonKV
+28.56
+23.84
+59.91
+28.85
+54.28
+99.50
+94.30
+92.65
+93.00
+61.29
+93.20
+84.80
+68.61
+Table 1: Compression performance comparison on long-context datasets. Bold indicates the best performance at an equivalent
+compression ratio. Due to significant performance loss, some methods do not report results for all compression ratios. Since
+Think only compresses the key cache, we calculate the final compression ratio as the average of the key-vale pairs. ∗denotes
+an actual compression ratio of 0.4.
+ily select several mainstream low-rank and cross-layer meth-
+ods as baselines for comparison:
+• MiniCache (Liu et al. 2024c) employs a disentangled
+representation of the KV cache to achieve training-free
+cross-layer sharing.
+• ThinK (Xu et al. 2024) achieves key cache compression
+and efficient QK computation by pruning the unneces-
+sary dimensions of the key vectors.
+• Palu (Chang et al. 2024) decomposes the weight matri-
+ces of each layer, thereby caching a lower-rank hidden
+KV cache.
+Additionally, xKV (Chang et al. 2025) achieves good com-
+pression by extracting the common information from the
+inter-layer cache via online SVD decomposition. However,
+its significant time overhead compared to other methods
+warrants a separate discussion in Section 5.2. We compare
+all methods at compression rates ranging from 0.3 to 0.6.
+Beyond a compression rate of 0.6, all methods experience a
+significant performance degradation.
+Implementation details.
+We conduct main experiments
+on two mainstream LLMs: Llama3.1-8B-Instruct (Dubey
+et al. 2024) and Mistral-v0.2-7B-Instruct (Jiang et al. 2023).
+For these GQA-based models, we choose a group size of 4
+for KV cache sharing. To achieve various compression ra-
+tios while optimally preserving performance, the SVD rank
+is set to 0.7·dhidden for compression ratios of 0.3 and 0.5, and
+to 0.6 · dhidden for a ratio of 0.6. Following setup of Chang
+et al. (2024), we utilize 2048 samples with a sequence length
+of 1024 from Wikitext-2 (Merity et al. 2016) to compute the
+Fisher Information during the merging phase.
+Challenges of GQA.
+For traditional MHA architectures,
+sharing the KV cache every N layers can theoretically
+achieve a compression ratio of 1/N. Unfortunately, for GQA
+models, dkv is usually smaller than dhidden. This means that
+after cross-layer SVD, latent cache of a single layer must
+be slightly larger than the original cache to maintain perfor-
+mance. To alleviate this issue, we first concatenate and share
+the Key and Value matrices, which increases the rank of the
+parameters for each layer. Additionally, during the SVD pro-
+cess, we reduce the rank of the concatenated matrix to fur-
+ther compress the storage of its latent cache. Ultimately, we
+achieved a 0.5 compression ratio on mainstream GQA mod-
+els by merging every 4 layers, with the flexibility to adjust
+the SVD rank.
+4.2
+Main Results
+Overall performance.
+We benchmark the performance
+of CommonKV against other comparable strong baselines
+on the mainstream long-context tasks. As shown in Ta-
+ble 1, the proposed method demonstrates significant advan-
+tages across multiple models and various compression ra-
+tios. Specifically, CommonKV can maintain 95% end-to-
+end performance at a 0.5 compression ratio, effectively al-
+leviating the memory pressure caused by KV cache in long-
+context scenarios. This is primarily attributable to the more
+
+
+xKV
+Full KV
+Palu
+CommonKV
+0
+5
+10
+15
+20
+25
+Latency (s)
+(a) Prefilling Latency
+Prefilling
+SVD Cost
+Sort Cost
+xKV
+Full KV
+Palu
+CommonKV
+0
+20
+40
+60
+80
+100
+Latency (ms/step)
+(b) Decoding Latency
+Performance
+w.o. Matrix Fusion
+w. Matrix Fusion
+Full KV
+Ours
++KVQuant +SnapKV
++Both
+0
+20
+40
+60
+80
+100
+KV Cache Memory
+100%
+50%
+12%
+6%
+2%
+(c) Integrated Effects on LongBench
+0
+20
+40
+60
+80
+100
+Performance
+0
+20
+40
+60
+80
+100
+Performance
+Figure 5: Inference Latency and Integration Analysis of CommonKV on Llama3.1-8B-Instruct. (a) Average latency of different
+methods during the prefilling stage. SVD Cost refers to the online SVD decomposition latency of xKV, while Sort Cost denotes
+the adaptive budget allocation overhead of CommonKV. (b) Average latency of different methods during the decoding stage.
+(c) Memory footprint of the KV cache integrated with different methods and their performance on downstream tasks.
+consistent latent KV cache resulting from cross-layer param-
+eter sharing, which further elevates the ceiling of training-
+free cross-layer sharing methods.
+Compared with cross-layer methods.
+As discussed in
+Section 2, the dissimilarity of the KV cache across layers is
+the main challenge for existing cross-layer sharing methods.
+Despite employing magnitude and direction vector extrac-
+tion for the KV cache of adjacent layers, MiniCache suffers
+significantly from this inherent dissimilarity, leading to sub-
+stantial performance degradation even at a mere 0.2 com-
+pression ratio. In contrast, the proposed method fundamen-
+tally mitigates the dissimilarity issue by sharing parameters
+across layers, naturally reducing the loss from merging. Un-
+der Fisher information-based weighted merging, the Com-
+monKV achieves dynamic four-layer merging, exhibiting no
+significant performance degradation even at a 0.6 compres-
+sion ratio.
+Compared with low-rank methods.
+Additionally, con-
+sidering CommonKV leverages the concept of SVD de-
+composition for compression, we also compare it with sev-
+eral low-rank KV cache compression methods. Compared
+to traditional cross-layer merging methods, low-rank meth-
+ods perform better at lower compression ratios, indicating
+that existing KV cache indeed has some redundancy in their
+dimensions. However, low-rank methods have a clear up-
+per limit on their compression ratio, with a noticeable de-
+cline observable after exceeding 0.5 compression. Halving
+the dimensionality while maintaining performance is far
+more challenging than merging two KV cache layers, due
+to the inherent inter-layer connections. The proposed Com-
+monKV greatly extends the upper bound of low-rank meth-
+ods through cross-layer merging, demonstrating a clear ad-
+vantage over the powerful baseline method ThinK and Palu
+at most compression ratios.
+5
+Analysis
+5.1
+Effect of Merging Mechanism
+To validate the effectiveness of our proposed Adaptive bud-
+get allocation strategy, we conduct an experimental analysis
+Method
+Adapt. QA
+Sum.
+FShot Synth. Code
+Avg.
+Full KV
+-
+17.20
+27.85
+68.31
+39.87
+61.15
+38.60
+MCache
+12.74
+23.06
+60.33
+41.00
+55.08
+34.16
+Mean
+13.52
+23.36
+60.63
+40.66
+52.96
+34.11
+Fisher
+12.82
+23.52
+63.48
+40.30
+52.20
+34.19
+Shallow
+16.00
+25.02
+68.44
+35.50
+57.72
+36.45
+Deep
+14.56
+23.80
+65.57
+35.50
+57.39
+35.23
+Mean
+16.20
+24.54
+66.84
+38.50
+57.03
+36.55
+Fisher
+16.74
+24.59
+64.62
+41.40
+57.86
+36.99
+Table 2: Performance of different merging mechanisms on
+LongBench at a compression ratio of 0.5. Adapt. indicates
+whether dynamic budget allocation is used.
+of the merging mechanism on LongBench, using Llama3.1-
+8B-Instruct. All merging strategies are built upon the pro-
+posed CommonKV method, tailored for a more consistent
+latent KV cache, with a selected compression ratio of 0.5.
+We compared two allocation strategies: static budgeting and
+dynamic budgeting, encompassing several distinct merging
+methods: Mean serves as the most straightforward base-
+line, representing a simple average. MCache represents the
+application of MiniCache (Liu et al. 2024c) to the latent
+KV cache. Shallow and Deep represent two extreme cases
+where only the latent cache of the first or last layer, respec-
+tively, is retained as a representative. Fisher is the proposed
+Fisher information based merging method, which merges the
+KV cache of adjacent layers based on the Fisher informa-
+tion of the parameters of corresponding layers. For consis-
+tent compression ratios, we use the full rank for static meth-
+ods to achieve global compression, while dynamic methods
+employ a lower rank for group-adaptive compression.
+The experimental results, as shown in Table 2, indicate
+that dynamic methods still possess a significant advantage
+over static methods, even when employing a lower-rank
+compression. Using a weighted averaging approach can bet-
+ter preserve the performance on downstream tasks compared
+to sharing the cache of specific layers. We can also see that
+the proposed method does not conflict with existing merg-
+ing methods like MiniCache. The consistent latent cache can
+
+
+further raise the upper bound of current algorithms.
+5.2
+Inference Latency Analysis
+Additionally, due to the introduction of an extra restoration
+operation, we also analyze the inference latency of the pro-
+posed method. Specifically, we compared the prefill and de-
+coding latency of our method against the similar methods
+Palu (Chang et al. 2024) and xKV (Chang et al. 2025) at an
+8K context length. The latency test is conducted on a single
+RTX A6000 GPU.
+As shown in Figure 5(a), the online SVD of the cache
+introduces non-negligible latency at an 8K context length.
+The SVD construction time alone accounts for more than
+six times the entire prefilling latency, whereas our cost for
+constructing the dynamic budget is only 5%. In terms of
+decoding latency, as shown in Figure 5(b), the proposed
+method exhibits no significant disadvantage compared to
+normal auto-regressive decoding after optimization of the
+matrix merging. Additionally, with nearly a 6x reduction in
+latency, CommonKV achieves comparable performance to
+both the online method xKV and the original baseline at a
+0.5 compression ratio on Ruler benchmark.
+5.3
+Integration with Other Methods
+As a relatively independent compression method, cross-
+layer merging has the potential to integrate with other KV
+cache compression techniques to further enhance compres-
+sion ratios. We validate the orthogonality of CommonKV
+with other methods on LongBench. Specifically, we select
+SnapKV (Li et al. 2024b) to represent eviction methods
+and KVQuant (Hooper et al. 2024) to represent quantization
+methods. For quantization, we directly apply K4V4 quanti-
+zation to the shared latent KV cache. Regarding the eviction
+strategy, we opt to share eviction indices across merged lay-
+ers, applying them to the sharing latent KV cache.
+The experimental results are shown in Figure 5(c). The
+cross-layer sharing method shows strong orthogonality with
+the other two categories of methods. By integrating these ap-
+proaches, we can achieve 98% KV cache compression. Ad-
+ditionally, we observe a phenomenon similar to Yang et al.
+(2024a), where using a single set of eviction indices across
+adjacent layers resulted in a much smaller performance loss
+than anticipated. This further validates the inherent similar-
+ity between layers.
+6
+Related Work
+In long-context tasks, the memory footprint of the KV cache
+has reached the same order of magnitude as the model it-
+self. Consequently, a growing number of studies (Liu et al.
+2024d; Li et al. 2024b; Hooper et al. 2024) are dedicated
+to KV cache compression. The proposed CommonKV com-
+bines the principles of low-rank approximation and cross-
+layer merging. Recently, many efforts have also focused on
+KV cache compression from these two perspectives.
+6.1
+Cross-layer Compression
+Architecture.
+To mitigate the KV cache problem in tra-
+ditional Transformer (Vaswani et al. 2017) architectures,
+some studies (Wu and Tu 2024) have focused on optimiz-
+ing the model architecture to enable cross-layer cache shar-
+ing. YOCO (Sun et al. 2024b) partitions all blocks into two
+parts: the self-decoder and the cross-decoder. which retains
+the KV cache only from the self-decoder portion. Similarly,
+both MLKV (Zuhri et al. 2024) and CLA (Brandon et al.
+2024) employ a Cross-Attention design to enable cross-layer
+KV cache sharing, thereby reducing deployment overhead.
+CMLA (Yang et al. 2024c) applies a sharing technique to
+the MLA model (Liu et al. 2024b). When combined with
+continuous pre-training, this approach compresses the KV
+cache to 2% through full-layer sharing.
+Algorithm.
+Several plug-and-play algorithms have also
+been proposed to merge the inter-layer KV cache. Mini-
+Cache (Liu et al. 2024c) leverages spherical interpolation to
+achieve efficient inter-layer cache merging and reconstruc-
+tion. While xKV (Chang et al. 2025) explores the inherent
+similarity of inter-layer caches from the perspective of Cen-
+tered Kernel Alignment (CKA). In addition to similarity,
+KVSharer (Yang et al. 2024b) proposes a counterintuitive
+strategy for cross-layer sharing, demonstrating that sharing
+dissimilar KV caches better preserves model performance
+than similarity-based approaches.
+6.2
+Low-rank Compression
+Architecture.
+Traditional MHA (Vaswani et al. 2017) is
+designed with a one-to-one correspondence between each
+query and its key-value pair, which results in dimensional
+redundancy. Multi-Query Attention (MQA) (Shazeer 2019)
+and Grouped-Query Attention (GQA) (Ainslie et al. 2023)
+have demonstrated that a single group of queries can still
+perform well with a single KV pair, which significantly re-
+duces the dimensionality of the KV cache. Multi-head La-
+tent Attention (MLA) (Liu et al. 2024a,b) restores a richer
+KV cache representation during inference by storing a low-
+rank KV cache.
+Algorithm.
+Shadow KV (Sun et al. 2024a) uses landmarks
+to reconstruct the SVD-compressed KV cache. It signifi-
+cantly improves system throughput combined with offload-
+ing operations. Furthermore, xKV (Chang et al. 2025) ex-
+plores the potential for cross-layer SVD compression. By
+leveraging the inherent similarity between layers, it achieves
+a higher compression ratio. By operating on position-related
+head dimensions, FourierAttention (Liu et al. 2025a) per-
+forms fixed-length compression on context-insensitive di-
+mensions, leading to a notable reduction in memory usage.
+7
+Discussion
+Conclusion.
+In this paper, we introduce CommonKV, a
+training-free KV cache cross-layer compression method.
+By exploiting the similarity of hidden states across lay-
+ers, it achieves effective cross-layer latent cache merg-
+ing through inter-layer parameter sharing. Extensive exper-
+iments demonstrate that our proposed method significantly
+outperforms existing sharing and low-rank approaches. Fur-
+thermore, our method is orthogonal to various existing KV
+cache compression techniques, which highlights its broad
+applicability.
+
+
+Future work.
+The effectiveness of CommonKV under a
+training-free setting suggests a potential consistency of the
+KV cache across layers. In the future, we will explore how
+to achieve a more stable and higher compression rate for
+cross-layer sharing models through low-cost fine-tuning, ul-
+timately reducing deployment costs.
+References
+Achiam, J.; Adler, S.; Agarwal, S.; Ahmad, L.; Akkaya, I.;
+Aleman, F. L.; Almeida, D.; Altenschmidt, J.; Altman, S.;
+Anadkat, S.; et al. 2023.
+Gpt-4 technical report.
+arXiv
+preprint arXiv:2303.08774.
+Ainslie, J.; Lee-Thorp, J.; De Jong, M.; Zemlyanskiy, Y.;
+Lebr´on, F.; and Sanghai, S. 2023.
+Gqa: Training gen-
+eralized multi-query transformer models from multi-head
+checkpoints. arXiv preprint arXiv:2305.13245.
+Bai, Y.; Lv, X.; Zhang, J.; Lyu, H.; Tang, J.; Huang, Z.; Du,
+Z.; Liu, X.; Zeng, A.; Hou, L.; et al. 2023. Longbench: A
+bilingual, multitask benchmark for long context understand-
+ing. arXiv preprint arXiv:2308.14508.
+Brandon, W.; Mishra, M.; Nrusimha, A.; Panda, R.; and
+Ragan-Kelley, J. 2024.
+Reducing transformer key-value
+cache size with cross-layer attention. Advances in Neural
+Information Processing Systems, 37: 86927–86957.
+Chang, C.-C.; Lin, C.-Y.; Akhauri, Y.; Lin, W.-C.; Wu,
+K.-C.; Ceze, L.; and Abdelfattah, M. S. 2025.
+xkv:
+Cross-layer svd for kv-cache compression. arXiv preprint
+arXiv:2503.18893.
+Chang, C.-C.; Lin, W.-C.; Lin, C.-Y.; Chen, C.-Y.; Hu, Y.-F.;
+Wang, P.-S.; Huang, N.-C.; Ceze, L.; Abdelfattah, M. S.; and
+Wu, K.-C. 2024. Palu: Compressing kv-cache with low-rank
+projection. arXiv preprint arXiv:2407.21118.
+Chen, Q.; Qin, L.; Liu, J.; Peng, D.; Guan, J.; Wang, P.; Hu,
+M.; Zhou, Y.; Gao, T.; and Che, W. 2025. Towards reasoning
+era: A survey of long chain-of-thought for reasoning large
+language models. arXiv preprint arXiv:2503.09567.
+Dubey, A.; Jauhri, A.; Pandey, A.; Kadian, A.; Al-Dahle, A.;
+Letman, A.; Mathur, A.; Schelten, A.; Yang, A.; Fan, A.;
+et al. 2024. The llama 3 herd of models. arXiv e-prints,
+arXiv–2407.
+Hooper, C.; Kim, S.; Mohammadzadeh, H.; Mahoney,
+M. W.; Shao, Y. S.; Keutzer, K.; and Gholami, A. 2024.
+Kvquant: Towards 10 million context length llm inference
+with kv cache quantization. Advances in Neural Informa-
+tion Processing Systems, 37: 1270–1303.
+Hsieh, C.-P.; Sun, S.; Kriman, S.; Acharya, S.; Rekesh,
+D.; Jia, F.; Zhang, Y.; and Ginsburg, B. 2024.
+RULER:
+What’s the Real Context Size of Your Long-Context Lan-
+guage Models? arXiv preprint arXiv:2404.06654.
+Jiang, A. Q.; Sablayrolles, A.; Mensch, A.; Bamford, C.;
+Chaplot, D. S.; de Las Casas, D.; Bressand, F.; Lengyel, G.;
+Lample, G.; Saulnier, L.; Lavaud, L. R.; Lachaux, M.-A.;
+Stock, P.; Scao, T. L.; Lavril, T.; Wang, T.; Lacroix, T.; and
+Sayed, W. E. 2023. Mistral 7B. ArXiv, abs/2310.06825.
+Lee, W.; Lee, J.; Seo, J.; and Sim, J. 2024. {InfiniGen}: Ef-
+ficient generative inference of large language models with
+dynamic {KV} cache management. In 18th USENIX Sym-
+posium on Operating Systems Design and Implementation
+(OSDI 24), 155–172.
+Li, H.; Li, Y.; Tian, A.; Tang, T.; Xu, Z.; Chen, X.; Hu, N.;
+Dong, W.; Li, Q.; and Chen, L. 2024a. A survey on large lan-
+guage model acceleration based on kv cache management.
+arXiv preprint arXiv:2412.19442.
+Li, Y.; Huang, Y.; Yang, B.; Venkitesh, B.; Locatelli, A.;
+Ye, H.; Cai, T.; Lewis, P.; and Chen, D. 2024b. Snapkv:
+Llm knows what you are looking for before generation.
+Advances in Neural Information Processing Systems, 37:
+22947–22970.
+Liu, A.; Feng, B.; Wang, B.; Wang, B.; Liu, B.; Zhao,
+C.; Dengr, C.; Ruan, C.; Dai, D.; Guo, D.; et al.
+2024a.
+Deepseek-v2: A strong, economical, and effi-
+cient mixture-of-experts language model.
+arXiv preprint
+arXiv:2405.04434.
+Liu, A.; Feng, B.; Xue, B.; Wang, B.; Wu, B.; Lu, C.; Zhao,
+C.; Deng, C.; Zhang, C.; Ruan, C.; et al. 2024b. Deepseek-
+v3 technical report. arXiv preprint arXiv:2412.19437.
+Liu, A.; Liu, J.; Pan, Z.; He, Y.; Haffari, G.; and Zhuang, B.
+2024c. Minicache: Kv cache compression in depth dimen-
+sion for large language models. Advances in Neural Infor-
+mation Processing Systems, 37: 139997–140031.
+Liu, L.; Zhang, S.; Kuang, Z.; Zhou, A.; Xue, J.-H.; Wang,
+X.; Chen, Y.; Yang, W.; Liao, Q.; and Zhang, W. 2021.
+Group fisher pruning for practical network compression.
+In International Conference on Machine Learning, 7021–
+7032. PMLR.
+Liu, X.; He, S.; Wang, Q.; Li, R.; Song, Y.; Liu, Z.; Li,
+L.; Liu, Q.; Huang, Z.; Guo, Q.; et al. 2025a.
+Beyond
+homogeneous attention: Memory-efficient llms via fourier-
+approximated kv cache. arXiv preprint arXiv:2506.11886.
+Liu, X.; Li, R.; Guo, Q.; Liu, Z.; Song, Y.; Lv, K.; Yan, H.;
+Li, L.; Liu, Q.; and Qiu, X. 2024d. Reattention: Training-
+free infinite context with finite attention scope.
+arXiv
+preprint arXiv:2407.15176.
+Liu, Y.; Yu, J.; Xu, Y.; Li, Z.; and Zhu, Q. 2025b. A survey
+on transformer context extension: Approaches and evalua-
+tion. arXiv preprint arXiv:2503.13299.
+Ly, A.; Marsman, M.; Verhagen, J.; Grasman, R. P.; and Wa-
+genmakers, E.-J. 2017.
+A tutorial on Fisher information.
+Journal of Mathematical Psychology, 80: 40–55.
+Merity, S.; Xiong, C.; Bradbury, J.; and Socher, R. 2016.
+Pointer Sentinel Mixture Models. arXiv:1609.07843.
+Shazeer, N. 2019. Fast transformer decoding: One write-
+head is all you need. arXiv preprint arXiv:1911.02150.
+Shi, L.; Zhang, H.; Yao, Y.; Li, Z.; and Zhao, H. 2024. Keep
+the cost down: A review on methods to optimize LLM’s KV-
+cache consumption. arXiv preprint arXiv:2407.18003.
+Su, J.; Ahmed, M.; Lu, Y.; Pan, S.; Bo, W.; and Liu, Y. 2024.
+Roformer: Enhanced transformer with rotary position em-
+bedding. Neurocomputing, 568: 127063.
+Sun, H.; Chang, L.-W.; Bao, W.; Zheng, S.; Zheng, N.; Liu,
+X.; Dong, H.; Chi, Y.; and Chen, B. 2024a. Shadowkv: Kv
+
+
+cache in shadows for high-throughput long-context llm in-
+ference. arXiv preprint arXiv:2410.21465.
+Sun, Y.; Dong, L.; Zhu, Y.; Huang, S.; Wang, W.; Ma, S.;
+Zhang, Q.; Wang, J.; and Wei, F. 2024b. You only cache
+once: Decoder-decoder architectures for language models.
+Advances in Neural Information Processing Systems, 37:
+7339–7361.
+Vaswani, A.; Shazeer, N.; Parmar, N.; Uszkoreit, J.; Jones,
+L.; Gomez, A. N.; Kaiser, Ł.; and Polosukhin, I. 2017. At-
+tention is all you need. Advances in neural information pro-
+cessing systems, 30.
+Wang, J.; Chen, Y.-G.; Lin, I.-C.; Li, B.; and Zhang,
+G. L. 2024.
+Basis sharing: Cross-layer parameter shar-
+ing for large language model compression. arXiv preprint
+arXiv:2410.03765.
+Wu, H.; and Tu, K. 2024. Layer-condensed kv cache for
+efficient inference of large language models. arXiv preprint
+arXiv:2405.10637.
+Wu, Y.; Wu, H.; and Tu, K. 2024. A systematic study of
+cross-layer kv sharing for efficient llm inference.
+arXiv
+preprint arXiv:2410.14442.
+Xu, Y.; Jie, Z.; Dong, H.; Wang, L.; Lu, X.; Zhou, A.;
+Saha, A.; Xiong, C.; and Sahoo, D. 2024.
+Think: Thin-
+ner key cache by query-driven pruning.
+arXiv preprint
+arXiv:2407.21018.
+Yang, A.; Li, A.; Yang, B.; Zhang, B.; Hui, B.; Zheng, B.;
+Yu, B.; Gao, C.; Huang, C.; Lv, C.; et al. 2025.
+Qwen3
+technical report. arXiv preprint arXiv:2505.09388.
+Yang, L.; Zhang, Z.; Chen, Z.; Li, Z.; and Jia, Z.
+2024a.
+Tidaldecode: Fast and accurate llm decoding
+with position persistent sparse attention.
+arXiv preprint
+arXiv:2410.05076.
+Yang, Y.; Cao, Z.; Chen, Q.; Qin, L.; Yang, D.; Zhao,
+H.; and Chen, Z. 2024b.
+Kvsharer: Efficient inference
+via layer-wise dissimilar kv cache sharing. arXiv preprint
+arXiv:2410.18517.
+Yang, Z.; Han, J.; Wu, K.; Xie, R.; Wang, A.; Sun, X.; and
+Kang, Z. 2024c.
+Lossless kv cache compression to 2%.
+arXiv preprint arXiv:2410.15252.
+Zhang, K.; Li, J.; Li, G.; Shi, X.; and Jin, Z. 2024.
+Codeagent: Enhancing code generation with tool-integrated
+agent systems for real-world repo-level coding challenges.
+arXiv preprint arXiv:2401.07339.
+Zhang, Z.; Sheng, Y.; Zhou, T.; Chen, T.; Zheng, L.; Cai,
+R.; Song, Z.; Tian, Y.; R´e, C.; Barrett, C.; et al. 2023. H2o:
+Heavy-hitter oracle for efficient generative inference of large
+language models. Advances in Neural Information Process-
+ing Systems, 36: 34661–34710.
+Zuhri, Z. M. K.; Adilazuarda, M. F.; Purwarianti, A.; and
+Aji, A. F. 2024.
+Mlkv: Multi-layer key-value heads for
+memory efficient transformer decoding.
+arXiv preprint
+arXiv:2406.09297.
+Reproducibility Checklist
+Instructions for Authors:
+This document outlines key aspects for assessing repro-
+ducibility. Please provide your input by editing this .tex
+file directly.
+For each question (that applies), replace the “Type your
+response here” text with your answer.
+Example: If a question appears as
+\question{Proofs of all novel claims
+are included} {(yes/partial/no)}
+Type your response here
+you would change it to:
+\question{Proofs of all novel claims
+are included} {(yes/partial/no)}
+yes
+Please make sure to:
+• Replace ONLY the “Type your response here” text and
+nothing else.
+• Use one of the options listed for that question (e.g., yes,
+no, partial, or NA).
+• Not modify any other part of the \question com-
+mand or any other lines in this document.
+You
+can
+\input
+this
+.tex
+file
+right
+before
+\end{document} of your main file or compile it as
+a stand-alone document. Check the instructions on your
+conference’s website to see if you will be asked to provide
+this checklist with your paper or separately.
+1. General Paper Structure
+1.1. Includes a conceptual outline and/or pseudocode de-
+scription of AI methods introduced (yes/partial/no/NA)
+yes
+1.2. Clearly delineates statements that are opinions, hypoth-
+esis, and speculation from objective facts and results
+(yes/no) yes
+1.3. Provides well-marked pedagogical references for less-
+familiar readers to gain background necessary to repli-
+cate the paper (yes/no) yes
+2. Theoretical Contributions
+2.1. Does
+this
+paper
+make
+theoretical
+contributions?
+(yes/no) no
+If yes, please address the following points:
+2.2. All assumptions and restrictions are stated clearly
+and formally (yes/partial/no) Type your response
+here
+2.3. All novel claims are stated formally (e.g., in theorem
+statements) (yes/partial/no) Type your response here
+
+
+2.4. Proofs of all novel claims are included (yes/par-
+tial/no) Type your response here
+2.5. Proof sketches or intuitions are given for complex
+and/or novel results (yes/partial/no) Type your re-
+sponse here
+2.6. Appropriate citations to theoretical tools used are
+given (yes/partial/no) Type your response here
+2.7. All theoretical claims are demonstrated empirically
+to hold (yes/partial/no/NA) Type your response here
+2.8. All experimental code used to eliminate or disprove
+claims is included (yes/no/NA) Type your response
+here
+3. Dataset Usage
+3.1. Does this paper rely on one or more datasets? (yes/no)
+yes
+If yes, please address the following points:
+3.2. A motivation is given for why the experiments
+are conducted on the selected datasets (yes/par-
+tial/no/NA) yes
+3.3. All novel datasets introduced in this paper are in-
+cluded in a data appendix (yes/partial/no/NA) yes
+3.4. All novel datasets introduced in this paper will be
+made publicly available upon publication of the pa-
+per with a license that allows free usage for research
+purposes (yes/partial/no/NA) yes
+3.5. All datasets drawn from the existing literature (po-
+tentially including authors’ own previously pub-
+lished work) are accompanied by appropriate cita-
+tions (yes/no/NA) yes
+3.6. All datasets drawn from the existing literature
+(potentially
+including
+authors’
+own
+previously
+published work) are publicly available (yes/par-
+tial/no/NA) yes
+3.7. All datasets that are not publicly available are de-
+scribed in detail, with explanation why publicly
+available alternatives are not scientifically satisficing
+(yes/partial/no/NA) NA
+4. Computational Experiments
+4.1. Does this paper include computational experiments?
+(yes/no) yes
+If yes, please address the following points:
+4.2. This paper states the number and range of values
+tried per (hyper-) parameter during development of
+the paper, along with the criterion used for selecting
+the final parameter setting (yes/partial/no/NA) yes
+4.3. Any code required for pre-processing data is in-
+cluded in the appendix (yes/partial/no) yes
+4.4. All source code required for conducting and analyz-
+ing the experiments is included in a code appendix
+(yes/partial/no) yes
+4.5. All source code required for conducting and ana-
+lyzing the experiments will be made publicly avail-
+able upon publication of the paper with a license
+that allows free usage for research purposes (yes/-
+partial/no) yes
+4.6. All source code implementing new methods have
+comments detailing the implementation, with refer-
+ences to the paper where each step comes from (yes/-
+partial/no) yes
+4.7. If an algorithm depends on randomness, then the
+method used for setting seeds is described in a way
+sufficient to allow replication of results (yes/par-
+tial/no/NA) NA
+4.8. This paper specifies the computing infrastructure
+used for running experiments (hardware and soft-
+ware), including GPU/CPU models; amount of
+memory; operating system; names and versions of
+relevant software libraries and frameworks (yes/par-
+tial/no) partial
+4.9. This paper formally describes evaluation metrics
+used and explains the motivation for choosing these
+metrics (yes/partial/no) yes
+4.10. This paper states the number of algorithm runs used
+to compute each reported result (yes/no) yes
+4.11. Analysis
+of
+experiments
+goes
+beyond
+single-
+dimensional summaries of performance (e.g., aver-
+age; median) to include measures of variation, con-
+fidence, or other distributional information (yes/no)
+yes
+4.12. The significance of any improvement or decrease in
+performance is judged using appropriate statistical
+tests (e.g., Wilcoxon signed-rank) (yes/partial/no) no
+4.13. This paper lists all final (hyper-)parameters used
+for each model/algorithm in the paper’s experiments
+(yes/partial/no/NA) yes

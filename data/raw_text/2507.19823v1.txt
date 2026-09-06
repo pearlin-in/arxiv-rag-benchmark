@@ -1,0 +1,1286 @@
+HCAttention: Extreme KV Cache Compression via
+Heterogeneous Attention Computing for LLMs
+Dongquan Yang
+Intellifusion Inc.
+Shenzhen, China
+matrixyangdq@gmail.com
+Yifan Yang
+Intellifusion Inc.
+Shenzhen, China
+yifan.yang.cn@gmail.com
+Xiaotian Yu
+Intellifusion Inc.
+Shenzhen, China
+xiaotianyu.ac@gmail.com
+Xianbiao Qi
+Intellifusion Inc.
+Shenzhen, China
+qixianbiao@gmail.com
+Rong Xiao
+Intellifusion Inc.
+Shenzhen, China
+rongxiao@gmail.com
+Abstract
+Processing long-context inputs with large language models presents a significant
+challenge due to the enormous memory requirements of the Key-Value (KV) cache
+during inference. Existing KV cache compression methods exhibit noticeable per-
+formance degradation when memory is reduced by more than 85%. Additionally,
+strategies that leverage GPU-CPU collaboration for approximate attention remain
+underexplored in this setting. We propose HCAttention, a heterogeneous attention
+computation framework that integrates key quantization, value offloading, and dy-
+namic KV eviction to enable efficient inference under extreme memory constraints.
+The method is compatible with existing transformer architectures and does not
+require model fine-tuning. Experimental results on the LongBench benchmark
+demonstrate that our approach preserves the accuracy of full-attention model while
+shrinking the KV cache memory footprint to 25% of its original size. Remarkably,
+it stays competitive with only 12.5% of the cache, setting a new state-of-the-art in
+LLM KV cache compression. To the best of our knowledge, HCAttention is the
+first to extend the Llama-3-8B model to process 4 million tokens on a single A100
+GPU with 80GB memory.
+1
+Introduction
+Large Language Models (LLMs) [1, 3, 16, 27, 19, 8, 26, 11] have demonstrated remarkable capabil-
+ities across diverse natural language processing tasks, but deploying them on long contexts poses
+serious efficiency challenges. Many real-world applications, including multi-turn dialogue [35, 14],
+document understanding [15, 36], and AI agent [39, 18], necessitate extending the context lengths
+of LLMs. The memory overhead of self-attention grows linearly with sequence length because the
+model must store a key and value vector for every past token. This quickly becomes prohibitive. For
+example, the Key-Value (KV) cache for the OPT-175B model [37], with 175 billion parameters, can
+demand approximately 950GB of memory when processing a batch size of 128 and a sequence length
+of 2,048 – roughly three times the size of the model’s parameters. Even with memory swapping and
+optimized libraries, inference on long sequences can become memory-bound, hurting throughput
+and latency. There is a pressing need for techniques that drastically reduce KV cache memory usage
+without sacrificing model performance.
+The challenges stem from the inherent complexity of the self-attention mechanism [28], which
+incurs substantial costs along two primary dimensions: computational complexity, which scales
+arXiv:2507.19823v1  [cs.CL]  26 Jul 2025
+
+
+quadratically with sequence length, and memory complexity, specifically related to the KV cache. The
+memory size of KV cache expands linearly with the context length, leading to a substantial increase
+in memory consumption. This substantial memory footprint not only limits the maximum processable
+sequence length and achievable batch size but also impedes efficient concurrent deployment.
+Prior research has significantly advanced the efficiency of LLM inference, especially in handling long
+input sequences [29, 7, 16, 31]. Findings from [23] suggest that not all tokens are equally critical for
+attention computation. Building upon this insight, recent methods estimate token importance using
+attention scores or derived statistical heuristics [31, 30, 34]. For example, Longformer [5] introduced
+sliding window attention combined with global tokens to enable efficient LLM applications, while
+DuoAttention [31] applied the eviction strategy to only a subset of attention heads for managing
+long-sequence generation. However, these methods suffer from significant performance degradation
+when attempting to further reduce the KV cache footprint beyond 85%. Even worse, the permanent-
+eviction strategies in prior studies introduce a systematic flaw. That is, tokens discarded early may
+later prove essential, resulting in substantial accuracy drops.
+Pushing the boundary of KV cache compression ratio requires addressing a series of interrelated
+challenges. A central problem is how to dynamically evict redundant KV entries while preserving
+all tokens essential for maintaining model performance throughout the entire inference process.
+Unlike static truncation (or token selection), effective token eviction must adapt to changing token
+importance over time and across layers, which is difficult to assess in an online setting.
+In order to achieve dynamic token eviction, a potential solution is to take advantage of cache
+quantization, e.g., KIVI [17] and Coupled Quantization [38]. Besides, among all KV components,
+it is noticeable that value vectors dominate the memory budget even though they are accessed only
+during the final weighted-sum step. This makes them prime candidates for CPU offloading. However,
+the heterogeneous computing between CPUs and GPUs in KV cache compression of LLMs is
+underexplored. These observations highlight a key open question: how to design efficient value
+offloading and approximate attention mechanisms with extreme KV cache compression without
+sacrificing inference speed or model accuracy.
+To address the aforementioned challenges, we argue that a unified framework must holistically coor-
+dinate multiple complementary techniques. Specifically, we identify three key strategies that, when
+integrated, can effectively overcome the limitations of existing KV cache compression approaches.
+First, key quantization can significantly reduce the memory footprint of the KV cache by compressing
+high-dimensional key vectors. This tackles the performance-memory trade-off while preserving all
+essential tokens during inference. Second, value offloading shifts memory-intensive value vectors
+to CPU memory, leveraging the CPU’s abundant capacity. Third, KV eviction selectively discards
+low-contribution tokens in real time, maintaining the integrity of necessary computations.
+To the best of our knowledge, this is the first unified framework that simultaneously leverages
+key quantization, value offloading, and dynamic KV eviction within a heterogeneous GPU-CPU
+architecture for efficient long-context inference. Prior works have explored these techniques in
+isolation, but none have effectively integrated them into a cohesive system that balances memory
+efficiency, computational cost, and inference quality. We posit that only a cohesive, device-aware
+design that leverages both GPUs and CPUs can push the limits of KV cache compression without
+sacrificing model performance.
+Based on this insight, we propose HCAttention, a heterogeneous approximate attention computation
+framework that fully exploits the complementary strengths of GPU and CPU. HCAttention extends
+the Llama-3-8B model to process 4 million tokens on a single A100 GPU with 80GB memory. In our
+framework, GPUs perform high-throughput attention score computation over quantized keys, while
+the CPU absorbs offloaded values and participates in final computation. Dynamic eviction policies
+further reduce memory load by pruning non-essential KV pairs across layers based on cumulative
+magnitude criterion. Our contributions are three-fold:
+• We propose an approximate attention mechanism that combines key quantization and dynamic KV
+eviction, enabling high compression efficiency with minimal accuracy loss.
+• We introduce a heterogeneous GPU-CPU execution architecture that offloads value cache storage
+and computation to CPU memory via overlap-aware, asynchronous coordination, ensuring runtime
+efficiency.
+2
+
+
+• We demonstrate through experiments on long-context benchmarks that HCAttention can reduce
+the KV cache memory footprint to 25% of the original size while maintaining the performance
+of full-attention model. Even with only 12.5% of the original cache, our method remains highly
+competitive, achieving less than 1% degradation in accuracy.
+2
+Related Work
+Efficient KV cache management for scalable LLM deployment has been explored in the following
+three categories: KV caches selection, KV caches quantization and heterogeneous computing of
+LLM inference.
+KV caches selection
+Recent studies focus on identifying and retaining only important tokens to
+reduce the size of KV caches. TOVA [20] proposes Token Omission Via Attention, which at each step
+drops the token with the lowest attention score to the current query, effectively keeping only the most
+attended values in the state. StreamingLLM [32] targets streaming inference by combining a sliding
+window of recent tokens with an “attention sink” mechanism. It retains certain early tokens (which
+tend to attract strong long-range attention) as anchors, allowing an effectively unbounded context
+without fine-tuning. Heavy–Hitter Oracle (H2O) [40] observes that a small subset of “heavy-hitter”
+tokens, those with high cumulative attention, dominate the value computation, and it dynamically
+select but permanently evicts cache entries to keep a balance of these heavy hitters and the most
+recent tokens. Keyformer [2] introduces a learned token selection mechanism based on Gumbel-
+softmax sampling. Keyformer scores tokens according to their contextual importance and selectively
+keeps a subset of keys and values. The permanent eviction of caches in previous methods might
+incur accuracy drops. Later, SqueezeAttention [30] further proposes a hierarchical memory budget
+allocation across transformer layers, coupled with adaptive sequence pruning algorithms per layer.
+Similarly, DuoAttention [31] further refines this by splitting attention heads into “retrieval” heads
+(given full KV cache) versus “streaming” heads (given a small fixed cache), based on an optimization
+that identifies which heads need long range memory. The Quest [24] method takes a query aware
+approach. It precomputes min/max summaries of each KV-page and, for each new query, estimates a
+criticality score for pages via inner products.
+KV caches quantization
+Latest work has proposed a variety of ultra-low-bit schemes for KV-cache
+quantization. KIVI [17] characterizes the statistics of KV caches and finds that keys should be quan-
+tized per-channel whereas values per-token. Similarly, AsymKV [25] also considers the asymmetric
+configuration of quantization between key and value matrices at the layer level. ZipCache [10]
+proposes to represent important tokens receive fewer bits, using normalized attention-score metric to
+evaluate token saliency. Coupled Quantization [38] observes that channels of key and value exhibit
+high level of dependency. This method scheme jointly quantize groups of channels rather than
+treating each independently, encoding them more information-efficiently. However, none of these
+approaches systematically investigates how token selection policies could further amplify the benefits
+of quantization.
+Heterogeneous computing
+Recent heterogeneous computing approaches for KV cache demonstrate
+diverse strategies for optimizing CPU-GPU collaboration. For instance, systems like NEO [12] and
+FastDecode [9] implement strategic workload distribution through CPU offloading of attention
+computations. In contrast, FlexInfer [33] introduces virtual memory abstractions to enhance resource
+coordination. While these methods primarily emphasize load-aware scheduling and asymmetric
+pipelining, our approach centers on minimizing both communication and computation overhead to
+effectively utilize CPUs for KV cache computations and value cache storage.
+Remark. HCAttention lies in the intersection of the above three directions. It targets at the KV-cache
+optimization. We use a quantization strategy to quant the keys. For the values, we offload them to the
+CPU so it will largely save GPU memory. To compute attention, we uses a heterogeneous computing
+strategy with part of the attention equation is calculated on GPU and the other part is computed on
+CPU.
+3
+
+
+Value offloading to CPU
+d
+n
+Key cache
+g
+g
+Value embedding
+Value Cache
+Codebook
+1
+2
+...
+C
+Query
+Approximate
+attention score
+Back to GPU
+as FFN inputs
+Attention score 
+offloading to CPU
+Sorted attention
+criterion
+Approximate attention
+score computation
+KV eviction
+Figure 1: Overview of the HCAttention heterogeneous attention computation framework. The
+unified system comprises three key components: (1) approximate attention score computation via
+key quantization on GPU, (2) KV eviction based on a cumulative magnitude criterion, and (3) final
+context vector computation with value offloading to CPU. Computational and storage resources
+represented in two colors: green indicates GPU, and light blue indicates CPU.
+3
+HCAttention
+HCAttention introduces a novel heterogeneous attention computation framework that enables extreme
+KV cache compression with minimal impact on inference quality. As illustrated in Fig. 1, our holistic
+strategy comprises three key components: (1) quantization-driven approximate attention computation;
+(2) dynamic KV eviction based on a cumulative magnitude criterion; (3) heterogeneous attention
+execution with value cache offloading.
+3.1
+Key Quantization
+Inspired by Zhang et al. [38], we utilize grouped vector quantization for the key cache, which takes
+full advantage of interdependencies among key embedding dimensions. The quantization codebook
+is constructed offline using a representative validation dataset. Let Kval ∈Rnval×d denote the set of
+key vectors extracted from the dataset, where nval is the number of tokens and d is the embedding
+dimension.
+The d-dimensional key embedding space is partitioned into g disjoint subspaces (i.e., groups), each
+with dimensionality ¯d = d/g. Conceptually, this transforms a key vector k ∈Rd into g sub-
+vectors ¯ki ∈R ¯d. Within each of these g groups, we apply a clustering method (e.g., K-means) to
+the corresponding sub-vectors across the validation dataset Kval to derive a codebook of c cluster
+centroids for each group. The complete codebook is denoted as C ∈Rg×c× ¯d. The generation process
+of C is conceptually illustrated in the diagram below:
+Kval ∈Rnval×d
+¯Kval ∈Rg×nval× ¯d
+C ∈Rg×c× ¯d,
+split into groups
+quantization
+where n is the sequence length of LLMs.
+3.2
+Heterogeneous Attention Computation
+Building upon the key cache quantization described in the previous section, we propose a heteroge-
+neous attention computation framework to enable efficient inference with memory constraints while
+maintaining model accuracy.
+4
+
+
+Given key and value caches K ∈Rn×d and V ∈Rn×d, the standard attention mechanism computes
+the output y for a query q ∈Rd as
+y = softmax(q · K⊤
+√
+d
+)V = softmax( z
+√
+d
+)V ,
+(1)
+where z = q · K⊤represents the attention scores.
+HCAttention combines two core approximate computation techniques, which reduces both memory
+requirements and computational complexity. The first is built upon the key quantization, the attention
+scores z are estimated with quantized centroids of key matrix, denoted as ez = q · Q(K)⊤. The
+second approximation comes from the KV eviction, dynamically pruning less impactful tokens from
+the cache. Thus it enables adaptive memory usage across layers, denoted as Fevict(ea). Combined
+these two approximate strategies with value offloading, the whole computation can be expressed as
+ey ≈softmax
+  q·Q(K)⊤
+√
+d
+
+V
+=
+softmax
+  ˜z
+√
+d
+
+V
+≈
+Fevict(˜a)
+Fevict(V ) .
+(2)
+1) GPU part in Eq. 2
+In the approximate attention score computation, the computation is performed group-wise. K is
+divided into predefined groups. Each sub-group is represented as nearest neighbor of the centroids in
+the codebook, serves as a compressed representation of K, stored in GPU memory. The compressed
+representation is an index matrix P ∈Zn×g, where P i,j ∈{1, . . . , c}.
+Similarly, query vector is partitioned into same groups. Instead of computing similarity between query
+and key value, the approximation computing is performed between the query ¯q and the codebook C,
+yields an intermediate hash table, denoted as T = ¯q · C where T ∈Rg×c. The computational cost is
+O(dc), constant with respect to sequence length n.
+The approximation computation q · Q(K)⊤is then obtained by aggregating the indexing result from
+each group, which is indexing T using index saved in P :
+˜zj =
+g
+X
+i=1
+T i,P j,i,
+(3)
+where ezj is the approximate attention score at the j-th of the sequence. Approximate attention scores
+ea are then derived as ea = softmax(˜z/
+√
+d).
+Different from existing methods, we argue that the token importance are context-aware and exhibits
+different distributions across layers. Following this observation, we propose an eviction criterion
+based on cumulative magnitude of attention scores, denoted as Fevict(ea).
+We first sort the sequence ea in descending order. Πn = {π1, π2, · · · , πn} is ordered index . ea =
+(aπ1, aπ2, . . . , aπn), where aπ1 ≥aπ2 ≥· · · ≥aπn. Given a threshold τ ∈(0, 1], the selected index
+k∗is defined by
+k∗= min
+n
+k ∈{1, 2, . . . , n}
+
+k
+X
+i=1
+aπi ≥τ
+o
+.
+(4)
+The attention computation can be approximated by a weighted sum of a selected subset of values,
+as the cumulative contribution of a few top-scoring entries dominates the output y. We denote the
+approximate attention scores as ea∗= {a(1), a(2), . . . , a(k)}, and the corresponding selected indices
+as Πk∗= {π1, π2, . . . , πk∗}. Note that both sequences are transferred to the CPU to participate in
+the final output computation with value offloading.
+2) CPU part in Eq. 2
+Based on approximate key cache eviction, we propose fully offloading the value matrix V ∈Rn×d
+to CPU memory to optimize the computation process. The weighted sum of values using selected
+keys can be represented as:
+ey = aV ≈Fevict(ea)Fevict(V ) = ea∗V ∗=
+X
+i∈Πk∗
+ea∗
+i × V i.
+(5)
+5
+
+
+3.3
+Overhead and Efficiency Analysis
+Compression ratio. The memory savings stem from a combination of value offloading and key
+quantization. Intuitively, offloading the value matrix to CPU memory releases half of the memory
+budget, since the key and value matrices have equivalent dimensions. The other strategy of memory
+reduction is achieved by caching only the indices of quantized codebooks. As described in Sec. 3.2,
+given a group number g = 64 (or g = 32) and embedding dimension d = 128, the key index matrix
+P ∈Zn×g occupies only a fraction of the original memory, with an effective footprint of g/d = 1/2
+(or 1/4), respectively. The overall memory budget breakdown is illustrated in Table 1a.
+Computational cost. The reduction in computational cost arises from the approximate computation
+of attention scores, denoted as q · Q(K)⊤. Rather than evaluating attention scores against all keys,
+the computation is restricted to the cluster centers in the codebook, significantly lowering the number
+of operations, as shown in Table 1b.
+Table 1: Comparison of memory compression ratio and computational cost
+(a) Compression ratio of GPU
+Strategy
+K Budget
+V Budget
+Total
+Full-attention
+100%
+100%
+100%
+Value Offloading (VO)
+100%
+0%
+50%
+VO + quantization (g = 64)
+50%
+0%
+25%
+VO + quantization (g = 32)
+25%
+0%
+12.5%
+(b) Computational cost
+Operation
+Original
+HCAttention
+Multiplications
+O(n2d)
+O(ndc)
+Additions
+O(n2d)
+O(n2g)
+The cost reduction is particularly significant in practice since c ≪n in the long context applications.
+Communication overhead. Thanks to KV cache eviction, only a small subset of attention scores
+needs to be transferred to CPU memory (see Sec. 3.2). Given a threshold τ, if 20% of important
+keys are retained across all layers of the LLM, the size of the resulting tensor ea∗can be estimated as
+1
+5 × n × L × H × 2 Bytes, where L is the number of attention layers and H denotes the number of
+attention heads. For example, using Llama3-8B, which has L = 32 layers and H = 8 attention heads
+per layer, and assuming a sequence length of n = 106, the total communication overhead amounts
+to approximately 102.4 MB. This is negligible compared to the bandwidth capacity of a standard
+PCIe connection. This demonstrates that HCAttention’s sparsified offloading mechanism can scale
+efficiently.
+4
+Experiment Results
+In this section, we evaluate HCAttention on long-context benchmarks using Llama models. We
+further conduct ablation studies to analyze the individual contribution of each component.
+4.1
+Setup
+Models and datasets. We employ two state-of-the-art open-source models for our experiments:
+Llama-2-7B-32K-Instruct [27] and Llama-3-8B-Instruct-Gradient-1048k [8]. For long-context evalu-
+ation, we use two widely adopted benchmarks: LongBench [4] and the Needle-in-a-Haystack (NIAH)
+benchmark [13].
+Baseline methods. We compare HCAttention against the original model inference without com-
+pression (referred as Full) and several state-of-the-art KV cache compression algorithms: H2O [40],
+TOVA [20], DuoAttention (referred as Duo) [31], and StreamingLLM (referred as SLLM ) [32].
+We follow the baseline configurations as described in their respective papers. Specifically, SLLM
+employs 64 sink tokens and retains 50% of the sequence as recent tokens. DuoAttention adopts the
+same configuration for its streaming heads, while the retrieval heads are selected proportionally.
+Implementation details. In the experiments, we set the attention sparsification threshold to τ = 0.9.
+Different memory budgets were explored: 50% memory used only value offloading (without key
+quantization); 25% memory combined value offloading with key quantization at g = 64; and the
+12.5% memory budget used key quantization at g = 32. The codebook is generated using the
+6
+
+
+MiniBatchKMeans algorithm [22] implemented in Scikit-learn [21]. For the clustering process, we
+used 3 randomly selected samples with a maximum of 200 iterations and a batch size of 10,000.
+4.2
+Long Context Benchmarks
+Table 2: LongBench performance of different methods under varying memory budgets. Results show
+that the HCAttention generally maintains strong performance, achieving competitive or superior
+results, particularly under constrained memory budgets (25% and 12.5% KV cache).
+Dataset
+Llama-3-8B-Instruct-1048K(50%)
+25%
+12.5%
+Llama-2-7B-Instruct-32K(25%)
+50%
+12.5%
+Full
+H2O
+SLLM
+TOVA
+Duo
+Ours
+Ours
+Ours
+Full
+H2O
+SLLM
+TOVA
+Duo
+Ours
+Ours
+Ours
+Average
+43.2
+39.6
+37.2
+39.7
+44.0
+43.2
+43.2
+42.5
+42.0
+32.5
+33.2
+34.8
+38.8
+41.5
+42.0
+40.0
+Single-Document QA
+NarrativeQA
+26.6
+25.1
+22.1
+25.6
+24.5
+26.0
+26.1
+24.3
+24.1
+19.1
+21.1
+23.1
+20.5
+24.5
+24.8
+25.0
+Qasper
+29.2
+20.7
+21.8
+23.1
+26.9
+29.8
+29.7
+27.9
+33.2
+16.8
+17.7
+20.9
+26.6
+31.4
+32.4
+32.9
+MultiFieldQA-en
+52.6
+38.5
+28.1
+44.9
+51.4
+53.9
+52.7
+50.5
+34.0
+21.0
+16.7
+18.2
+25.5
+34.3
+35.0
+33.8
+Multi-Document QA
+HotpotQA
+40.4
+36.8
+39.3
+38.5
+41.6
+39.7
+40.3
+41.6
+48.0
+39.6
+40.4
+47.5
+50.4
+46.8
+48.0
+46.0
+2WikiMQ
+28.8
+28.0
+29.2
+26.9
+29.1
+28.8
+29.9
+28.7
+35.6
+28.9
+29.7
+31.2
+33.4
+34.9
+36.2
+33.9
+Musique
+24.2
+19.2
+20.5
+23.1
+24.7
+25.1
+25.1
+24.6
+23.0
+20.6
+20.1
+21.0
+19.3
+23.7
+23.5
+22.9
+Summarization
+GovReport
+34.2
+29.4
+29.1
+30.1
+32.7
+34.5
+34.3
+33.5
+31.2
+20.7
+24.1
+22.9
+28.0
+30.8
+30.8
+28.9
+QMSum
+24.5
+22.9
+22.1
+23.2
+24.2
+24.1
+24.1
+23.9
+20.8
+18.9
+20.1
+20.2
+21.5
+20.7
+20.7
+20.3
+MultiNews
+27.7
+25.5
+24.9
+26.3
+27.7
+27.5
+28.2
+27.5
+27.1
+19.2
+20.5
+21.4
+25.0
+26.8
+27.1
+26.0
+Few-shot Learning
+TREC
+71.5
+64.0
+67.0
+54.0
+71.0
+71.5
+71.5
+72.0
+71.5
+48.5
+56.5
+47.0
+68.5
+72.0
+72.0
+70.0
+TriviaQA
+87.7
+86.0
+86.1
+85.0
+87.1
+87.2
+87.2
+86.8
+86.2
+85.2
+85.2
+85.7
+86.2
+86.8
+86.9
+82.1
+SAMSum
+42.5
+40.8
+40.3
+40.5
+41.8
+42.4
+42.8
+42.8
+42.1
+39.7
+37.4
+36.2
+33.1
+41.5
+41.1
+39.5
+Synthetic Task
+Passage Retrieval-en
+81.0
+74.8
+49.0
+72.0
+87.0
+80.1
+80.5
+80.0
+50.9
+19.5
+19.1
+30.2
+47.3
+46.5
+47.9
+41.9
+Code Completion
+LCC
+38.2
+43.1
+41.9
+42.3
+44.2
+39.2
+37.8
+36.1
+51.2
+45.8
+44.3
+47.9
+48.3
+51.7
+52.0
+50.5
+RepoBench-P
+38.9
+40.0
+37.6
+40.1
+46.1
+39.8
+38.8
+36.8
+51.6
+45.2
+45.3
+49.0
+48.6
+50.9
+51.6
+46.9
+LongBench is a specialized benchmark for evaluating long-context comprehension capabilities of
+LLMs, consisting of various tasks including single-document QA, multi-document QA, summariza-
+tion, code understanding, and logical reasoning. We presents a comprehensive evaluation of different
+methods on the LongBench across various memory constraints, utilizing two different Llama models.
+The memory budgets are represented as percentages of the full KV cache size (Full, 50%, 25%,
+12.5%).
+As shown in Table 2, HCAttention consistently demonstrates robust performance. In many tasks
+and across both model sizes, HCAttention is competitive with or surpasses other methods under
+these memory constraints. It achieves performance nearly indistinguishable from the full attention
+baseline under a 25% GPU memory budget for both models. Remarkably, it stays competitive with
+only 12.5% of the cache with Lllma-3-8B-Instruct-1048, setting a new state-of-the-art in LLM KV
+cache compression. This highlights the robustness of our heterogeneous attention design, especially
+in balancing GPU memory efficiency with attention quality.
+These results collectively demonstrate that HCAttention enables practical long-context inference with
+minimal trade-offs in accuracy, offering a scalable and generalizable solution for memory-efficient
+deployment of LLMs.
+NIAH primarily measures a model’s ability to precisely locate and extract key information from
+extremely long contexts. We maintains the same experimental settings to those used in LongBench.
+We investigate the impact of different "needles" on the task performance. We take “The best thing to
+do in Paris is buy a fresh croissant and lounge by the Seine at twilight.” as an example “needle”.
+We conduct NIAH testing on Llama-2-7B-32K-Instruct. As shown in Fig. 2, DuoAttention maintains
+model performance at a 50% memory budget but fails under lower budgets, leading to performance
+collapse. In contrast, our method achieves performance comparable to the full attention model at
+both 50% and 25% memory budgets, and crucially, it remains effective even at the extreme 12.5%
+budget significantly outperforming DuoAttention under such constrained settings. Additional results
+with alternative “needle” queries are provided in the Appendix.
+Efficiency result. By combining the Llama-3-8B model (using FlashAttention2 [6] for 1024k window
+prefilling) with our approach, which integrates g = 32 key quantization and value offloading, we
+successfully processed sequences up to 4 million tokens on a single A100 GPU (80GB memory).
+7
+
+
+Figure 2: DuoAttention can maintain model performance at 50% memory budget, but lower budgets
+cause model collapse. Our solution achieves performance close to the full attention model at 50% and
+25% memory budget, and crucially maintains model effectiveness even at lower budgets of 12.5%,
+significantly outperforming DuoAttention in these constrained scenarios.
+4.3
+Ablation Studies
+4.3.1
+Ablation on KV eviction
+Table 3: Performance under varying KV eviction
+thresholds.
+Threshold τ
+0.3
+0.5
+0.7
+0.9
+1
+Selection Ratio %
+1.9
+3.2
+6.0
+15.6
+100
+Average
+40.2
+41.2
+43.9
+47.2
+46.9
+2WikiQA
+27.0
+29.6
+33.6
+36.0
+35.6
+GovReport
+29.2
+30.3
+31.0
+30.2
+31.2
+HotpotQA
+35.3
+38.6
+44.2
+48.7
+48.0
+LCC
+45.4
+48.6
+51.4
+52.0
+51.5
+MultiNews
+25.9
+25.2
+26.4
+26.6
+27.1
+MultiFieldQA-en
+28.8
+25.3
+29.8
+36.8
+34.0
+PassageRetrieval-en
+46.8
+41.4
+40.9
+51.2
+50.9
+Qasper
+23.7
+24.4
+28.5
+32.7
+33.2
+RepoBench-P
+45.1
+48.3
+49.8
+51.2
+51.6
+SAMSum
+38.9
+41.2
+41.1
+41.8
+42.1
+TREC
+68.0
+68.0
+70.1
+72.0
+71.5
+TriviaQA
+68.8
+73.1
+80.1
+86.9
+86.2
+Figure 3: Comparison of dynamic KV eviction
+selection ratio across transformer layers.
+We evaluate the effectiveness of applying layer-wise dynamic KV eviction (i.e., attention score
+thresholding) without key quantization or value offloading. This ablation study is conducted using
+the Llama-2-7B-32K model on the LongBench benchmark.
+As shown in Table 3, we varied the threshold τ from 0.3 to 1.0. Results indicate that setting τ = 0.9
+allows the system to prune over 80% of tokens while maintaining accuracy on average. Lower
+thresholds, while pruning more tokens (i.e., retaining fewer), introduce noise (or discard essential
+information) and lead to performance degradation. Therefore, τ = 0.9 strikes a favorable balance
+between information retention and computational efficiency.
+Layer-wise token selection ratios (Figure 3) demonstrate that dynamic KV eviction benefits from
+adapting to each layer’s redundancy. Early layers permit aggressive eviction, middle layers require
+caution, and the final layer varies by task, highlighting the efficiency of a layer-aware approach for
+memory management.
+4.3.2
+Key quantization quality
+We analyze the quantization quality in HCAttention by comparing the output attention scores between
+the full-attention and quantized attention. As shown in Figure 4, we plot the attention scores for
+the first few hundred tokens, with full attention in blue and quantized attention in red. The two
+curves largely overlap, indicating that the quantization introduces negligible loss in attention scores.
+Furthermore, we visualize four different layers and observe that even in the final layer, there is no
+noticeable accumulation of error, demonstrating the effectiveness and stability of our key quantization.
+8
+
+
+Figure 4: Attention scores in different layers between full-attention and group quantization (g = 32,
+c = 8192).
+Table 4: Ablation on key quantization settings (“∗” indicates that the groups do not share the codebook,
+and “-” denotes the full-attention baseline.)
+(a) Effect of codebook granularity
+number of centers
+256
+1024
+2048
+4096
+8192
+Average
+23.8
+36.4
+41.4
+42.2
+43.5
+2WikiQA
+23.8
+30.9
+33.6
+33.7
+32.8
+GovReport
+9.5
+22.8
+25.6
+26.1
+28.7
+HotpotQA
+29.4
+37.7
+45.4
+45.0
+45.1
+LCC
+23.1
+37.6
+40.9
+48.4
+48.9
+MultiNews
+12.9
+16.8
+21.1
+25.5
+25.4
+MultiFieldQA-en
+19.3
+31.2
+34.0
+31.6
+34.3
+PassageRetrieval-en
+13.3
+24.0
+35.9
+39.3
+41.0
+Qasper
+19.9
+26.8
+31.4
+29.5
+32.4
+RepoBench-P
+18.4
+38.4
+44.0
+44.1
+45.9
+SAMSum
+18.1
+34.0
+36.6
+38.2
+37.5
+TREC
+48.0
+64.5
+66.0
+66.0
+68.0
+TriviaQA
+50.3
+72.6
+81.9
+78.6
+81.9
+(b) Effect of group dimension
+group size
+-
+16
+32
+64
+64∗
+Average
+46.9
+12.8
+43.5
+46.5
+45.6
+2WikiQA
+35.6
+18.0
+32.8
+35.2
+35.5
+GovReport
+31.2
+2.1
+28.7
+31.1
+31.0
+HotpotQA
+48.0
+27.0
+45.1
+46.9
+46.4
+LCC
+51.5
+4.8
+48.9
+51.3
+50.3
+MultiNews
+27.1
+0.1
+25.4
+26.7
+26.2
+MultiFieldQA-en
+34.0
+10.8
+34.3
+34.9
+33.7
+PassageRetrieval-en
+50.9
+7.0
+41.0
+48.5
+47.8
+Qasper
+33.2
+14.3
+32.4
+32.1
+32.3
+RepoBench-P
+51.6
+7.3
+45.9
+51.5
+48.4
+SAMSum
+42.1
+6.4
+37.5
+41.4
+39.8
+TREC
+71.5
+28.5
+68.0
+72.0
+69.5
+TriviaQA
+86.2
+27.7
+81.9
+86.7
+86.0
+4.3.3
+Key quantization strategy comparison
+To assess the impact of quantization settings, we conduct ablation studies on (a) the number of
+codebook centroids and (b) the group size in channel-wise partitioning, with KV eviction threshold
+τ = 1 to isolate the quantization effect.
+The results are summarized in Table 4.Varying the number of centroids (256–8192) with a fixed group
+size (g = 32), we observe a clear trade-off between quantization granularity and attention accuracy.
+Performance improves significantly from 256 to 2048 centroids and stabilizes at 4096+, highlighting
+the need for expressive codebooks to preserve semantic similarity.
+For group size (g = 16, 32, 64), larger sizes yield better performance by reducing quantization noise.
+Additionally, using separate codebooks for each group (Table 4b, last column) slightly increases
+memory but consistently improves accuracy, suggesting that decoupled clustering better captures
+diverse semantics in long contexts.
+5
+Conclusion
+In this work, we present HCAttention, a heterogeneous approximate attention framework that effec-
+tively addresses the KV cache memory bottleneck in long-context LLM inference. By combining key
+quantization, value offloading to CPU memory, and layer-wise KV eviction, HCAttention signifi-
+cantly reduces GPU memory consumption while maintaining high-quality outputs and low inference
+latency. The framework is fine-tuning-free and can be readily integrated into standard Transformer
+inference pipelines. Empirical results on LongBench and NIAH benchmarks demonstrate that HCAt-
+tention achieves state-of-the-art compression efficiency, and remains robust even under extreme
+memory constraints (as low as 12.5% of the original KV cache size). Ablation studies further validate
+the effectiveness of our quantization strategy and attention sparsification design. To the best of our
+knowledge, HCAttention is the first to extend the Llama-3-8B model to process 4 million tokens on a
+single A100 GPU with 80GB memory.
+For future work, two main directions appear particularly promising. Firstly, exploring the integra-
+tion of HCAttention with the DeepSeek MLA (Multi-head Latent Attention) presents a promising
+9
+
+
+direction. Since MLA is inherent memory efficiency compared to MHA and GQA, combining it with
+HCAttention holds the potential for even greater memory savings. Validating the effectiveness of this
+synergy will be a key focus of future research. Secondly, we aim to investigate the application of
+HCAttention in broader scenarios, including multimodal models, AI Agent and Retrieval-Augmented
+Generation system. The efficient handling of long contexts offered by HCAttention could unlock
+significant improvements in the performance and capabilities of these systems.
+6
+References
+[1]
+J. Achiam, S. Adler, S. Agarwal, L. Ahmad, I. Akkaya, F. L. Aleman, D. Almeida, J.
+Altenschmidt, S. Altman, S. Anadkat, et al. “GPT-4 technical report”. In: arXiv preprint
+arXiv:2303.08774 (2023).
+[2]
+M. Adnan, A. Arunkumar, G. Jain, P. J. Nair, I. Soloveychik, and P. Kamath. “Keyformer: Kv
+cache reduction through key tokens selection for efficient generative inference”. In: Proceed-
+ings of Machine Learning and Systems 6 (2024), pp. 114–127.
+[3]
+J. Bai, S. Bai, Y. Chu, Z. Cui, K. Dang, X. Deng, Y. Fan, W. Ge, Y. Han, F. Huang, et al. “Qwen
+technical report”. In: arXiv preprint arXiv:2309.16609 (2023).
+[4]
+Y. Bai, X. Lv, J. Zhang, H. Lyu, J. Tang, Z. Huang, Z. Du, X. Liu, A. Zeng, L. Hou, Y. Dong,
+J. Tang, and J. Li. “LongBench: A Bilingual, Multitask Benchmark for Long Context Under-
+standing”. In: Proceedings of the 62nd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers). Bangkok, Thailand: Association for Computational
+Linguistics, 2024, pp. 3119–3137.
+[5]
+I. Beltagy, M. E. Peters, and A. Cohan. “Longformer: The long-document transformer”. In:
+arXiv preprint arXiv:2004.05150 (2020).
+[6]
+T. Dao. “FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning”. In:
+International Conference on Learning Representations (ICLR). 2024.
+[7]
+S. Ge, Y. Zhang, L. Liu, M. Zhang, J. Han, and J. Gao. “Model tells you what to discard:
+Adaptive kv cache compression for llms”. In: arXiv preprint arXiv:2310.01801 (2023).
+[8]
+A. Grattafiori, A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman, A.
+Mathur, A. Schelten, A. Vaughan, et al. “The llama 3 herd of models”. In: arXiv preprint
+arXiv:2407.21783 (2024).
+[9]
+J. He and J. Zhai. “Fastdecode: High-throughput gpu-efficient llm serving using heterogeneous
+pipelines”. In: arXiv preprint arXiv:2403.11421 (2024).
+[10]
+Y. He, L. Zhang, W. Wu, J. Liu, H. Zhou, and B. Zhuang. “ZipCache: Accurate and Efficient
+KV Cache Quantization with Salient Token Identification”. In: The Thirty-eighth Annual
+Conference on Neural Information Processing Systems.
+[11]
+A. Q. Jiang, A. Sablayrolles, A. Roux, A. Mensch, B. Savary, C. Bamford, D. S. Chaplot,
+D. d. l. Casas, E. B. Hanna, F. Bressand, et al. “Mixtral of experts”. In: arXiv preprint
+arXiv:2401.04088 (2024).
+[12]
+X. Jiang, Y. Zhou, S. Cao, I. Stoica, and M. Yu. “Neo: Saving gpu memory crisis with cpu
+offloading for online llm inference”. In: arXiv preprint arXiv:2411.01142 (2024).
+[13]
+G. Kamradt. Llmtest_needleinahaystack: Doing simple retrieval from llm models at vari-
+ous context lengths to measure accuracy. https://github.com/gkamradt/LLMTest_
+NeedleInAHaystack. 2024.
+[14]
+Y. Li, X. Shen, X. Yao, X. Ding, Y. Miao, R. Krishnan, and R. Padman. “Beyond Single-
+Turn: A Survey on Multi-Turn Interactions with Large Language Models”. In: arXiv preprint
+arXiv:2504.04717 (2025).
+[15]
+Z. Li, Y. Zhang, T. Pan, Y. Sun, Z. Duan, J. Fang, R. Han, Z. Wang, and J. Wang. “Focus-
+LLM: Precise Understanding of Long Context by Dynamic Condensing”. In: arXiv preprint
+arXiv:2408.11745 (2024).
+[16]
+A. Liu, B. Feng, B. Wang, B. Wang, B. Liu, C. Zhao, C. Dengr, C. Ruan, D. Dai, D. Guo, et al.
+“Deepseek-v2: A strong, economical, and efficient mixture-of-experts language model”. In:
+arXiv preprint arXiv:2405.04434 (2024).
+10
+
+
+[17]
+Z. Liu, J. Yuan, H. Jin, S. Zhong, Z. Xu, V. Braverman, B. Chen, and X. Hu. “KIVI: a tuning-
+free asymmetric 2bit quantization for KV cache”. In: Proceedings of the 41st International
+Conference on Machine Learning. 2024, pp. 32332–32344.
+[18]
+Y. Mao, J. Li, F. Meng, J. Xiong, Z. Zheng, and M. Zhang. “LIFT: Improving Long Context
+Understanding Through Long Input Fine-Tuning”. In: arXiv preprint arXiv:2412.13626 (2024).
+[19]
+J. Ni, G. H. Abrego, N. Constant, J. Ma, K. B. Hall, D. Cer, and Y. Yang. “Sentence-t5: Scalable
+sentence encoders from pre-trained text-to-text models”. In: arXiv preprint arXiv:2108.08877
+(2021).
+[20]
+M. Oren, M. Hassid, N. Yarden, Y. Adi, and R. Schwartz. “Transformers are Multi-State
+RNNs”. In: Proceedings of the 2024 Conference on Empirical Methods in Natural Language
+Processing. 2024, pp. 18724–18741.
+[21]
+F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion, O. Grisel, M. Blondel, P.
+Prettenhofer, R. Weiss, V. Dubourg, et al. “Scikit-learn: Machine learning in Python”. In: the
+Journal of machine Learning research 12 (2011), pp. 2825–2830.
+[22]
+D. Sculley. “Web-scale k-means clustering”. In: Proceedings of the 19th international confer-
+ence on World wide web. 2010, pp. 1177–1178.
+[23]
+N. Shazeer and M. Stern. “Adafactor: Adaptive learning rates with sublinear memory cost”. In:
+International Conference on Machine Learning. PMLR. 2018, pp. 4596–4604.
+[24]
+J. Tang, Y. Zhao, K. Zhu, G. Xiao, B. Kasikci, and S. Han. “QUEST: Query-Aware Sparsity
+for Efficient Long-Context LLM Inference”. In: Proceedings of the International Conference
+on Machine Learning (ICML). 2024.
+[25]
+Q. Tao, W. Yu, and J. Zhou. “AsymKV: Enabling 1-Bit Quantization of KV Cache with Layer-
+Wise Asymmetric Quantization Configurations”. In: Proceedings of the 31st International
+Conference on Computational Linguistics. 2025, pp. 2316–2328.
+[26]
+G. Team, R. Anil, S. Borgeaud, J.-B. Alayrac, J. Yu, R. Soricut, J. Schalkwyk, A. M. Dai,
+A. Hauth, K. Millican, et al. “Gemini: a family of highly capable multimodal models”. In:
+arXiv preprint arXiv:2312.11805 (2023).
+[27]
+H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra,
+P. Bhargava, S. Bhosale, et al. “Llama 2: Open foundation and fine-tuned chat models”. In:
+arXiv preprint arXiv:2307.09288 (2023).
+[28]
+A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, and I.
+Polosukhin. “Attention is all you need”. In: Advances in neural information processing systems
+30 (2017).
+[29]
+A. Vyas, A. Katharopoulos, and F. Fleuret. “Fast transformers with clustered attention”. In:
+Advances in Neural Information Processing Systems 33 (2020), pp. 21665–21674.
+[30]
+Z. Wang, C. Bin, and S. Gan. “SqueezeAttention: 2D Management of KV-Cache in LLM
+Inference via Layer-wise Optimal Budget”. In: The Thirteenth International Conference on
+Learning Representations.
+[31]
+G. Xiao, J. Tang, J. Zuo, J. Guo, S. Yang, H. Tang, Y. Fu, and S. Han. “Duoattention: Ef-
+ficient long-context llm inference with retrieval and streaming heads”. In: arXiv preprint
+arXiv:2410.10819 (2024).
+[32]
+G. Xiao, Y. Tian, B. Chen, S. Han, and M. Lewis. “Efficient Streaming Language Models with
+Attention Sinks”. In: The Twelfth International Conference on Learning Representations.
+[33]
+J. Xu, R. Zhang, C. Guo, W. Hu, Z. Liu, F. Wu, Y. Feng, S. Sun, C. Shao, Y. Guo, et al.
+“vtensor: Flexible virtual tensor management for efficient llm serving”. In: arXiv preprint
+arXiv:2407.15309 (2024).
+[34]
+Y. Xu, Z. Jie, H. Dong, L. Wang, X. Lu, A. Zhou, A. Saha, C. Xiong, and D. Sahoo. “Think:
+Thinner key cache by query-driven pruning”. In: arXiv preprint arXiv:2407.21018 (2024).
+[35]
+C. Zhang, X. Dai, Y. Wu, Q. Yang, Y. Wang, R. Tang, and Y. Liu. “A Survey on Multi-Turn
+Interaction Capabilities of Large Language Models”. In: arXiv preprint arXiv:2501.09959
+(2025).
+[36]
+P. Zhang, Z. Liu, S. Xiao, N. Shao, Q. Ye, and Z. Dou. “Soaring from 4k to 400k: Extending
+llm’s context with activation beacon”. In: arXiv preprint arXiv:2401.03462 2.3 (2024), p. 5.
+11
+
+
+[37]
+S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan, M. Diab, X. Li,
+X. V. Lin, et al. “Opt: Open pre-trained transformer language models”. In: arXiv preprint
+arXiv:2205.01068 (2022).
+[38]
+T. Zhang, J. Yi, Z. Xu, and A. Shrivastava. “KV cache is 1 bit per channel: Efficient large
+language model inference with coupled quantization”. In: Advances in Neural Information
+Processing Systems 37 (2024), pp. 3304–3331.
+[39]
+Y. Zhang, R. Sun, Y. Chen, T. Pfister, R. Zhang, and S. Arik. “Chain of agents: Large language
+models collaborating on long-context tasks”. In: Advances in Neural Information Processing
+Systems 37 (2024), pp. 132208–132237.
+[40]
+Z. Zhang, Y. Sheng, T. Zhou, T. Chen, L. Zheng, R. Cai, Z. Song, Y. Tian, C. Ré, C. Barrett,
+et al. “H2O: Heavy-hitter oracle for efficient generative inference of large language models”.
+In: Advances in Neural Information Processing Systems 36 (2023), pp. 34661–34710.
+12
+
+
+A
+Alternative experiment results on NIAH
+This section presents the visualization results of NIAH test with alternative "needles," as depicted in
+Figures 1 and 2. HCAttention demonstrates robust model performance across varying token lengths
+and depths, maintaining efficacy at both 50% and 25% GPU memory budgets. Only a marginal
+degradation was observed at 12.5% memory budget. In contrast, DuoAttention variant exhibited
+a significant performance loss when the memory budget fell below 25%. These visualizations
+underscore the robustness of our approach in preserving retrieval capabilities under extreme KV
+cache compression conditions.
+Figure 1: Visualization of NIAH test. The "needle" text is "Remember, the best thing to do in San
+Francisco is eat a sandwich and sit in Dolores Park on a sunny day.".
+Figure 2: Visualization of NIAH test. The "needle" text is "Remember, the best thing to do in New
+York is grab a bagel and people-watch in Washington Square Park at golden hour.".
+B
+Enhanced prefilling with block-wise attention
+Our proposed method, HCAttention, can be further enhanced by integration with other efficient
+long-context LLM inference techniques during the prefilling stage.
+Inspired by Star Attention, our approach utilizes a block-wise decomposition strategy. This breaks
+down computationally intensive global attention into more manageable, localized computations. For
+prefilling, attention is computed exclusively between a designated anchor block and the current
+processing block. This approximated attention computation significantly boosts computational
+efficiency. Furthermore, when a block operation concludes, the quantization of the key cache can
+further enhance efficiency without compromising performance.
+As illustrated in Figure 3, the attention mask pattern equivalent to this approach clearly demonstrates
+how these localized computations effectively approximate global attention behavior. This design
+allows the model to capture essential long-range dependencies, crucial for understanding complex
+contexts, even though computations are performed on smaller, manageable blocks. This approxima-
+tion is vital for deploying large language models on devices with limited memory and computational
+resources.
+13
+
+
+Figure 3: Attention mask patterns illustrating the integration of HCAttention with block-wise attention
+to achieve efficient prefilling and decoding.
+Figure 4: Visualization of NIAH test of HCAttention enhanced with block-wise attention in prefilling
+stage.
+Figure 4 demonstrates that by combining HCAttention with the sparsification technique during the
+prefilling phase, our method achieves performance on the NIAH task equivalent to full attention.
+C
+Experiment setup details
+Hardware Platform The experiments were conducted on Linux servers running Ubuntu 22.04,
+configured with: 2 × Intel Xeon 8358P CPUs, 1TB RAM, and 8 × NVIDIA A100 GPUs with 80GB
+memory.
+Software Our algorithm was implemented using PyTorch (version 2.5.1+cu121) and HuggingFace
+Transformers (version 4.45.2).
+14

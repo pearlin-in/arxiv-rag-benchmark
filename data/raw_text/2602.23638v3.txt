@@ -1,0 +1,3009 @@
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Haoran Zhang 1 Dongjun Kim 1 Seohyeon Cha 1 Haris Vikalo 1
+Abstract
+Federated LoRA provides a communication-
+efficient mechanism for fine-tuning large lan-
+guage models on decentralized data. In practice,
+however, a discrepancy between the factor-wise
+averaging used to preserve low rank and the math-
+ematically correct aggregation of local updates
+can cause significant aggregation error and un-
+stable training. We argue that a major source
+of this problem is rotational misalignment, aris-
+ing from the rotational invariance of low-rank
+factorizations – semantically equivalent updates
+can be represented in different latent subspaces
+across clients since (BiRi)(R⊤
+i Ai) = BiAi.
+When such misaligned factors are averaged di-
+rectly, they interfere destructively and degrade
+the global update. To address this issue, we pro-
+pose FedRot-LoRA, a federated LoRA frame-
+work that aligns client updates via orthogonal
+transformations prior to aggregation. This align-
+ment preserves the semantic update while reduc-
+ing cross-client subspace mismatch, without in-
+creasing communication cost or restricting model
+expressivity. We provide a convergence analysis
+that examines the aggregation error induced by
+factor-wise averaging and shows how rotational
+alignment yields a tighter upper bound on this
+error. Extensive experiments on natural language
+understanding and generative tasks demonstrate
+that FedRot-LoRA consistently outperforms ex-
+isting federated LoRA baselines across a range
+of heterogeneity levels and LoRA ranks. The
+code is available at https://github.com/
+haoran-zh/FedRot-LoRA.
+1Chandra Department of Electrical and Computer Engineering,
+The University of Texas at Austin, TX, USA. Correspondence to:
+Haoran Zhang <haoranz@austin.utexas.edu>.
+Proceedings of the 43 rd International Conference on Machine
+Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026
+by the author(s).
+1. Introduction
+The remarkable performance of large language models
+(LLMs) is driven by training and adaptation on large-scale,
+diverse datasets (Kaplan et al., 2020). In many real-world
+applications, however, high-quality data is distributed across
+devices or institutions and cannot be centralized due to pri-
+vacy or regulatory constraints (Rieke et al., 2020). Federated
+learning (FL) (McMahan et al., 2017) offers a framework
+to leverage such decentralized data by coordinating training
+across clients while keeping raw data local.
+In practice, federated fine-tuning faces major practical barri-
+ers (Zhang et al., 2023). Full-model training is often com-
+putationally infeasible on resource-constrained clients (Xu
+et al., 2024), and exchanging full model updates across
+training rounds introduces severe communication overhead.
+Parameter-efficient fine-tuning (PEFT) has emerged as an ef-
+fective way to reduce computation and communication cost
+by updating only a small subset of parameters while keeping
+the backbone frozen (Lialin et al., 2023; Han et al., 2024).
+Among PEFT methods, Low-Rank Adaptation (LoRA) (Hu
+et al., 2022) parameterizes weight updates via low-rank
+factors (∆W = BA), making it particularly attractive in
+federated settings. Unlike prompt-based or adapter-based
+approaches, LoRA operates directly in the model weight
+space and incurs no additional inference-time overhead
+once the low-rank updates are merged, while remaining
+expressive under a low-rank assumption. These proper-
+ties make LoRA well-suited for FL and have motivated a
+growing body of work on federated LoRA, which aims to
+combine FL’s privacy guarantees and broad data coverage
+with LoRA’s efficiency for practical decentralized LLM
+fine-tuning (Babakniya et al., 2023; Kuang et al., 2024).
+Challenge of Federated LoRA. Integrating LoRA into FL
+introduces a fundamental aggregation challenge of balanc-
+ing communication cost against mathematical correctness.
+Consider an FL system with N clients, where each client
+i in round t computes a local update ∆W t
+i = Bt
+iAt
+i, with
+Bt
+i ∈Rd×r, At
+i ∈Rr×d, and r ≪d. The mathematically
+ideal aggregation at the server is
+∆W t
+ideal = 1
+N
+N
+X
+i=1
+∆W t
+i = 1
+N
+N
+X
+i=1
+Bt
+iAt
+i,
+(1)
+which provides the exact average of the local weight updates.
+1
+arXiv:2602.23638v3  [cs.LG]  11 Jun 2026
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Client 1
+Client 2
+Client 3
+Naive Aggregation
+Client 1
+Client 2
+Client 3
+Rotational Alignment
+FedRot-LoRA
+𝑅!
+𝑅"
+𝑅#
+B# = 1/N∑B$
+A# = 1/N∑A$
+B# = 1/N∑B$R$ A# = 1/N∑R$
+%A$
+B!
+A!
+Figure 1. Overview of rotational alignment in FedRot-LoRA. Top:
+Naive aggregation averages unaligned LoRA factors (Ai, Bi),
+causing destructive interference due to cross-client subspace mis-
+match. Bottom: FedRot-LoRA applies client-specific rotations
+Ri to align local updates prior to aggregation. This preserves the
+semantic update while reducing subspace misalignment, leading
+to lower aggregation error and more stable training behavior.
+However, ∆W t
+ideal is generally of rank greater than r, de-
+feating the purpose of LoRA’s low-rank parameterization
+and leading to prohibitive communication overhead when
+transmitting updates back to clients. Additionally, clients
+cannot directly resume LoRA training from a high-rank
+update, complicating continual fine-tuning. To preserve
+the low-rank structure, a commonly used alternative is to
+average the LoRA factors separately (Zhang et al., 2024a):
+∆W t
+naive = ¯Bt ¯At =
+ 
+1
+N
+N
+X
+i=1
+Bt
+i
+! 
+1
+N
+N
+X
+i=1
+At
+i
+!
+.
+(2)
+While this guarantees rank(∆W t
+naive) ≤r, enabling effi-
+cient communication and local re-initialization, it introduces
+a critical inconsistency (∆W t
+naive̸ = ∆W t
+ideal). This dis-
+crepancy manifests through cross terms Bt
+iAt
+j for i̸ = j,
+which can destabilize training and degrade the performance
+of the global model (Chen et al., 2025; Bai et al., 2024).
+The Rotational Invariance Problem. We argue that the
+limitations of naive factor-wise averaging cannot be fully
+explained by algebraic non-commutativity alone, but are
+strongly influenced by rotational noise arising from the ro-
+tational invariance of the LoRA decomposition. Given a
+local update ∆W t
+i = Bt
+iAt
+i, this factorization is not unique
+since for any orthogonal matrix R ∈Rr×r, the transformed
+factors ˜Bt
+i = Bt
+iR and ˜At
+i = R⊤At
+i yield the same up-
+date, i.e., ˜Bt
+i ˜At
+i = Bt
+iAt
+i. As a result, different clients may
+produce semantically identical updates while representing
+them in misaligned latent subspaces. When such unaligned
+factors are averaged directly, as in ∆W t
+naive, combining
+mismatched subspaces leads to destructive interference, ex-
+acerbating aggregation error and adversely affecting training
+stability and global performance.
+Our Approach.
+To mitigate the adverse effects of
+rotational misalignment, we propose FedRot-LoRA, a
+communication-efficient federated fine-tuning framework
+that aligns latent subspaces of LoRA updates across clients
+prior to aggregation. Figure 1 illustrates the key idea. In
+each communication round, clients compute local low-rank
+updates that may span misaligned latent subspaces, leading
+to noisy aggregation and degraded global performance when
+averaged directly (top row of Fig. 1). To address this issue,
+FedRot-LoRA introduces a rotational alignment step that re-
+orients local LoRA factors before aggregation (bottom row
+of Fig. 1). This alignment preserves the semantic update
+while reducing cross-client subspace mismatch, mitigating
+rotational noise and improving training stability.
+Our key contributions are summarized as follows:
+• We identify rotational noise, induced by the rotational
+invariance of LoRA factorization, as an underexplored
+source of aggregation error in federated LoRA. To
+address this issue, we propose FedRot-LoRA, a feder-
+ated fine-tuning framework that explicitly aligns local
+LoRA updates prior to aggregation, mitigating cross-
+client subspace mismatch under heterogeneous data.
+• We provide a convergence analysis of federated LoRA
+that examines the aggregation error induced by factor-
+wise averaging, and show that rotational alignment
+yields a strictly tighter upper bound on this error in
+standard federated learning settings.
+• Through extensive experiments on RoBERTa-Large
+(GLUE) and Llama 3-8B (GSM8K, HumanEval), we
+show that FedRot-LoRA consistently outperforms ex-
+isting federated LoRA baselines across a wide range
+of client scales, LoRA ranks, and heterogeneity levels.
+2. Related Work
+2.1. Federated Parameter-Efficient Fine-Tuning
+A growing body of work explores applying parameter-
+efficient fine-tuning (PEFT) methods in FL to adapt large
+models under resource constraints.
+Prompt-based ap-
+proaches apply soft prompt tuning to avoid modifying the
+full model parameters. Examples include FedPrompt (Zhao
+et al., 2023) and pFedPrompt (Guo et al., 2023), which learn
+prompt representations that are either globally aggregated or
+personalized across clients. While these methods are highly
+communication-efficient and preserve model privacy, their
+adaptation capacity can be limited for tasks that require
+major changes to internal model representations (Lester
+et al., 2021). Adapter-based approaches introduce com-
+putationally efficient modules trained alongside the frozen
+backbone to capture task- or modality-specific information.
+M2FedSA (Zhang et al., 2024b) incorporates specialized
+adapters to capture such information in federated settings.
+However, adapter-based methods incur additional inference
+2
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+latency as adapters must be loaded and executed jointly
+with the backbone model at deployment. In contrast, LoRA-
+based methods (Wang et al., 2024b; Sun et al., 2024; Bai
+et al., 2024) compute updates via low-rank weight modifi-
+cations that can be merged into the backbone after training,
+incurring no additional inference-time cost. Combined with
+their strong adaptation capacity under a low-rank assump-
+tion, LoRA-based approaches are particularly well-suited
+for federated fine-tuning of LLMs. Accordingly, in this
+work we focus on federated LoRA.
+2.2. Federated LoRA
+LoRA (Hu et al., 2022) reduces the parameter overhead of
+fine-tuning by reparameterizing weight updates as the prod-
+uct of two low-rank matrices. This proved to be an effective
+mechanism for adapting LLMs under limited computational
+and communication budgets (Hayou et al., 2024; Wang et al.,
+2024a). In FL settings, LoRA reduces the cost of fine-tuning
+across distributed clients by restricting communication to
+low-rank updates (Wang et al., 2024b). In practice, how-
+ever, federated LoRA faces a key challenge: a mismatch
+between aggregating full local updates and aggregating low-
+rank factors, as in naive factor-wise averaging (Zhang et al.,
+2024a). Prior work has explored several strategies to miti-
+gate this issue. (1) Linearization via Parameter Freezing.
+Methods such as FFA-LoRA (Sun et al., 2024) freeze one
+LoRA factor and aggregate only the other factor, ensuring
+linearity of aggregation. RoLoRA (Chen et al., 2025) al-
+ternates the frozen factor across training rounds. While
+these approaches simplify aggregation, they significantly
+restrict the parameter space, which may slow convergence
+and limit adaptation capacity. FedSA-LoRA (Guo et al.,
+2025) trains both factors locally but aggregates only a subset,
+leading to incomplete global adapters. (2) Decomposition
+and Reconstruction. Other methods perform aggregation
+in the full-weight space and then project the result to a
+low-rank form. For example, FlexLoRA (Bai et al., 2024)
+aggregates full updates and applies SVD-based projection
+to recover low-rank adapters, while FedSRD (Yan et al.,
+2025) reconstructs global updates from sparsified client up-
+dates before projection. These approaches incur substantial
+server-side computation and introduce approximation error
+due to repeated high-dimensional SVD operations, which
+can become numerically unstable (Chen et al., 2025). (3)
+High-Communication Aggregation. Another line of work
+preserves aggregation fidelity by transmitting extra infor-
+mation beyond low-rank adapters. FedEx-LoRA (Singhal
+et al., 2024) augments updates with high-rank residual terms,
+while FLoRA (Wang et al., 2024b) aggregates in the full pa-
+rameter space with increasing effective rank. These methods
+substantially increase communication overhead, undermin-
+ing the motivation for LoRA in bandwidth-constrained FL.
+We compare these federated LoRA methods with FedRot-
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+Parameter A
+0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+Parameter B
+Optimization Trajectory
+(Target BA = 1.00)
+Global Optimal Manifold
+Naive Aggregation (FedIT)
+Freeze A (FFA-LoRA)
+RoLoRA
+FedRot-LoRA
+FedRot-LoRA, = 0.5
+Start
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8
+Global Loss
+Figure 2. Optimization trajectories with target ∆W ∗= 1.0, ini-
+tialized at ¯B0 = 0 and ¯A0 = 0.44 (black star). The red dashed
+curve denotes the optimal solution manifold. Each marker along
+a trajectory represents the global factors (B, A) after one com-
+munication round under a given method. Different aggregation
+schemes induce distinct optimization paths, illustrating the impact
+of rotational misalignment on training dynamics.
+LoRA in terms of aggregation space, communication, and
+computation in Table 7 of Appendix B.1.
+In contrast to these methods, our work isolates rotational
+misalignment as a distinct contributor to aggregation error
+in federated LoRA and addresses it by explicitly aligning
+client updates prior to aggregation.
+3. Methods
+We consider an FL system with N clients that jointly
+minimize the global objective f(W) =
+1
+N
+PN
+i=1 fi(W),
+where the model parameters are updated relying on a LoRA
+parameterization W = W0 + ∆W = W0 + BA with
+B ∈Rd×r, A ∈Rr×d (r ≪d). In communication round t,
+client i locally optimizes fi to obtain the low-rank update
+∆W t
+i = Bt
+iAt
+i. Since direct aggregation of the correspond-
+ing LoRA factors can introduce a discrepancy between the
+aggregated update and the average of local updates, we intro-
+duce a rotational alignment step that reorients local LoRA
+factors prior to aggregation.
+Motivating Example. We begin with a scalar example
+to illustrate the effect of aggregation misalignment. Con-
+sider the optimization problem with global loss ℓ(B, A) =
+(BA −1)2, where B, A ∈R. The set of global mini-
+mizers satisfies BA = 1, forming a hyperbolic solution
+manifold (Fig. 2, red dashed line). Due to factorization
+invariance, different clients may converge to distinct but
+equivalent parameters (e.g., Bt
+i = 2, At
+i = 0.5 versus
+Bt
+j = 1.5, At
+j = 2/3). Naive factor averaging (FedIT
+(Zhang et al., 2024a), blue line) shifts the aggregate up-
+date off this manifold, introducing aggregation error and
+3
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+unstable global updates. Parameter-freezing methods (FFA-
+LoRA (Sun et al., 2024), RoLoRA (Chen et al., 2025)) avoid
+this by aggregating a single factor, at the cost of reduced
+expressivity and slower convergence.
+FedRot-LoRA instead aligns local factors prior to aggre-
+gation. In the scalar case, alignment reduces to rescal-
+ing: given a reference Aref (e.g., the previous global pa-
+rameter ¯At−1), each client solves minRt
+i ∥Rt
+iAt
+i −Aref∥2
+with Rt
+i ∈R, and applies the transformation (At
+i, Bt
+i) →
+(Rt
+iAt
+i, Bt
+i/Rt
+i) which preserves Bt
+iAt
+i, yielding stable ag-
+gregated updates and faster convergence (red line). We
+further introduce a soft alignment mechanism (purple line)
+to improve robustness in early rounds. While the scalar
+case admits a simple rescaling interpretation, higher-rank
+LoRA (r > 1) is characterized by a more complex invari-
+ance setting where different clients may span misaligned
+latent subspaces. There, alignment generalizes from scalar
+rescaling to transformations that act on the latent subspace.
+Simple extensions such as diagonal or norm-based scaling
+cannot resolve relative subspace misalignment, while un-
+restricted invertible mappings may lead to ill-conditioned
+factors and require iterative, non–closed-form optimization.
+As a result, FedRot-LoRA adopts orthogonal alignment,
+which preserves invertibility, admits an efficient Procrustes
+solution, and provides r(r −1)/2 degrees of freedom for
+subspace alignment. A detailed comparison between rescal-
+ing and rotation is provided in Appendix B.3.1.
+Alternating Factor Alignment. To mitigate subspace mis-
+alignment during aggregation, FedRot-LoRA introduces an
+alignment step prior to transmitting Bt
+i and At
+i to the server.
+We formulate this as an alternating optimization problem,
+where each client aligns its local LoRA factors to a common
+global reference, defined by the aggregated adapter from
+the previous round (i.e., Aref = ¯At−1 and Bref = ¯Bt−1).1
+To balance alignment across both factors, clients alternate
+between aligning A and B in consecutive communication
+rounds. Specifically, each client solves
+min
+Rt
+i
+∥(Rt
+i)⊤At
+i −Aref∥2
+F ,
+if t mod 2 = 1
+min
+Rt
+i
+∥Bt
+iRt
+i −Bref∥2
+F ,
+if t mod 2 = 0
+s.t.
+(Rt
+i)⊤Rt
+i = Ir, det(Rt
+i) > 0.
+(3)
+This optimization is an instance of the orthogonal Pro-
+crustes problem (Sch¨onemann, 1966), which admits a
+closed-form solution obtained via singular value decomposi-
+tion (SVD). Let M denote the correlation matrix, defined as
+M = Aref(At
+i)⊤in A-alignment rounds (t mod 2 = 1) and
+M = (Bref)⊤Bt
+i in B-alignment rounds (t mod 2 = 0).
+Let M = UΣV ⊤be its SVD; the rotation matrix that mini-
+1We use the previous global model to avoid extra communica-
+tion overhead; alternatives are discussed in Appendix B.3.2.
+mizes the above objective is then given by
+Rt,∗
+i
+= V · diag(1, ..., 1, det(UV ⊤)) · U ⊤.
+(4)
+Soft Rotation. In the early stages of training, the global
+reference may be noisy or unrepresentative due to limited
+aggregation history and client heterogeneity. In such cases,
+the optimal alignment matrix Rt,∗
+i
+can induce corrections
+that are unreasonably large, destabilizing training. To im-
+prove robustness, we introduce soft rotation, which interpo-
+lates between no alignment and exact Procrustes alignment.
+Specifically, we form an interpolated matrix
+R′ = (1 −λ)I + λRt,∗
+i ,
+(5)
+and project it by computing its SVD R′ = UΣV ⊤and
+setting Rt
+i,soft = V diag(1, . . . , 1, det(UV ⊤)) U ⊤. The
+aligned factors are defined as
+˜At
+i = (Rt
+i,soft)⊤At
+i,
+˜Bt
+i = Bt
+iRt
+i,soft.
+(6)
+This transformation preserves the semantic update, since
+˜Bt
+i ˜At
+i = Bt
+iAt
+i = ∆W t
+i . The interpolation factor λ ∈[0, 1]
+controls the strength of alignment. When λ = 1, soft rota-
+tion reduces to hard alignment; when λ = 0, no alignment
+is applied and FedRot-LoRA boils down to naive factor-
+wise aggregation. By reducing reliance on a noisy reference
+in early rounds, soft rotation prevents over-correction and
+leads to more stable training behavior.
+The full training procedure for FedRot-LoRA is summarized
+as Algorithm 1. In each communication round t, the server
+broadcasts the current global LoRA adapters { ¯At−1, ¯Bt−1}
+to all clients. Client i initializes local training from these
+weights and updates its local factors At
+i and Bt
+i on private
+data. Following local training, clients apply rotational align-
+ment to their updated factors; the aligned factors, ˜At
+i and
+˜Bt
+i, are then sent to the server, which aggregates them to
+generate the updated global adapters ¯At and ¯Bt.
+Complexity Analysis. FedRot-LoRA adds a small per-
+round computational cost that depends only on the LoRA
+rank. The alignment process involves two steps: (1) Corre-
+lation matrix construction. Each client computes the cor-
+relation matrix M ∈Rr×r, which requires a matrix mul-
+tiplication with time complexity O(d · r2). (2) SVD. An
+SVD is then performed on the resulting r × r matrix M,
+which incurs a cost of O(r3). For the soft rotation, a similar
+SVD on an r × r matrix is required. Overall, the per-round
+complexity of the alignment step is O(d · r2 + r3). In con-
+trast, decomposition-based methods such as FlexLoRA (Bai
+et al., 2024) require repeated decompositions or projections
+involving matrices of dimension d, leading to substantially
+higher computational cost when d ≫r. In practice, LoRA
+ranks are small (e.g., r ∈{4, 8, 16}), and thus the alignment
+cost is modest relative to local training. Furthermore, the
+rotational alignment step introduces no additional commu-
+nication overhead beyond standard federated LoRA.
+4
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Algorithm 1 FedRot-LoRA
+1: Input: N clients, learning rate η, rank r, rounds T.
+2: Server Init: Global parameters W = W0 + ∆W0,
+∆W0 = ¯B0 ¯A0 = 0.
+3: for round t = 1 to T do
+4:
+Server broadcasts { ¯At−1, ¯Bt−1} to all clients.
+5:
+for each client i ∈{1, . . . , N} in parallel do
+6:
+Local Training: Update local At
+i, Bt
+i via SGD
+starting from ¯At−1, ¯Bt−1.
+7:
+Rotational Alignment:
+8:
+if t mod 2 = 1 (align A) then
+9:
+Solve minRt
+i ∥(Rt
+i)⊤At
+i −Aref∥2
+F , s.t. (3).
+10:
+else
+11:
+Solve minRt
+i ∥Bt
+iRt
+i −Bref∥2
+F , s.t. (3).
+12:
+end if
+13:
+Compute rotation matrix Rt
+i,soft via Eq. (5).
+14:
+Align ˜At
+i = (Rt
+i,soft)⊤At
+i, ˜Bt
+i = Bt
+iRt
+i,soft.
+15:
+Send { ˜At
+i, ˜Bt
+i} to server.
+16:
+end for
+17:
+Aggregate: ¯At = 1
+N
+PN
+i=1 ˜At
+i, ¯Bt = 1
+N
+PN
+i=1 ˜Bt
+i.
+18: end for
+4. Theoretical Analysis
+In this section, we study how naive (i.e., factor-wise) aggre-
+gation in federated LoRA affects standard nonconvex con-
+vergence bounds. We explicitly characterize the aggregation
+error that arises from averaging low-rank factors instead of
+the resulting updates, and show that FedRot-LoRA reduces
+this error, yielding a strictly tighter bound.
+4.1. Convergence Analysis
+For the convergence analysis, we make standard smooth-
+ness and bounded gradient assumptions, along with a mild
+boundedness condition on local LoRA updates.
+Assumption 4.1 (L-smoothness). The global objective
+function f(W) is differentiable and L-smooth: f(Y ) ≤
+f(X) + ⟨∇f(X), Y −X⟩+ L
+2 ∥Y −X∥2
+F .
+Assumption 4.2 (Bounded Gradients). For each client i
+and round t, let ξi denote random local data samples. The
+stochastic gradients with respect to each parameter block
+θ ∈{A, B, W} are unbiased and have bounded norm:
+E[∇θfi(W t, ξi)] = ∇θfi(W t), ∥∇θfi(W t)∥F ≤Gθ.
+Assumption 4.3 (Bounded LoRA Norms). For each client i,
+the local LoRA update satisfies ∥Bt
+i∥F · ∥At
+i∥F ≤τ, ∀i, t.
+Assumption 4.1 is a standard smoothness condition used
+to derive descent-based bounds in non-convex optimiza-
+tion. Assumption 4.2 ensures that stochastic gradients are
+uniformly bounded. Assumption 4.3 limits the scale ambi-
+guity inherent to the LoRA factorization and implies that,
+in the fine-tuning regime, local low-rank updates remain
+bounded and client heterogeneity is limited. We define the
+aggregation error as
+Et =
+ 
+1
+N
+N
+X
+i=1
+Bt
+i
+! 
+1
+N
+N
+X
+i=1
+At
+i
+!
+−1
+N
+N
+X
+i=1
+Bt
+iAt
+i.
+(7)
+Et quantifies the discrepancy between the aggregation pro-
+duced by factor-wise averaging and the ideal aggregation of
+local updates, and can be interpreted as an additive pertur-
+bation to the global model update at round t.
+We present the convergence analysis in Theorem 4.4, with
+the proof detailed in Appendix A.1. Our analysis follows
+standard L-smooth nonconvex FL optimization to bound
+the per-round descent of the global objective (Wang et al.,
+2020), while explicitly isolating the aggregation error term
+Et. This formulation explicitly quantifies how misaligned
+LoRA updates affect the convergence bound.
+Theorem 4.4 (Convergence Analysis). Let Assumptions 4.1,
+4.2, and 4.3 hold, and let f ∗= infW f(W). For a learn-
+ing rate η, the following stationarity bound holds for the
+aggregated global model W t = W0 + ¯Bt ¯At over T com-
+munication rounds:
+min
+t∈{0,...,T } E
+
+∥∇Af(W t)∥2
+F + ∥∇Bf(W t)∥2
+F
+
+(8)
+≤f(W 0) −f ∗
+ηT
++ 3Lη2 + 2
+2Tη
+T
+X
+t=1
+E
+∥Et+1∥2
+F
+η2
+
++ O(η).
+Interpretation: The bound consists of three terms: the initial
+optimality gap, the accumulated aggregation error ∥Et+1∥2
+F ,
+and a learning-rate-dependent term O(η). The aggrega-
+tion error term quantifies the effect of naive factor-wise
+aggregation. Under the ideal aggregation, this term van-
+ishes, resulting in a tighter convergence bound at the cost of
+rank expansion and increased communication cost. FedRot-
+LoRA reduces this error by aligning local updates prior to
+aggregation; in the next subsection, we formalize how such
+alignment leads to a strictly tighter aggregation error bound.
+4.2. Rotational Alignment Yields Tighter Error Bound
+We here analyze how rotational alignment affects the ag-
+gregation error ∥Et∥F introduced by factor-wise averaging.
+Under mild assumptions, we show that the proposed align-
+ment step yields a strictly tighter upper bound on this error
+term, thereby strengthening the convergence bound derived
+in the previous subsection.
+Let ˜At
+i(λ) and ˜Bt
+i(λ) denote the soft-aligned LoRA factors
+for client i in round t, obtained with λ ∈[0, 1]. We quantify
+cross-client misalignment via the dispersion defined as
+Φ (λ) =
+(
+1
+N
+PN
+i=1 ∥˜At
+i(λ) −Aref∥2
+F , if t mod 2 = 1
+1
+N
+PN
+i=1 ∥˜Bt
+i(λ) −Bref∥2
+F , if t mod 2 = 0.
+5
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Note that Φ(0) corresponds to the dispersion under factor-
+wise aggregation without rotational alignment. We define
+the relative alignment gain as
+α(λ) = 1 −Φ (λ)
+Φ (0) .
+(9)
+Assumption 4.5 (Linear Lower Envelope). There exists a
+constant c0 > 0 such that α(λ) ≥c0λ for all λ ∈(0, 1].
+Assumption 4.6 (Non-IID Data Distribution). There exist
+δA, δB > 0 such that ∥At
+i −Aref∥F ≥δA and ∥Bt
+i −
+Bref∥F ≥δB.
+Assumption 4.7 (Bounded Dispersion). There exist κ > 0
+such that the optimal rotation matrices Rt,∗
+i
+satisfy: ∥Rt,∗
+i
+−
+I∥F ≤κ∥At
+i−Aref∥F when aligning A, and ∥Rt,∗
+i −I∥F ≤
+κ∥Bt
+i −Bref∥F when aligning B.
+Assumption 4.5 characterizes the effectiveness of rotational
+alignment as a function of the alignment strength by requir-
+ing the gain to be lower bounded. Assumption 4.6 captures
+non-vanishing client drift induced by data heterogeneity.
+Assumption 4.7 requires that rotational corrections remain
+controlled when local updates are close to the reference. We
+provide empirical diagnostics supporting these assumptions
+in Appendix B.3.5.
+Theorem 4.8 (Error Bound Analysis). In a round t where
+matrix A is actively aligned, and under Assumptions 4.3,
+4.5, 4.6, and 4.7, the aggregation error satisfies
+∥Et
+aligned∥F ≤1
+N
+N
+X
+i=1
+
+∥˜Bt
+i −Bref∥2
+F + ∥˜At
+i −Aref∥2
+F
+
+|
+{z
+}
+Error bound with rotational alignment
+≤1
+N
+N
+X
+i=1
+
+∥Bt
+i −Bref∥2
+F + ∥At
+i −Aref∥2
+F
+|
+{z
+}
+Error bound without alignment
+−Γ(λ) · ∥At
+i −Aref∥2
+F
+|
+{z
+}
+Alignment gain
+
+,
+where Γ(λ) =
+
+c0 −4√τκηGB
+δA
+
+λ −4κ2λ2τ, which is pos-
+itive for a non-trivial range of λ under mild conditions. An
+analogous result holds when aligning matrix B.
+Corollary 4.9 (Feasible λ for Strict Improvement). If the
+learning rate satisfies η <
+c0δA
+4√τκGB , then there exists a
+non-trivial range of soft rotation strengths λ for which the
+alignment gain in Theorem 4.8 is strictly positive. In partic-
+ular, if 0 < λ < min
+n
+1, c0δA−4√τκηGB
+4κ2τδA
+o
+, the aggregation
+error admits a strictly smaller upper bound than that ob-
+tained without alignment.
+Interpretation. Theorem 4.8 characterizes the effect of rota-
+tional alignment on the aggregation error through an explicit
+upper bound. Compared with naive factor averaging, rota-
+tional alignment introduces a λ-controlled alignment gain.
+Corollary 4.9 shows that there exists a non-trivial range of
+0 < λ < min
+n
+1, c0δA−4√τκηGB
+4κ2τδA
+o
+for which this gain is
+strictly positive, yielding a strictly tighter upper bound than
+naive aggregation under the same analysis. This provides
+a concrete guideline for selecting λ to balance alignment
+strength and training stability. This range is a conservative
+sufficient condition arising from worst-case bounds, rather
+than a tight characterization of all effective choices of λ.
+In practice, as shown in our sensitivity experiments (see
+Section 5), FedRot-LoRA remains effective over a broader
+range of λ values, suggesting that the theoretical condition
+captures the existence of a favorable alignment regime while
+the empirically useful range can be larger.
+5. Experiments
+In this section, we evaluate FedRot-LoRA against repre-
+sentative federated LoRA baselines on natural language
+understanding and generative tasks. We vary the number
+of clients, LoRA rank, and degree of data heterogeneity to
+examine performance across a range of federated settings.
+5.1. Experimental Setup
+Datasets and Models. For natural language understand-
+ing tasks, we use the pretrained RoBERTa-Large (Liu
+et al., 2019) model from the HuggingFace Transformers
+library (Wolf et al., 2020) and evaluate all methods on five
+datasets from GLUE (Wang et al., 2018): SST-2, QNLI,
+MNLI, QQP, and RTE. For generative tasks, we use Llama
+3-8B (Grattafiori et al., 2024), evaluating mathematical rea-
+soning on GSM8K (Cobbe et al., 2021) and code generation
+on HumanEval (Chen et al., 2021), with models trained on
+CodeSearchNet (Husain et al., 2019).
+Baselines. We compare FedRot-LoRA against three fed-
+erated LoRA baselines. FedIT (Zhang et al., 2024a) trains
+both LoRA factors A and B and aggregates them via naive
+averaging ( ¯A, ¯B), preserving full expressivity but being sus-
+ceptible to aggregation errors due to subspace misalignment.
+FFA-LoRA (Sun et al., 2024) freezes A with random initial-
+ization and trains only B, allowing linear aggregation rule.
+RoLoRA (Chen et al., 2025) alternates between updating B
+(with A frozen) and updating A (with B frozen) across com-
+munication rounds. Both FFA-LoRA and RoLoRA avoid
+bilinear factor aggregation, but achieve that by restricting
+the effective parameter space, which can reduce expressivity
+and slow convergence.
+Implementation Details. We implement all methods us-
+ing the FederatedScope-LLM framework (Kuang et al.,
+2024).
+All experiments are conducted on RTX 6000
+Ada and GH200 GPUs.
+To evaluate robustness across
+6
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Table 1. GLUE benchmark results comparing different federated LoRA methods under three client scales (N ∈{3, 10, 50}), using r = 4
+and Dirichlet concentration parameter h = 0.5. FedRot-LoRA achieves the highest average accuracy and shows improved stability across
+tasks.
+Clients Num
+Methods
+SST-2
+QNLI
+QQP
+RTE
+MNLI
+Avg.
+3
+FedIT (Zhang et al., 2024a)
+0.953 ± 0.001
+0.926 ± 0.002
+0.771 ± 0.098
+0.840 ± 0.013
+0.866 ± 0.001
+0.8712
+FlexLoRA (Bai et al., 2024)
+0.949 ± 0.003
+0.910 ± 0.007
+0.832 ± 0.008
+0.813 ± 0.015
+0.845 ± 0.008
+0.8698
+FFA-LoRA (Sun et al., 2024)
+0.768 ± 0.056
+0.926 ± 0.002
+0.838 ± 0.002
+0.830 ± 0.005
+0.862 ± 0.001
+0.8448
+RoLoRA (Chen et al., 2025)
+0.951 ± 0.004
+0.917 ± 0.011
+0.841 ± 0.012
+0.854 ± 0.005
+0.868 ± 0.005
+0.8862
+FedRot-LoRA (Ours)
+0.954 ± 0.001
+0.926 ± 0.002
+0.842 ± 0.002
+0.868 ± 0.014
+0.876 ± 0.002
+0.8932
+10
+FedIT (Zhang et al., 2024a)
+0.949 ± 0.002
+0.913 ± 0.004
+0.849 ± 0.000
+0.621 ± 0.054
+0.849 ± 0.002
+0.8362
+FlexLoRA (Bai et al., 2024)
+0.922 ± 0.009
+0.876 ± 0.018
+0.801 ± 0.032
+0.592 ± 0.030
+0.792 ± 0.011
+0.7966
+FFA-LoRA (Sun et al., 2024)
+0.946 ± 0.001
+0.894 ± 0.008
+0.849 ± 0.002
+0.600 ± 0.024
+0.840 ± 0.002
+0.8258
+RoLoRA (Chen et al., 2025)
+0.956 ± 0.001
+0.911 ± 0.015
+0.863 ± 0.001
+0.805 ± 0.007
+0.858 ± 0.005
+0.8786
+FedRot-LoRA (Ours)
+0.958 ± 0.000
+0.921 ± 0.010
+0.868 ± 0.001
+0.798 ± 0.005
+0.864 ± 0.001
+0.8818
+50
+FedIT (Zhang et al., 2024a)
+0.928 ± 0.023
+0.803 ± 0.005
+0.814 ± 0.022
+0.622 ± 0.051
+0.673 ± 0.023
+0.7680
+FlexLoRA (Bai et al., 2024)
+0.752 ± 0.135
+0.733 ± 0.121
+0.739 ± 0.066
+0.632 ± 0.059
+0.677 ± 0.032
+0.7066
+FFA-LoRA (Sun et al., 2024)
+0.933 ± 0.015
+0.851 ± 0.004
+0.716 ± 0.018
+0.658 ± 0.038
+0.701 ± 0.008
+0.7718
+RoLoRA (Chen et al., 2025)
+0.851 ± 0.176
+0.893 ± 0.042
+0.847 ± 0.003
+0.733 ± 0.064
+0.798 ± 0.114
+0.8244
+FedRot-LoRA (Ours)
+0.947 ± 0.004
+0.920 ± 0.012
+0.854 ± 0.002
+0.787 ± 0.004
+0.859 ± 0.003
+0.8734
+Table 2. FedRot-LoRA achieves an order-of-magnitude reduction
+in aggregation error compared to FedIT.
+Methods
+SST-2
+QNLI
+QQP
+RTE
+MNLI
+FedIT
+7.49e-3
+1.98e-3
+1.04e-2
+1.91e-3
+3.98e-3
+FedRot-LoRA
+4.72e-4
+1.34e-4
+8.70e-4
+2.11e-4
+1.48e-4
+runs, experiments are repeated with three random seeds,
+and we report the mean accuracy with standard devia-
+tion.
+We perform a grid search over the learning rate
+η ∈{5e-4, 1e-3, 5e-3, 2e-2} and the alignment strength
+λ ∈{0.2, 0.4, 0.6, 0.8, 1.0}. For each method, hyperpa-
+rameters are tuned separately using validation, and the best-
+performing configuration is reported in Appendix B.2. We
+set the number of local epochs to 20 and the number of
+communication rounds to 250 for all natural language un-
+derstanding tasks, and to 30 local epochs and 200 communi-
+cation rounds for generative tasks.
+5.2. Language Understanding Tasks
+Table 1 reports RoBERTa-Large performance on five GLUE
+natural language understanding tasks (SST-2, QNLI, MNLI,
+QQP, RTE), where we report mean test accuracy and stan-
+dard deviation over three random seeds. All methods use
+LoRA rank r = 4, and we adopt the non-IID data parti-
+tion scheme from (Li et al., 2022) using a Dirichlet dis-
+tribution with concentration parameter h = 0.5. We con-
+sider three FL scales, with N ∈{3, 10, 50} clients. Under
+N = 3, FedRot-LoRA achieves the highest average accu-
+racy (0.8932) among all methods. This improvement is
+consistent with the substantial reduction in aggregation er-
+ror achieved by FedRot-LoRA (Table 2). The performance
+gains are more pronounced on challenging tasks such as
+MNLI and RTE, where limited data and label noise can
+amplify aggregation mismatch across clients. In contrast,
+for relatively easy binary tasks such as SST-2 and QNLI,
+multiple methods approach similar performance ceilings,
+consistent with reduced sensitivity to aggregation effects in
+these settings. When scaling to N = 10, most baselines de-
+grade, particularly on small-data tasks such as RTE, reflect-
+ing the increased difficulty of aggregating heterogeneous
+client updates. FedRot-LoRA remains the most accurate
+method on average (0.8818) and improves training stabil-
+ity, reducing the averaged standard deviation across tasks
+to 0.0034 compared to 0.0058 for the strongest baseline
+RoLoRA. At the larger scale of N = 50, the advantage of
+FedRot-LoRA becomes more pronounced: it achieves the
+best performance on all five tasks and improves the average
+accuracy to 0.8734, compared with 0.8244 for RoLoRA and
+0.7680 for FedIT. This suggests that rotational alignment
+becomes increasingly beneficial as client heterogeneity and
+aggregation difficulty grow.
+(1) Effect of Rank.
+Table 3 reports MNLI accuracy for different LoRA ranks
+r ∈{2, 4, 8, 16, 24} under a non-IID partition with Dirich-
+let concentration parameter h = 0.5 and N = 3 clients.
+FedRot-LoRA achieves the best performance across all
+ranks, with consistently low standard deviation. At the low-
+rank setting r = 2, FedRot-LoRA still performs strongly, in-
+dicating that rotational alignment does not hurt optimization
+even when the adaptation subspace is highly constrained. As
+the rank increases, aggregation becomes more challenging
+because clients may span higher-dimensional and more mis-
+aligned latent subspaces. This particularly affects RoLoRA,
+whose performance drops sharply at r = 16 and r = 24,
+with large variance across runs. In contrast, FedRot-LoRA
+remains stable at both moderate and high ranks, achieving
+0.865 at r = 16 and 0.872 at r = 24 with very small stan-
+dard deviation. These results suggest that FedRot-LoRA is
+robust across both capacity-limited low-rank settings and
+higher-rank settings.
+7
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Table 3.
+MNLI accuracy under different LoRA ranks (r ∈
+{2, 4, 8, 16, 24}). FedRot-LoRA outperforms all baselines across
+ranks, demonstrating stable performance across ranks.
+Rank
+Methods
+ACC±std@MNLI
+2
+FedIT (Zhang et al., 2024a)
+0.844 ± 0.051
+FlexLoRA (Bai et al., 2024)
+0.811 ± 0.108
+FFA-LoRA (Sun et al., 2024)
+0.837 ± 0.008
+RoLoRA (Chen et al., 2025)
+0.860 ± 0.002
+FedRot-LoRA (Ours)
+0.877 ± 0.005
+4
+FedIT (Zhang et al., 2024a)
+0.866 ± 0.001
+FlexLoRA (Bai et al., 2024)
+0.845 ± 0.008
+FFA-LoRA (Sun et al., 2024)
+0.862 ± 0.001
+RoLoRA (Chen et al., 2025)
+0.868 ± 0.005
+FedRot-LoRA (Ours)
+0.876 ± 0.002
+8
+FedIT (Zhang et al., 2024a)
+0.861 ± 0.001
+FlexLoRA (Bai et al., 2024)
+0.836 ± 0.021
+FFA-LoRA (Sun et al., 2024)
+0.864 ± 0.001
+RoLoRA (Chen et al., 2025)
+0.869 ± 0.004
+FedRot-LoRA (Ours)
+0.877 ± 0.002
+16
+FedIT (Zhang et al., 2024a)
+0.855 ± 0.003
+FlexLoRA (Bai et al., 2024)
+0.852 ± 0.010
+FFA-LoRA (Sun et al., 2024)
+0.834 ± 0.009
+RoLoRA (Chen et al., 2025)
+0.722 ± 0.215
+FedRot-LoRA (Ours)
+0.865 ± 0.002
+24
+FedIT (Zhang et al., 2024a)
+0.857 ± 0.001
+FlexLoRA (Bai et al., 2024)
+0.864 ± 0.009
+FFA-LoRA (Sun et al., 2024)
+0.844 ± 0.001
+RoLoRA (Chen et al., 2025)
+0.746 ± 0.274
+FedRot-LoRA (Ours)
+0.872 ± 0.001
+(2) Effect of Data Heterogeneity. Table 4 reports MNLI
+performance under varying levels of data heterogeneity,
+controlled by the Dirichlet concentration parameter h ∈
+{100, 1, 0.5}; larger values correspond to more uniform
+(IID) client data, smaller values induce stronger non-IID
+skew. In the near-IID setting (h = 100), FedRot-LoRA
+achieves the highest accuracy (88.4%) with low standard de-
+viation, outperforming all baselines. Most methods perform
+relatively well in this regime, as aggregation is less sensitive
+to client misalignment in this setting, though FedRot-LoRA
+retains a consistent advantage. As heterogeneity increases
+(h = 1 and 0.5), performance degrades across all methods.
+FedRot-LoRA maintains the strongest performance in all
+settings and exhibits smaller standard deviation compared
+to competing approaches, indicating improved robustness
+to client drift under increasingly non-IID conditions.
+5.3. Natural Language Generation
+We evaluate natural language generation on GSM8K (math-
+ematical reasoning) and HumanEval (code generation,
+trained on CodeSearchNet) using Llama 3-8B. Table 5 re-
+ports the final performance metrics (exact match accuracy
+for GSM8K and pass@1 for HumanEval). FedRot-LoRA
+achieves the strongest performance on both tasks, reaching
+Table 4. MNLI accuracy under varying levels of data heterogeneity
+(h ∈{100, 1, 0.5}). FedRot-LoRA outperforms all baselines
+across settings, highlighting its robustness to both homogeneous
+and heterogeneous data distributions.
+Methods
+h = 100
+h = 1
+h = 0.5
+FedIT
+0.868 ± 0.003
+0.864 ± 0.015
+0.866 ± 0.001
+FlexLoRA
+0.871 ± 0.001
+0.839 ± 0.017
+0.845 ± 0.008
+FFA-LoRA
+0.869 ± 0.000
+0.856 ± 0.003
+0.862 ± 0.001
+RoLoRA
+0.767 ± 0.158
+0.780 ± 0.140
+0.868 ± 0.005
+FedRot-LoRA
+0.884 ± 0.001
+0.873 ± 0.001
+0.876 ± 0.002
+Table 5. Performance on generative tasks. We report pass@1
+scores for code generation (evaluated on HumanEval) and ex-
+act match accuracy for mathematical reasoning (evaluated on
+GSM8K). FedRot-LoRA outperforms all baselines on both tasks.
+Methods
+HumanEval (pass@1)
+GSM8K (acc)
+FedIT (Zhang et al., 2024a)
+0.2877 ± 0.017
+0.4293 ± 0.018
+FlexLoRA (Bai et al., 2024)
+0.2930 ± 0.048
+0.3515 ± 0.126
+FFA-LoRA (Sun et al., 2024)
+0.3851 ± 0.009
+0.4361 ± 0.001
+RoLoRA (Chen et al., 2025)
+0.2951 ± 0.081
+0.3444 ± 0.172
+FedRot-LoRA (Ours)
+0.4088 ± 0.012
+0.4437 ± 0.009
+44.37% on GSM8K and 40.88% on HumanEval, consis-
+tently outperforming all baselines. RoLoRA exhibits sub-
+stantially higher variance across runs, indicating reduced
+training stability in these generative settings. In contrast,
+FedRot-LoRA maintains lower standard deviation while
+achieving higher accuracy, suggesting improved robustness
+under federated fine-tuning for complex generative tasks.
+Overall, these results indicate that FedRot-LoRA extends ef-
+fectively beyond classification to generative language tasks.
+5.4. Ablation Study
+(1) With vs. Without Rotational Alignment. FedIT serves
+as a non-rotational baseline in which clients aggregate LoRA
+factors via naive factor-wise averaging. As shown in Tables
+1-5, FedRot-LoRA outperforms FedIT across all tasks and
+LoRA ranks (higher accuracy, lower standard deviation),
+indicating the benefit of aligning latent subspaces prior to
+aggregation. We further evaluate a random rotation baseline,
+in which clients apply arbitrary orthogonal transformations
+before aggregation. This variant achieves an MNLI accu-
+racy of 0.3181 (see Appendix B.3.3), demonstrating that
+meaningful, rather than random, alignment is required.
+(2) Effect of Soft Rotation Level λ. We evaluate FedRot-
+LoRA with λ ∈{0, 0.1, 0.2, . . . , 0.9, 1.0} on MNLI and
+QQP (Fig. 3). Across both tasks, a wide range of λ values
+outperforms the average performance of the baseline meth-
+ods. Performance is highest for intermediate values of λ,
+while too small or too large values lead to reduced accuracy.
+On MNLI, performance degrades when λ is set too high
+(e.g., λ = 1.0), suggesting that aggressive alignment can be
+detrimental when the global reference is noisy, particularly
+in early rounds. A similar trend is observed on QQP, where
+excessive alignment also leads to lower accuracy. These
+8
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.85
+0.86
+0.87
+0.88
+FedRot-LoRA
+Average of Baselines
+Soft rotation level ( )
+Accuracy ± std
+MNLI
+(a) MNLI Performance
+0.81
+0.82
+0.83
+0.84
+0.85
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.77
+FedRot-LoRA
+Average of Baselines
+Soft rotation level ( )
+Accuracy ± std
+QQP
+(b) QQP Performance
+Figure 3. Effect of soft rotation level λ in FedRot-LoRA on MNLI
+and QQP. Red dashed line denotes the baseline’s average accuracy.
+Table 6. Ablation comparing alternating and single-factor align-
+ment. FedRot-LoRA performs best, while single-factor alignment
+degrades accuracy, especially when aligning B alone.
+Methods
+SST-2
+QNLI
+MNLI
+Align A Only
+0.883 ± 0.015
+0.913 ± 0.008
+0.861 ± 0.001
+Align B Only
+0.879 ± 0.015
+0.806 ± 0.149
+0.862 ± 0.017
+FedRot-LoRA
+0.954 ± 0.001
+0.926 ± 0.002
+0.876 ± 0.002
+results indicate that soft rotation provides an effective way
+to control alignment strength, enabling gradual subspace
+alignment without destabilizing training.
+(3) Effect of Alternating Rotation Targets. To test the
+importance of aligning both LoRA factors, we compare
+FedRot-LoRA with two variants that apply rotational align-
+ment only to A or only to B throughout training. As shown
+in Table 6, both variants underperform the full method. The
+performance drop is most pronounced when aligning only B.
+One possible explanation is that B is initialized with a small
+norm, which may limit the effectiveness of alignment in
+early training stages. In contrast, alternating the alignment
+target between A and B consistently yields better perfor-
+mance. These results indicate that alternating alignment
+across both LoRA factors is beneficial, and that restricting
+alignment to a single factor degrades performance.
+Additional experimental results are deferred to Appendix B.
+6. Conclusion
+We identify rotational noise, caused by the rotational in-
+variance of low-rank factorization, as a key source of ag-
+gregation error in federated LoRA. To address this issue,
+we propose FedRot-LoRA, which aligns local LoRA up-
+dates via client-side rotations prior to aggregation while
+preserving semantic equivalence. We provide a theoretical
+analysis showing that rotational alignment yields a strictly
+tighter bound on aggregation error induced by factor-wise
+averaging. Extensive experiments show that FedRot-LoRA
+outperforms existing federated LoRA methods across differ-
+ent client scales, ranks, and data heterogeneity levels.
+Acknowledgements
+This work was funded in part by National Science Founda-
+tion (NSF) Grant 2148224.
+Impact Statement
+This work improves federated fine-tuning of large lan-
+guage models by mitigating aggregation misalignment
+through a lightweight rotational alignment mechanism.
+This can facilitate the practical deployment of federated
+parameter-efficient fine-tuning in privacy-sensitive and
+resource-constrained settings. The work improves aggrega-
+tion fidelity and training stability in federated learning and
+does not introduce additional societal risks beyond those
+inherent to federated learning and large language models.
+References
+Babakniya, S., Elkordy, A., Ezzeldin, Y., Liu, Q., Song,
+K.-B., EL-Khamy, M., and Avestimehr, S. SLoRA: Fed-
+erated parameter efficient fine-tuning of language models.
+In International Workshop on Federated Learning in the
+Age of Foundation Models in Conjunction with NeurIPS
+2023, 2023.
+Bai, J., Chen, D., Qian, B., Yao, L., and Li, Y. Federated
+fine-tuning of large language models under heterogeneous
+tasks and client resources. Advances in Neural Informa-
+tion Processing Systems, 37:14457–14483, 2024.
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,
+H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,
+Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,
+M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,
+S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-
+ian, M., Winter, C., Tillet, P., Such, F. P., Cummings, D.,
+Plappert, M., Chantzis, F., Barnes, E., Herbert-Voss, A.,
+Guss, W. H., Nichol, A., Paino, A., Tezak, N., Tang,
+J., Babuschkin, I., Balaji, S., Jain, S., Saunders, W.,
+Hesse, C., Carr, A. N., Leike, J., Achiam, J., Misra,
+V., Morikawa, E., Radford, A., Knight, M., Brundage,
+M., Murati, M., Mayer, K., Welinder, P., McGrew, B.,
+Amodei, D., McCandlish, S., Sutskever, I., and Zaremba,
+W. Evaluating large language models trained on code.
+2021.
+Chen, S., Guo, Y., Ju, Y., Dalal, H., Zhu, Z., and Khisti,
+A. J. Robust federated finetuning of LLMs via alternat-
+ing optimization of loRA. In The Thirty-ninth Annual
+Conference on Neural Information Processing Systems,
+2025.
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+R., Hesse, C., and Schulman, J. Training verifiers to solve
+9
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+math word problems. arXiv preprint arXiv:2110.14168,
+2021.
+Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,
+A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A.,
+Vaughan, A., et al. The llama 3 herd of models. arXiv
+preprint arXiv:2407.21783, 2024.
+Guo, P., Zeng, S., Wang, Y., Fan, H., Wang, F., and Qu, L.
+Selective aggregation for low-rank adaptation in federated
+learning. In The Thirteenth International Conference on
+Learning Representations, 2025.
+Guo, T., Guo, S., and Wang, J. Pfedprompt: Learning per-
+sonalized prompt for vision-language models in federated
+learning. In Proceedings of the ACM Web Conference
+2023, pp. 1364–1374, 2023.
+Han, Z., Gao, C., Liu, J., Zhang, J., and Zhang, S. Q.
+Parameter-efficient fine-tuning for large models: A com-
+prehensive survey. Transactions on Machine Learning
+Research, 2024. ISSN 2835-8856.
+Hayou, S., Ghosh, N., and Yu, B. LoRA+: Efficient low rank
+adaptation of large models. In Forty-first International
+Conference on Machine Learning, 2024.
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang,
+S., Wang, L., Chen, W., et al. Lora: Low-rank adaptation
+of large language models. ICLR, 1(2):3, 2022.
+Husain, H., Wu, H.-H., Gazit, T., Allamanis, M., and
+Brockschmidt, M. Codesearchnet challenge: Evaluat-
+ing the state of semantic code search. arXiv preprint
+arXiv:1909.09436, 2019.
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B.,
+Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and
+Amodei, D. Scaling laws for neural language models.
+arXiv preprint arXiv:2001.08361, 2020.
+Kuang, W., Qian, B., Li, Z., Chen, D., Gao, D., Pan, X., Xie,
+Y., Li, Y., Ding, B., and Zhou, J. Federatedscope-llm:
+A comprehensive package for fine-tuning large language
+models in federated learning. In Proceedings of the 30th
+ACM SIGKDD Conference on Knowledge Discovery and
+Data Mining, pp. 5260–5271, 2024.
+Lester, B., Al-Rfou, R., and Constant, N. The power of scale
+for parameter-efficient prompt tuning. In Proceedings of
+the 2021 Conference on Empirical Methods in Natural
+Language Processing, pp. 3045–3059, 2021.
+Li, Q., Diao, Y., Chen, Q., and He, B. Federated learning
+on non-iid data silos: An experimental study. In 2022
+IEEE 38th international conference on data engineering
+(ICDE), pp. 965–978. IEEE, 2022.
+Lialin, V., Deshpande, V., and Rumshisky, A. Scaling down
+to scale up: A guide to parameter-efficient fine-tuning.
+arXiv preprint arXiv:2303.15647, 2023.
+Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D.,
+Levy, O., Lewis, M., Zettlemoyer, L., and Stoyanov, V.
+Roberta: A robustly optimized bert pretraining approach.
+arXiv preprint arXiv:1907.11692, 2019.
+McMahan, B., Moore, E., Ramage, D., Hampson, S., and
+y Arcas, B. A. Communication-efficient learning of deep
+networks from decentralized data. In Artificial intelli-
+gence and statistics, pp. 1273–1282. PMLR, 2017.
+Rieke, N., Hancox, J., Li, W., Milletari, F., Roth, H. R.,
+Albarqouni, S., Bakas, S., Galtier, M. N., Landman, B. A.,
+Maier-Hein, K., et al. The future of digital health with
+federated learning. NPJ digital medicine, 3(1):119, 2020.
+Sch¨onemann, P. H. A generalized solution of the orthogonal
+procrustes problem. Psychometrika, 31(1):1–10, 1966.
+Singhal, R., Ponkshe, K., and Vepakomma, P. Exact aggrega-
+tion for federated and efficient fine-tuning of foundation
+models. arXiv e-prints, pp. arXiv–2410, 2024.
+Sun, Y., Li, Z., Li, Y., and Ding, B. Improving LoRA in
+privacy-preserving federated learning. In The Twelfth
+International Conference on Learning Representations,
+2024.
+Wang, A., Singh, A., Michael, J., Hill, F., Levy, O., and
+Bowman, S. Glue: A multi-task benchmark and analysis
+platform for natural language understanding. In Pro-
+ceedings of the 2018 EMNLP workshop BlackboxNLP:
+Analyzing and interpreting neural networks for NLP, pp.
+353–355, 2018.
+Wang, J., Liu, Q., Liang, H., Joshi, G., and Poor, H. V. Tack-
+ling the objective inconsistency problem in heterogeneous
+federated optimization. Advances in neural information
+processing systems, 33:7611–7623, 2020.
+Wang, X., Ye, F., and Zhang, Y.
+Task-aware low-rank
+adaptation of segment anything model. arXiv preprint
+arXiv:2403.10971, 2024a.
+Wang, Z., Shen, Z., He, Y., Sun, G., Wang, H., Lyu, L.,
+and Li, A. Flora: Federated fine-tuning large language
+models with heterogeneous low-rank adaptations. Ad-
+vances in Neural Information Processing Systems, 37:
+22513–22533, 2024b.
+Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C.,
+Moi, A., Cistac, P., Rault, T., Louf, R., Funtowicz, M.,
+et al. Transformers: State-of-the-art natural language
+processing. In Proceedings of the 2020 conference on em-
+pirical methods in natural language processing: system
+demonstrations, pp. 38–45, 2020.
+10
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Xu, M., Cai, D., Wu, Y., Li, X., and Wang, S. Fwdllm: Effi-
+cient federated finetuning of large language models with
+perturbed inferences. In 2024 USENIX Annual Technical
+Conference (USENIX ATC 24), pp. 579–596, 2024.
+Yan, G., Xie, L., Shen, Q., Fang, Y., and Wu, Z. Fed-
+srd: Sparsify-reconstruct-decompose for communication-
+efficient federated large language models fine-tuning.
+arXiv preprint arXiv:2510.04601, 2025.
+Zhang, J., Vahidian, S., Kuo, M., Li, C., Zhang, R., Yu,
+T., Wang, G., and Chen, Y. Towards building the fed-
+eratedgpt: Federated instruction tuning.
+In ICASSP
+2024-2024 IEEE International Conference on Acoustics,
+Speech and Signal Processing (ICASSP), pp. 6915–6919.
+IEEE, 2024a.
+Zhang, Z., Yang, Y., Dai, Y., Wang, Q., Yu, Y., Qu, L.,
+and Xu, Z. Fedpetuning: When federated learning meets
+the parameter-efficient tuning methods of pre-trained lan-
+guage models. In Annual Meeting of the Association of
+Computational Linguistics 2023, pp. 9963–9977. Associ-
+ation for Computational Linguistics (ACL), 2023.
+Zhang, Z., Qi, F., and Xu, C. Enhancing storage and com-
+putational efficiency in federated multimodal learning
+for large-scale models. In Forty-first International Con-
+ference on Machine Learning, 2024b.
+URL https:
+//openreview.net/forum?id=QgvBcOsF4B.
+Zhao, H., Du, W., Li, F., Li, P., and Liu, G. Fedprompt:
+Communication-efficient and privacy-preserving prompt
+tuning in federated learning. In ICASSP 2023-2023 IEEE
+International Conference on Acoustics, Speech and Sig-
+nal Processing (ICASSP), pp. 1–5. IEEE, 2023.
+11
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+A. Proofs
+A.1. Proof of Theorem 4.4
+Proof. We analyze the convergence of the global model W t under the proposed FedRot-LoRA. We denote the aggregated
+LoRA matrices at round t as ¯At =
+1
+N
+PN
+i=1 At
+i and ¯Bt =
+1
+N
+PN
+i=1 Bt
+i. The global model is constructed as W t =
+W0 + ¯Bt ¯At.
+1. Definitions and Update Rules
+Let the “ideal” global model update W t+1
+ideal be the result of averaging the local weight updates directly, whereas the actual
+global model W t+1 is formed by multiplying the averaged LoRA matrices.
+W t+1
+ideal = W0 + 1
+N
+N
+X
+i=1
+Bt+1
+i
+At+1
+i
+(10)
+W t+1 = W0 +
+ 
+1
+N
+N
+X
+i=1
+Bt+1
+i
+! 
+1
+N
+N
+X
+i=1
+At+1
+i
+!
+(11)
+We define the aggregation error Et+1 as the difference between the actual and ideal updates:
+Et+1 = W t+1 −W t+1
+ideal = −1
+2N 2
+N
+X
+i=1
+N
+X
+j=1
+(Bt+1
+i
+−Bt+1
+j
+)(At+1
+i
+−At+1
+j
+)
+(12)
+The global updates for the LoRA adapters follow the gradient descent rule with learning rate η.
+2. Smoothness Analysis via Intermediate Step
+Since the objective function f is L-smooth, we have:
+f(Y ) ≤f(X) + ⟨∇f(X), Y −X⟩+ L
+2 ∥Y −X∥2
+(13)
+where ∥· ∥indicates Frobenius norm. We decompose the transition from W t to W t+1 into two steps: W t →W t+1
+ideal and
+W t+1
+ideal →W t+1.
+Step 2a: Gap between W t+1 and W t+1
+ideal
+Applying smoothness between W t+1 and W t+1
+ideal:
+f(W t+1) ≤f(W t+1
+ideal) + ⟨∇f(W t+1
+ideal), W t+1 −W t+1
+ideal⟩+ L
+2 ∥W t+1 −W t+1
+ideal∥2
+= f(W t+1
+ideal) + ⟨∇f(W t+1
+ideal), Et+1⟩+ L
+2 ∥Et+1∥2
+(14)
+Using Young’s Inequality ⟨x, y⟩≤
+1
+2η2 ∥x∥2 + η2
+2 ∥y∥2 on the inner product term:
+⟨Et+1, ∇f(W t+1
+ideal)⟩≤
+1
+2η2 ∥Et+1∥2 + η2
+2 ∥∇f(W t+1
+ideal)∥2 ≤
+1
+2η2 ∥Et+1∥2 + η2
+2 G2
+W
+(15)
+We have:
+f(W t+1) ≤f(W t+1
+ideal) +
+L
+2 +
+1
+2η2
+
+∥Et+1∥2 + η2
+2 G2
+W
+(16)
+Step 2b: Gap between W t+1
+ideal and W t
+Applying smoothness between W t+1
+ideal and W t:
+f(W t+1
+ideal) ≤f(W t) + ⟨∇f(W t), W t+1
+ideal −W t⟩+ L
+2 ∥W t+1
+ideal −W t∥2
+(17)
+≤f(W t) + ⟨∇f(W t), W t+1
+ideal −W t+1 + W t+1 −W t⟩+ L
+2 ∥W t+1
+ideal −W t+1 + W t+1 −W t∥2
+(18)
+= f(W t) −⟨∇f(W t), Et+1⟩+ ⟨∇f(W t), W t+1 −W t⟩+ L(∥Et+1∥2 + ∥W t+1 −W t∥2)
+(19)
+12
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Following similar steps from (15): −⟨∇f(W t), Et+1⟩≤
+1
+2η2 ∥Et+1∥2 + η2
+2 G2
+W . Then we have:
+f(W t+1
+ideal) ≤f(W t) −⟨∇f(W t), Et+1⟩+ ⟨∇f(W t), W t+1 −W t⟩+ L(∥Et+1∥2 + ∥W t+1 −W t∥2)
+(20)
+≤f(W t) +
+ 1
+2η2 ∥Et+1∥2 + η2
+2 G2
+W
+
++ ⟨∇f(W t), W t+1 −W t⟩+ L(∥Et+1∥2 + ∥W t+1 −W t∥2)
+(21)
+Step 2c: Gap between W t+1 and W t
+Substituting (21) into (16):
+f(W t+1) ≤f(W t+1
+ideal) +
+L
+2 +
+1
+2η2
+
+∥Et+1∥2 + η2
+2 G2
+W
+(22)
+≤f(W t) + (3L
+2 + 1
+η2 )∥Et+1∥2 + ⟨∇f(W t), W t+1 −W t⟩+ L∥W t+1 −W t∥2 + η2G2
+W
+(23)
+The change in global weights is:
+W t+1 −W t = ¯Bt+1 ¯At+1 −¯Bt ¯At
+=
+ 
+¯Bt −η 1
+N
+N
+X
+i=1
+∇Bfi(W t, ξi)
+! 
+¯At −η 1
+N
+N
+X
+i=1
+∇Afi(W t, ξi)
+!
+−¯Bt ¯At
+Define Gt
+A = 1
+N
+N
+X
+i=1
+∇Afi(W t, ξi) and Gt
+B = 1
+N
+N
+X
+i=1
+∇Bfi(W t, ξi),
+(24)
+= ( ¯Bt ¯At −η ¯BtGt
+A −ηGt
+B ¯At + η2Gt
+BGt
+A) −¯Bt ¯At
+= −η( ¯BtGt
+A + Gt
+B ¯At)
+|
+{z
+}
+First Order Term
++
+η2Gt
+BGt
+A
+|
+{z
+}
+Second Order Term
+(25)
+Substituting this expansion into the inner product term ⟨W t+1 −W t, ∇f(W t)⟩:
+⟨W t+1 −W t, ∇f(W t)⟩= ⟨−η( ¯BtGt
+A + Gt
+B ¯At) + η2Gt
+BGt
+A, ∇f(W t)⟩
+= −η ⟨¯BtGt
+A, ∇f(W t)⟩
+|
+{z
+}
+Term I
+−η ⟨Gt
+B ¯At, ∇f(W t)⟩
+|
+{z
+}
+Term II
++η2⟨Gt
+BGt
+A, ∇f(W t)⟩
+(26)
+We apply the chain rule properties of matrix calculus to simplify Terms I and II. Note that ∇Af(W) = ( ¯Bt)T ∇W f(W)
+and ∇Bf(W) = ∇W f(W)( ¯At)T .
+• Term I: Using the trace property ⟨X, Y ⟩= Tr(XT Y ):
+⟨¯BtGt
+A, ∇f(W t)⟩= ⟨Gt
+A, ( ¯Bt)T ∇f(W t)⟩= ⟨Gt
+A, ∇Af(W t)⟩
+(27)
+• Term II: Similarly:
+⟨Gt
+B ¯At, ∇f(W t)⟩= ⟨Gt
+B, ∇f(W t)( ¯At)T ⟩= ⟨Gt
+B, ∇Bf(W t)⟩
+(28)
+We bound the higher-order inner product term using the Cauchy-Schwarz inequality and assuming bounded gradients:
+⟨η2Gt
+BGt
+A, ∇f(W t)⟩≤η2∥Gt
+BGt
+A∥∥∇f(W t)∥
+(29)
+≤η2GW ∥Gt
+BGt
+A∥
+(30)
+≤η2GW ∥Gt
+B∥∥Gt
+A∥
+(31)
+≤η2GW GBGA
+(32)
+13
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+We bound ∥W t+1 −W t∥2:
+∥W t+1 −W t∥2 = ∥−η( ¯BtGt
+A + Gt
+B ¯At) + η2Gt
+BGt
+A∥2
+≤2η2∥¯BtGt
+A + Gt
+B ¯At∥2 + 2η4∥Gt
+BGt
+A∥2
+≤η2M1 + η4M2
+(where M1, M2 are constant combination of bounds)
+(33)
+Substituting these back into (23):
+f(W t+1) ≤f(W t) + (3L
+2 + 1
+η2 )∥Et+1∥2
+−η⟨Gt
+A, ∇Af(W t)⟩−η⟨Gt
+B, ∇Bf(W t)⟩
++ η2G2
+W + η2(GW GAGB + M1) + η4M2
+(34)
+Taking the expectation E over the sampling randomness at round t, where E[Gt
+A] = ∇Af(W t) and E[Gt
+B] = ∇Bf(W t),
+yields the final recursive step:
+E[f(W t+1)] ≤E[f(W t)] −ηE
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
++ (3L
+2 + 1
+η2 )E[∥Et+1∥2] + O(η2)
+(35)
+We rearrange the inequality to isolate the gradient norm term on the left-hand side:
+ηE
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤E[f(W t)] −E[f(W t+1)] + (3L
+2 + 1
+η2 )E[∥Et+1∥2] + O(η2)
+(36)
+We sum this inequality over the training rounds from t = 0 to T −1 (or equivalently 1 to T, depending on indexing notation;
+we use 0 to T −1 to match the standard updates):
+η
+T −1
+X
+t=0
+E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤
+T −1
+X
+t=0
+ E[f(W t)] −E[f(W t+1)]
+
++ (3L
+2 + 1
+η2 )
+T −1
+X
+t=0
+E[∥Et+1∥2] +
+T −1
+X
+t=0
+O(η2)
+(37)
+The first term on the RHS is a telescoping sum:
+T −1
+X
+t=0
+ E[f(W t)] −E[f(W t+1)]
+
+= f(W 0) −E[f(W T )]
+(38)
+Let f ∗= infW f(W) denote the infimum of the objective. Since f ∗≤f(W T ), we have f(W 0) −E[f(W T )] ≤
+f(W 0) −f ∗. Substituting this back:
+η
+T −1
+X
+t=0
+E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤f(W 0) −f ∗+ (3L
+2 + 1
+η2 )
+T −1
+X
+t=0
+E[∥Et+1∥2] + T · O(η2)
+(39)
+3. Final Bound
+We divide the entire inequality by Tη to obtain the average gradient norm:
+1
+T
+T −1
+X
+t=0
+E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤f(W 0) −f ∗
+Tη
++ ( 3L
+2Tη +
+1
+Tη3 )
+T −1
+X
+t=0
+E[∥Et+1∥2] + T · O(η)
+Tη
+= f(W 0) −f ∗
+Tη
++ 3Lη2 + 2
+2Tη
+T −1
+X
+t=0
+E
+∥Et+1∥2
+η2
+
++ O(η)
+(40)
+14
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Using the property that the minimum of a set is less than or equal to its average, i.e.,
+min
+t∈{0,...,T −1} E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤1
+T
+T −1
+X
+t=0
+E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+(41)
+We show the convergence:
+min
+t
+E
+
+∥∇Af(W t)∥2 + ∥∇Bf(W t)∥2
+≤f(W 0) −f ∗
+Tη
++ 3Lη2 + 2
+2Tη
+T −1
+X
+t=0
+E
+∥Et+1∥2
+η2
+
++ O(η)
+(42)
+A.2. Proof of Theorem 4.8 and Corollary 4.9
+Lemma A.1 (Soft Rotation Shrinkage). Let R be a rotation matrix and λ ∈[0, 1]. Define the soft rotation matrix Rsoft as in
+Eq. (5). Then
+∥Rsoft −I∥F ≤2λ∥R −I∥F .
+(43)
+Consequently, in A-alignment rounds, with FedRot-LoRA, we have
+∥Rt
+i,soft −I∥F ≤2λ∥Rt,∗
+i
+−I∥F ≤2κλ∥At
+i −Aref∥F
+(44)
+where κλ = 2κλ. Analogous results hold for B-alignment rounds.
+Proof. Notice that Eq. (5) is the closed-form solution for the problem:
+Rsoft = arg min
+Q
+Q −
+ (1 −λ)I + λR
+2
+F ,
+(45)
+s.t. Q⊤Q = I, det(Q) > 0.
+(46)
+Define
+M(λ) = (1 −λ)I + λR.
+(47)
+By definition, Rsoft minimizes ∥Q −M(λ)∥F with constraints (46). Notice that I is a feasible solution, then
+∥Rsoft −M(λ)∥F ≤∥I −M(λ)∥F .
+(48)
+But I −M(λ) = I −[(1 −λ)I + λR] = λ(I −R), hence ∥I −M(λ)∥F = λ∥R −I∥F . Using triangle inequality,
+∥Rsoft −I∥F ≤∥Rsoft −M(λ)∥F + ∥M(λ) −I∥F ≤λ∥R −I∥F + λ∥R −I∥F = 2λ∥R −I∥F ,
+(49)
+proving (43). With Assumption 4.7, the final inequality holds:
+∥Rt
+i,soft −I∥F ≤2λ∥Rt,∗
+i
+−I∥F
+(50)
+≤2λκ∥At
+i −Aref∥F
+(51)
+Proof of Theorem 4.8
+Proof. The error gap is defined as:
+Et = W t −W t
+ideal
+(52)
+=
+ 
+1
+N
+N
+X
+i=1
+Bt
+i
+! 
+1
+N
+N
+X
+i=1
+At
+i
+!
+−1
+N
+N
+X
+i=1
+Bt
+iAt
+i
+(53)
+= −1
+2N 2
+N
+X
+i=1
+N
+X
+j=1
+(Bt
+i −Bt
+j)(At
+i −At
+j)
+(Apply Lagrange’s Identity)
+(54)
+15
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Thus, the norm of Et is:
+Et =
+
+1
+2N 2
+N
+X
+i=1
+N
+X
+j=1
+(Bt
+i −Bt
+j)(At
+i −At
+j)
+
+(55)
+≤
+1
+2N 2
+N
+X
+i=1
+N
+X
+j=1
+(Bt
+i −Bt
+j)(At
+i −At
+j)
+
+(Triangle Inequality)
+(56)
+≤
+1
+2N 2
+N
+X
+i=1
+N
+X
+j=1
+Bt
+i −Bt
+j
+ ·
+At
+i −At
+j
+
+(57)
+Let xij := ∥Bt
+i −Bt
+j∥and yij := ∥At
+i −At
+j∥. Cauchy–Schwarz gives
+P
+i,j xijyij
+2
+≤
+P
+i,j x2
+ij
+ P
+i,j y2
+ij
+
+. Thus
+∥Et∥2 ≤
+
+
+1
+2N 2
+X
+i,j
+∥Bt
+i −Bt
+j∥2
+
+
+
+
+1
+2N 2
+X
+i,j
+∥At
+i −At
+j∥2
+
+
+(58)
+Apply AM-GM inequality (√xy ≤1
+2(x + y)),
+∥Et∥≤1
+2
+
+
+1
+2N 2
+X
+i,j
+∥Bt
+i −Bt
+j∥2 +
+1
+2N 2
+X
+i,j
+∥At
+i −At
+j∥2
+
+
+(59)
+For each pair (i, j),
+∥At
+i −At
+j∥2 = ∥(At
+i −Aref) −(At
+j −Aref)∥2 ≤2∥At
+i −Aref∥2 + 2∥At
+j −Aref∥2,
+(60)
+Sum over i, j and divide by 2N 2:
+1
+2N 2
+X
+i,j
+∥At
+i −At
+j∥2 ≤
+1
+2N 2
+X
+i,j
+ 2∥At
+i −Aref∥2 + 2∥At
+j −Aref∥2
+.
+(61)
+Since PN
+j=1 1 = N,
+1
+2N 2
+X
+i,j
+2∥At
+i −Aref∥2 = 1
+N
+N
+X
+i=1
+∥At
+i −Aref∥2,
+(62)
+and similarly for the j-term. Hence
+1
+2N 2
+X
+i,j
+∥At
+i −At
+j∥2 ≤2
+N
+N
+X
+i=1
+∥At
+i −Aref∥2.
+(63)
+Similar inequalities hold for matrix B:
+1
+2N 2
+X
+i,j
+∥Bt
+i −Bt
+j∥2 ≤2
+N
+N
+X
+i=1
+∥Bt
+i −Bref∥2.
+(64)
+Apply (63) and (64) to (59),
+∥Et∥≤1
+2
+
+
+1
+2N 2
+X
+i,j
+∥Bt
+i −Bt
+j∥2 +
+1
+2N 2
+X
+i,j
+∥At
+i −At
+j∥2
+
+
+(65)
+≤1
+N
+N
+X
+i=1
+∥Bt
+i −Bref∥2 + 1
+N
+N
+X
+i=1
+∥At
+i −Aref∥2
+(66)
+16
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+With Assumption 4.5, we have:
+1
+N
+N
+X
+i=1
+∥˜At
+i −Aref∥2 ≤1
+N (1 −α(λ))
+N
+X
+i=1
+∥At
+i −Aref∥2
+(67)
+Here we bound ∥˜Bt
+i −Bref∥2.
+∥˜Bt
+i −Bref∥2 = ∥˜Bt
+i −Bt
+i∥2 + ∥Bt
+i −Bref∥2 + 2⟨˜Bt
+i −Bt
+i, Bt
+i −Bref⟩
+(68)
+With Lemma A.1: ∥Rt
+i,soft −I∥≤2λ∥Rt,∗
+i
+−I∥≤2κλ∥At
+i −Aref∥, then:
+∥˜Bt
+i −Bt
+i∥2 ≤∥Bt
+i∥2∥Rt
+i,soft −I∥2
+(69)
+≤∥Bt
+i∥2(2κλ)2∥At
+i −Aref∥2
+(70)
+Here we provide bounds for ∥Bt
+i∥and ∥At
+i∥.
+Remark A.2 (Rescaling Does Not Affect Rotational Alignment). Due to the scale invariance of LoRA, the factors At
+i and
+Bt
+i can be rescaled without changing the effective update ∆W t
+i = Bt
+iAt
+i. In particular, for any c > 0, one may apply the
+transformation
+Bt′
+i = 1
+cBt
+i,
+At′
+i = cAt
+i,
+B′
+ref = 1
+cBref,
+A′
+ref = cAref.
+(71)
+This rescaling leaves the Procrustes alignment problem unchanged, since both the local factors and the reference are scaled
+consistently, and therefore does not affect the resulting rotation or the aggregated update. Such rescaling can be reversed
+after aggregation and thus has no impact on the final model update. We introduce this operation solely for theoretical
+analysis to rule out degenerate factorizations with extreme magnitudes (e.g., B →0, A→∞). In practice, we do not perform
+explicit rescaling, as the norms of A and B remain naturally bounded due to the limited number of local fine-tuning steps.
+With Remark A.2 and Assumption 4.3 (∥∆W t
+i ∥≤τ), we choose c =
+q
+∥At
+i∥
+∥Bt
+i∥for rescaling, leading to ∥cBt
+i∥= ∥1
+cAt
+i∥.
+The rescaled factors are bounded:
+∥At
+i∥= ∥Bt
+i∥≤√τ.
+(72)
+We further bound Eq.(70):
+∥˜Bt
+i −Bt
+i∥2 ≤τ(2κλ)2∥At
+i −Aref∥2
+(73)
+Then we bound the term 2⟨˜Bt
+i −Bt
+i, Bt
+i −Bref⟩from Eq. (68).
+2⟨˜Bt
+i −Bt
+i, Bt
+i −Bref⟩≤2 · ∥˜Bt
+i −Bt
+i∥· ∥Bt
+i −Bref∥
+(74)
+≤2 ·
+ 2√τκλ
+
+∥At
+i −Aref∥· ∥Bt
+i −Bref∥
+(75)
+= 4√τκλ∥At
+i −Aref∥· ∥η∇Bfi(W t−1)∥
+(76)
+≤4√τκληGB∥At
+i −Aref∥
+(77)
+Thus, Eq. (68) can be bounded as:
+∥˜Bt
+i −Bref∥2 = ∥˜Bt
+i −Bt
+i∥2 + ∥Bt
+i −Bref∥2 −2⟨(Rt
+i,soft −I)At
+i, ηGt
+A,i⟩
+(78)
+≤∥Bt
+i −Bref∥2 + 4τκ2λ2∥At
+i −Aref∥2 + 4√τκληGB ∥At
+i −Aref∥
+|
+{z
+}
+∥At
+i−Aref∥≥δA
+(79)
+≤∥Bt
+i −Bref∥2 +
+
+4τκ2λ2 + 4
+δA
+√τκληGB
+
+∥At
+i −Aref∥2
+(80)
+17
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Apply (67) and (80) to (66),
+∥Et∥≤1
+N
+N
+X
+i=1
+∥˜Bt
+i −Bref∥2 + 1
+N
+N
+X
+i=1
+∥˜At
+i −Aref∥2
+(Error bound with rotation alignment)
+(81)
+≤1
+N
+N
+X
+i=1
+
+∥Bt
+i −B2
+ref∥2 + ∥At
+i −Aref∥2
+|
+{z
+}
+error bound without rotation
+−
+
+α(λ) −
+
+4τκ2λ2 + 4
+δA
+√τκληGB
+
+∥At
+i −Aref∥2
+
+
+(82)
+Notice that with Assumption 4.5, we have α(λ) > c0λ, therefore,
+∥Et∥≤1
+N
+N
+X
+i=1
+
+∥Bt
+i −B2
+ref∥2 + ∥At
+i −Aref∥2
+|
+{z
+}
+error bound without rotation
+−
+
+c0λ −
+
+4τκ2λ2 + 4
+δA
+√τκληGB
+
+∥At
+i −Aref∥2
+
+
+(83)
+To ensure positive gain, we require c0λ −
+
+4τκ2λ2 +
+4
+δA
+√τκληGB
+
+> 0. Rearranging this term yields the quadratic
+inequality
+4κ2τ λ2 +
+ 4
+δA
+√τκηGB −c0
+
+λ < 0.
+(84)
+Since λ > 0, a necessary condition for (84) to admit a feasible solution is
+4
+δA
+√τκηGB −c0 < 0, which equivalently
+requires
+η <
+c0δA
+4√τκGB
+.
+(85)
+Under (85), the set of λ values that ensure a positive gain is given by
+0 < λ < min
+
+1, c0δA −4√τκηGB
+4κ2τδA
+
+.
+(86)
+This completes the proof.
+18
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+B. Additional Experimental Details
+B.1. Comparison of federated LoRA methods
+Table 7. Comparison of representative federated LoRA methods in terms of aggregation type, aggregation space, communication
+payload, and additional computation. “Pure agg.” indicates whether the method mainly modifies the aggregation rule without introducing
+personalization, compression/reconstruction, or residual-transmission components. Computational costs are reported per communication
+round unless otherwise specified.
+Method
+Pure agg.
+Agg. space
+Communication
+Extra computation
+FlexLoRA
+Yes
+Full-parameter space
+LoRA factors B, A only
+Full parameter SVD: O(d3)
+FedSRD
+No
+Full-parameter space
+Sparsified factors O(ρdr), ρ < 1
+Sparsification + SVD: O(d3)
+FedEx-LoRA
+Yes
+Mixed ¯B ¯A + ∆Wres
+Residual matrix ∆Wres ∈Rd×d
+O
+ Nd2r
+
+to form residual matrix
+LoRA-FAIR
+Yes
+Full-parameter space
+LoRA factors B, A only
+O(Td2r) for T steps gradient descent
+FLoRA
+Yes
+Full-parameter space
+Stacked B ∈Rd×Nr, A ∈RNr×d
+server stacking O
+ Nrd
+
+FedSA-LoRA
+No
+Factor A only (personalized FL)
+Factor A only
+0
+B.2. Detailed Experimental Settings
+Table 8 summarizes the hyperparameters used in our experiments. All results are averaged over 3 random seeds. We
+perform a grid search over the learning rate η ∈{5e-4, 1e-3, 5e-3, 2e-2}. For FedRot-LoRA, we tune the alignment strength
+λ ∈{0.2, 0.4, 0.6, 0.8, 1.0}. We set the number of local epochs to 20 and the number of communication rounds to 250 for
+all natural language understanding tasks, and to 30 local epochs and 200 communication rounds for generative tasks. For
+each method, hyperparameters are tuned separately using validation, and the best-performing configurations are reported
+in Table 8. The aggregation error reported in Table 2 is computed from the MNLI results in Table 1 with N = 3 clients.
+We sum the aggregation error across all LoRA layers and average over all communication rounds and 3 random seeds.
+For Figure 3, we additionally evaluate λ ∈{0.1, 0.3, 0.5, 0.7, 0.9}. The results in Table 6 use the same experimental
+configurations as Table 1 (N = 3, MNLI). For MNLI experiments, all results in this paper correspond to the matched
+(MNLI-m) setting. Most of our experiments are conducted under highly non-IID data distributions. We perform HumanEval
+(trained on CodeSearchNet) and GSM8K experiments (Table 5) following the default configurations of (Kuang et al., 2024).
+Since LoRA is initialized with ¯B0 ¯A0 = 0, FedRot-LoRA applies rotational alignment after the first communication round
+to avoid ill-conditioned rotations.
+Table 8. The hyperparameters for each experimental setting.
+Experiments
+Clients Num
+Rank
+Data distributions
+Optimal learning rates
+(FedIT/FFA-LoRA/RoLRA/FedRot-LoRA)
+Optimal λ
+GLUE results (Table 1)
+N = 3, 10
+r = 4
+Dirichlet h = 0.5
+SST-2
+N = 3 : (0.02/0.02/0.0005/0.02)
+N = 10 : (0.005/0.02/0.0005/0.005)
+λ = 0.6
+λ = 0.6
+QNLI
+N = 3 : (0.02/0.02/0.001/0.005)
+N = 10 : (0.02/0.02/0.0005/0.005)
+λ = 0.2
+λ = 0.2
+QQP
+N = 3 : (0.005/0.02/0.001/0.005)
+N = 10 : (0.005/0.02/0.0005/0.005)
+λ = 0.4
+λ = 0.6
+RTE
+N = 3 : (0.005/0.02/0.0005/0.005)
+N = 10 : (0.005/0.02/0.0005/0.005)
+λ = 0.2
+λ = 0.4
+MNLI
+N = 3 : (0.02/0.02/0.001/0.005)
+N = 10 : (0.005/0.02/0.001/0.005)
+λ = 0.4
+λ = 0.4
+MNLI
+with different ranks (Table 3)
+N = 3
+r = 4, 8, 16
+Dirichlet h = 0.5
+r = 4 : (0.02/0.02/0.001/0.005)
+r = 8 : (0.02/0.02/0.001/0.005)
+r = 16 : (0.02/0.02/0.0005/0.005)
+λ = 0.4
+λ = 0.4
+λ = 0.4
+MNLI
+with different non-IID level (Table 4)
+N = 3
+r = 4
+Dirichlet h = 100, 1, 0.5
+h = 100 : (0.005/0.02/0.001/0.005)
+h = 1 : (0.02/0.02/0.001/0.005)
+h = 0.5 : (0.02/0.02/0.001/0.005)
+λ = 0.8
+λ = 0.8
+λ = 0.4
+HumanEval
+(Trained on CodeSearchNet, Table 5)
+N = 6
+r = 8
+Non-IID: distinct programming languages per client
+(0.005/0.005/0.0005/0.005)
+λ = 0.4
+GSM8K
+(Table 5)
+N = 3
+r = 8
+IID
+(0.005/0.005/0.001/0.005)
+λ = 0.2
+19
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Table 9. Comparison of scalar rescaling and rotational alignment. Results show that rotational alignment substantially outperforms
+rescaling in higher-dimensional LoRA settings.
+Methods
+SST-2
+MNLI
+GSM8K
+FedIT (No Alignment)
+0.953 ± 0.001
+0.866 ± 0.001
+0.4293 ± 0.018
+Scalar Rescaling
+0.953 ± 0.002
+0.865 ± 0.006
+0.4286 ± 0.021
+FedRot-LoRA (Rotation)
+0.954 ± 0.001
+0.876 ± 0.002
+0.4437 ± 0.009
+B.3. Additional Experimental Results
+B.3.1. RESCALING VS ROTATION
+In Section 3, we introduced a scalar optimization example (Figure 2) to illustrate the effect of aggregation misalignment
+in federated LoRA. This example is one-dimensional and serves to show that naive factor-wise aggregation can introduce
+instability near the optimal solution manifold. In this example, we consider three clients with local optima satisfying
+B1A1 = 0.5, B2A2 = 1.0, and B3A3 = 1.5, so that the global optimum is BA = 1.0. We set the learning rate as 0.01, and
+local steps as 30 per communication round. In this setting, FedIT (naive factor-wise averaging) suffers from aggregation
+misalignment: when the global iterate approaches the optimal manifold, aggregation noise causes the parameters to drift
+along the manifold, leading to misguided slide along the curve and slow convergence. Factor-freezing methods avoid this
+issue by enforcing linear aggregation, but at the cost of reduced expressivity and slower optimization.
+In one-dimension, the only admissible invariance of the factorization is scalar rescaling. To mitigate aggregation misalign-
+ment while allowing both factors to be trained, we consider aligning local updates via a scalar transformation. Specifically,
+in round t, each client solves
+min
+ct
+i
+∥ct
+iAt
+i −Aref∥2,
+if t mod 2 = 1
+(87)
+min
+ct
+i
+∥ct
+iBt
+i −Bref∥2,
+if t mod 2 = 0
+(88)
+where (Aref, Bref) denote the aggregated global parameters from the previous round. The above problem admits closed-form
+solutions,
+ct
+i = ⟨At
+i, Aref⟩
+∥At
+i∥2
+F
+,
+if t mod 2 = 1
+(89)
+ct
+i = ⟨Bt
+i, Bref⟩
+∥Bt
+i∥2
+F
+,
+if t mod 2 = 0
+(90)
+The aligned factors are given by
+˜At
+i = ct
+iAt
+i,
+˜Bt
+i = (ct
+i)−1Bt
+i,
+if t mod 2 = 1
+(91)
+˜At
+i = (ct
+i)−1At
+i, ˜Bt
+i = ct
+iBt
+i.
+if t mod 2 = 0
+(92)
+In the scalar case, this rescaling exactly preserves the semantic update ( ˜Bt
+i ˜At
+i = Bt
+iAt
+i) and is sufficient to eliminate
+aggregation misalignment.
+In higher-dimensional LoRA, ∆W = BA with B ∈Rd×r and A ∈Rr×d for r > 1. A natural generalization of scalar
+rescaling is to replace ct
+i ∈R with a matrix Rt
+i ∈Rr×r and consider transformations of the form Bt
+iRt
+i(Rt
+i)−1At
+i. To
+preserve semantic equivalence, Rt
+i must be invertible, which introduces two major difficulties. First, enforcing invertibility
+requires nonconvex constraints (e.g., det(Rt
+i)̸ = 0), and the resulting optimization no longer admits an efficient closed-form
+solution. Second, unconstrained invertible matrices can be arbitrarily ill-conditioned, leading to numerical instability
+and highly imbalanced factors during training. As a result, directly optimizing over general invertible transformations is
+computationally expensive, ill-conditioned, and unsuitable for federated settings.
+An alternative is to retain scalar rescaling in high dimensions, effectively restricting Rt
+i = ct
+iI. While this remains well-
+defined, it only adjusts the global magnitude of the factors and cannot resolve subspace misalignment: rescaling does not
+20
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Table 10. Effect of reference model selection.
+Reference Model
+SST-2
+MNLI
+Random client local model
+0.954 ± 0.002
+0.871 ± 0.006
+Old global model (W t−2)
+0.951 ± 0.001
+0.866 ± 0.002
+Previous global model (W t−1)
+0.954 ± 0.001
+0.876 ± 0.002
+change the column space of Bt
+i or the row space of At
+i. As the LoRA rank increases, client updates typically span misaligned
+latent subspaces, and scalar rescaling alone provides limited reduction in aggregation error. FedRot-LoRA instead restricts
+Rt
+i to the orthogonal group, enforcing (Rt
+i)⊤Rt
+i = I and det(Rt
+i) > 0. This choice ensures invertibility, preserves the
+semantic update, and yields a well-conditioned transformation with an efficient closed-form solution via the orthogonal
+Procrustes problem. Orthogonal alignment provides r(r −1)/2 degrees of freedom,2 enabling direct alignment of latent
+subspaces rather than mere magnitude adjustment. In contrast, scalar rescaling has only one degree of freedom and cannot
+correct subspace mismatch.
+We compare scalar rescaling and FedRot-LoRA in high-dimensional settings on SST-2, MNLI (the same setting of Table 1,
+N = 3) and GSM8K (the same setting of Table 5). For scalar rescaling, we perform the same grid search over learning rates
+as stated in Appendix B.2. Its optimal learning rates are (0.02, 0.005, 0.005) for SST-2, MNLI, and GSM8K, respectively.
+As reported in Table 9, FedRot-LoRA achieves higher accuracy and greater stability across runs than scalar rescaling,
+confirming that correcting subspace misalignment via rotation is essential in higher-dimensional LoRA.
+B.3.2. EFFECT OF REFERENCE MODEL SELECTION
+In the main paper, we use the global model from the previous communication round as the reference model, as this choice
+has no additional communication overhead. Here, we evaluate alternative reference selection strategies. First, one may use
+an older global model as the reference (e.g., W t−2), which can improve robustness to communication delays or failures.
+Second, one may use a client’s local model as the reference. For this baseline, we randomly sample a client in each round
+and treat its post-training LoRA factors as the reference. Table 10 compares these strategies. All three choices yield
+competitive performance. Using either a random client’s local model or the previous global model (W t−1) consistently
+outperforms using an older global model (W t−2). The random client local model performs well because its update is recent,
+and aligning to a fresh subspace can be beneficial. However, randomly switching the reference client across rounds may
+introduce instability, and identifying an ideal fixed client is non-trivial. Using the previous global model (W t−1) incurs
+no additional communication cost and performs well due to the smooth evolution of the LoRA subspace across adjacent
+rounds; we therefore adopt this strategy by default.
+B.3.3. COMPARISON WITH RANDOM ROTATION
+To isolate whether the gains of FedRot-LoRA come from optimized subspace alignment rather than merely exploiting
+LoRA’s rotational invariance, we include a Random Rotation baseline. In this variant, each client independently applies a
+Haar-uniform random rotation to its local LoRA factors prior to aggregation at every communication round.
+For client i at round t, we generate a random rotation matrix Rt
+i ∈SO(r) as follows. We first sample a matrix Z ∈Rr×r
+with i.i.d. entries Za,b ∼N(0, 1) and compute its QR decomposition Z = QP, where Q⊤Q = I and P is upper triangular.
+To remove the sign ambiguity inherent in the QR factorization, we fix the column signs of Q by enforcing a nonnegative
+diagonal of P. If det(Q) < 0, we further flip the sign of one column to ensure det(Q) = +1. The resulting matrix Rt
+i := Q
+is Haar-uniformly distributed over the special orthogonal group SO(r). Rt
+i satisfies (Rt
+i)⊤Rt
+i = I and det(Rt
+i) = 1. Rt
+i is
+then applied to the post-training factors:
+˜Bt
+i = Bt
+iRt
+i,
+˜At
+i = (Rt
+i)⊤At
+i.
+(93)
+In the random rotation baseline, each client independently samples a rotation matrix Rt
+i at every round using the procedure
+above. In Table 11, we compare FedRot-LoRA with this baseline on SST-2 and MNLI. Despite preserving each client’s
+local update ( ˜Bt
+i ˜At
+i = Bt
+iAt
+i), random rotation leads to unstable training and often collapses performance, as the rotations
+2An arbitrary r × r matrix has r2 free parameters. The constraint R⊤R imposes r(r+1)
+2
+independent constraints, therefore the
+remaining degrees of freedom are r(r−1)
+2
+.
+21
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Table 11. Comparison with random rotation. FedRot-LoRA outperforms random rotation on GLUE tasks.
+Methods
+SST-2
+MNLI
+Random Rotation
+0.541 ± 0.182
+0.318 ± 0.000
+FedRot-LoRA
+0.954 ± 0.001
+0.876 ± 0.002
+may amplify cross-client subspace mismatch during aggregation. Unlike FedRot-LoRA, this baseline uses no reference
+model and optimizes no Procrustes objective; consequently, it does not actively reduce alignment error across clients.
+FedRot-LoRA explicitly mitigates aggregation misalignment, resulting in substantially more stable and effective training.
+B.3.4. ADDITIONAL RESULTS ON THE EFFECT OF SOFT ROTATION LEVEL λ
+Figure 4. Effect of soft rotation level λ in FedRot-LoRA on MNLI and QQP.
+B.3.5. EMPIRICAL DIAGNOSTICS FOR THE ALIGNMENT ASSUMPTIONS
+0
+50
+100
+150
+200
+250
+Round
+0.000
+0.005
+0.010
+0.015
+0.020
+0.025
+( )
+Alignment Gain ( )
+( = 0.2)
+( = 0.4)
+( = 0.6)
+Align A
+Align B
+Figure 5. Alignment gain α(λ) across training rounds. The minimum observed alignment gain is α(λ) ≥0.00043. The shaded
+background regions denote the active alignment target during each respective round. The experimental configuration utilizes the SST-2
+dataset distributed across 3 clients, consistent with the settings detailed in Table 1.
+Figures 5–7 provide empirical diagnostics for the alignment assumptions used in the analysis. Figure 5 tracks the relative
+alignment gain α(λ) during training and shows that it remains positive for the tested values of λ, supporting the positive-gain
+condition in Assumption 4.5. Figure 6 reports the maximum relative rotation discrepancy maxi ∥Rt,∗
+i
+−I∥F /∥At
+i −Aref∥F ,
+which remains bounded throughout training, consistent with the bounded-dispersion condition in Assumption 4.7. Figure 7
+shows that the client factors maintain non-vanishing distance from the global reference, indicating persistent client drift
+22
+
+
+FedRot-LoRA: Mitigating Rotational Misalignment in Federated LoRA
+Figure 6. Evolution of the maximum relative alignment discrepancy, given by maxi ∥Rt,∗
+i
+−I∥F /∥At
+i −Aref∥F , among all clients
+over the course of training rounds t. The y-axis is presented on a logarithmic scale to capture the magnitude shifts. The experimental
+configuration utilizes the SST-2 dataset distributed across 3 clients, consistent with the settings detailed in Table 1.
+Figure 7. Evolution of the minimum client distance to the global reference matrices, quantified by the Frobenius norms mini ∥At
+i −Aref∥F
+and mini ∥Bt
+i −Bref∥F , among all clients at each training round t. The experimental configuration utilizes the SST-2 dataset distributed
+across 3 clients, consistent with the settings detailed in Table 1.
+under the non-IID partition and supporting Assumption 4.6. Together, these diagnostics suggest that the assumptions
+are consistent with observed training behavior in heterogeneous federated settings, rather than relying on pathological or
+degenerate cases.
+23

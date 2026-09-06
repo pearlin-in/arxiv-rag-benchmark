@@ -1,0 +1,2463 @@
+arXiv:2605.17613v1  [cs.AR]  17 May 2026
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+VeriCache: Turning Lossy KV Cache into Lossless LLM
+Inference
+Jiayi Yao1, Samuel Shen2, Kuntai Du2, Shaoting Feng1, Dongjoo Seo3, Rui Zhang,
+Yuyang Huang1, Yuhan Liu1, Shan Lu4,1, Junchen Jiang2,1
+1University of Chicago
+2Tensormesh Inc.
+3Samsung Semiconductor
+4Microsoft Research
+Abstract
+The large size of the KV cache has become a major bot-
+tleneck for serving LLMs with increasing context lengths.
+In response, many KV cache compression methods, such
+as token dropping and quantization, have been proposed.
+However, almost all of these methods are inherently lossy—
+despite minimal accuracy degradation for short outputs, their
+outputs increasingly diverge from full-KV-cache outputs as
+more tokens are decoded, which leads to catastrophic failures
+in code generation and tool calling.
+We present VeriCache, the first inference framework that
+ensures the same output as full-KV-cache decoding but largely
+preserves the high decoding throughput of a range of KV
+cache compression algorithms. VeriCache uses the compressed
+KV cache to draft tokens, then verifies them against the full
+KV cache. While it may seem like just speculative decod-
+ing, VeriCache requires addressing a key system challenge
+to work—keeping the full KV cache out of GPU memory
+and minimizing the overhead of swapping it in for verifica-
+tion. The insight is two-fold: (1) compressed-KV decoding
+can be parallelized with full-KV swap, because one is HBM-
+bandwidth-bound and the other is PCIe/network-bound, and
+(2) the compressed KV cache often produces output similar
+to the full KV cache, allowing a long drafting horizon to
+amortize each full-KV swap.
+VeriCache applies to both long-context decoding and re-
+mote prefix caching, supports a broad family of token-dropping
+and quantization methods through a uniform compressor in-
+terface, and composes with traditional speculative decoding.
+Experimental results show that VeriCache achieves up to 4×
+higher throughput than full-KV inference while producing
+identical outputs.
+1
+Introduction
+The context lengths of state-of-the-art LLMs have grown
+to more than one million tokens. This growth has pow-
+ered many applications, from repository-level code gener-
+ation [12, 31, 33, 40, 54], multi-document reasoning [23, 47,
+59, 67], to agentic workflows with long interaction histo-
+ries [42, 43, 56, 75].
+Full Cache
+VeriCache
+Lossy Cache
+Token Generation Throughput
+Output Accuracy
+Figure 1: The accuracy–throughput dichotomy. Veri-
+Cache attains the throughput of compression with the
+same output as full KV.
+The performance impact of KV cache manifests at both
+single-request and multi-request LLM serving. Within a sin-
+gle request, every decoding step must read the entire KV
+cache from GPU memory (HBM) to on-chip memory for
+attention. Furthermore, the size of the KV cache degrades
+request throughput, as it reduces the number of requests that
+can fit in GPU memory [36, 58]. Across requests, KV cache
+reuse is a common practice to avoid repetitive KV cache
+generation among requests that share long common prefixes
+(e.g., system prompts, shared documents, prior conversation
+turns). Then large KV caches on storage need to be quickly
+loaded onto GPU memory when a request arrives, which can
+dominate request latency [36, 37, 64].
+A growing line of work tackles these problems by com-
+pressing the KV cache—either by dropping tokens at selected
+layers and attention heads [8, 17, 20, 60, 65] or by reducing
+precision through quantization [15, 37, 38, 69, 74]. Both de-
+liver substantial efficiency gains—with 2–5× reductions in
+memory or transfer size.
+Although effective at improving throughput, compress-
+ing KV cache changes its content , causing inference output
+to diverge from the distribution of decoding outputs using
+the full-size KV cache. As we will show in Section 3, the
+probability of divergence accumulates with more output to-
+kens. When an application needs long output, the output
+divergence often violates functional correctness or structural
+requirements, even if the output is still smooth natural lan-
+guage. On coding and tool-calling benchmarks, functional
+accuracy (e.g., syntax validity, exact argument matching)
+degrades sharply even at moderate compression ratios.
+1
+
+
+This creates a dichotomy (Figure 1): accept lossy KV and
+risk output quality, or use full KV at the cost of much lower
+throughput. We pose the following question:
+Can we exploit the throughput benefits of KV cache
+compression without affecting LLM output?
+In this paper, we present VeriCache, a new inference scheme
+inspired by speculative decoding [4, 6, 27, 28, 44]. Instead
+of directly serving tokens from compressed KV cache, Veri-
+Cache uses the compressed KV cache to draft tokens, then
+verifies them against the full KV cache. Wrong tokens are
+corrected, so the final output is identical 1 to full-KV infer-
+ence.
+Directly applying existing speculative decoding techniques
+is insufficient as token verification overhead can cause through-
+put degradation (see §4), negating the benefits of KV cache
+compression. VeriCache uses two key designs that take ad-
+vantage of the fact that drafting and verification in VeriCache
+use exactly the same model and model weights, a property
+different from traditional speculative decoding.
+First, VeriCache schedules cross-resource staggering. By
+sharing exactly the same model (weights), token drafting
+and token verification become feasible to execute in the
+same batch, offering a huge performance benefit as draft-
+ing and verification have complementary resource bottlenecks.
+Drafting decodes one token at a time using compressed KV
+located in GPU memory. Its sequential vector-matrix mul-
+tiplication under-utilizes GPU FLOPs and makes it a GPU
+memory bandwidth bound operation. Verification, in con-
+trast, requires loading the full KV cache from secondary
+storage into GPU and verifying multiple tokens in parallel,
+putting its bottleneck on inter-connect bandwidth and GPU
+FLOPs. Consequently, staggering drafting and verification
+across these distinct hardware resources offers much better
+utilization than running only drafting or only verification in
+each batch—the lock-step playbook in traditional speculative
+decoding. Cross-resource staggering requires much more
+sophisticated scheduling, which we will explain in §5.
+Second, VeriCache uses an extended verification period
+that maximizes the parallelism of verification and minimizes
+the loading frequency of full KV cache. How often verifica-
+tion happens (i.e., every how many output tokens per verifi-
+cation) depends on how likely the drafted tokens would be
+accepted by the verification process. The more likely they are,
+the less frequent the verification can be. Different from tra-
+ditional speculative decoding, compressed KV caches retain
+the same model weights and dominant attention patterns as
+the full model, so the compressed-KV drafter sustains much
+1In this paper, we define identical results as identical under greedy decoding
+(i.e., zero temperature) except for randomness caused by hardware
+longer accepted runs than a traditional small-model drafter—
+25–40 accepted tokens per verification round for VeriCache
+vs. only 2–3 for typical small-model drafters (Section 4.3).
+VeriCache handles both long-context decoding and remote
+prefix caching, with a runtime scheduler that adapts verifi-
+cation frequency and batch composition to hardware and
+workload conditions.
+The idea of driving a speculative drafter from a sparser or
+compressed KV cache is not new. MagicDec [53] pairs a small-
+model drafter with a sparse KV cache; QuantSpec [62] and
+SparseSpec [77] extend it to self-speculation with hierarchi-
+cal quantization and dynamic sparse attention, respectively.
+However, there are two key differences. First, prior sys-
+tems all keep the full KV cache in GPU memory, capping com-
+pression’s throughput gains. In long-context decoding, they
+cannot realize compression’s batch-size or HBM-bandwidth
+benefits; VeriCache instead dedicates HBM to compressed
+KV and reloads the full KV from host DRAM only at veri-
+fication (§4.2). In remote prefix caching—where the bottle-
+neck is the slow storage-to-remote-GPU link, not HBM—no
+prior speculative-with-compressed-KV system applies; Veri-
+Cache’s remote drafter sees only the compressed KV over the
+slow link, while a local GPU on the fast link either caches or
+loads and applies the full KV for verification. In long-context
+decoding—the setting where prior systems apply—VeriCache
+also achieves higher throughput (§8).
+Second, VeriCache enables lossless inference at a high
+throughput for a range of lossy KV cache compression techniques—
+quantization and token dropping—for the first time. Veri-
+Cache exposes a uniform compressor interface: any token-
+dropping or quantization method that conforms can serve
+as the drafter, with no change to scheduling, verification,
+or transfer (§6). We instantiate this interface for seven ex-
+isting methods spanning token dropping and quantization,
+whereas prior systems hard-wire a single compressor.
+VeriCache, built on top of vLLM [22] and LMCache [36],
+achieves up to 4× higher throughput than full-KV inference
+on long-context decoding and up to 2× on remote prefix
+caching across models and workloads, with identical outputs.
+2
+Background
+2.1
+The KV cache bottleneck in inference
+LLM inference consists of two phases: (1) prefill, which gen-
+erates the KV cache for a prompt, and (2) decode, which
+generates tokens autoregressively from the KV cache. The
+KV cache introduces two overheads scaling with context
+length.
+Within-request KV overhead. The KV cache incurs
+𝑂(𝑛) memory footprint and bandwidth cost that grows lin-
+early with context length 𝑛[13, 24, 70]. On the memory
+side, larger KV caches leave less room for batching requests:
+serving Qwen-32B [61] (∼64GB weights) on a single H100
+2
+
+
+Table 1: Representative KV cache compression meth-
+ods.
+Strategy
+Methods
+Token dropping
+Keyformer [1], H2o [76], Ada-KV [9],
+LagKV [29], KVzip [21], FastKVzip [20],
+KVzap [17], SnapKV [26], PyramidKV [5],
+PyramidInfer [71], DuoAttention [65].
+KV
+quantization
+KIVI [38], KVQuant [15], KVTuner [25],
+TurboQuant [74], CacheGen [37],
+KVTC [55], QServe [30], GEAR [19],
+LLM.265 [69], RotateKV [57].
+80GB GPU, a 2K-token context requires ∼0.3GB of KV per
+request, allowing a batch of ∼50 requests; scaling to 100K
+tokens grows the KV to ∼15GB, reducing the batch size to
+1. On the bandwidth side, each decode step must read the
+full KV from HBM: serving Llama-3.1-8B-1M [68] (∼16GB
+weights) on an H100 (3TB/s HBM), each decode step takes
+∼5ms at 5K context (∼0.6GB KV) and ∼25ms at 500K context
+(∼60GB KV)—decoding 100 tokens takes ∼0.5s at 5K context
+but ∼2.5s at 500K.
+Cross-request KV overhead. Many long-context work-
+loads share long prefixes across requests—system prompts,
+shared documents, prior conversation turns—making the
+𝑂(𝑛2) prefill redundantly expensive when each request re-
+computes them from scratch. To avoid this, systems precom-
+pute KV caches once and reuse them across requests [36,
+45, 49, 78]. However, reusing a precomputed cache requires
+transferring KV caches from storage or across the network
+onto the serving GPU, and this transfer can itself become
+the new bottleneck at long contexts [7, 37, 49, 64]. For ex-
+ample, loading Qwen-32B’s precomputed KV cache from S3
+(∼3GB/s [3]) takes ∼0.5s at 10K context (∼1.5GB) but ∼5s
+at 100K context (∼15GB)—matching or exceeding the prefill
+time reuse was meant to avoid.
+2.2
+KV cache compression techniques
+A growing line of work tackles these bottlenecks by com-
+pressing the KV cache (Table 1). These methods fall into two
+categories. Token dropping changes the shape of the cache
+by dropping tokens at certain layers and attention heads. For
+example, StreamingLLM [66] retains only a few initial “atten-
+tion sink” tokens plus a sliding window of recent tokens, en-
+abling unbounded generation. DuoAttention [65] identifies
+attention heads that need full context and drops most entries
+for the rest. KVzip [21] scores KV pair importance via a con-
+text reconstruction loss at prefill and evicts low-importance
+pairs once for reuse across queries. FastKVzip [20] learns a
+per-token gating function that evicts low-importance entries.
+KV quantization preserves the cache shape but reduces
+Context: MediTrade Nexus (20 files, ~280K chars)
+Query: Implement collateral management feature
+Full KV
+from __future__ import annota…
+from dataclasses import datac…
+from datetime import datetime…
+from enum import Enum
+from typing import Any, Dict,…
+class CollateralStatus(str, E…
+    PENDING = "PENDING"
+    LOCKED = "LOCKED"
+    RELEASED = "RELEASED"
+~200 lines
+@router.post("/{trade_id}/col…
+async def post_collateral(
+    trade_id: uuid.UUID,
+    cmd: PostCollateralComman…
+    svc: TradeApplicationServ…
+) -> Collateral:
+    await svc.post_collateral…
+    return await svc._collate…
+4× Compaction (KVzip)
+from __future__ import annota…
+from dataclasses import datac…
+from datetime import datetime…
+from enum import Enum
+from typing import List, Opti…
+class CollateralStatus(str, E…
+    PENDING = "PENDING"
+    LOCKED = "LOCKED"
+    RELEASED = "RELEASED"
+~200 lines
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+from meditrade_nexus.core.dom…
+Figure 2: Code-generation failure from compressed KV.
+Asked to implement a feature over a ∼280K-character
+codebase, Full KV produces correct code while KVzip
+4× goes clearly wrong after ∼200 lines.
+F1-Score
+Code Format
+0.0
+0.5
+1.0
+Normalized Metrics
+Coding
+No Compact.
+2X Compact.
+4X Compact.
+F1-Score
+Function Call
+0.0
+0.5
+1.0
+Normalized Metrics
+Tool Call
+No Compact.
+2X Compact.
+4X Compact.
+Figure 3: Soft metrics mask functional failures (all met-
+rics normalized to no-compression baseline).
+its per-element precision—for example, KVQuant [15] quan-
+tizes keys per-channel before rotary positional embedding
+to preserve outlier structure at sub-4-bit precision. KIVI [38]
+applies per-channel quantization to keys and per-token to
+values for tuning-free 2-bit compression. TurboQuant [74]
+randomly rotates key/value vectors to induce a known coor-
+dinate distribution, enabling optimal per-coordinate scalar
+quantization at 2–4 bits without calibration. CacheGen [37]
+encodes KV tensors into compact bitstreams by exploiting
+token-wise locality and layer-wise sensitivity.
+Inherently lossy. All these compression methods are
+inherently lossy: the compressed KV cache deviates from the
+original, and these deviations propagate through inference.
+3
+Motivation: Why Lossy KV Methods Fail
+3.1
+Semantic similarity ≠functional
+correctness
+Previous KV compression techniques have been evaluated
+using token-level metrics [1, 38, 65, 72, 74, 76], such as F1,
+ROUGE, perplexity, and cosine similarity. These token-level
+3
+
+
+metrics tolerate small text deviation and are suitable for
+open-ended or short-answer tasks such as summarization,
+natural language Q&A, etc. However, they are ill-fitted for
+applications that have strict syntax or semantics requirement.
+For example, an invalid syntax token can break a program; a
+misplaced delimiter can corrupt a JSON object; and a wrong
+operator alters the semantics of a shell command (e.g., rm
+-rf *.logs →rm -rf * .). Figure 2 shows a real code-
+generation failure caused by the use of compressed KV.
+Figure 3 illustrates this significant difference between a
+token-level metric (F1) and functional metrics (i.e., code for-
+mat accuracy and function call accuracy). These two types
+of metrics are measured when we apply a representative
+token-dropping method, KVzip [21], on Qwen3-Coder-30B
+[61]. The left figure shows the results on a coding task in
+SWE-bench Lite [18]; the right figure shows the results on a
+tool-calling task in ComplexFuncBench [79].
+The pattern is consistent across both tasks: F1, which gives
+partial credit for partially correct outputs, remains above
+75%, but functional correctness collapses [32]. Code format
+accuracy—which requires the output to be a syntactically
+valid git diff—drops to near zero under KVzip 4× compaction.
+Function call accuracy—which requires every call name and
+argument to match exactly—drops below 10% under KVzip
+4× compaction.
+For some of the fastest-growing LLM use cases including
+code generation, agentic tool use, and any tasks that require
+structured output, traditional token-level metrics are too le-
+nient: any partial token-level deviation could be devastating.
+3.2
+Root cause: per-token bias
+accumulation
+The quality collapse shown in Figure 3 reflects a fundamental
+limitation of KV compression. The altered KV cache changes
+the attention weights at every layer. It replaces the model’s
+learned next-token distribution 𝑝full with a different distri-
+bution 𝑝lossy that the model was never trained to produce.
+Unlike sampling noise (e.g., temperature), which draws differ-
+ent tokens within 𝑝full, this is a systematic bias: every sample
+is drawn from the wrong distribution, and no amount of
+resampling corrects it.
+Per-step distribution shift. We quantify this bias with the
+KL divergence [52] between the full-KV and lossy-KV next-
+token distributions at each decoding step 𝑡:
+KL𝑡=
+∑︁
+𝑥𝑡
+𝑝full(𝑥𝑡| 𝑥<𝑡) log 𝑝full(𝑥𝑡| 𝑥<𝑡)
+𝑝lossy(𝑥𝑡| 𝑥<𝑡) .
+(1)
+KL𝑡is zero only when the two conditional distributions are
+identical, and grows as they diverge.
+Distribution shift compounds over the generation. This per-
+step bias accumulates over the autoregressive generation. By
+0
+100
+200
+Decoding Steps
+0
+5
+DKL(Pfull‖Plossy)
+KVzip (4x Compaction)
+0
+100
+200
+Decoding Steps
+0
+10
+DKL(Pfull‖Plossy)
+TurboQuant (k4v3)
+Figure 4: Sequence-level KL KL(𝑝full(𝑥1:𝑡) ∥𝑝lossy(𝑥1:𝑡))
+grows roughly linearly in 𝑡under KVzip 4× (left) and
+TurboQuant k4v3 (right); at temperature 0.5.
+the chain rule of KL divergence:
+KL1:𝑇≜KL 𝑝full(𝑥1:𝑇) ∥𝑝lossy(𝑥1:𝑇) =
+𝑇∑︁
+𝑡=1
+E𝑥<𝑡∼𝑝full [KL𝑡] .
+(2)
+if per-step KL exceeds 𝜀> 0, sequence-level KL grows lin-
+early: KL1:𝑇≥𝜀𝑇. Since KL1:𝑇equals E𝑥∼𝑝full
+
+log(𝑝full(𝑥1:𝑇)/𝑝lossy(𝑥1:𝑇))
+
+,
+this means that for a sequence sampled from 𝑝full, the log-
+likelihood ratio has mean ≥𝜀𝑇, and so the likelihood ratio
+𝑝full(𝑥1:𝑇)/𝑝lossy(𝑥1:𝑇) is typically of order 𝑒𝜀𝑇—i.e., exponen-
+tial in𝑇(proof in Appendix A). Figure 4 confirms this empir-
+ically: KL1:𝑇grows linearly with decoding steps under both
+KVzip 4× compaction and TurboQuant k4v3 quantization.
+Concretely, in Figure 4, KVzip 4× accumulates only ∼0.023
+nats of KL per step—so the lossy model assigns the full-KV
+token 𝑒−0.023≈98% of its full-KV probability, barely distin-
+guishable. After𝑇=250 steps, cumulative KL reaches ∼6 nats,
+so the lossy model emits the full-KV output sequence with
+probability only 𝑒−6≈2.5×10−3—the ∼2% per-step gap am-
+plified into a 400× mismatch over a few hundred tokens.
+Figure 2 shows the consequence: on a long code generation
+task, the 4× compacted output starts correctly but rapidly
+degenerates as compounding bias drives the model off its
+learned distribution.
+The accuracy-efficiency dichotomy. For precision-critical
+applications, existing KV compressions force a binary choice:
+accept lossy KV and risk silent failures, or use full KV and
+forgo the efficiency gains. We argue that this dichotomy is
+unnecessary: compression should not replace exact compu-
+tation, but accelerate it without sacrificing correctness.
+4
+KV Cache Verification
+4.1
+VeriCache overview
+At the algorithm level, VeriCache repurposes any lossy KV
+compression method into a speculative execution layer of the
+inference pipeline, where tokens are drafted quickly. These
+drafted tokens are then verified against the full KV cache
+to guarantee correctness (Figure 5). Concretely, let KVcomp
+denote the compressed KV cache and KVfull the full cache.
+The core loop proceeds as follows2:
+2We describe greedy decoding for clarity; VeriCache extends to sampling-
+based decoding via standard rejection sampling [28, 44].
+4
+
+
+Remove the scratch from ./. 
+Give only the rm -rf cmd.
+Comp.
+Inference with full KV cache:
+Inference with compressed KV cache:
+rm
+-
+.
+rf
+<eos>
+Slow generation
+Fast generation
+All files gone!!!
+Full
+VeriCache: KV Cache Verification
+Speculation:
+Verification:
+rm
+-
+.
+rf
+<eos>
+/*.
+Full
+Are all tokens 
+correct?
+/*
+rejected
+Fast generation
+Files  correctly deleted,
+Files  correctly deleted
+Comp.
+tmp
+/*
+rm
+-
+.
+rf
+/*
+<eos>
+/*. tmp
+Figure 5: Overview of VeriCache. Tokens drafted with
+compressed KV, then verified with full KV.
+(1) Draft: autoregressively generate 𝑥candidate tokens
+𝑡1, . . . ,𝑡𝑥using KVcomp—each 𝑡𝑖is the most-likely next token
+under the model’s distribution conditioned on the prompt
+(represented by KVcomp) and the previously generated to-
+kens.
+(2) Verify: one forward pass over the 𝑥drafted positions in
+parallel, conditioned on KVfull and 𝑡1..𝑘−1 at each position 𝑘.
+A single forward pass yields 𝑥+1 predictions 𝑡∗
+1, . . . ,𝑡∗
+𝑥+1: one
+at each drafted position 𝑘(the full-KV next-token prediction
+given 𝑡1..𝑘−1), plus one bonus prediction 𝑡∗
+𝑥+1 that follows the
+last drafted token.
+(3) Accept: find the first position 𝑗∈[1,𝑥] where 𝑡𝑗≠𝑡∗
+𝑗;
+accept 𝑡1, . . . ,𝑡𝑗−1 and the verifier’s correction 𝑡∗
+𝑗, and discard
+the rest. If all𝑥drafted tokens match (no such 𝑗exists), accept
+all 𝑥of them plus the bonus 𝑡∗
+𝑥+1. Drafting then resumes from
+the position immediately after the last accepted token.
+At the system level, each verify step demands three re-
+sources beyond drafting: (1) interconnect bandwidth to load
+KVfull from CPU or remote storage, (2) GPU HBM to hold it
+during the verify pass (competing with resident compressed
+caches), and (3) GPU compute for the verify pass over 𝑥to-
+kens. The first two are tightly budgeted and lock-step verifi-
+cation would spike both; compute is handled implicitly, since
+staggering verifies across iterations (§5) smooths the com-
+pute. Without care, these costs would erase compression’s
+throughput gain. We next present two design principles (P1,
+P2) that let VeriCache pay for verification without giving it
+back. The runtime mechanisms that realize these principles
+are detailed in Section 5.
+4.2
+P1: Cross-resource staggering
+Traditional speculative decoding runs requests in lock-step:
+all draft for 𝑥iterations, then all verify at iteration 𝑥+1. Every
+iteration shares the same bottleneck, leaving other resources
+idle.
+Draft Requests
+Verification Requests
+r1
+load r1
+GPU BW
+ICN
+Inference stalled by verification!
+r1 will verify at 
+i+2 iter
+r2 will verify at 
+i+2 iter
+r1 will verify at 
+i+1 iter
+r2 will verify at 
+i+2 iter
+Time
+(a) Without staggering 
+GPU 
+Comp.
+r1 r2
+r2
+r1
+r2
+r1 r2
+load r2
+r2
+r1
+r1
+r2
+r1
+load r1
+GPU BW
+ICN
+Time
+(b) With staggering 
+GPU 
+Comp.
+r1 r2
+r2
+r2
+r1
+r2
+load r2
+r2
+r1
+r1
+r2
+r1
+Figure 6: Cross-resource staggering. (a) Lock-step: si-
+multaneous verification at 𝑖+2 congests the intercon-
+nect and stalls the GPU. (b) Staggered: shifting 𝑟1 to
+𝑖+1 overlaps KV transfer and verify with the other re-
+quest’s draft, keeping interconnect, GPU, and HBM
+busy.
+VeriCache’s first design principle is to stagger requests
+instead, mixing some requests’ verification into iterations
+where others are drafting. Since compressed-KV drafting
+and full-KV verification consume complementary resources
+(elaborated below), staggering yields much better resource
+utilization. We describe the design for both use cases below;
+the runtime mechanics appear in §5.
+4.2.1
+Staggering with long-context decoding.
+Deployment and resource consumption. Traditionally, when
+compressed KV is used for long-context decoding, the KV
+cache is kept in compressed form in GPU high-performance
+memory (HBM) throughout serving, and the full KV is never
+retained on the GPU. In subsequent iterations, the com-
+pressed KV cache is read from HBM to help generate the
+next token(s).
+In VeriCache, we keep all the traditional setting and in
+addition, keep the full in CPU memory as shown in Figure
+7. Whenever this request’s drafted tokens are ready to be
+verified, the full KV is reloaded from CPU to GPU over the
+CPU–GPU interconnect, and used for verification.
+Under this setting, the performance of drafting is bounded
+by HBM-bandwidth: the GPU spends an iteration to read
+model weights and the compressed KV cache from HBM,
+with little compute (i.e., forward pass for one token) to do. In
+contrast, the performance of verification draws on different
+resources entirely: it must transfer KVfull across an inter-
+connect (CPU–GPU) and run a forward pass over 𝑥drafted
+5
+
+
+Remote GPUs
+Network
+Load full KV for 
+verification
+Setting 1: Long-context decoding 
+Setting 2: Remote prefix caching 
+Local GPUs
+KV Store
+GPUs
+Load full KV 
+for verification
+Send comp. KV 
+for faster decode
+Draft tokens
+Verified tokens
+Full KV
+Compressed KV
+CPUs
+Figure 7: VeriCache’s two settings: long-context decod-
+ing (top, full KV on CPU) and remote prefix caching
+(bottom, full KV in local storage).
+Table 2: Notation for throughput analysis.
+Symbol
+Description
+𝑀
+Model weights size
+KVfull
+Full KV cache size per request
+𝑐
+Compression ratio (KVcomp = 𝑐· KVfull, 𝑐< 1)
+𝛾(𝑥,𝑐)
+Acceptance rate (fn. of draft length 𝑥and compression 𝑐)
+𝑥
+Draft (speculation) length
+𝐵
+Batch size (number of concurrent requests)
+𝐾
+Number of output tokens per request
+BWhbm
+GPU HBM bandwidth
+BWinter
+CPU–GPU interconnect bandwidth
+BWℎ, BW𝑙
+Storage–local / storage–remote bandwidth
+tokens, putting its bottleneck on interconnect bandwidth
+and GPU compute rather than HBM bandwidth.
+Staggering schedule & performance estimation. We now
+discuss our staggering schedule in more details, together
+with a performance estimation; the full derivations with
+relaxed assumptions are in Appendix B. Table 2 summarizes
+the notation.
+Consider a single GPU serving 𝐵long-context requests.
+Each request keeps KVcomp = 𝑐·KVfull on GPU and KVfull on
+CPU. Cross-resource staggering schedules verifications so
+that, at any iteration, only about 𝐵/𝑥of the 𝐵requests are in
+the verify phase, each checking the 𝑥tokens it most recently
+drafted. Per iteration, the GPU does 𝐵single-token forward
+passes for the drafting requests plus ∼(𝐵/𝑥) · 𝑥= 𝐵token
+forward passes for the staggered verifications—roughly 2𝐵
+tokens total. The HBM traffic these passes incur has three
+components: the model weights (𝑀), the compressed KV
+cache of every drafting request (𝐵·𝑐· KVfull, the compressed-
+KV bandwidth used by drafting), and the full KV cache of the
+𝐵/𝑥verifying requests ((𝐵/𝑥) ·KVfull, the full-KV bandwidth
+used by verification). In parallel, the next 𝐵/𝑥full KV caches
+transfer from CPU to GPU over the interconnect, overlapping
+with the forward passes. The iteration time 𝑇iter is therefore
+the longer of the GPU forward-pass time 𝑇gpu and the CPU–
+GPU transfer time 𝑇xfer:
+𝑇iter = max
+ 𝑀+ 𝐵· KVfull · (𝑐+ 1/𝑥)
+BWhbm
+|                           {z                           }
+𝑇gpu
+,
+𝐵· KVfull
+𝑥· BWinter
+|       {z       }
+𝑇xfer
+
+(3)
+This staggered schedule offers better resource utilization
+than the traditional lock-step schedule that conducts all-draft
+iterations followed by all-verify iterations: the all-draft itera-
+tions leave the CPU-GPU link idle; even if CPU-GPU transfer
+overlaps with drafting iterations, the resource utilization of
+all-verify iterations would still be a concern. Assume that re-
+quests 𝐵1, 𝐵2 ... 𝐵𝑘are scheduled to enter the same all-verify
+iteration. Transferring their full KVs from CPU to GPU will
+take a lot of time, much longer than one forward-pass itera-
+tion. Even worse, since the transfer is serial, the full KV of
+𝐵1 will have to stay in the HBM idle, waiting for the full KVs
+of 𝐵2, ... 𝐵𝑘to arrive before the verification starts. We further
+explain this comparison with a concrete example below.
+Concrete example. Consider serving Mistral 24B on an
+RTX PRO 6000 (PCIe Gen5 ×16, 64 GB/s) with 𝐵=10 requests,
+KVcomp=1 GB and KVfull=4 GB per request, and draft length
+𝑥=30. Each verify transfers one KVfull over PCIe (∼80 ms).
+A draft-only iteration reads 𝑀+ 𝐵· KVcomp from HBM (∼35
+ms); folding in a verify adds one KVfull to the HBM read,
+extending it to ∼37 ms. With VeriCache, the 10 verifies are
+spread one every 3 draft iterations, so each ∼80-ms PCIe
+transfer overlaps with concurrent draft work and peak HBM
+stays at 𝑀+ 𝐵· KVcomp + 1 · KVfull = 64 GB. A lock-step
+alternative that batches all 10 verifies at iteration 30 serializes
+40 GB on the single PCIe link (∼800 ms of transfer time,
+∼20× the iteration window) and spikes HBM to 𝑀+ 𝐵·
+KVfull = 90 GB (assuming compressed cache is offloaded to
+CPU). A sequential variant (one verify per iteration after
+drafting) avoids the HBM spike but still pays the same ∼800
+ms of PCIe transfer overhead per 30-token draft cycle that
+staggering eliminates.
+4.2.2
+Staggering with remote prefix caching.
+Deployment and resource consumption. Traditionally, in
+remote prefix caching, pre-computed KV caches are saved on
+a storage node. When an incoming request’s prefix matches
+one, the KV is transferred to a remote serving GPU before
+decoding can begin. Because the serving GPUs connect to the
+6
+
+
+storage node over a slow link, transferring the compressed
+KV greatly reduces this transfer time.
+VeriCache additionally leverages the storage node’s local
+GPU for verification (Figure 7): on a prefix match, the storage
+node sends the compressed KV through the slow link to the
+remote GPU for drafting, and the full KV through the fast
+link to its local GPU for verification. Drafting and verification
+thus run on completely different hardware.
+Staggering schedule & performance estimation. Drafting
+(remote, HBM-bound) and verifying (local, storage-bandwidth-
+bound load plus a forward pass) use distinct hardware, so
+VeriCache pipelines them within a single request as follows.
+Every 𝑥drafted tokens trigger one verify: the remote drafter
+advances 𝑥tokens on the compressed KV cache while, in
+parallel, the local verifier prefetches the full KV cache from
+storage over BWℎ. When both finish, the local runs a forward
+pass over those 𝑥positions; the remote then waits for the
+accept/reject result before drafting the next 𝑥tokens. So per-
+request, only the verify transfer hides behind drafting—the
+verify forward pass itself sits on the critical path, because
+the next 𝑥drafts depend on which of the previous 𝑥were
+accepted. At the system level, while the remote pool waits
+on request 𝑟’s verify forward pass, it drafts for other requests
+in the batch, so no GPU is ever idle. The per-request time is:
+𝑇req = 𝑐· KVfull
+BW𝑙
+|     {z     }
+startup
++
+𝐾
+𝑥𝛾(𝑥,𝑐)
+|    {z    }
+# draft-verify cycles
+·𝑇cycle
+(4)
+where 𝑇cycle = max 𝑥· 𝑇decode, KVfull/BWℎ
+ + 𝑇fwd(𝑥): the
+max captures the draft–load overlap, and 𝑇fwd(𝑥) is paid
+serially after it. The startup is ∼1/𝑐× faster than the full-
+KV baseline (KVfull/BW𝑙), and 𝛾(𝑥,𝑐) directly reduces the
+number of draft-verify cycles needed.
+4.3
+P2: High acceptance rate amortizes
+verification
+Observation 2: 𝑥and 𝛾together govern verification cost.
+Given a compression ratio𝑐, the draft length 𝑥sets how often
+verification fires (once per 𝑥+1 iterations) and the acceptance
+rate𝛾(𝑥,𝑐) sets how many drafted tokens each round actually
+keeps. If 𝑥is too small, verification fires too often and the
+verification overhead dominates; if 𝛾is too low, most drafted
+tokens are discarded and the work in each round is wasted.
+Verification amortizes cheaply only when both 𝑥and 𝛾are
+high.
+Insight 1. Because VeriCache’s drafter is the target model
+itself running on the compressed KV cache, the compressed
+cache preserves the model’s weights and the dominant atten-
+tion patterns. The drafted tokens therefore closely track the
+10
+20
+30
+Draft Length
+0.0
+0.5
+1.0
+Acceptance Rate
+10
+20
+30
+Draft Length
+1
+2
+3
+4
+Ideal Speedup
+VeriCache 4X
+VeriCache 4X (w. verification overhea
+Figure 8: Acceptance rate (left) and ideal speedup (right)
+vs. draft length for VeriCache at 4× compaction.
+10
+20
+30
+Draft Length
+0
+15
+30
+Acceptance Length
+Qwen-32B
+10
+20
+30
+Draft Length
+0
+15
+30
+Acceptance Length
+Llama-70B
+VeriCache (4X Compact)
+Eagle
+Small Model
+Figure 9: Acceptance length vs. draft length, comparing
+VeriCache with Eagle and small draft model (Qwen-
+1.7B for Qwen-32B; Llama-8B for Llama-70B).
+full-KV output, so 𝛾stays high even at long draft lengths—
+verification fires rarely and a large fraction of each round’s
+drafted tokens are accepted.
+Figure 8 confirms this on 20 samples from the LMCache
+agentic trace [39], running Llama-70B on 2×H100 NVL un-
+der KVzip [21] compaction. The left panel shows that at 4×
+compaction, the acceptance rate stays above ∼0.8 even at
+draft length 30—each verification round keeps a large frac-
+tion of its drafted tokens. The right panel translates this
+into ideal speedup3: VeriCache reaches a peak of ∼3.7× at
+draft length 15. The dashed curve includes the verification
+overhead (after request staggering) and lies slightly below
+the solid (no-overhead) upper bound, with the residual gap—
+visible mostly at short draft lengths.
+By comparison, traditional speculative decoding drafts
+tokens from a small auxiliary model whose parameters dif-
+fer from the target; because the two distributions diverge
+quickly, typical small-model drafters sustain only a few ac-
+cepted tokens [2, 35, 48]. VeriCache keeps the target model
+and merely swaps in compressed KV, which is why its ac-
+ceptance length stretches an order of magnitude further.
+Figure 9 quantifies the gap on Qwen-32B and Llama-70B: at
+draft length 30, VeriCache at 4× compaction sustains accep-
+tance lengths of ∼19 on Qwen-32B and ∼23 on Llama-70B,
+while Eagle saturates near 1–2 on both, and a small draft
+model reaches only ∼3 on Qwen-32B and ∼10 on Llama-70B.
+The two drafting strategies compose naturally: a small-
+model drafter (e.g., MTP [4], EAGLE [28]) proposes tokens
+3Computed using the detailed throughput model in Appendix B, which
+accounts for pipelined reloads and GPU memory constraints; Eq. (11) is a
+simplified version capturing the same tradeoffs.
+7
+
+
+20
+40
+Draft Length
+0
+50
+Acceptance Length
+Eagle
+VeriCache VeriCache
++ Eagle
+2.5
+5.0
+Ideal Speedup
+1.78×
+3.50×
+4.35×
+VeriCache + Eagle
+VeriCache
+Eagle
+Figure 10: Composing VeriCache with Eagle. (Left) Ac-
+ceptance length vs. draft length. (Right) Ideal speedup.
+that VeriCache verifies against the compressed KV, periodi-
+cally rechecking against the full KV to correct compression
+errors. Figure 10 shows the payoff: VeriCache + Eagle reaches
+4.35× ideal speedup vs. 3.50× for VeriCache alone and 1.78×
+for Eagle alone (Appendix C).
+5
+VeriCache Runtime
+The VeriCache runtime realizes the cross-resource stagger-
+ing of §4: it decides which requests draft or verify at each
+iteration and schedules KV transfers so each verify lands
+on time. It maintains a resource model of the interconnect
+and GPU HBM, then places each request’s next verify in a
+window with spare capacity—a placement made flexible by
+the high acceptance rate (§4.3).
+5.1
+Resource model
+The runtime maintains 𝑊future iterations horizon, indexed
+𝑖∈[0,𝑊), tracking two reserve rings across the windows:
+BW ring (interconnect). 𝑇[𝑖] holds the interconnect time
+already reserved for transfers landing in window 𝑖. The link
+is serialized—one transfer at a time, with a transfer’s duration
+on the link equal to its size divided by the link’s bandwidth
+BW—so the constraint is
+𝑇[𝑖] ≤𝑇iter
+∀𝑖∈[0,𝑊).
+Both KV loads at request arrival (compressed for speculat-
+ing requests, full for non-speculating) and verify reloads
+on each speculative round share this ring. For request 𝑟
+with KV(𝑟)
+full, the reload’s iteration-equivalent duration is ℓ𝑟=
+KV(𝑟)
+full/(BW · 𝑇iter), spanning 𝑆𝑟= max(1, ⌈ℓ𝑟⌉) windows.
+HBM ring (GPU memory). 𝐵[𝑖] holds the in-flight KV
+cache occupying HBM during window 𝑖—KV streaming onto
+the GPU for an upcoming verify but not yet consumed by it.
+Together with persistent residency, the constraint is
+𝑀+ KVresident + 𝐵[𝑖] ≤HBM
+∀𝑖∈[0,𝑊),
+where 𝑀is the model weights and KVresident counts every
+KV cache kept on the GPU between iterations—compressed
+for drafting requests, full for pinned or non-speculating ones.
+GPU compute is not modeled as a third ring: VeriCache’s
+cross-resource staggering (§4.2) spreads verifies evenly across
+iterations, so compute load is smoothed rather than bursting.
+Algorithm 1 Admit(𝑟)
+1: ℓ𝑟←KV(𝑟)
+full/(BW · 𝑇iter);
+𝑆𝑟←max(1, ⌈ℓ𝑟⌉)
+2: anchor ←clamp(𝑥, 𝑆𝑟, 𝑊−1)
+3: candidates ←anchor, anchor±1, anchor±2, . . .
+⊲
+clamped to [𝑆𝑟,𝑊−1]
+4: for all 𝑑∈candidates do
+5:
+span𝑟←[𝑑−𝑆𝑟+ 1, 𝑑]
+6:
+if the BW-ring and HBM-ring constraints (§5.1) hold
+over span𝑟then
+7:
+reserve 𝑟on span𝑟;
+𝑑𝑟←𝑑;
+mode[𝑟] ←
+Speculative
+8:
+return
+9:
+end if
+10: end for
+11: return 𝑟to waiting queue
+5.2
+Request admission and execution loop
+Request admission. VeriCache runtime conducts an Admit
+operation (See Algorithm 1) at request arrival and again after
+every verify. It either picks a future verify iteration 𝑑𝑟within
+its lookahead window—reserving the full-KV-cache transfer
+that must complete by 𝑑𝑟—or returns 𝑟to waiting queue.
+The search for the next verify iteration starts from check-
+ing whether the 𝑥-th iteration from now is feasible — 𝑥is
+the draft length that maximizes ideal speedup (Figure 8 in
+§4.3), typically 20–50. VeriCache runtime looks at its resource
+model to see if there is sufficient interconnect to reload the
+full KV back to GPU likely before the iteration 𝑥and whether
+there is sufficient HBM resource to hold the full KV. When
+𝑥does not work, the runtime checks the 𝑥−1th and the
+𝑥+ 1th iteration from now, then 𝑥−2 and 𝑥+ 2, and so on;
+each candidate window indexes both rings simultaneously,
+and a reservation spans 𝑆𝑟consecutive windows on both.
+The first candidate that satisfies the BW-ring and HBM-ring
+constraints (§5.1) is reserved; if none does, 𝑟is returned to
+waiting queue.
+Execution loop. At each iteration 𝑡, the runtime performs
+three steps: (i) Kick off verify reloads. For each speculating
+request whose reserved span has its first window at iteration
+𝑡, start the asynchronous full-KV-cache reload on the link
+feeding the verifying GPU. (ii) Draft and verify. Draft run
+the next iteration’s forward pass; concurrently, the verify
+completes the verify forward pass for each request whose
+scheduled iteration is the current one. For each completed
+verify, re-invoke Admit(𝑟) with the updated state—either
+continuing speculation with the next verify iteration sched-
+uled, or returning 𝑟to the waiting queue. (iii) Advance. Slide
+the lookahead window one iteration forward.
+8
+
+
+Listing 1: VeriCache’s compressor interface.
+class CompressedKV:
+dropped_indices: list[Tensor]
+bit_scheme:
+int
+class Compressor:
+scenario: Literal["long-context", "remote-prefix"]
+mode:
+Literal["offline", "online"]
+def compress(full_kv, ratio) -> CompressedKV: ...
+def decompress(compressed, layer_idx=None, page_table=
+None): ...
+def update(layer_idx, q, k, v, hidden, req_offsets) ->
+list[Tensor]: ...
+5.3
+Per-setting specialization
+The two settings differ in their interconnects and in whether
+the verifying GPU is the same physical device as the drafter.
+Long-context decoding. Drafting and verification share the
+serving GPU, and the interconnect is the CPU↔GPU link.
+The BW ring (§5.1) tracks reservations on this link, and the
+HBM ring tracks the same GPU’s HBM usage. The com-
+pressed cache stays on GPU for drafting, and each verify
+reloads the full KV cache from CPU.
+Remote prefix caching. Two GPU pools share a storage
+node (Figure 7): a small local pool on a fast link BWℎ, and
+a larger remote pool on a slow link BW𝑙≪BWℎ. Remote-
+pool requests speculate: the remote GPU drafts using the
+compressed KV cache streamed over BW𝑙, while a local GPU
+concurrently loads the full KV cache over BWℎfor an up-
+coming verify and runs the verify forward pass for a request
+whose KV has already arrived. Because VeriCache issues
+each load ahead of its verify deadline, drafting, loading, and
+verifying all pipeline together. All links and pool HBMs are
+tracked by their own BW/HBM rings (§5.1): BW𝑙carries ini-
+tial compressed-KV loads to remote drafters, BWℎcarries
+verify reloads, and each pool’s HBM ring tracks HBM usage.
+6
+Compressor Interface
+KV cache compression methods differ in what they produce:
+some drop token positions per (layer, head), others quan-
+tize entries to lower precision. VeriCache’s runtime relies
+on a small interface (Listing 1) that exposes only what it
+needs to allocate HBM and run attention—which positions
+are dropped, and bits per element.
+Offline means the compression step runs off the serving
+GPU (on CPU or an idle GPU), since methods often need in-
+formation not computed by normal inference (e.g., explicit at-
+tention weights) or extra forward passes that would slow in-
+line serving. Online compression runs inline through update,
+with decisions driven by per-iteration state.
+Mistral-24B
+Qwen-32B
+Llama-70B
+0
+200
+157
+204
+301
+44
+81
+44
+120
+188
+102
+154
+109
+256
+317
+Long-Context Decoding
+Mistral-24B
+Qwen-32B
+Llama-70B
+0
+500
+380
+803
+181 240
+240
+485
+Remote Prefix Caching
+Throughput (tok/s)
+Full KV
+Trad. Drafter
+SparseSpec
+VeriCache
+VeriCache + Trad. Drafter
+Figure 11: Sustained decoding throughput on long-
+context decoding and remote prefix caching.
+The interface is pass-through: the runtime hands the com-
+pressor the physical-layout metadata and lets it gather, de-
+quantize, or write pages itself. update mirrors this by pass-
+ing req_offsets for batch slicing. The cost—compressor
+authors must understand the runtime’s paged layout—avoids
+a virtualization layer; KIVI’s fused dequant-attention already
+operates on pages directly.
+Long-context decoding. The runtime keeps the compressed
+cache in HBM and drafts against it. With offline compres-
+sion, for example, KVzip [21] scores tokens by context re-
+constructability and keeps, say, 25% per (layer, head) of
+a 100K-token context; compress runs offline and returns
+CompressedKV with the 75K evicted positions per (layer,
+head) and bit_scheme=16, after which the runtime allocates
+pages for the retained 25K and runs sparse attention with
+decompress never called. With online compression, for ex-
+ample, KVzap [17] scores tokens during inference with a
+small MLP on hidden state: compress initializes dropped_
+indices to empty; after each layer’s forward, the runtime
+calls update(layer,q,k,v,hidden,req_offsets) on the
+batched tensors, and the compressor slices the batch via
+req_offsets, scores per request, and returns a (num_heads,
+new_drops) tensor per request. The runtime appends the
+new drops to dropped_indices[layer] and trims the (layer,
+head) page allocation.
+Remote prefix caching. The runtime never inspects the
+compressed cache: compress produces a payload at storage,
+the runtime streams the bytes, and decompress(compressed)
+materializes full KV at the remote drafter. The payload is a
+blob the compressor can fill however it wants.
+Scope. The interface targets deployment-time substitution
+under four constraints: (i) heads within a layer may drop
+different positions but the same number of tokens (count
+varies only across layers); (ii) the system runs one mode at a
+time; token-dropping and quantization do not mix across con-
+current requests; (iii) bit_scheme is uniform across tokens
+9
+
+
+0.0
+0.2
+0.4
+0.6
+0
+200
+400
+Req Latency (s)
+Mistral-24B
+0.0
+0.1
+0.2
+0.3
+0.4
+0
+200
+400
+Req Latency (s)
+Qwen-32B
+0.0
+0.2
+0.4
+0.6
+0
+200
+400
+Req Latency (s)
+Llama-70B
+0.0
+0.5
+1.0
+0
+200
+400
+Req Latency (s)
+Mistral-24B
+0.0
+0.5
+1.0
+0
+100
+200
+Req Latency (s)
+Qwen-32B
+0.0
+0.2
+0.4
+0.6
+0
+500
+Req Latency (s)
+Llama-70B
+Request rate (req/s)
+Long-Context
+Remote Prefix
+Full KV
+Trad. Drafter
+VeriCache
+VeriCache + Trad. Drafter
+Figure 12: End-to-end request latency vs. request rate on Pipeline 1 (top) and Pipeline 2 (bottom).
+and layers; (iv) the compression method is fixed at deploy-
+ment. Each is a straightforward future-work extension. We
+instantiate the interface for seven methods.
+7
+Implementation
+VeriCache is a thin layer between the request frontend and
+the GPU workers, built atop vLLM [22] (serving engine) and
+LMCache [36] (persistent KV cache storage and transfer).
+VeriCache is implemented with 8K LoC of Python and C++.
+VeriCache subclasses vLLM’s AsyncScheduler and man-
+ages its own GPU KV allocations so that compressed and
+transient reload KVs can coexist under our admission con-
+trol. A scheduler hook runs Admit (Algorithm 1) against
+the BW and HBM rings of §5.1 and kicks each request’s
+verify reload asynchronously 𝑆𝑟windows ahead of its dead-
+line; the bytes themselves move via LMCache, which ex-
+poses lookup/lookup_compressed returning (compressed)
+KV pointers, move for cross-tier transfers (CPU↔GPU, storage↔GPU),
+and a wrapper that invokes the Compressor of §6 on a stored
+KV pointer. Per-layer attention activations are routed through
+a forward hook to Compressor.update for online compres-
+sors; offline compressors run before serving (or on idle com-
+pute) and apply when the context’s KV is reused.
+8
+Results
+8.1
+Evaluation settings
+Models and hardware. Mistral-24B [41] and Qwen-32B [61]
+run on a NVIDIA RTX PRO 6000 (96 GB); Llama-70B [11]
+runs on 2×H100 NVL (94 GB, TP=2). Each node connects
+CPU–GPU via PCIe 5.0 x16 (64 GB/s); the local node reaches
+the KV store at 40 GB/s, remote nodes at 1.2 GB/s.
+Two evaluation pipelines. Pipeline 1 (long-context decod-
+ing) precomputes the context’s KV in CPU memory or stor-
+age and compresses it offline or online (§6); a single serving
+instance. Pipeline 2 (remote prefix caching) reuses KV across
+requests over the slow remote link with one local and four
+remote instances.
+Compression methods. Token dropping: KVzip [21], KVZap [17],
+ExpectedAttention [8], SnapKV [26]. Quantization: KIVI [38],
+KVQuant [15], RotateKV [57].
+Speculative-decoding baselines. Traditional: EAGLE3 [27,
+28] auxiliary drafter, with RedHatAI pretrained speculators
+for Llama-70B [50] and Qwen-32B [51]. Self-speculative: Spars-
+eSpec [77], which drafts on the target model with PillarAttn
+(sparse attention selecting critical tokens via prior-verification
+scores) and verifies with full attention over resident full KV.
+Datasets and quality metrics. We use five datasets, each
+with its own quality metric:
+• LMCache-trace [39]: both pipelines, offline+online
+(900 samples); KL-divergence from Full KV.
+• ComplexFuncBench [79]: Pipeline 1 offline (150 sam-
+ples); fraction of function calls with exactly-matching
+arguments.
+• PISanitizer [10]: Pipeline 1 offline (50 samples); de-
+fense success rate against prompt injection.
+• LongGenBench [63]: Pipeline 1 online (50 samples);
+fraction of per-prompt constraints satisfied (comple-
+tion rate).
+• GSM8K-Long [34]: Pipeline 1 online (100 samples);
+fraction of chained math problems answered exactly.
+Efficiency metrics. End-to-end request latency (s) and through-
+put (tok/s).
+8.2
+Comparing with full KV and traditional
+speculative decoding
+Throughout this comparison, VeriCache uses KVzip (com-
+pression ratio 0.2, anchored draft length𝑥=25) as its compressed-
+KV drafter on Pipeline 1 and KIVI (4-bit, 𝑥=40) on Pipeline 2.
+Figure 11 compares VeriCache against Full KV, a tradi-
+tional drafter, SparseSpec, and VeriCache + traditional drafter
+on three models. On long-context decoding, VeriCache de-
+livers 1.92×–2.73× over Full KV (e.g., 256 vs. 102 tok/s on
+Llama-70B), beating the traditional drafter, whose speedup
+10
+
+
+0.2
+0.5
+0.8
+KV Cache Memory Ratio
+1
+2
+3
+Speedup
+10
+30
+60
+HBM BW / Interconnect BW
+2
+4
+Speedup
+GH200
+RTX PRO 6000
+H100-NVL
+VeriCache
+SparseSpec
+1
+4
+8
+12
+16
+GR / GL
+1
+2
+Speedup
+1.5 5.0 10.0 15.0 20.0 25.0
+Tinit_remote / Tdecode
+1
+2
+Speedup
+ 
+Figure 13: VeriCache’s speedup over Full KV: Pipeline 1, varying KV-cache budget and HBM/interconnect ratio
+(left); Pipeline 2, varying 𝐺𝑅/𝐺𝐿and 𝑇init_remote/𝑇decode (right).
+0
+200
+400
+600
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Mistral-24B
+0
+50
+100
+150
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Qwen-32B
+0
+100
+200
+300
+400
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Llama-70B
+0
+200
+400
+600
+800
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Mistral-24B
+0
+100
+200
+300
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Qwen-32B
+0
+200
+400
+−102
+−101
+−100
+0
+−DKL(pfull, plossy)
+Llama-70B
+Throughput (tok/s)
+Long-Context
+Remote Prefix
+Full KV
+KVzip
+VeriCache
+Full KV
+KIVI
+VeriCache
+Figure 14: Quality (negative KL-divergence) vs. throughput on Pipeline 1 (top) and Pipeline 2 (bottom).
+is bounded by the unchanged KV footprint. Composing Ver-
+iCache with the drafter peaks at 4.26× (Qwen-32B), as the
+two attack orthogonal bottlenecks: VeriCache shrinks per-
+request KV to enable larger batches, the drafter speeds up to-
+kens within each request. On remote prefix caching, drafter-
+based methods do not apply; VeriCache still gives 1.33×–
+2.11× over Full KV (e.g., 485 vs. 240 tok/s on Llama-70B).
+Varying hardware (Pipeline 1). Figure 13 sweeps the two
+hardware axes that dominate long-context decoding. Left:
+the KV-cache budget, varied by serving Qwen-8B, Qwen-
+14B, Mistral-24B, and Qwen-32B (larger weights leave less
+HBM for KV). As the budget shrinks from 0.74 to 0.2 of HBM,
+VeriCache’s speedup grows from 1.61× to 2.71×—Full KV’s
+batch collapses faster than VeriCache’s, while SparseSpec
+drops from 1.82× to 1.02× since it must keep full KV resident
+on the drafting GPU. Right: as the HBM-to-interconnect
+ratio falls from 60 (H100 NVL) to 10 (GH200), VeriCache’s
+speedup rises from 1.92× to 3.01×, as a faster interconnect
+makes each full-KV reload cheap, so verification fires more
+often without stalling drafting.
+Varying hardware (Pipeline 2). Figure 13 (Left) sweeps the
+number of remote gpus divided by the number of local gpus
+(𝐺𝑅/𝐺𝐿), which sets whether the local and remote pools
+produce and consume speculated tokens at matching rates.
+Below the sweet spot at 𝐺𝑅/𝐺𝐿=4, the remote pool under-
+supplies drafts and spare local cycles fall back to Full KV;
+above it, local HBM cannot verify drafts fast enough and
+0
+200
+400
+600
+−102
+−101
+−1000
+−DKL(pfull, plossy)
+ExpectedAttention
+0
+200
+400
+600
+−102
+−101
+−1000
+−DKL(pfull, plossy)
+SnapKV
+Throughput (tok/s)
+Full KV
+Token-dropping
+VeriCache
+0
+250
+500
+750
+−102
+−101
+−1000
+−DKL(pfull, plossy)
+KVQuant
+0
+250
+500
+750
+−102
+−101
+−1000
+−DKL(pfull, plossy)
+RotateKV
+Throughput (tok/s)
+Full KV
+Quantization
+VeriCache
+Figure 15: Additional token-dropping and quantization
+baselines on Mistral-24B.
+spare remote cycles fall back instead—in both regimes the
+speedup converges back toward 1×. Figure 13 (Right) sweeps
+𝑇init_remote/𝑇decode, the ratio of remote-KV arrival time to one
+draft-plus-verify round. Up to 5, streaming a quantized KV
+over the slow remote network pays off since initial loading
+dominates the request lifecycle; beyond that, 𝑇decode domi-
+nates and the benefit fades back toward 1×.
+8.3
+Comparing with lossy KV
+For each lossy baseline we sweep its compression knob to
+trace the quality–throughput frontier: offline token-dropping
+methods at compression ratios 0.25, 0.5, and 0.75; online
+11
+
+
+0
+1000
+2000
+35
+40
+CFB
+Func. Call Acc.
+Mistral-24B
+0
+200
+400
+600
+50
+60
+70
+Func. Call Acc.
+Qwen-32B
+0
+1000
+2000
+3000
+10
+20
+Func. Call Acc.
+Llama-70B
+0
+1000
+2000
+3000
+0
+50
+PISanitizer
+Defense Acc.
+0
+250
+500
+750
+1000
+25
+50
+75
+Defense Acc.
+0
+500
+1000
+1500
+2000
+90
+100
+Defense Acc.
+Throughput (tok/s)
+Full KV
+KVzip
+VeriCache
+Figure 16: Quality vs. throughput: function-call accuracy (top), defense success rate (bottom).
+0
+250
+500
+750
+60
+80
+100
+Completion Rate
+LongGenBench
+0
+200
+400
+600
+60
+80
+100
+Accuracy
+GSM8K-Long
+Throughput (tok/s)
+Full KV
+KVzap-MLP
+VeriCache
+Figure 17: Quality vs. throughput on Pipeline 1 long-
+generation: completion rate (left), accuracy (right).
+token-dropping methods at KV-cache budgets of 1024, 2048,
+and 4096 tokens; and quantization methods at 8, 4, and 2 bits.
+Quality and throughput on two pipelines. Figure 14 re-
+ports KL-divergence from Full KV vs. decoding throughput
+across Pipeline 1 (top), Pipeline 2 (bottom), and three mod-
+els. VeriCache’s KL stays under 0.01 nats (attributable to
+hardware nondeterminism [14]) while reaching up to 3.82×
+Full KV’s throughput (Llama-70B, Pipeline 1). The lossy base-
+lines (KVzip, KIVI) must trade quality for throughput: on
+Llama-70B/Pipeline 1 at compression 0.5, KVzip accumu-
+lates ∼14.4 nats of KL per request—the lossy model emits
+Full KV’s exact output with probability only 𝑒−14.4≈5×10−7.
+At the highest compression this widens by another ∼12×.
+Varying datasets. The same picture holds across task-specific
+quality metrics on both Pipeline 1 workloads. Figure 16 re-
+ports function-call accuracy on ComplexFuncBench [79]:
+VeriCache reaches at least 59% of the fastest KVzip con-
+figuration’s throughput at Full KV accuracy, while KVzip
+loses up to ∼30 points at the same throughput and collapses
+to ∼31% of Full KV’s accuracy on Llama-70B even at the
+most conservative ratio. Figure 17 runs long-generation on
+Qwen-32B with LongGenBench [63] (completion rate) and
+GSM8K-Long [34] (accuracy): VeriCache preserves Full KV’s
+100% completion at 339 tok/s and 90% accuracy at 385 tok/s.
+KVzip’s quality drops by around 10 points at the same speed.
+Varying compression methods. Figure 15 adds two token-
+dropping baselines (ExpectedAttention [8], SnapKV [26])
+and two quantization baselines (KVQuant [15], RotateKV [57])
+on Mistral-24B. Across all four, VeriCache’s KL stays within
+0.01 nats while running 1.4–1.9× faster than Full KV; the
+baselines trace the same quality–throughput frontier as the
+KVzip/KIVI headlines, accumulating tens of nats of KL.
+9
+Related Work
+KV cache compression. Token-dropping methods (KVzip [21],
+KVzap [17]) and quantization (KIVI [38], KVQuant [15])
+shrink the KV cache but are inherently lossy (§3). VeriCache
+turns them lossless by drafting with the compressed cache
+and verifying against the full one.
+Speculative decoding. Speculative decoding accelerates
+a target model with a cheaper proposer (EAGLE [27, 28],
+MTP [4], n-gram [6]); these compose with VeriCache. Closer
+to us, MagicDec [53], QuantSpec [62], and SparseSpec [77]
+draft from a sparse/compressed cache but pin the full KV
+in HBM, ignore remote prefix caching, and hard-wire one
+compressor—VeriCache addresses all three.
+Prefill–decode disaggregation. Serving systems disaggre-
+gate prefill and decode onto separate GPU pools (DistServe [80],
+Splitwise [46], TetriInfer [16], Mooncake [49]). Decode nodes
+hit exactly the HBM-bandwidth bottleneck VeriCache tar-
+gets, so VeriCache slots directly into a decode pool.
+10
+Limitations & Future Work
+Memory overhead. VeriCache keeps the full KV cache on
+CPU (or storage) in addition to the compressed cache on
+GPU, so it incurs more storage overhead.
+Static draft length. VeriCache uses a fixed draft length
+per workload; a per-request adaptive policy driven by early
+accept/reject outcomes would handle heterogeneous com-
+pressors and contexts more gracefully.
+Drafter-specific compression. Existing compressors opti-
+mize direct-serving accuracy; a compressor designed to max-
+imize acceptance length at large draft horizons—a different
+objective—could push VeriCache’s throughput further.
+Verification beyond compression. Other lossy KV techniques
+besides compression—for instance, reusing precomputed KV
+across non-prefix chunks (CacheBlend [73])—also produce
+outputs that diverge from full-KV decoding. Whether a draft-
+then-verify approach could help here would be an interesting
+question to explore.
+12
+
+
+11
+Conclusion
+Lossy KV compression speeds up long-context LLM serving
+while lowering output quality. VeriCache restores lossless in-
+ference by drafting from the compressed cache and verifying
+against the full cache, with cross-resource staggering and
+long acceptance runs hiding the verification cost. It delivers
+up to 4× higher throughput than full-KV decoding while
+producing identical outputs, across both token-dropping and
+quantization methods.
+13
+
+
+References
+[1] Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant J Nair,
+Ilya Soloveychik, and Purushotham Kamath. 2024. Keyformer: Kv
+cache reduction through key tokens selection for efficient generative
+inference. Proceedings of Machine Learning and Systems 6 (2024), 114–
+127.
+[2] Sudhanshu Agrawal, Wonseok Jeon, and Mingu Lee. 2024. Adaedl:
+Early draft stopping for speculative decoding of large language models
+via an entropy-based lower bound on token acceptance probability.
+arXiv preprint arXiv:2410.18351 (2024).
+[3] Amazon Web Services. 2025.
+Performance specifications for
+Amazon S3.
+https://docs.aws.amazon.com/AmazonS3/latest/
+userguide/s3-files-performance.html. Accessed: 2026-04-16.
+[4] Yuxuan Cai, Xiaozhuan Liang, Xinghua Wang, Jin Ma, Haijin Liang,
+Jinwen Luo, Xinyu Zuo, Lisheng Duan, Yuyang Yin, and Xi Chen.
+2025. FastMTP: Accelerating LLM Inference with Enhanced Multi-
+Token Prediction. arXiv:2509.18362 [cs.LG] https://arxiv.org/
+abs/2509.18362
+[5] Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu, Yucheng Li, Tianyu Liu,
+Keming Lu, Wayne Xiong, Yue Dong, Junjie Hu, et al. 2024. Pyramidkv:
+Dynamic kv cache compression based on pyramidal information fun-
+neling. arXiv preprint arXiv:2406.02069 (2024).
+[6] Jinglin Chen, Qiwei Li, Zuchao Li, Baoyuan Qi, Liu Guoming, Haojun
+Ai, Hai Zhao, and Ping Wang. 2025. Faster In-Context Learning for
+LLMs via N-Gram Trie Speculative Decoding. In Proceedings of the
+2025 Conference on Empirical Methods in Natural Language Processing.
+18051–18062.
+[7] Weijian Chen, Shuibing He, Haoyang Qu, Ruidong Zhang, Siling Yang,
+Ping Chen, Yi Zheng, Baoxing Huai, and Gang Chen. 2025. {IMPRESS}:
+An {Importance-Informed}{Multi-Tier} prefix {KV} storage system
+for large language model inference. In 23rd USENIX Conference on File
+and Storage Technologies (FAST 25).
+[8] Alessio Devoto, Maximilian Jeblick, and Simon Jégou. 2025. Expected
+attention: Kv cache compression by estimating attention from future
+queries distribution. arXiv preprint arXiv:2510.00636 (2025).
+[9] Yuan Feng, Junlin Lv, Yukun Cao, Xike Xie, and S Kevin Zhou. 2024.
+Ada-kv: Optimizing kv cache eviction by adaptive budget allocation
+for efficient llm inference. arXiv preprint arXiv:2407.11550 (2024).
+[10] Runpeng Geng, Yanting Wang, Chenlong Yin, Minhao Cheng, Ying
+Chen, and Jinyuan Jia. 2025. PISanitizer: Preventing Prompt Injec-
+tion to Long-Context LLMs via Prompt Sanitization. arXiv preprint
+arXiv:2511.10720 (2025).
+[11] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav
+Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil
+Mathur, Alan Schelten, Alex Vaughan, et al. 2024. The llama 3 herd of
+models. arXiv preprint arXiv:2407.21783 (2024).
+[12] Wenchao Gu, Juntao Chen, Yanlin Wang, Tianyue Jiang, Xingzhe
+Li, Mingwei Liu, Xilin Liu, Yuchi Ma, and Zibin Zheng. 2025. What
+to Retrieve for Effective Retrieval-Augmented Code Generation? An
+Empirical Study and Beyond. arXiv:2503.20589 [cs.SE] https://
+arxiv.org/abs/2503.20589
+[13] LI Haoyang, Yiming Li, Anxin Tian, Tianhao Tang, Zhanchao Xu,
+Xuejia Chen, HU Nicole, Wei Dong, Li Qing, and Lei Chen. 2025.
+A survey on large language model acceleration based on kv cache
+management. Transactions on Machine Learning Research (2025).
+[14] Horace He and Thinking Machines Lab. 2025. Defeating Nondeter-
+minism in LLM Inference. https://thinkingmachines.ai/blog/
+defeating-nondeterminism-in-llm-inference/.
+[15] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Ma-
+honey, Yakun S Shao, Kurt Keutzer, and Amir Gholami. 2024. Kvquant:
+Towards 10 million context length llm inference with kv cache quanti-
+zation. Advances in Neural Information Processing Systems 37 (2024),
+1270–1303.
+[16] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng Chen, Jiang Xu,
+Shuang Chen, Hao Feng, Chenxi Wang, Sa Wang, Yungang Bao, et al.
+2024. Inference without Interference: Disaggregate LLM Inference
+for Mixed Downstream Workloads. arXiv preprint arXiv:2401.11181
+(2024).
+[17] Simon Jegou and Maximilian Jeblick. 2026. KVzap: Fast, Adaptive, and
+Faithful KV Cache Pruning. arXiv preprint arXiv:2601.07891 (2026).
+[18] Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei,
+Ofir Press, and Karthik Narasimhan. 2024. SWE-bench: Can Language
+Models Resolve Real-World GitHub Issues? arXiv:2310.06770 [cs.CL]
+https://arxiv.org/abs/2310.06770
+[19] Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing
+Liu, Tushar Krishna, and Tuo Zhao. 2024. GEAR: An efficient error
+reduction framework for KV cache compression in LLM inference. In
+Proc. NeurIPS, Vol. 262. 305–321.
+[20] Jang-Hyun Kim, Dongyoon Han, and Sangdoo Yun. 2026. Fast KVzip:
+Efficient and Accurate LLM Inference with Gated KV Eviction. arXiv
+preprint arXiv:2601.17668 (2026).
+[21] Jang-Hyun Kim, Jinuk Kim, Sangwoo Kwon, Jae W Lee, Sangdoo Yun,
+and Hyun Oh Song. 2025. Kvzip: Query-agnostic kv cache compression
+with context reconstruction. arXiv preprint arXiv:2505.23416 (2025).
+[22] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Sto-
+ica. 2023. Efficient Memory Management for Large Language Model
+Serving with PagedAttention.
+arXiv:2309.06180 [cs.LG]
+https:
+//arxiv.org/abs/2309.06180
+[23] Yuanyuan Lei and Ruihong Huang. 2025.
+Multi-document Sum-
+marization through Multi-document Event Relation Graph Reason-
+ing in LLMs: a case study in Framing Bias Mitigation. In Proceed-
+ings of the 63rd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), Wanxiang Che, Joyce Nabende,
+Ekaterina Shutova, and Mohammad Taher Pilehvar (Eds.). Associ-
+ation for Computational Linguistics, Vienna, Austria, 26603–26619.
+doi:10.18653/v1/2025.acl-long.1291
+[24] Haoyang Li, Yiming Li, Anxin Tian, Tianhao Tang, Zhanchao Xu,
+Xuejia Chen, Nicole Hu, Wei Dong, Qing Li, and Lei Chen. 2025. A
+Survey on Large Language Model Acceleration based on KV Cache
+Management. arXiv:2412.19442 [cs.AI] https://arxiv.org/abs/
+2412.19442
+[25] Xing Li, Zeyu Xing, Yiming Li, Linping Qu, Hui-Ling Zhen, Wu-
+long Liu, Yiwu Yao, Sinno Jialin Pan, and Mingxuan Yuan. 2025. Kv-
+tuner: Sensitivity-aware layer-wise mixed-precision kv cache quanti-
+zation for efficient and nearly lossless llm inference. arXiv preprint
+arXiv:2502.04420 (2025).
+[26] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr
+Locatelli, Hanchen Ye, Tianle Cai, Patrick Lewis, and Deming Chen.
+2024. Snapkv: Llm knows what you are looking for before generation.
+Advances in Neural Information Processing Systems 37 (2024), 22947–
+22970.
+[27] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024.
+EAGLE-2: Faster Inference of Language Models with Dynamic Draft
+Trees.
+arXiv:2406.16858 [cs.CL]
+https://arxiv.org/abs/2406.
+16858
+[28] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2025. EA-
+GLE: Speculative Sampling Requires Rethinking Feature Uncertainty.
+arXiv:2401.15077 [cs.LG] https://arxiv.org/abs/2401.15077
+[29] Manlai Liang, JiaMing Zhang, Xiong Li, and Jinlong Li. 2025. LagKV:
+Lag-Relative Information of the KV Cache Tells Which Tokens Are
+Important. arXiv preprint arXiv:2504.04704 (2025).
+[30] Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang, Guangxuan Xiao,
+Chuang Gan, and Song Han. 2025. Qserve: W4a8kv4 quantization
+14
+
+
+and system co-design for efficient llm serving. Proceedings of Machine
+Learning and Systems 7 (2025).
+[31] Jingjing Liu, Silin Li, Zeming Liu, Zihao Cheng, Yuhang Guo, Yuan-
+fang Guo, Yunhong Wang, and Haifeng Wang. 2026. Towards multi-
+language repository-level code generation: From-scratch to guided
+tasks. Neurocomputing (2026), 133204.
+[32] Jiawei Liu, Chunqiu Steven Xia, Yuyao Wang, and Lingming Zhang.
+2023. Is your code generated by chatgpt really correct? rigorous
+evaluation of large language models for code generation. Advances in
+neural information processing systems (2023).
+[33] Tianyang Liu, Canwen Xu, and Julian McAuley. 2023. RepoBench:
+Benchmarking Repository-Level Code Auto-Completion Systems.
+arXiv:2306.03091 [cs.CL] https://arxiv.org/abs/2306.03091
+[34] Xiang Liu, Peijie Dong, Xuming Hu, and Xiaowen Chu. 2024. LongGen-
+Bench: Long-context Generation Benchmark. arXiv:2410.04199 [cs.CL]
+https://arxiv.org/abs/2410.04199
+[35] Xiaoxuan Liu, Jiaxiang Yu, Jongseok Park, Ion Stoica, and Alvin Che-
+ung. 2025. Speculative Decoding: Performance or Illusion? arXiv
+preprint arXiv:2601.11580 (2025).
+[36] Yuhan Liu, Yihua Cheng, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaot-
+ing Feng, Yuyang Huang, Samuel Shen, Rui Zhang, Kuntai Du, and
+Junchen Jiang. 2025. LMCache: An Efficient KV Cache Layer for
+Enterprise-Scale LLM Inference. arXiv:2510.09665 [cs.LG] https:
+//arxiv.org/abs/2510.09665
+[37] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang,
+Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Anantha-
+narayanan, et al. 2024. Cachegen: Kv cache compression and stream-
+ing for fast large language model serving. In Proceedings of the ACM
+SIGCOMM 2024 Conference. 38–56.
+[38] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu,
+Vladimir Braverman, Beidi Chen, and Xia Hu. 2024. Kivi: A tuning-
+free asymmetric 2bit quantization for kv cache.
+arXiv preprint
+arXiv:2402.02750 (2024).
+[39] LMCache. 2025. LMCache Agentic Traces. https://huggingface.
+co/datasets/sammshen/lmcache-agentic-traces.
+[40] Qinyu Luo, Yining Ye, Shihao Liang, Zhong Zhang, Yujia Qin, Yaxi Lu,
+Yesai Wu, Xin Cong, Yankai Lin, Yingli Zhang, Xiaoyin Che, Zhiyuan
+Liu, and Maosong Sun. 2024. RepoAgent: An LLM-Powered Open-
+Source Framework for Repository-level Code Documentation Gen-
+eration. arXiv:2402.16667 [cs.CL] https://arxiv.org/abs/2402.
+16667
+[41] Mistral AI. 2025.
+Mistral Small 24B Instruct 2501.
+https:
+//huggingface.co/mistralai/Mistral-Small-24B-Instruct-
+2501.
+[42] NVIDIA Corporation. 2026. NemoClaw: Secure AI Agent Stack for
+OpenClaw.
+https://github.com/NVIDIA/NemoClaw.
+Accessed:
+2026-04-01.
+[43] OpenAI. 2026. Agents Guide. https://developers.openai.com/
+api/docs/guides/agents. Accessed: 2026-04-01.
+[44] Siru Ouyang, Shuohang Wang, Minhao Jiang, Ming Zhong, Dong-
+han Yu, Jiawei Han, and Yelong Shen. 2024. Temperature-centric
+investigation of speculative decoding with knowledge distillation. In
+Findings of the Association for Computational Linguistics: EMNLP 2024.
+13125–13137.
+[45] Zaifeng Pan, Ajjkumar Patel, Zhengding Hu, Yipeng Shen, Yue Guan,
+Wan-Lu Li, Lianhui Qin, Yida Wang, and Yufei Ding. 2025. KVFlow:
+Efficient prefix caching for accelerating LLM-based multi-agent work-
+flows. arXiv preprint arXiv:2507.07400 (2025).
+[46] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient
+generative LLM inference using phase splitting. In 2024 ACM/IEEE 51st
+Annual International Symposium on Computer Architecture (ISCA).
+[47] Joseph J Peper, Wenzhao Qiu, Ali Payani, and Lu Wang. 2025. Mdbench:
+A synthetic multi-document reasoning benchmark generated with
+knowledge guidance. In Findings of the Association for Computational
+Linguistics: ACL 2025. 25592–25621.
+[48] Kimonas Provatas, Aris Karatzikos, Charalampos Koilakos, Michail
+Patsakis, Alexandros Tzanakakis, Akshatha Nayak, Ioannis Mouratidis,
+Evangelos Ioannis Avgoulas, and Ilias Georgakopoulos-Soares. 2026.
+Accelerating inference in genomic and proteomic foundation models
+via speculative decoding. bioRxiv (2026), 2026–01.
+[49] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Heyi Tang, Feng Ren,
+Teng Ma, Shangming Cai, Yineng Zhang, Mingxing Zhang, et al. 2024.
+Mooncake: A kvcache-centric disaggregated architecture for llm serv-
+ing. ACM Transactions on Storage (2024).
+[50] RedHat
+AI.
+2025.
+Llama-3.3-70B-Instruct-speculator.eagle3.
+https://huggingface.co/RedHatAI/Llama-3.3-70B-Instruct-
+speculator.eagle3.
+[51] RedHat AI. 2025.
+Qwen3-32B-speculator.eagle3.
+https://
+huggingface.co/RedHatAI/Qwen3-32B-speculator.eagle3.
+[52] Fazlollah M Reza. 1994. An introduction to information theory. Courier
+Corporation.
+[53] Ranajoy Sadhukhan, Jian Chen, Zhuoming Chen, et al. 2024. MagicDec:
+Breaking the Latency-Throughput Tradeoff for Long Context Gen-
+eration with Speculative Decoding. arXiv preprint arXiv:2408.11049
+(2024).
+[54] Minju Seo, Jinheon Baek, Seongyun Lee, and Sung Ju Hwang. 2026.
+Paper2Code: Automating Code Generation from Scientific Papers in
+Machine Learning. arXiv:2504.17192 [cs.CL] https://arxiv.org/
+abs/2504.17192
+[55] Konrad Staniszewski and Adrian Łańcucki. 2025. KV Cache Trans-
+form Coding for Compact Storage in LLM Inference. arXiv preprint
+arXiv:2511.01815 (2025).
+[56] Peter Steinberger. 2025. OpenClaw: Open-source autonomous AI
+agent. https://github.com/openclaw/openclaw. GitHub reposi-
+tory.
+[57] Zunhai Su, Zhe Chen, Wang Shen, Hanyu Wei, Linge Li, Huangqi
+Yu, and Kehong Yuan. 2025. Rotatekv: Accurate and robust 2-bit kv
+cache quantization for llms via outlier-aware adaptive rotations. arXiv
+preprint arXiv:2501.16383 (2025).
+[58] Hanshi Sun, Li-Wen Chang, Wenlei Bao, Size Zheng, Ningxin Zheng,
+Xin Liu, Harry Dong, Yuejie Chi, and Beidi Chen. 2025. ShadowKV:
+KV Cache in Shadows for High-Throughput Long-Context LLM Infer-
+ence. In Proceedings of the 42nd International Conference on Machine
+Learning.
+[59] Xingyu Tan, Xiaoyang Wang, Qing Liu, Xiwei Xu, Xin Yuan, Liming
+Zhu, and Wenjie Zhang. 2025. HydraRAG: Structured Cross-Source
+Enhanced Large Language Model Reasoning. arXiv:2505.17464 [cs.CL]
+https://arxiv.org/abs/2505.17464
+[60] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci,
+and Song Han. 2024. Quest: Query-aware sparsity for efficient long-
+context llm inference. arXiv preprint arXiv:2406.10774 (2024).
+[61] Qwen Team. 2025. Qwen3 Technical Report. arXiv:2505.09388 [cs.CL]
+https://arxiv.org/abs/2505.09388
+[62] Rishabh Tiwari, Haocheng Xi, Aditya Tomar, Coleman Hooper, Se-
+hoon Kim, Maxwell Horton, Mahyar Najibi, Michael W. Mahoney,
+Kurt Keutzer, and Amir Gholami. 2025. QuantSpec: Self-Speculative
+Decoding with Hierarchical Quantized KV Cache. In Proceedings of
+the 42nd International Conference on Machine Learning.
+[63] Yuhao Wu, Ming Shan Hee, Zhiqing Hu, and Roy Ka-Wei Lee. 2024.
+LongGenBench: Benchmarking Long-Form Generation in Long Con-
+text LLMs. arXiv:2409.02076 [cs.CL] https://arxiv.org/abs/2409.
+02076
+15
+
+
+[64] Xingyu Xiang, Raj Joshi, Yuhan Liu, Jiayi Yao, Chenxingyu Zhao,
+Junchen Jiang, Yang Zhou, Eddie Kohler, and Minlan Yu. 2025. Shad-
+owServe: Interference-Free KV Cache Fetching for Distributed Prefix
+Caching. arXiv:2509.16857 [cs.DC] https://arxiv.org/abs/2509.
+16857
+[65] Guangxuan Xiao, Jiaming Tang, Jingwei Zuo, Junxian Guo, Shang
+Yang, Haotian Tang, Yao Fu, and Song Han. 2024.
+Duoattention:
+Efficient long-context llm inference with retrieval and streaming heads.
+arXiv preprint arXiv:2410.10819 (2024).
+[66] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike
+Lewis. 2023. Efficient streaming language models with attention sinks.
+arXiv preprint arXiv:2309.17453 (2023).
+[67] Junyu Xiong, Yonghui Wang, Weichao Zhao, Chenyu Liu, Bing
+Yin, Wengang Zhou, and Houqiang Li. 2025.
+DocR1: Evi-
+dence Page-Guided GRPO for Multi-Page Document Understanding.
+arXiv:2508.07313 [cs.CV] https://arxiv.org/abs/2508.07313
+[68] Chejian Xu, Wei Ping, Peng Xu, Zihan Liu, Boxin Wang, Mohammad
+Shoeybi, and Bryan Catanzaro. 2025. From 128K to 4M: Efficient
+Training of Ultra-Long Context Large Language Models. arXiv preprint
+(2025).
+[69] Ceyu Xu, Yongji Wu, Xinyu Yang, Beidi Chen, Matthew Lentz,
+Danyang Zhuo, and Lisa Wu Wills. 2025. LLM. 265: Video Codecs are
+Secretly Tensor Codecs. In Proceedings of the 58th IEEE/ACM Interna-
+tional Symposium on Microarchitecture. 445–460.
+[70] Yichun Xu, Navjot K Khaira, and Tejinder Singh. 2026. KV Cache
+Optimization Strategies for Scalable and Efficient LLM Inference. arXiv
+preprint arXiv:2603.20397 (2026).
+[71] Dongjie Yang, XiaoDong Han, Yan Gao, Yao Hu, Shilin Zhang, and
+Hai Zhao. 2024. Pyramidinfer: Pyramid kv cache compression for
+high-throughput llm inference. In Findings of the Association for Com-
+putational Linguistics: ACL 2024. 3258–3270.
+[72] Shang Yang, Junxian Guo, Haotian Tang, Qinghao Hu, Guangxuan
+Xiao, Jiaming Tang, Yujun Lin, Zhijian Liu, Yao Lu, and Song Han.
+2025. Lserve: Efficient long-sequence llm serving with unified sparse
+attention. Proceedings of Machine Learning and Systems 7 (2025).
+[73] Jiayi Yao, Hanchen Li, Yuhan Liu, Siddhant Ray, Yihua Cheng, Qizheng
+Zhang, Kuntai Du, Shan Lu, and Junchen Jiang. 2025. Cacheblend:
+Fast large language model serving for rag with cached knowledge
+fusion. In Proceedings of the twentieth European conference on computer
+systems. 94–109.
+[74] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2025.
+Turboquant: Online vector quantization with near-optimal distortion
+rate. arXiv preprint arXiv:2504.19874 (2025).
+[75] Yusen Zhang, Ruoxi Sun, Yanfei Chen, Tomas Pfister, Rui Zhang, and
+Sercan O Arik. [n. d.]. Chain of agents: Large language models collabo-
+rating on long-context tasks, 2024. URL https://arxiv. org/abs/2406.02818
+3 ([n. d.]).
+[76] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin
+Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark
+Barrett, et al. 2023. H2o: Heavy-hitter oracle for efficient generative
+inference of large language models. Advances in Neural Information
+Processing Systems 36 (2023), 34661–34710.
+[77] Yilong Zhao, Jiaming Tang, Kan Zhu, Zihao Ye, Chi-Chih Chang, Chao-
+fan Lin, Jongseok Park, Guangxuan Xiao, Mohamed S. Abdelfattah,
+Mingyu Gao, Baris Kasikci, Song Han, and Ion Stoica. 2025. Accelerat-
+ing Large-Scale Reasoning Model Inference: Self-Speculative Decoding
+with Sparse Attention. arXiv preprint arXiv:2512.01278 (2025).
+[78] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody H Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E
+Gonzalez, et al. 2024. Sglang: Efficient execution of structured lan-
+guage model programs. Advances in neural information processing
+systems 37 (2024), 62557–62583.
+[79] Lucen Zhong, Zhengxiao Du, Xiaohan Zhang, Haiyi Hu, and
+Jie Tang. 2025.
+ComplexFuncBench: Exploring Multi-Step
+and Constrained Function Calling under Long-Context Scenario.
+arXiv:2501.10132 [cs.CL] https://arxiv.org/abs/2501.10132
+[80] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+Prefill and Decoding for Goodput-optimized Large Language Model
+Serving. In 18th USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 24).
+.
+.
+16
+
+
+A
+Proof of the KL Chain Rule for
+Autoregressive Distributions
+We prove Eq. (2) from Section 3: for autoregressive distribu-
+tions 𝑝full and 𝑝lossy over a sequence 𝑥1:𝑇, the sequence-level
+KL divergence decomposes additively as
+KL 𝑝full(𝑥1:𝑇) ∥𝑝lossy(𝑥1:𝑇) =
+𝑇∑︁
+𝑡=1
+E𝑥<𝑡∼𝑝full [KL𝑡] ,
+where KL𝑡
+≜
+KL 𝑝full(· | 𝑥<𝑡) ∥𝑝lossy(· | 𝑥<𝑡) is the per-
+step KL at decoding step 𝑡given the prefix 𝑥<𝑡.
+Proof. For brevity, let
+ℓ𝑡(𝑥≤𝑡) ≜log 𝑝full(𝑥𝑡| 𝑥<𝑡)
+𝑝lossy(𝑥𝑡| 𝑥<𝑡)
+denote the per-step log-likelihood ratio. By the chain rule
+of probability, both joint distributions factor as 𝑝(𝑥1:𝑇) =
+Î𝑇
+𝑡=1 𝑝(𝑥𝑡| 𝑥<𝑡), so
+log 𝑝full(𝑥1:𝑇)
+𝑝lossy(𝑥1:𝑇) =
+𝑇∑︁
+𝑡=1
+ℓ𝑡(𝑥≤𝑡).
+By definition, the sequence-level KL is the expected log-
+likelihood ratio under 𝑝full:
+KL1:𝑇= E𝑥1:𝑇∼𝑝full
+h
+log 𝑝full(𝑥1:𝑇)
+𝑝lossy(𝑥1:𝑇)
+i
+=
+𝑇∑︁
+𝑡=1
+E𝑥1:𝑇∼𝑝full [ℓ𝑡(𝑥≤𝑡)] .
+Each ℓ𝑡depends only on 𝑥≤𝑡, so by the tower property,
+E𝑥1:𝑇∼𝑝full [ℓ𝑡(𝑥≤𝑡)] = E𝑥<𝑡∼𝑝full
+
+E𝑥𝑡∼𝑝full(·|𝑥<𝑡) [ℓ𝑡(𝑥≤𝑡)]
+
+= E𝑥<𝑡∼𝑝full [KL𝑡] ,
+where the last equality uses the fact that the inner expecta-
+tion, E𝑥𝑡∼𝑝full(·|𝑥<𝑡) [ℓ𝑡], is exactly the per-step KL conditioned
+on 𝑥<𝑡. Substituting back,
+KL1:𝑇=
+𝑇∑︁
+𝑡=1
+E𝑥<𝑡∼𝑝full [KL𝑡] .
+■
+Implication. If the per-step KL is bounded below by some
+𝜀> 0 on average—i.e., E𝑥<𝑡∼𝑝full [KL𝑡] ≥𝜀for all 𝑡—then
+KL1:𝑇≥𝜀𝑇grows at least linearly in the output length 𝑇.
+Because KL1:𝑇= E𝑥∼𝑝full [log(𝑝full(𝑥1:𝑇)/𝑝lossy(𝑥1:𝑇))], this
+means the expected log-likelihood ratio under 𝑝full grows
+linearly in 𝑇. Equivalently, for a sample 𝑥1:𝑇∼𝑝full, the log-
+likelihood ratio log(𝑝full(𝑥1:𝑇)/𝑝lossy(𝑥1:𝑇)) has mean ≥𝜀𝑇,
+so the likelihood ratio itself is typically of order 𝑒𝜀𝑇—i.e.,
+exponential in 𝑇.
+B
+Full Theoretical Analysis
+This appendix provides the complete derivations for the
+throughput models summarized in Section 4.
+Table 3: Notation for theoretical analysis.
+Symbol
+Description
+Notations (shared)
+𝑀
+Model weights size
+KVfull
+Full KV cache size per request
+𝑐
+Compression fraction (KVcompressed = 𝑐· KVfull, 𝑐< 1)
+𝛾(𝑥,𝑐)
+Token acceptance rate (function of draft length and compression)
+𝑥
+Draft (speculation) length
+BWhbm
+GPU HBM bandwidth
+GPUmem
+GPU memory capacity
+Notations (intra-request token dropping)
+BWinter
+CPU–GPU interconnect bandwidth
+𝐵
+Total batch size (number of concurrent requests)
+𝐵𝑔
+Number of non-offloaded requests (full KV on GPU)
+𝐵𝑐
+Number of offloaded requests (full KV on CPU, 𝐵𝑔+ 𝐵𝑐= 𝐵)
+ℓ
+Cycles per load (iterations to complete one full-KV reload)
+Notations (inter-request KV quantization)
+𝐺𝐿
+Number of local GPUs (close to storage)
+𝐺𝑅
+Number of remote GPUs (far from storage)
+BWℎ
+Storage–local GPU bandwidth (high)
+BW𝑙
+Storage–remote GPU bandwidth (low)
+𝐾
+Number of output tokens per request
+B.1
+Intra-request KV access
+We consider a single GPU serving 𝐵homogeneous long-
+context decoding requests in steady state, where each re-
+quest has the same context length and thus the same KV
+cache size KVfull. We focus on the decode phase, which is
+HBM-bandwidth-bound for long-context workloads. Table 3
+summarizes the notation used throughout this analysis. All
+requests speculate: each cycles through 𝑥draft iterations
+(using compressed KV) followed by one verification iteration
+(using full KV). A request is either non-offloaded (𝐵𝑔: full
+KV remains on GPU) or offloaded (𝐵𝑐: full KV resides on
+CPU). Non-offloaded requests verify for free since the full
+KV is already on GPU; offloaded requests must reload the
+full KV from CPU for verification. In steady state,
+𝑥
+𝑥+1𝐵𝑐of-
+floaded requests are drafting and
+1
+𝑥+1𝐵𝑐are verifying, giving
+an average GPU KV footprint per offloaded request of:
+KVavg = KVfull · 𝑥𝑐+ 1
+𝑥+ 1 .
+(5)
+GPU memory constraint. Since KVavg < KVfull, VeriCache
+serves a larger batch than the baseline:
+𝑀+ 𝐵𝑔· KVfull + 𝐵𝑐· KVavg ≤GPUmem.
+(6)
+Per-iteration time. The GPU time is bounded by HBM band-
+width:
+𝑇gpu = 𝑀+ 𝐵· KVavg
+BWhbm
+.
+(7)
+Each offloaded verification requires transferring the extra
+KV of size (1−𝑐) · KVfull from CPU to GPU. Rather than
+assuming each reload completes within a single iteration, we
+17
+
+
+let ℓdenote the number of iterations a single reload spans
+(cycles per load). Spreading the transfer over ℓiterations
+reduces the per-iteration interconnect demand:
+𝑇xfer = 𝐵𝑐· (1 −𝑐) · KVfull
+(𝑥+ 1) · BWinter · ℓ.
+(8)
+However, the interconnect can only sustain one in-flight
+reload at a time, which constrains the arrival rate of new
+loads:
+𝐵𝑐
+𝑥+ 1 · ℓ≤1.
+(9)
+Since HBM reads and interconnect transfers use distinct
+hardware, they overlap:
+𝑇iter = max(𝑇gpu, 𝑇xfer).
+(10)
+Throughput. All requests produce 𝛾(𝑥,𝑐)·𝑥+1
+𝑥+1
+tokens per
+iteration on average, where𝛾(𝑥,𝑐) is the acceptance rate as a
+function of draft length and compression ratio. The scheduler
+chooses 𝐵𝑐, 𝑥, 𝑐, and ℓto maximize throughput:
+max
+𝐵𝑐,𝑥,𝑐, ℓ
+𝐵· 𝛾(𝑥,𝑐)·𝑥+1
+𝑥+1
+max 𝑇gpu, 𝑇xfer
+
+s.t. Eqs. (6), (9), 0 ≤𝐵𝑐≤𝐵,
+𝑥≥1, 0 < 𝑐< 1, ℓ≥1.
+(11)
+The four knobs navigate a trade-off between 𝑇gpu, 𝑇xfer, and
+the effective tokens per iteration. Increasing 𝐵𝑐lowers 𝑇gpu
+(smaller per-request HBM footprint enables larger batches
+and faster reads) but raises 𝑇xfer (more offloaded requests
+require more interconnect transfers). Increasing ℓreduces
+𝑇xfer by spreading each reload over more iterations, but the
+constraint 𝐵𝑐
+𝑥+1 · ℓ≤1 forces either fewer offloaded requests
+or longer draft sequences. Decreasing 𝑐further reduces 𝑇gpu
+by shrinking the compressed KV size, but also lowers 𝛾(𝑥,𝑐),
+reducing the number of accepted tokens per iteration. In-
+creasing 𝑥amortizes the interconnect cost over more draft
+tokens (lowering 𝑇xfer), but 𝛾(𝑥,𝑐) decreases with longer
+drafts, yielding diminishing returns in accepted tokens.
+The full KV baseline (𝐵𝑐=0) serves at most ⌊(GPUmem−𝑀)/KVfull⌋
+requests; pure lossy decoding serves up to 1/𝑐× more but
+sacrifices exactness. VeriCache operates between these ex-
+tremes while maintaining lossless output.
+B.2
+Inter-request KV reuse
+We consider a cluster with 𝐺𝐿local GPUs close to a KV stor-
+age node (bandwidth BWℎ) and 𝐺𝑅remote GPUs connected
+via a slower link (bandwidth BW𝑙, with BWℎ≫BW𝑙). Each
+request reuses a pre-computed KV cache from storage and
+must generate 𝐾output tokens. Here, for simplicity, we as-
+sume all requests have the same KV size and output length.
+We consider KV quantization methods where the KV cache is
+compressed offline to reduce network transfer size (𝑐· KVfull
+bytes) but is decompressed to full size on the GPU upon
+reuse.
+Derived quantities. Each GPU can batch at most 𝐵max =
+⌊(GPUmem−𝑀)/KVfull⌋requests. The per-request per-token
+decode time depends on the actual batch occupancy 𝐵of that
+GPU:
+𝑇tok(𝐵) = 𝑀/𝐵+ KVfull
+BWhbm
+.
+(12)
+Since model weights 𝑀are shared across the batch, 𝑇tok
+decreases as 𝐵grows and reaches its minimum at 𝐵= 𝐵max.
+Network transfer times per request are 𝑇ℎ= KVfull/BWℎ
+(full KV to local), 𝑇𝑙= KVfull/BW𝑙(full KV to remote), 𝑇𝑐
+𝑙=
+𝑐·KVfull/BW𝑙(compressed KV to remote), and𝑇rem
+𝑙
+= (1−𝑐)·
+KVfull/BW𝑙(remaining KV to remote).
+Resource model. We model each GPU pool with three re-
+sources: network time (how long the per-GPU network link
+is active), GPU compute time (how long the GPU computes),
+and memory-time (how long a memory slot is occupied). Al-
+though network and compute are serialized within a single re-
+quest, they use distinct hardware and can be pipelined across
+requests: one request’s KV transfer overlaps with another
+request’s decode on the same GPU. The capacity constraints
+are:
+Í
+𝑖𝐿net
+𝑖
+· 𝑛𝑖≤𝐺𝐿,
+(13)
+Í
+𝑖𝐿gpu
+𝑖
+· 𝑛𝑖≤𝐺𝐿,
+(14)
+Í
+𝑖𝐿mem
+𝑖
+· 𝑛𝑖≤𝐺𝐿· 𝐵max,
+(15)
+Í
+𝑖𝑅net
+𝑖
+· 𝑛𝑖≤𝐺𝑅,
+(16)
+Í
+𝑖𝑅gpu
+𝑖
+· 𝑛𝑖≤𝐺𝑅,
+(17)
+Í
+𝑖𝑅mem
+𝑖
+· 𝑛𝑖≤𝐺𝑅· 𝐵max,
+(18)
+where 𝑛𝑖is the throughput (requests per second) assigned
+to path 𝑖, and 𝐿net
+𝑖
+, 𝐿gpu
+𝑖
+, 𝐿mem
+𝑖
+, 𝑅net
+𝑖
+, 𝑅gpu
+𝑖
+, 𝑅mem
+𝑖
+are the per-
+request local and remote costs (in seconds). Memory-time
+equals the wall-clock duration a slot is occupied (transfer
+plus compute), and may exceed GPU compute time when
+KV is cached between verification rounds.
+Baseline paths. Two paths are available without VeriCache:
+• B1 (pure local): Transfer full KV to local, decode 𝐾tokens.
+𝐿net=𝑇ℎ, 𝐿gpu=𝐾· 𝑇tok, 𝐿mem=𝑇ℎ+ 𝐾· 𝑇tok, 𝑅=0.
+• B2 (pure remote): Transfer full KV to remote, decode 𝐾
+tokens. 𝑅net=𝑇𝑙, 𝑅gpu=𝐾· 𝑇tok, 𝑅mem=𝑇𝑙+ 𝐾· 𝑇tok, 𝐿=0.
+VeriCache paths. VeriCache adds two speculative paths
+that exploit the gap between compressed and full transfer
+times.
+P1 (verify-only, no full KV to remote). Remote receives
+compressed KV (𝑇𝑐
+𝑙) and drafts 𝐾/𝛾tokens with lossy KV.
+Local receives full KV (𝑇ℎ) and verifies in 𝑁1 = ⌈𝐾/(𝛾𝑥)⌉
+rounds of 𝑥draft tokens each. Since local GPU memory is
+limited, KV may be evicted between rounds. We model two
+variants:
+18
+
+
+• Cached: KV stays on local GPU across rounds. 𝐿net = 𝑇ℎ,
+𝐿gpu = 𝑁1 ·𝑇tok, 𝐿mem = 𝑇ℎ+ (𝐾/𝛾) ·𝑇tok (slot held during
+entire draft phase).
+• Stateless: KV re-transferred each round. 𝐿net = 𝑁1 · 𝑇ℎ,
+𝐿gpu = 𝑁1 · 𝑇tok, 𝐿mem = 𝑁1 · (𝑇ℎ+𝑇tok).
+In both cases, 𝑅net = 𝑇𝑐
+𝑙, 𝑅gpu = (𝐾/𝛾) · 𝑇tok, 𝑅mem = 𝑇𝑐
+𝑙+
+(𝐾/𝛾) ·𝑇tok. P1 is efficient for short outputs where streaming
+full KV to remote is wasteful.
+P2 (stream full KV to remote + AR). Remote receives
+compressed KV (𝑇𝑐
+𝑙) and begins drafting immediately. In par-
+allel, the remaining KV streams to remote (𝑇rem
+𝑙
+). During this
+streaming window, remote produces 𝑁draft = min(𝑇rem
+𝑙
+/𝑇tok, 𝐾/𝛾)
+draft tokens, verified by local in 𝑁2 = ⌈𝑁draft/𝑥⌉rounds.
+Once the full KV arrives, remote completes the remaining
+𝐾2 = max(0, 𝐾−𝛾· 𝑁draft) tokens via standard decode.
+• Remote: 𝑅net = 𝑇𝑐
+𝑙+𝑇rem
+𝑙
+, 𝑅gpu = (𝑁draft+𝐾2)·𝑇tok, 𝑅mem =
+𝑇𝑐
+𝑙+ max(𝑁draft · 𝑇tok, 𝑇rem
+𝑙
+) + 𝐾2 · 𝑇tok.
+• Local cached: 𝐿net = 𝑇ℎ, 𝐿gpu = 𝑁2 · 𝑇tok, 𝐿mem = 𝑇ℎ+
+𝑁draft · 𝑇tok.
+• Local stateless: 𝐿net = 𝑁2 · 𝑇ℎ, 𝐿gpu = 𝑁2 · 𝑇tok, 𝐿mem =
+𝑁2 · (𝑇ℎ+𝑇tok).
+P2 is efficient for long outputs where the streaming window
+amortizes the cost of transferring full KV.
+Throughput optimization. With all six paths {B1, B2, P1-
+cached, P1-stateless, P2-cached, P2-stateless}, the system
+maximizes total throughput (in tok/s):
+max
+{𝑛𝑖≥0} 𝐾· Í
+𝑖𝑛𝑖
+s.t. Eqs. (13)
+(19)
+where the resource costs in Eqs. (13) are evaluated at the
+actual batch occupancies implied by {𝑛𝑖}. The optimizer nat-
+urally selects the best mix: P1 for short outputs, P2 for long
+outputs, cached verification when local memory is abundant,
+stateless when local compute is abundant, and baseline paths
+when speculation offers no benefit.
+C
+Ideal Speedup Calculation for
+Speculative-Decoding Comparisons
+This calculation extends the intra-request throughput model
+of Appendix B.1 to a two-level speculation scheme. Veri-
+Cache proposes 𝑥outer tokens using the target model on
+compressed KV (the same 𝑥and 𝛾(𝑥,𝑐) as Appendix B.1); an
+auxiliary drafter (Eagle, MTP-head) proposes𝑑𝑒−1 additional
+tokens at each outer position.
+Under chain-independence of the two drafters, the ex-
+pected accepted draft length per cycle becomes
+𝛾(𝑥,𝑐) · 𝑥·
+
+1 + 𝛾𝑒(𝑑𝑒) · (𝑑𝑒−1)
+
+,
+i.e., VeriCache’s accepted length𝛾(𝑥,𝑐)·𝑥from Eq. (11) scaled
+by the composition multiplier [1 + 𝛾𝑒(𝑑𝑒)(𝑑𝑒−1)].
+Received 20 February 2007; revised 12 March 2009; accepted 5 June
+2009
+19

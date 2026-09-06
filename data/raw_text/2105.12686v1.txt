@@ -1,0 +1,1127 @@
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+1
+Dynamic Probabilistic Pruning: A general
+framework for hardware-constrained pruning at
+different granularities
+Lizeth Gonzalez-Carabarin, Iris A.M. Huijben, Bastiaan S. Veeling, Alexandre Schmid and Ruud J.G. van Sloun
+Abstract—Unstructured neural network pruning algorithms
+have achieved impressive compression rates. However, the re-
+sulting - typically irregular - sparse matrices hamper efﬁcient
+hardware implementations, leading to additional memory usage
+and complex control logic that diminishes the beneﬁts of un-
+structured pruning. This has spurred structured coarse-grained
+pruning solutions that prune entire ﬁlters or even layers, enabling
+efﬁcient implementation at the expense of reduced ﬂexibility. Here
+we propose a ﬂexible new pruning mechanism that facilitates
+pruning at different granularities (weights, kernels, ﬁlters/feature
+maps), while retaining efﬁcient memory-organization (e.g. prun-
+ing exactly k-out-of-n weights for every output neuron, or
+pruning exactly k-out-of-n kernels for every feature map). We
+refer to this algorithm as Dynamic Probabilistic Pruning (DPP).
+DPP leverages the Gumbel-softmax relaxation for differentiable
+k-out-of-n sampling, facilitating end-to-end optimization. We
+show that DPP achieves competitive compression rates and clas-
+siﬁcation accuracy when pruning common deep learning models
+trained on different benchmark datasets for image classiﬁcation.
+Relevantly, the non-magnitude-based nature of DPP allows for
+joint optimization of pruning and weight quantization in order
+to even further compress the network, which we show as well.
+Finally, we propose novel information theoretic metrics that show
+the conﬁdence and pruning diversity of pruning masks within a
+layer.
+Index Terms—IEEE, IEEEtran, journal, LATEX, paper, tem-
+plate.
+I. INTRODUCTION
+T
+HE evident success of Deep Learning (DL) models is
+accompanied by a steadfast growth in the number of
+hyperparameters and computational cost. This has become a
+bottleneck for hardware deployment, which is constrained to
+certain computational and memory budgets. For instance, the
+VGG-16 architecture occupies more than 500 MB of storage
+and performs 1.6 x 1010 ﬂoating-point arithmetic operations
+[1], [2]. In contrast, ﬁeld-programmable gate array (FPGA)-
+based platforms are constrained to a few thousands computing
+operations, making them unsuitable for deployment of large
+DL models.
+To shrink such big models, different solutions have been
+proposed such as quantization [3] (and in the extreme case
+binarization [4]), knowledge distillation, [5], weight sharing
+[6], and model pruning.
+Pruning has gained notable attention since pruned model
+performance was found to yield on par performance compared
+with non-pruned counterparts. Remarkably, pruning has been
+shown to prevent overﬁtting as well [7], [8]. Pruning algorithms
+can result in either structured or unstructured pruning strategies.
+(a)
+(b)
+Fig. 1: Illustration of memory sparse formats of custom hard-
+ware for (a) unstructured ﬁne-grained and (b) structured ﬁne-
+grained pruning. DPP learns sparse patterns that follow a regular
+structure, facilitating memory organization by preventing zero-
+padding, and therewith allowing efﬁcient bandwidth usage.
+Structured pruning methods remove model parts at the level of
+e.g. layer, channels, or individual ﬁlters [9]. We refer to this
+kind of pruning as structured coarse-grained pruning. Unstruc-
+tured pruning, on the other hand, prunes individual weights (i.e.
+it sets a fraction of weights to zero). We refer to this type of
+pruning as unstructured ﬁne-grained pruning. Unstructured
+ﬁne-grained pruning has achieved impressive compression
+rates, nevertheless implementing ﬁne-grained sparse matrices
+in dedicated hardware is a challenging task due to the typically
+irregular distribution of non-zero values. Usually, to avoid
+storage of a large number of zeros, non-zero values are stored
+in speciﬁc formats [10]. Several other works have proposed
+more sophisticated compressing coding techniques for sparse
+weights targeting hardware implementations [11], [12], [13].
+For instance, COO format stores the indexes of columns and
+rows of non-zero values, and the ELLPACK format stores only
+the column indexes but a zero padding is required, wasting
+a large amount of memory and leading to poor bandwidth
+usage (see Fig.1a). Besides, additional control logic is required
+to compute operations (e.g matrix multiplication) with such
+formats, increasing the complexity and power consumption for
+arXiv:2105.12686v1  [cs.LG]  26 May 2021
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+2
+embedded applications [14], [15], [16]. Therefore, we propose
+a framework that naturally generates structured sparsity for
+several levels of granularity, by ﬁxing the number of active
+elements within a candidate set (comprising e.g. weights,
+kernels, ﬁlters) to K.
+Fig.1b illustrates the beneﬁts of our approach for unstruc-
+tured ﬁne-grained vs structured ﬁne-grained pruning (our
+approach). The additional degree of freedom on selecting the
+granularity level allows to chose the best pattern depending
+on the network’s architecture and/or application. In addition,
+the framework is capable of integrating both pruning and
+quantization, to beneﬁt from both techniques. The proposed
+method exploits the notion of Deep Probabilistic Subsampling
+(DPS) [17] to dynamically generate stochastic pruning masks
+during training, which are independent of the magnitude of
+the weights, allowing for direct applications to quantize and
+even binarize weights in one run without the need of post-
+training ﬁnetuning. The main contributions of this work are
+the following:
+• We propose Deep Probabilistic Pruning (DPP), which
+learns to generate hardware-oriented sparse structures
+for different levels of granularity: ﬁne-grained (weights),
+medium-grained (kernels) and coarse-grained (ﬁlters),
+facilitating memory allocation and access for hardware
+implementations. We adopt a layer-wise sparsity level that
+can be selected by the user, which is beneﬁcial in case
+of hardware constraints that dictate a maximum memory
+usage and speciﬁc patterns.
+• Thanks to the fact that DPP is not a magnitude-based
+pruning algorithm, it allows for joint optimization of
+pruning masks and quantization (and even binarization) of
+network parameters, producing ultra-compressed models
+with low-memory and low-complexity, suitable for further
+dedicated hardware.
+• Leveraging the probabilistic nature of DPP, we propose
+novel information-theoretic metrics that capture the conﬁ-
+dence and diversity of the pruning masks leveraged within
+a network layer. We show how these metrics differ during
+training and between fully-connected and convolutional
+layers.
+II. RELATED WORK
+In this section we will give an overview on different pruning
+strategies. Network pruning approaches can be coarsely divided
+into single- and multi-stage strategies, strategies that prune
+at different granularities, i.e. ﬁne-grained (weights), medium-
+grained (kernels), and coarse-grained (ﬁlters), and approaches
+that do or do not result in hardware-friendly pruned models.
+Hardware-friendly pruning is achieved when structure is
+present in the pruning pattern, since an unstructured selection
+results in memory storage using matrices that need (memory-
+inefﬁcient) zero-ﬁlling. When pruning entire ﬁlters (or even
+layers), such structure is present, and therefore, conventionally,
+the term coarse-grained pruning is often used analogously with
+the term structured pruning. Similarly, ﬁne-grained pruning
+is often referred to as unstructured pruning. Following the
+terminology introduced by [18], we slightly redeﬁne terms and
+use structured pruning for methods that result in hardware-
+friendly pruned models at any granularity.
+Our approach generalizes advantages of different methods
+into one general framework that - opposed to other approaches
+- facilitates single-stage, hardware-friendly pruning at any
+granularity; ﬁne-, medium- and coarse-grained. Additionally,
+it allows for joint optimization of pruning and quantization
+(and even binarization).
+A. Unstructured ﬁne-grained pruning
+The early work of [19] proposed a three-stage pipeline for
+unstructured ﬁne-grained pruning, which was later extended to
+deep compression [6]. These works were followed by single-
+stage pruning approaches, that jointly/dynamically optimize
+both the model parameters and pruning process. The authors of
+[20], [21] e.g. prune weights based on the gradual increment
+of sparsity during training, and a magnitude-based pruning
+framework in which a minimal sparsity value is set, is proposed
+at [22] propose.
+Further the work of [23] proposes Dynamic Sparse Reparam-
+eterization (DSR) based on an adaptive threshold for pruning
+and an automatic reallocation of pruning parameters across
+layers. The authors of [24] propose to select the weights with
+highest momentum, which signiﬁcantly improved accuracy. All
+these works yield unstructured ﬁne-grained pruning matrices,
+which lead to inefﬁciencies in terms of memory access and
+allocation in current hardware platforms [25], [26].
+B. Structured coarse-grained pruning
+To prevent unstructured pruning masks, previous work has
+explored pruning at the architectural level (rather than the
+weight level) such as pruning ﬁlters or layers. In fact, it
+has been experimentally shown that rather than eliminating
+weight connections, pruning at the architectural level may offer
+more beneﬁts to reduce memory, while retaining state-of-the-
+art accuracy [9]. Most works adopt a multi-stage approach,
+where pruning and model training happens disjointly [27],
+[28], [29], [30], [31], [32]. Such multi-stage methods typically
+suffer from performance drops after pruning, requiring ﬁne-
+tuning steps. The magnitudes of the weights are often used as
+indicator whether or not to prune an entire structure, [28] e.g.
+prunes ﬁlters based on the sum of the absolute magnitudes of
+the corresponding weights, and [33] proposed the Structured
+Sparsity Learning (SSL) method to prune ﬁlters, channels,
+and depth structures. Different from the magnitude-based
+approaches, [34] rely on the output of activation layers and
+calculate an average percentage of zeros as a weighting for the
+ﬁlter relevance. The authors of [35], [36] leverage, opposed to
+the other methods, a single-stage approach. The work of [36]
+most resembles our generalized framework, when applied on
+the coarse level. However, we are guaranteed to exactly select
+k-out-of-n ﬁlters, while this number k is only approximated
+using a proxy for the ℓ0 penalty during training in the work
+of [36]. To conclude, all methods reviewed in this paragraph
+prune at coarse-grained level (layers or ﬁlters), and have not
+been transferred to prune models at ﬁne-grained levels (i.e.
+weights), making them more restricted than our generalized
+framework that is suitable for pruning any of the granularities.
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+3
+C. Structured ﬁne-grained pruning
+To the best of our knowledge only few works have addressed
+the issue of structured pruning of ﬁne-grained elements
+(weights). The authors of [37] introduce convolutional sparse
+patterns for hardware-oriented pruning, however this approach
+limits the possible pruning patterns to only a few options,
+reducing its ﬂexibility. The work of [38] also introduces a
+hardware-friendly sparse approach for kernel pruning, however
+it requires several stages to achieve competitive results, which
+contrasts with our single-stage approach. The authors of [39]
+also proposed the generation of structured ﬁne-grained pruning
+by generating sparse patterns compatible with their GPU A100.
+Their approach also considers a multi-stage approach, and it
+is focused on ﬁne-grained pruning, without exploring other
+levels of granularity. Recently, [18] extended the work of [39]
+to a single-stage approach, by jointly training the model to
+generate structured ﬁne-grained pruning from scratch. Their
+method in its current form, however, is only applicable to
+ﬁne-grained pruning, since the pruning mask is directly created
+from the magnitudes of the weights. Moreover, the authors
+adopt the straight-through estimator (STE) to circumvent the
+non-differentiable pruning procedure, while we adopt a more
+principled gradient estimator, dedicated to differentiable subset
+sampling [40].
+D. Pruning and quantization
+Works that optimize pruning and quantization offer ultra-
+compressed models for higher memory savings for unstructured
+pruning [41] [42], and structured pruning [43], [6], [42], [44],
+[41], [45], [46], [43], [47]. Nevertheless, many of them require
+several stages during training to achieve this integration; none
+of these works has achieved joint optimization of quantization
+and structured ﬁne-grained pruning.
+III. METHODOLOGY
+A. Notation
+We introduce a neural network with L layers, indexed with
+i. Each layer is parameterised by a
+matrix W (i) ∈RN(i−1)×a×N(i), and a bias vector b(i) ∈
+RN(i) (which we ignore in the rest of the notations), where
+N (i−1) and N (i) are the number of feature maps (or channels)
+of layer i −1 and i, respectively, and a (= √a × √a) denotes
+the size of a 2D convolutional kernel.
+The
+output
+of
+the
+ith
+layer
+can
+be
+deﬁned
+as
+x(i) = g(i)
+W (x(i−1)), where the functionality of g(i)
+W (), depends
+on the layer being e.g. fully-connected or convolutional, and
+linearly or non-linearly activated. Note that the fully-connected
+layer is a special case of a convolutional layer with a = 1.
+B. Dynamic masking based on probabilistic subsampling
+We aim to jointly optimize the parameters of the model
+while simultaneously learning to prune them. In this section
+we explain how our framework, which we refer to as Dynamic
+Probabilistic Pruning (DPP), achieves this joint learning.
+For all layers g(i)
+W (), with i ∈{1, . . . , L}, we introduce
+a binary mask M Φ(i) ∈{0, 1}, parameterised by Φ(i). By
+Fig. 2: An illustration of deep probabilistic pruning (DPP) for
+dynamically masking of weights W (i) with a binary mask
+realization f
+M Φ(i). This mask is generated by sampling from
+a categorical distribution with probabilities that are jointly
+trained with the model weights W . The symbol ⋆indicates
+element-wise multiplication.
+means of element-wise multiplication it activates a subset of S
+elements from W (i). Generation of these masks M Φ(i) follows
+the DPS-topK framework [17], on which we will elaborate
+here.
+The authors of [17] propose an end-to-end framework for
+joint learning of a discrete sampling mask with a downstream
+task model by introducing DPS; a parameterised generative
+sampling model:
+P(M Φ(i)|Φ(i)).
+(1)
+Trainable parameters Φ(i) ∈RN(i−1)×a×N(i) denote unnor-
+malized log-probabilities (logits). In order to generate a binary
+sampling mask realization f
+M Φ(i) from Φ(i), we select/sample
+exactly K unique values over one axis of Φ(i). This implies
+that pruning takes place over this same axis in W (i) (e.g.
+pruning the N (i) channels of layer i, implies sampling over the
+axis of length N (i)). As this pruning axis differs per case in
+our experiment section, we denote it with p-axis (pruning axis)
+for now. Each element in Φ(i) is thus the (unnormalized) log-
+probability of activating the corresponding element in W (i).
+Note that thanks to the fact that the binary mask f
+M Φ(i) is
+parameterised on Φ(i) rather than W (i), we can combine DPP
+with quantization of the values in W (i), which we can jointly
+learn as well.
+Similarly as in [17], [48], we adopt Gumbel top-K sampling
+[49], [50] to draw K unique elements from the elements in the
+pruning axis. We denote this operation by topKp-axis(·), where
+the subscript p-axis indicates that sampling is only performed
+over the pruning axis. In order to create a binary sampling
+mask of equivalent size as W(i), we transform the samples to
+a K-hot vector, which contains K ones at the selected indices,
+and zeros at the remaining/non-selected positions. Formally,
+we deﬁne the binary mask realization f
+M Φ(i) as:
+f
+M Φ(i) = Khotp-axis
+
+topKp-axis(Φ(i) + βE(i))
+	
+,
+(2)
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+4
+where E ∈RN (i−1)×a×N (i) are i.i.d. Gumbel noise samples
+from Gumbel(0, 1), scaled with a scalar 0 < β ≤1. Note that
+the pruning axis relates to only one of the three axes of the
+3-dimensional matrix f
+M Φ(i). Therefore, the total number of
+active elements S in f
+M Φ(i) does not equal K, but K times
+the size of the two remaining axes.
+If we would allow S ones to be distributed randomly within
+f
+M Φ(i), it would result in unstructured pruning of the model
+when applying this mask element-wise on W (i). However, by
+demanding exactly K elements to be active over the pruning
+axis, we enforce structure in the binary mask f
+M Φ(i). To deﬁne
+structure at different granularities (e.g. pruning weights, kernels
+or ﬁlters), we ‘tie’ together certain elements in Φ(i), such
+that they all update equivalently during training. It effectively
+reduces the number of trainable logits within Φ(i). As a result,
+if for example all logits over the kernel axis with size √a×√a
+are tied, a kernel will be either activated or deactivated as a
+whole, rather than on weight level. Section III-C elaborates on
+structured pruning at different granularities.
+During backpropagation the Khotp-axis ◦topKp-axis operation
+must be relaxed as it is non-differentiable. The work of [48],
+[17] proposes to adopt the Gumbel-softmax relaxation [51],
+[52] for that. It relaxes the non-differentiable argmax operation
+using a temperature (τ)-parameterised softmaxτ(·) function.
+The authors of [50] showed that sampling K times without
+replacement from the same distribution is equivalent to top-
+K sampling, and [40] showed that iterative sampling without
+replacement from its relaxed counterpart (using the softmax),
+is a valid top-K relaxation. As such we can directly leverage
+Gumbel-softmax sampling without replacement during back-
+propagation in order to ﬂow gradients to Φ(i) ∀i ∈{1, . . . , L}.
+Figure 2 and Algorithm 1 provide a schematic overview and
+pseudocode, respectively, of the full training procedure.
+C. DPP for pruning different levels of granularity
+As explained in the previous section, DPP learns a binary
+mask f
+M Φ(i) that selects exactly S elements from W (i). By
+connecting trainable log-probabilities in Φ(i) during training,
+we enforce pruning at different granularaties. We deﬁne three
+different pruning scenarios: a) Fine-grained pruning (DPP-F)
+b) Medium-grained pruning (DPP-M) and c) Coarse-grained
+pruning (DPP-C).
+Figure 3 illustrates the three scenarios. DPP-F activates K out
+of a kernel weights for each (2D) kernel within each (3D) ﬁlter.
+DPP-M on the other hand activates K (out of N (i−1)) kernels
+per N (i) feature maps of layer i. Finally, DPP-C activates K
+entire ﬁlters per layer. Table I summarizes the three different
+scenarios, and also indicates the number of values to be stored
+in memory in case of hardware implementation of the pruned
+model (e.g. on an FPGA). Additionally, for clariﬁcation we
+indicate the effective number of trainable logits within Φ(i) as a
+results of connecting logits over certain axes to enforce pruning
+at different granularities. Taking DPP-M as an example; as we
+prune K out of N (i−1) entire kernels, the weights axis (of
+size a) has tied logits, as either all or none of the weights in a
+kernel are activated by the binary mask. We can interpret the
+resulting 2-dimensional logits matrix Φ(i) as containing the
+Algorithm 1: Dynamic Probabilistic Pruning (DPP)
+Input: Training dataset D, neural network with L layers, and
+initialized trainable parameters {Φ}, W , b}, Number of
+active elements K, Pruning axis p-axis, Gumbel noise
+scaling β, temperature annealing settings
+{τinit, τend} = {5.0, 0.5}, Loss scaling µ, number of epochs
+niter.
+Output: Model with trained parameters W and b, binary
+mask realizations f
+M Φ parameterised by Φ.
+- Compute: ∆τ = τinit−τend
+niter−1
+for n = 1 to niter do
+// Forward pass
+- Draw random batch xn ∼D
+for i = 1 to L do
+- Draw i.i.d. Gumbel noise samples: E(i)
+- Sample binary mask:
+f
+M Φ(i) = Khotp-axis
+
+topKp-axis(Φ(i) + βE(i))
+	
+- Apply mask: f
+W
+(i) = W (i) ⃝∗f
+M Φ(i)
+end for
+- Compute output: ˆxn = gL
+f
+W ◦g1
+f
+W (xn)
+- Compute loss: LCE(ˆx, x) + Le(Φ)
+// Backward pass
+- Set: τ = τinit −(i −1) · ∆τ
+- ∇Φ f
+M Φ ∝∇ΦEE
+
+softmaxp-axis{ Φ+βE
+τ
+}
+
+- Update: {Φ, W , b} ∝LCE(ˆx, x) + µLe(Φ)
+end for
+log-probabilities of N (i) number of categorical distributions,
+each containing N (i−1) classes. In order to generalize the three
+scenarios, we deﬁne D as the number of such independent
+categorical distributions, and C as the number of classes of
+each of these distributions.
+In the particular case of pruning connections within fully-
+connected layers, DPP activates K (out of N (i−1)) input
+neurons for each N (i) output neurons. Given the different
+granularity deﬁnitions we proposed, this pruning situation ﬁts
+to DPP-M, with a = 1. However, as the weights of the input
+neurons are the smallest possible entity to be pruned in fully-
+connected layers, this case is in literature often referred to as
+structured ﬁne-grained pruning [18], [39]. In the rest of this
+paper, we therefore use DPP-F when referring to the special
+case of pruning connections in fully-connected layers.
+D. Training details
+Here we elaborate on training details of DPP. We jointly
+train the model parameters {W , b} and the unnormalized logits
+in Φ, by means of error back-propagation of the total loss
+with respect to these parameters. The down-stream task model
+loss is deﬁned as the cross-entropy between the targets and
+the predictions (denoted with LCE). Also, to encourage sparse
+distributions in Φ, as proposed by [17] (eq. 8), we penalize
+these unnormalized log-probabilities with an entropy penalty
+Le, which we multiply by µ. During training, the unnormalized
+log-probabilities Φ(i) (∀i ∈L) are constantly being updated.
+Also, the realization of the Gaussian noise matrix E(i) differs
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+5
+TABLE I: DPP for structured pruning for different granularity levels, and their corresponding pruned axis. For the estimation of
+the amount of stored values, the number of necessary indexes to point non-zero values plus the amount of non-zero elements
+m is considered.
+Granularity
+Pruning axis
+Effective nr of trainable
+D: nr of independent
+S: nr of active
+Stored values
+level
+(K out of C)
+logits per layer i
+categorical distr.
+weights in W (i)
+per layer i
+Fine
+Kernel weights
+N (i−1) × a × N (i)
+N (i−1) × N (i)
+N (i−1) × K × N (i)
+2S
+(DPP-F)
+(K out of a)
+Medium
+Kernels
+N (i−1) × 1 × N (i)
+1 × N (i)
+K × a × N (i)
+S + KN (i)
+(DPP-M)
+(K out of N (i−1))
+Coarse
+Filters
+1 × 1 × N (i)
+1 × 1
+N (i−1) × a × K
+S
+(DPP-C)
+(K out of N (i))
+per element within a mini-batch and over training/epochs. As a
+result, binary mask realizations vary during training and within
+the mini-batches, allowing the model to efﬁciently explore
+different pruned model instantiations. While in the original
+Gumbel-max trick [49] the Gumbel noise is typically un-scaled
+when sampling from the distribution, heuristically, we found
+improved model performance when down-scaling the Gumbel
+noise with a factor β. In the experiments where we combine
+DPP with parameter quantization, we follow the quantization
+procedure proposed by [53]. In all experiments we prune (and
+in some cases quantize) only W , and not b, as the weights
+in W contribute to the largest part of the parameters in the
+model.
+During inference, one binary mask f
+M Φ(i) per layer is drawn
+from the trained log-probabilities Φ(i), which is then used to
+prune the model and compute the performance on the test set.
+E. Information-theoretic metrics on sparsity conﬁdence and
+diversity
+To get insight into the training dynamics of DPP, we are
+interested in the change of conﬁdence and diversity of the
+pruning patterns as training progresses. The probabilistic nature
+of DPP enables the use of the information theoretic measures,
+entropy and mutual information, to evaluate this. We compute
+these metrics per layer i due to the heterogeneity of the masks
+between layers.
+As deﬁned in Section III-C, within each layer i, D (≥1)
+number of independent categorical distributions, each with C
+classes are being trained, from which we sample K out of
+C elements (weights, kernels or ﬁlters) without replacement.
+The average entropy of these D pruning distributions tells us
+how conﬁdent the sparsity patterns on average are within this
+layer; the lower this Average Pruning Entropy, the sparser
+the distributions, and thus the more certain the model is about
+the binary mask to be applied. Note, this metric can only be
+computed for DPP-F and DPP-M, as DPP-C implies D = 1
+(see Table I).
+We can measure the average entropy from these D prun-
+ing distributions in the ith-layer mask marginal probabilities
+{π(i) ∈RD×C : 0 ≤π(i)
+d,c ≤1, P
+c π(i)
+d,c = K}. No tractable
+function exists to compute marginal probabilities π from the
+unnormalized log-probabilities in Φ. Instead we can easily
+take a Monte Carlo estimate by computing the average of T
+realizations of M Φ(i):
+π(i) ≈1
+T
+T
+X
+t=1
+f
+M Φ(i),
+f
+M Φ(i) ∼P(M Φ(i)|Φ(i)),
+(3)
+which
+can
+effectively
+be
+estimated
+in
+parallel
+af-
+ter every epoch for T
+=
+100. It’s trivial to show
+that the entropy of any Gumbel-top-K distributed vari-
+able x can be computed using the typical Shannon en-
+tropy H(x) = −PC
+c=1 P(c ∈x) log P(c ∈x), and is upper
+bounded by −K log(K/C). As such, we can compute the
+Average Pruning Entropy for layer i:
+H(M Φ(i)|d) = 1
+D
+D
+X
+d=1
+[−
+C
+X
+c=1
+π(i)
+d,c log π(i)
+d,c].
+(4)
+Furthermore, we can measure the diversity of the different
+sparsity patterns (within layer i), that result from sampling from
+the D independent categorical distributions. This diversity can
+be measured as the mutual information between the different
+masks in layer i.
+This Pruning Diversity metric can be formalized as:
+I(M Φ(i), d) = H(M Φ(i)) −H(M Φ(i)|d),
+(5)
+where H(M Φ(i)) denotes the entropy of the average mask
+in layer i:
+H(M Φ(i)) = −
+C
+X
+c=1
+eπ(i)
+c
+log eπ(i)
+c ,
+with
+eπ(i) = 1
+D
+D
+X
+d=1
+π(i)
+d
+∈R1×C.
+(6)
+IV. EXPERIMENTS
+We ﬁrst assess DPP for pruning weights (FPP-F) on small
+convolutional and fully-connected architectures (LeNet) for
+the MNIST dataset. Additionally, we will demonstrate the
+performance in LeNet architectures in combination with
+quantized and binary weights based on [53]. Across these
+experiments, we set a K value per layer, which determines
+the exact number of non-pruned weights assigned to each
+output neuron. In the case of convolutional layers, K is the
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+6
+a. Fine-grained pruning (DPP-F): pruning weights
+b. Medium-grained pruning (DPP-M): pruning kernels
+c. Coarse-grained pruning (DPP-C): pruning ﬁlters
+Fig. 3: Visualization for activating exactly K elements at three
+different granularities (weights, kernels, ﬁlters). All adopted
+values are illustrative. Black squares of masks denote selected
+connections. We also show how the structure in our sparse
+matrices enables efﬁcient memory implementation for all three
+cases.
+number of non-pruned kernel weights per input feature map.
+Second, we test DPP for structured medium- and coarse-grained
+pruning (DPP-M and DPP-C) in medium-size convolutional
+networks (VGG-16 and MobileNet v1). It is important to notice
+that structured ﬁne-grained pruning (DPP-F) is used for fully-
+connected layers. For DPP-C, we use K as a selector of the
+number of kernels or ﬁlters that must remain active in each
+layer, while for DPP-M, K is the number of non-pruned kernels
+per output feature map. Additionally, we integrate quantization
+for medium-size datasets (VGG-16). We train all our models
+from scratch, without using any pre-trained model. For the
+results, non-pruned accuracy refers to the baseline accuracy
+for non-pruned networks, while pruned accuracy refers to the
+accuracy obtained after the network is pruned. ∆acc is obtained
+after the network is pruned with the remaining parameters.
+Since in some experiments, DPP is jointly integrated with
+quantization [53], the bit representation is presented, as well
+as the compression rate after pruning and quantization. For the
+compression rate, we consider the additional required memory
+to store the indexes of non-pruned values.
+A. MNIST
+We evaluate DPP ﬁrst on MNIST benchmark dataset con-
+sisting of a total of 70,000 grayscale images of handwritten
+digits having a size of 28 × 28 pixels. We use 60,000 images
+for training and 10,000 images for testing. We evaluate the
+performance on 2 architectures. First, we use LeNet 300-100
+[54], which consists of two fully-connected layers of 300 and
+100 units, respectively. For this experiment, we use structured
+ﬁne-grained pruning or DPP-F. Second, we use LeNet-5 Caffe,
+which consists on two convolutional layers (20 and 50 ﬁlters
+respectively) followed by one fully-connected layer and a
+classiﬁcation layer [54]. Both, the convolutional and fully-
+connected layer are pruned with DPP-F. We compare DPP-F
+with one of the latest ﬁne-grained pruning algorithms [55] and
+show results in Table II.
+Training details. For training both networks we use Adam
+optimizer with a learning rate of 0.001, µ is set to 0.005, while
+β is set to 1 . We used a batch size of 128, and all weights
+are initialized with Xavier uniform initialization
+B. CIFAR-10 and CIFAR-100
+We evaluate DPP-C and DPP-M on VGG-16 [58] and
+MobileNet v1 for both CIFAR-10 and CIFAR-100. For VGG-
+16 trained on CIFAR-10, we evaluate DPP-M with PENNI-D.
+PENNI-D was recently proposed by [38], and similarly provides
+a method for kernel pruning. Notice that [38] provides a four-
+stage pruning pipeline, therefore we based our comparison
+with PENNI-D (without the additional shrinkage stage). DPP-
+C is compared with the recent ﬁlter pruning algorithm of [56]
+for both cases, CIFAR-10 and CIFAR-100. Finally, DPP-C is
+compared with [57] that performs ﬁlter pruning. Relevantly,
+for all fully-connected layers, DPP-F is applied, therefore the
+networks are completely pruned in all stages (convolutional
+and fully-connected layers), in comparison with most of
+conventional structured pruning approaches. Results are shown
+in Table II.
+Training details. Training details for CIFAR-10 and CIFAR-
+100 include a learning rate schedule, which halves the learning
+rate every 40 epochs. µ is set to 0.005, while β is set to 0.1 SGD
+optimizer is used with momentum=0.9. Data augmentation is
+used for these experiments. All weights are initialized using
+He normal initialization
+C. ImageNet
+We test DPP-C on ResNet18 trained on the ImageNet dataset
+[59]. We train the model with an initial learning rate of 0.1,
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+7
+TABLE II: Experimental results of DPP for MNIST dataset using LeNet architectures
+Network
+Model
+Non-pruned
+Pruned
+∆acc
+Remain. (%)
+Bits
+Compression
+acc. (%)
+acc. (%)
+params.
+rate
+[55]
+98.16
+98.03
+-0.13
+2.48
+32
+13,44x
+DPP-F (This work)
+98.19
+97.90
+-0.29
+1.95
+32
+25.64x
+LeNet300-100
+DPP-F (This work)
+98.19
+97.82
+-0.37
+6.71
+8
+29.80x
+DPP-F (This work)
+98.19
+96.81
+-1.38
+21
+2
+38.09x
+[55]
+99.18
+99.11
+-0.07
+1.64
+32
+20.32x
+DPP-F (This work)
+99.23
+99.23
+0.0
+2.5
+32
+20x
+LeNet5-Caffe
+DPP-F (This work)
+99.23
+99.00
+-0.23
+4.1
+8
+48.78x
+DPP-F (This work)
+99.23
+98.36
+-0.87
+4.1
+2
+195.12x
+TABLE III: Experimental results of DPP for CIFAR-10 and CIFAR-100 datasets using VGG-16 and MobileNet v1 architectures
+Dataset
+Network
+Model
+Non-pruned
+Pruned
+∆acc
+Remain. (%)
+Bits
+Comp.
+acc.(%)
+acc. (%)
+params.
+rate
+CIFAR-10
+VGG-16
+[38]
+93.49
+93.14
+-0.35
+55.56
+32
+1.80x
+DPP-M (This work)
+93.50
+93.60
++0.10
+10.73
+32
+9.32x
+DPP-M (This work)
+93.50
+93.52
++0.02
+15.3
+8
+26.14x
+[56]
+93.25
+93.18
+-0.07
+26.66
+32
+3.75x
+DPP-C (This work)
+93.50
+93.52
++0.02
+19.49
+32
+5.13x
+DPP-C (This work)
+93.50
+93.10
+-0.4
+15.61
+8
+25.62x
+MobileNet v1
+[57]
+92.3
+91.77
+-0.53
+25
+32
+4x
+DPP-C (This work)
+93.6
+93.14
+-0.46
+36,95
+32
+2.70x
+CIFAR-100
+VGG-16
+[56]
+73.26
+73.33
++0.07
+68
+32
+1.47x
+DPP-C (This work)
+70.32
+70.40
++0.08
+18.8
+32
+5.31x
+MobileNet v1
+[57]
+69.1
+68.52
+-0.58
+35
+32
+2.85x
+DPP-C (This work)
+72.35
+72.50
+-0.15
+40
+32
+2.50x
+which we decreased by a factor of 10 after 30 epochs. We use
+the SGD optimizer with a momentum of 0.9. After training for
+35 epochs, the top-1 test accuracy with 48.24% of the ﬁlters
+dynamically pruned is 62.3%, which is only 0.2% lower than
+its non-pruned counterpart.
+D. Analysis of sparsity belief over time
+To analyze the pruning behavior during training, we vi-
+sualize the proposed metrics from Section III-E in Fig. 4,
+where we normalized by the upper bound of the entropy
+to facilitate straightforward comparison between layers. Re-
+call that a low Average Pruning EntropyH(M Φ(i)|d) de-
+notes a high conﬁdence in pruning masks, whereas a high
+Pruning DiversityI(M Φ(i), d) indicates high mask diver-
+sity/specialization.
+We ﬁnd interesting dynamics in Fig. 4a,b (VGG16 - CI-
+FAR10), where convolutional layers seem to more quickly
+learn a diverse set of sparse patterns (I(M Φ(i), d) grows faster)
+with high conﬁdence (H(M Φ(i)|d) drops quicker) than fully-
+connected layers.
+Figure 4c shows the aforementioned metrics for the ﬁrst two
+layers of LeNet300-100. Both layers show similar behavior;
+a quick improvement both in conﬁdence (H(M Φ(i)|d)) and
+diversity (I(M Φ(i), d)) at the start of training, after which
+both metrics stabilize.
+(a)
+(b)
+(c)
+Fig. 4: H(M Φ(i)|d) and I(M Φ(i), d) for VGG16 (CIFAR10)
+are shown in (a) and (b) respectively. The plots correspond
+to 5th, 8th, and 11th convolutional layers, and the 1st fully-
+connected layer (FC). H(M Φ(i)|d) and I(M Φ(i), d) for the
+ﬁrst two fully-connected layers of LeNet300-100 are shown in
+(c).
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+8
+V. CONCLUSION
+In this paper, we propose dynamic probabilistic pruning
+(DPP), an algorithm that enables training sparse networks
+based on stochastic and dynamic masking. DPP is a general
+framework that enables structured pruning for fully-connected
+and convolutional layers, suitable for hardware implementations.
+We demonstrated that DPP enables a larger hardware memory
+saving by leveraging structured pruning at different levels
+of granularities (ﬁne, medium and coarse). Leveraging its
+probabilistic nature, we showed how one can assess the
+conﬁdence and diversity of pruning masks among neurons
+by monitoring proposed information-theoretic metrics.
+Since DPP does not rely on magnitudes for determining the
+relevance of weights, it can be straightforwardly integrated
+with weight quantization (including binarization). This allows
+for a larger model compression as it is observed in the results.
+We test its performance for three benchmark datasets and
+obtain competitive accuracies for different architectures. In
+conclusion, our method generates ultra-compressed models,
+allowing the integration of quantization (and even binarization)
+and pruning, while providing a level of structured sparsity,
+enabling a more efﬁcient implementation on existing hardware
+platforms. Further, the potential of DPP should be explored
+to generate even more efﬁcient sparsity patterns for hardware
+such as tiling at different levels of granularities.
+REFERENCES
+[1] Y. Cheng, D. Wang, P. Zhou, and T. Zhang, “A Survey of Model Com-
+pression and Acceleration for Deep Neural Networks,” arXiv:1710.09282
+[cs], Sept. 2019.
+[2] V. Sze, Y.-H. Chen, J. Emer, A. Suleiman, and Z. Zhang, “Hardware for
+Machine Learning: Challenges and Opportunities,” 2017 IEEE Custom
+Integrated Circuits Conference (CICC), Apr. 2017.
+[3] I. Hubara, M. Courbariaux, D. Soudry, R. El-Yaniv, and Y. Bengio,
+“Quantized neural networks: Training neural networks with low precision
+weights and activations,” Journal of Machine Learning Research, vol. 18,
+09 2016.
+[4] M. Courbariaux and Y. Bengio, “Binarynet: Training deep neural
+networks with weights and activations constrained to +1 or -1,” CoRR,
+vol. abs/1602.02830, 2016.
+[5] G. Hinton, O. Vinyals, and J. Dean, “Distilling the knowledge in a
+neural network,” in NIPS Deep Learning and Representation Learning
+Workshop, 2015.
+[6] S. Han, H. Mao, and W. J. Dally, “Deep compression: Compressing deep
+neural networks with pruning, trained quantization and huffman coding,”
+2016.
+[7] Y. LeCun, J. S. Denker, and S. A. Solla, “Optimal brain damage,” in
+Advances in Neural Information Processing Systems 2 (D. S. Touretzky,
+ed.), pp. 598–605, Morgan-Kaufmann, 1990.
+[8] S. J. Hanson and L. Y. Pratt, “1811.01907ring biases for minimal network
+construction with back-propagation,” in Advances in Neural Information
+Processing Systems 1 (D. S. Touretzky, ed.), pp. 177–185, Morgan-
+Kaufmann, 1989.
+[9] Z. Liu, M. Sun, T. Zhou, G. Huang, and T. Darrell, “Rethinking the
+value of network pruning,” in International Conference on Learning
+Representations, 2019.
+[10] R. Dorrance, F. Ren, and D. Markovi´c, “A scalable sparse matrix-
+vector multiplication kernel for energy-efﬁcient sparse-blas on fpgas,”
+in Proceedings of the 2014 ACM/SIGDA International Symposium on
+Field-Programmable Gate Arrays, FPGA ’14, (New York, NY, USA),
+p. 161–170, Association for Computing Machinery, 2014.
+[11] J. Fowers, K. Ovtcharov, K. Strauss, E. S. Chung, and G. Stitt, “A
+high memory bandwidth fpga accelerator for sparse matrix-vector
+multiplication,” in 2014 IEEE 22nd Annual International Symposium on
+Field-Programmable Custom Computing Machines, pp. 36–43, 2014.
+[12] D. Fujiki, N. Chatterjee, D. Lee, and M. O’Connor, “Near-memory data
+transformation for efﬁcient sparse matrix multi-vector multiplication,”
+SC ’19, (New York, NY, USA), Association for Computing Machinery,
+2019.
+[13] M. Kreutzer, G. Hager, G. Wellein, H. Fehske, A. Basermann, and
+A. R. Bishop, “Sparse matrix-vector multiplication on gpgpu clusters: A
+new storage format and a scalable implementation,” in 2012 IEEE 26th
+International Parallel and Distributed Processing Symposium Workshops
+PhD Forum, pp. 1696–1702, 2012.
+[14] L. Lu, J. Xie, R. Huang, J. Zhang, W. Lin, and Y. Liang, “An
+efﬁcient hardware accelerator for sparse convolutional neural networks
+on fpgas,” in 2019 IEEE 27th Annual International Symposium on Field-
+Programmable Custom Computing Machines (FCCM), pp. 17–25, 2019.
+[15] S. Dey, D. Chen, Z. Li, S. Kundu, K. Huang, K. M. Chugg, and
+P. A. Beerel, “A highly parallel fpga implementation of sparse neural
+network training,” in 2018 International Conference on ReConFigurable
+Computing and FPGAs (ReConFig), pp. 1–4, 2018.
+[16] Y. Niu, H. Zeng, A. Srivastava, K. Lakhotia, R. Kannan, Y. Wang, and
+V. K. Prasanna, “Spec2: Spectral sparse cnn accelerator on fpgas,” 2019
+IEEE 26th International Conference on High Performance Computing,
+Data, and Analytics (HiPC), pp. 195–204, 2019.
+[17] I. A. Huijben, B. S. Veeling, and R. J. van Sloun, “Deep probabilistic
+subsampling for task-adaptive compressed sensing,” in International
+Conference on Learning Representations, 2020.
+[18] A. Zhou, Y. Ma, J. Zhu, J. Liu, Z. Zhang, K. Yuan, W. Sun, and H. Li,
+“Learning n:m ﬁne-grained structured sparse neural networks from scratch,”
+in International Conference on Learning Representations, 2021.
+[19] S. Han, J. Pool, J. Tran, and W. J. Dally, “Learning both weights and
+connections for efﬁcient neural networks,” CoRR, vol. abs/1506.02626,
+2015.
+[20] M. Zhu and S. Gupta, “To prune, or not to prune: exploring the efﬁcacy
+of pruning for model compression,” 2017.
+[21] S. Narang, G. F. Diamos, S. Sengupta, and E. Elsen, “Exploring sparsity
+in recurrent neural networks,” CoRR, vol. abs/1704.05119, 2017.
+[22] G. Bellec, D. Kappel, W. Maass, and R. A. Legenstein, “Deep rewiring:
+Training very sparse deep networks,” 2018.
+[23] H. Mostafa and X. Wang, “Parameter efﬁcient training of deep convolu-
+tional neural networks by dynamic sparse reparameterization,” 2019.
+[24] T. Dettmers and L. Zettlemoyer, “Sparse networks from scratch: Faster
+training without losing performance,” 2019.
+[25] C. Zhang, P. Li, G. Sun, Y. Guan, B. Xiao, and J. Cong, “Optimizing
+fpga-based accelerator design for deep convolutional neural networks,” in
+Proceedings of the 2015 ACM/SIGDA International Symposium on Field-
+Programmable Gate Arrays, p. 161?170, Association for Computing
+Machinery, 2015.
+[26] J. Zhang and J. Li, “Improving the performance of opencl-based fpga
+accelerator for convolutional neural network,” in Proceedings of the
+2017 ACM/SIGDA International Symposium on Field-Programmable
+Gate Arrays, p. 25?34, Association for Computing Machinery, 2017.
+[27] Y. He, X. Zhang, and J. Sun, “Channel pruning for accelerating very deep
+neural networks,” in 2017 IEEE International Conference on Computer
+Vision (ICCV), pp. 1398–1406, 2017.
+[28] H. Li, A. Kadav, I. Durdanovic, H. Samet, and H. P. Graf, “Pruning
+Filters for Efﬁcient ConvNets,” arXiv:1608.08710 [cs], Mar. 2017.
+[29] Z. Liu, J. Li, Z. Shen, G. Huang, S. Yan, and C. Zhang, “Learning
+efﬁcient convolutional networks through network slimming,” CoRR,
+vol. abs/1708.06519, 2017.
+[30] W. Wen, C. Wu, Y. Wang, Y. Chen, and H. Li, “Learning structured
+sparsity in deep neural networks,” in Advances in Neural Information
+Processing Systems 29 (D. D. Lee, M. Sugiyama, U. V. Luxburg, I. Guyon,
+and R. Garnett, eds.), pp. 2074–2082, Curran Associates, Inc.
+[31] J. Luo, J. Wu, and W. Lin, “Thinet: A ﬁlter level pruning method for
+deep neural network compression,” CoRR, vol. abs/1707.06342, 2017.
+[32] X. Dong and Y. Yang, “Network pruning via transformable architecture
+search,” 2019.
+[33] W. Wen, C. Wu, Y. Wang, Y. Chen, and H. Li, “Learning Structured
+Sparsity in Deep Neural Networks,” arXiv:1608.03665 [cs, stat], Oct.
+2016.
+[34] H. Hu, R. Peng, Y. Tai, and C. Tang, “Network trimming: A data-driven
+neuron pruning approach towards efﬁcient deep architectures,” CoRR,
+vol. abs/1607.03250, 2016.
+[35] M. Kang and B. Han, “Operation-aware soft channel pruning using
+differentiable masks,” 2020.
+[36] Y. Wang, X. Zhang, X. Hu, B. Zhang, and H. Su, “Dynamic network
+pruning with interpretable layerwise channel selection,” in AAAI, 2020.
+
+
+JOURNAL OF LATEX CLASS FILES, VOL. , NO. ,
+9
+[37] X. Ma, F. Guo, W. Niu, X. Lin, J. Tang, K. Ma, B. Ren, and Y. Wang,
+“PCONV: the missing but desirable sparsity in DNN weight pruning
+for real-time execution on mobile devices,” CoRR, vol. abs/1909.05073,
+2019.
+[38] S. Li, E. Hanson, H. Li, and Y. Chen, “Penni: Pruned kernel sharing for
+efﬁcient cnn inference,” 2020.
+[39] Nvidia, “A100 tensor core gpu architecture,” tech. rep., 2020.
+[40] S. Xie and S. Ermon, “Reparameterizable subset sampling via continuous
+relaxations,” in International Joint Conference on Artiﬁcial Intelligence,
+2019.
+[41] S. Ye, T. Zhang, K. Zhang, J. Li, J. Xie, Y. Liang, S. Liu, X. Lin, and
+Y. Wang, “A uniﬁed framework of DNN weight pruning and weight
+clustering/quantization using ADMM,” CoRR, vol. abs/1811.01907, 2018.
+[42] F. Tung and G. Mori, “Clip-q: Deep network compression learning by
+in-parallel pruning-quantization,” pp. 7873–7882, 06 2018.
+[43] L. Yang, Z. He, and D. Fan, “Harmonious coexistence of structured
+weight pruning and ternarization for deep neural networks,” Proceedings
+of the AAAI Conference on Artiﬁcial Intelligence, vol. 34, pp. 6623–6630,
+Apr. 2020.
+[44] K. Wang, Z. Liu, Y. Lin, J. Lin, and S. Han, “HAQ: hardware-aware
+automated quantization,” CoRR, vol. abs/1811.08886, 2018.
+[45] T. Wang, K. Wang, H. Cai, J. Lin, Z. Liu, and S. Han, “Apq: Joint search
+for network architecture, pruning and quantization policy,” 2020.
+[46] H. Yang, S. Gui, Y. Zhu, and J. Liu, “Learning sparsity and quantization
+jointly and automatically for neural network compression via constrained
+optimization,” CoRR, vol. abs/1910.05897, 2019.
+[47] Y. Zhao, X. Gao, D. Bates, R. Mullins, and C.-Z. Xu, “Focused
+quantization for sparse CNNs,” in Advances in Neural Information
+Processing Systems 32 (H. Wallach, H. Larochelle, A. Beygelzimer,
+F. d. Alch ˜A©-Buc, E. Fox, and R. Garnett, eds.), pp. 5584–5593, Curran
+Associates, Inc.
+[48] I. A. Huijben, B. S. Veeling, and R. J. van Sloun, “Learning sampling
+and model-based signal recovery for compressed sensing mri,” in ICASSP
+2020-2020 IEEE International Conference on Acoustics, Speech and
+Signal Processing (ICASSP), pp. 8906–8910, IEEE, 2020.
+[49] E. J. Gumbel, “Statistical theory of extreme values and some practical
+applications,” NBS Applied Mathematics Series, vol. 33, 1954.
+[50] W. Kool, H. Van Hoof, and M. Welling, “Stochastic beams and where
+to ﬁnd them: The gumbel-top-k trick for sampling sequences without
+replacement,” arXiv preprint arXiv:1903.06059, 2019.
+[51] E. Jang, S. Gu, and B. Poole, “Categorical Reparameterization with
+Gumbel-Softmax,” 5th International Conference on Learning Represen-
+tations, ICLR 2017 - Conference Track Proceedings, 11 2016.
+[52] C. J. Maddison, A. Mnih, and Y. W. Teh, “The concrete distribution:
+A continuous relaxation of discrete random variables,” in International
+Conference on Machine Learning, 2017.
+[53] M. Courbariaux, Y. Bengio, and J. David, “Binaryconnect: Training
+deep neural networks with binary weights during propagations,” CoRR,
+vol. abs/1511.00363, 2015.
+[54] Y. Lecun, L. Bottou, Y. Bengio, and P. Haffner, “Gradient-based learning
+applied to document recognition,” Proceedings of the IEEE, vol. 86,
+pp. 2278 – 2324, 12 1998.
+[55] J. Liu, Z. Xu, R. Shi, R. C. C. Cheung, and H. K.-H. So, “Dynamic
+sparse training: Find efﬁcient sparse network from scratch with trainable
+masked layers,” in ICLR, 2020.
+[56] C. Zhao, B. Ni, J. Zhang, Q. Zhao, W. Zhang, and Q. Tian, “Variational
+convolutional neural network pruning,” in Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), June
+2019.
+[57] E. S. Lubana and R. P. Dick, “A gradient ﬂow framework for analyzing
+network pruning,” 2020.
+[58] K. Simonyan and A. Zisserman, “Very deep convolutional networks for
+large-scale image recognition,” CoRR, vol. abs/1409.1556, 2015.
+[59] A. Krizhevsky, I. Sutskever, and G. E. Hinton, “Imagenet classiﬁcation
+with deep convolutional neural networks,” in Advances in Neural
+Information Processing Systems (F. Pereira, C. J. C. Burges, L. Bottou,
+and K. Q. Weinberger, eds.), vol. 25, pp. 1097–1105, Curran Associates,
+Inc., 2012.

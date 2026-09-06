@@ -1,0 +1,5957 @@
+Preprint, Under Review
+SCALING LAWS FOR MIXED QUANTIZATION
+Zeyu Cao1∗
+Boyang Gu 2∗
+Cheng Zhang2
+Pedro Gimenes2
+Jianqiao Lu3
+Jianyi Cheng4
+Xitong Gao5,6
+Yiren Zhao2†
+1Department of Computer Science and Technology, University of Cambridge
+2Department of Electrical & Electronic Engineering, Imperial College London
+3Department of Computer Science, University of Hong Kong
+4School of Informatics, University of Edinburgh
+zeyu.cao@cl.cam.ac.uk, jqlu@cs.hku.hk, jianyi.cheng@ed.ac.uk
+{boyang.gu19, cheng.zhang122, pedro.gimenes19, a.zhao}@ic.ac.uk
+xt.gao@siat.ac.cn
+ABSTRACT
+Post-training quantization of Large Language Models (LLMs) has proven effec-
+tive in reducing the memory and computational requirements for inference. In
+this study, we focus on a straightforward question: When aiming for a target ac-
+curacy or perplexity with low-precision quantization, how much high-precision
+computation needs to be preserved and how fine-grained this quantization would
+need to be as we scale LLMs to larger sizes? We first introduce two critical met-
+rics named the quantization ratio (Qr) and quantization block size (Qb). The
+former measures the number of parameters quantized to low-precision arithmetic
+normalized by the total parameter count, whereas the latter defines the number
+of values within a block that share a scaling factor, akin to the block size concept
+introduced in the FP4 format in NVIDIA’s Blackwell architecture. Through exten-
+sive and carefully controlled experiments across different model and quantization
+methods, we propose a unified scaling law on post-training quantization (PTQ)
+that can predict loss degeneration for varying Qr and Qb. For Qr, our scaling law
+implies that parameter scaling and ratio scaling have a multiplicative relationship.
+Consequently, larger models are more amenable to a higher quantization ratio Qr,
+thus supporting an increase in the adoption of mixed quantization for inference.
+Regarding Qb, our findings indicate that a small block size, similar to that used
+in Blackwell, is not essential for large models. Employing a small Qb can instead
+unnecessarily complicate the design of the hardware circuit.
+1
+INTRODUCTION
+Large language models (LLMs) have demonstrated remarkable performance in a range of natural
+language processing (NLP) tasks (Brown et al., 2020), and state-of-the-art models now contain bil-
+lions of parameters (Anthropic, 2025; OpenAI, 2025; DeepMind, 2025). As such, researchers have
+attempted to understand the scaling laws of LLMs by characterizing how the required number of
+training tokens scales with parameter count to train compute-optimal models under a fixed compute
+budget (Kaplan et al., 2020; Hoffmann et al., 2022). These works provide insight into how to best
+allocate resources in training increasingly large LLMs.
+Despite these training scaling laws, the substantial size of LLMs and their computational demands
+require significant hardware resources. As such, quantization has become a promising solution
+to increase the compute and memory efficiency of LLM inference (Lin et al., 2024; Chee et al.,
+2024; Ashkboos et al., 2024). The recently proposed Scaling Laws for Precision by Kumar et al.
+further examined the interplay among precision levels, model parameters, and data – they suggested
+a revised version of the Chinchilla form (Kaplan et al., 2020), with an additional error term to capture
+the impacts of post-training quantization (PTQ).
+∗Equal Contribution.
+†Corresponding author.
+1
+arXiv:2410.06722v3  [cs.CL]  6 Aug 2025
+
+
+Preprint, Under Review
+Meanwhile, there is also an active research thread, which has shown that weights and activations in
+pre-trained transformer blocks often yield magnitude outliers (Gu et al., 2024). This issue has been
+tackled by assigning higher precision to outliers while putting the remainder of the network at lower
+precision (Dettmers et al., 2022; Zhang et al., 2023a; Dettmers et al., 2023). With the introduction
+of more compact arithmetic types in NVIDIA’s Blackwell GPUs, including the support for 4-bit and
+6-bit MXFP formats (Tirumala & Wong, 2024). These arithmetic types, such as MX arithmetics,
+incorporate a block size Qb, in which a set of values shares the same scaling factor. The first iteration
+of this concept, known as block floating point, dates back to the 1990s and was used in digital
+signal processing (Kobayashi & Fettweis, 1999). This can be seen as a granularity of quantization
+where, at Qb = 1, the arithmetic resembles the traditional floating-point number format, comprising
+both a mantissa and an exponent for scaling purposes. Subsequently, this concept of blockwise
+scaling factors was adopted in the domain of low bitwidth quantization for neural networks (Dai
+et al., 2021; Lingle, 2023; Darvish Rouhani et al., 2020), including the recently available MX-
+format on the Blackwell GPUs. These hardware advancements enable both high- and low-precision
+computations on silicon, making mixed-precision inference a compelling approach to maintain
+model performance while reducing compute and memory costs.
+Driven by the significance of developing systematic scaling laws to direct future research in mixed
+quantization, we aim to address a largely under-explored question: How does the optimal ratio of
+low-precision elements and the optimal granularity in a mixed quantization mapping change as the
+model size enlarges? Put another way, what are the scaling laws that govern mixed quantization?
+For a pair of low- and high-precision parameters (Wl, Wh), we define the mixed-quantization ratio
+Qr as the ratio of parameters using low-precision arithmetic to the total number of parameters, and
+consider the scenario where this allocation happens normally only at the post-training stage. We
+consider block size granularities as Qb for the block-based quantization methods. Then our search
+space over the respective random variable of low-precision and high-precision parameters (Wl, Wh)
+for a given pair of Qr and Qb is as follows.
+(Wl, Wh) ∼
+
+(Wl, Wh) :
+∥Wl∥0
+∥Wh∥0 + ∥Wl∥0
+= Qr ∧Qb(Wl, Wh) = Qb
+
+,
+(1)
+where ∥·∥0 refers to the l0 norm, and Qb(Wl, Wh) is the function that calculates the block size
+used for the searched quantization. We experimented with 3 different LLM model families and
+4 different post-training quantization methods, covering weight-only and weight-activation (W-A)
+quantizations. In total, we applied mixed quantization to 17 models, with model sizes ranging from
+60M to 14B, resulting in a total of 54, 600 quantized model checkpoints.
+For a language model with N parameters, trained on D tokens with a fixed quantization ratio Qr
+and fixed block size Qb, the loss can be considered a discrete random variable L. The variation in
+loss is due to the combinatorial space among all possible combinations of low- and high-precision
+parameter pairs for the given Qr and Qb. Note that in our post-training quantization space, D is
+fixed for the given model. We describe a unified scaling law that formulates the model inference
+loss as the sum of the usual Chinchilla form with a post-training quantization loss degeneration term
+(∆), which itself is also a discrete random variable defined similarly on (Wl, Wh).
+L(N, D, Qr, Qb) =
+aN −α
+| {z }
+Training-time Effects
++bD−β + E
+|
+{z
+}
+Usual Chinchilla form
++ ∆(N, Qb, Qr)
+|
+{z
+}
+Loss Degeneration
+,
+(2)
+where a, b, α, β, and E are constants.
+We claim that the optimal (minimum) and expectation of ∆are the overall effect of ratio, parameter,
+and granularity scaling effects. I.e.,
+δopt(N, Qr, Qb) = min(∆(N, Qr, Qb)) = C ·
+eAQr
+| {z }
+ratio scaling
+·
+N −γN
+| {z }
+parameter scaling
+· (Qb + d)γc
+|
+{z
+}
+granularity scaling
+,
+(3)
+E[δ(N, Qr, Qb)] = C′eA′QrN −γ′
+N (Qb + d′)γ′
+c ,
+(4)
+respectively, where A, A′, C, C′, γN, γ′
+N, d, d′, γc, and γ′
+c are constant coefficients. This finding
+also suggests a strong link to the prior work conducted by Kumar et al.. If Qr = 1 and Qb are fixed
+as constants, Equation (3) agrees asymptotically with the Precision Scaling Law proposed by Kumar
+et al. (Section 2). We make the following contributions:
+2
+
+
+Preprint, Under Review
+1. Unified Scaling Law on PTQ with ratio and granularity scaling. We propose a unified scaling
+law that considers both the mixed quantization ratio Qr and quantization block size granularity
+Qb, and its expectation and minimum forms reach asymptotic agreement with existing Precision
+Scaling Laws shown by Kumar et al.. Our scaling laws integrate model sizes, mixed quantization
+ratios, and quantization granularities, thereby extending the scope beyond existing scaling laws
+that focus solely on precision levels.
+2. Ratio matters more. Our scaling law indicates that, since O(eAQr) grows faster than O(N γN ),
+the growth of Qr dominates the quantization loss. However, although eAQr growth faster than
+N γN asymptotically, Qr can only be 1 at most while N can grow without a limit, showing
+that larger models can accommodate a progressively larger quantization ratio. This effectively
+shows that mixed quantization is a promising future direction for further reducing model sizes
+and model computation complexity.
+3. The quantization “strength” provides diminishing returns at large model sizes. Since γc is
+within 0 and 1 with our scaling law (See Section 2), lowering Qr is more effective than lowering
+Qb related terms, allowing better quantization performance.
+2
+SCALING LAWS FOR MIXED QUANTIZATION
+Our scaling law can be considered a further development of the previous Precision Scaling Law
+(Kumar et al., 2024). The usual Chinchilla form (Hoffmann et al., 2022) suggests that for a language
+model with a total number of parameters N, trained on a number of tokens D, its loss L should scale
+as follows.
+L(N, D) = aN −α + bD−β + E ,
+(5)
+where a, b, α, β and E are positive constants. The Precision Scaling Law (Kumar et al., 2024)
+further investigates the case where post-training quantization is applied. In detail, following previ-
+ous notations, if the model is trained and tested (inferenced) at different precisions Ptrain and Ppost,
+Equation (5) becomes
+L(N, D, Ptrain, Ppost) = aN −α
+eff + bD−β + E + δPTQ(Neff, D, Ptrain, Ppost) ,
+(6)
+where δ is the post-training quantization loss degeneration. It has the following form:
+δPTQ(N, D, Ptrain, Ppost) = CT e−Ppost/γpost
+ DγD
+N γN
+
+Y
+x∈{w,a,kv}
+[1 −e−Cx(Px−Ppost)] ,
+(7)
+where Pw, Pa, Pkv are the weight, activation, and kv-cache precision bit-width at training, and CT ,
+γpost, γD, γN, and Cx-s are constants. Such a scaling law for the loss degeneration was developed
+under the consideration that the quantization setting is applied to all weights. Equation (7), proposed
+by Kumar et al. (2024), only allows the degree of freedom to quantize the combination of weight,
+activation, and KV-cache. However, different quantization configurations should also be considered
+for mixed quantization inference. To investigate this aspect, we introduce the quantization ratio Qr
+and the quantization block size Qb.
+Consider a model M with size N, with a block size Qb, we define the block number as Nb =
+N/Qb.
+As M
+= {mi}N
+i=1, we define a partition of M into Nb blocks, i.e. B = {bj =
+m(j−1)·Qb+1:j·Qb+1}Nb
+j=1. Given a codebook collection C = {Ck}Nc
+k=1 of size Nc where each code-
+book Ck is a binary partition function over B to a pair of low- and high-precision components,
+i.e., Ck(bi) = (W (i,k)
+l
+, W (i,k)
+h
+), we further define a mapping f : B →{j}Nc
+j=1 according to the
+quantization setting. Then we denote Qb(Wl, Wh) = Qb as saying that the block size is Qb for
+(Wl, Wh) =
+
+
+Nb
+[
+j=1
+C0
+f(bj)(bj),
+Nb
+[
+j=1
+C1
+f(bj)(bj)
+
+.
+(8)
+For a given quantization ratio (Qr) and quantization block size (Qb), there are different pairs of
+(Wl, Wh).
+The set of all possible pairs forms the binary discrete random variable (Wl, Wh).
+For each pair of (Wl, Wh), we could calculate the corresponding quantized model loss and post-
+quantization loss degeneration, with a bit of abuse of notation, Equation (6) turns into its random
+variable form
+L(N, D, Qr, Qb) = aN −α + bD−β + E + ∆(N, Qb, Qr) ,
+(9)
+3
+
+
+Preprint, Under Review
+where L and ∆are the random variable forms of L and δ respectively.
+We define the optimal allocation of low-precision parameters for a model under Qr and Qb as
+(W opt
+l
+, W opt
+h ), where it minimizes the loss L. I.e.,
+(W opt
+l
+, W opt
+h ) = arg min
+(Wl,Wh)
+L(Wl, Wh)
+s.t.
+∥Wl∥0
+∥Wh∥0 + ∥Wl∥0
+= Qr ∧Qb(Wl, Wh) = Qb . (10)
+It is easily seen that the pair (W opt
+l
+, W opt
+h ) minimizes the loss degeneration δ too. Equation (10)
+outlines the optimization problem used to evaluate the hypothesized scaling laws. Note that the
+number of candidate pairs (Wl, Wh) explodes with the weight numbers. In this work, we find
+an approximate solution to the problem using a random search algorithm to allocate a numerical
+precision to each network component (i.e., layer or matrix multiply operation, according to the
+quantization method). We estimate the expectation via its unbiased estimator. For n observed loss
+degeneration (δi)n
+i=1, E(δ) is approximated by
+µδ((δi)n
+i=1) =
+Pn
+i=1 δi
+n
+.
+(11)
+With a larger number of random search trials, we get a more precise estimate of loss degenera-
+tion. However, we discovered that even a small amount of random sampling of ∆could reveal its
+distribution quite successfully. Detailed discussion of this phenomenon can be seen in Appendix B.
+Recall Equation (9), since (W opt
+l
+, W opt
+h ) is obtained from a group of candidates, we rewrite Equa-
+tion (9) to the form of its best realization
+Lopt(N, D, Qr, Qb) = aN −α + bD−β + E + δopt(N, Qr, Qb) ,
+(12)
+δopt(N, Qr, Qb) = δ(W opt
+l
+, W opt
+h ) .
+(13)
+Similarly, one may be interested in the expectation loss degeneration E(∆) rather than the optimal
+value. The expectation counterpart of Equation (12) is
+E[L(N, D, Qr, Qb)] = aN −α + bD−β + E + E[∆(N, Qr, Qb)] .
+(14)
+Instead of studying the scaling law of one model, we focus on the minimum loss a group of models
+can achieve optimally. Furthermore, no weight training is performed after quantization to observe
+immediate performance degradation. We claim that such optimality also follows its own scaling.
+We describe the observed scaling laws and present empirical evidence to support them in Section 3.
+Parameter scaling in Equation (2)
+Given a fixed Qr, the optimal and expected loss degeneration
+(δopt, E(∆)) decreases polynomially as the model size N = ∥W opt
+h ∥0 + ∥W opt
+l
+∥0 increases.
+Ratio scaling in Equation (2)
+Given a fixed model size (N), the optimal and expected loss de-
+generation (δopt, E(∆)) increases exponentially as the quantization ratio Qr increases.
+Those two scaling laws posit one of our central hypotheses: the loss degeneration is affected by both
+the model size and the quantization ratio. We further discovered that their effects are independent.
+Therefore, we claim the following weak law of loss degeneration:
+Weak Law of Loss Degeneration. Given a fixed quantization block size Qb, a fixed quantiza-
+tion method, a model architecture that can scale its parameters N and change the quantization
+ratio Qr. Following previous definitions, the optimal (minimum) and expectation of the loss
+degeneration have the following form:
+δopt(N, Qr) = CeAQrN −γN ,
+(15)
+E[∆(N, Qr)] = C′eA′QrN −γ′
+N ,
+(16)
+where C, C′, A, A′, γN, and γ′
+N are constant coefficients that vary with different quantization
+block sizes and methods.
+4
+
+
+Preprint, Under Review
+We could interpret eAQr and N −γN as the quantization scaling effect and parameter scaling effect,
+respectively. Note that our scaling law is an extension of the precision scaling law shown in Equa-
+tion (7). For Qr = 1, the only possible pair is (Wl, Wh) = (∅, M). In such a case, our random
+variable ∆degenerates into its only realization, and the quantization scaling effect is absorbed into
+the coefficient C. On the other hand, if we fix D, Ptrain, and Ppost in Equation (7), it leaves us with
+only a term of model size N that aligns with our parameter scaling effect.
+In the weak law of loss degeneration, while δopt increases with Qr exponentially, a larger model size
+N could compensate for such degeneration. Quantitatively, by fixing the loss budget δopt = l, we
+have the following:
+log(N) = A′′Qr + C′′ ,
+(17)
+where A′′ = A/γN and C′′ = (log(C) −log(l))/γN. This shows that given a fixed loss budget
+(δ = l), the maximum achievable mixed precision quantization ratio Qr increases as the model size
+N increases. This aligns with findings from related research, such as AWQ (Lin et al., 2024), Quip
+(Chee et al., 2024), and LQER (Zhang et al., 2024), which empirically demonstrated that larger
+models can accommodate more aggressive quantization levels. An alternative view, also reflected in
+related work, is that for a fixed quantization ratio, task loss decreases when the model size becomes
+larger.
+The weak scaling law is sufficient for the case where only the model size (N) and the quantization
+ratio Qr are taken into consideration. If we want to estimate the loss degeneration with respect to the
+quantization block size Qb, a stronger scaling law is needed. In fact, the scaling effect of granularity
+(block size) is also independent from the model size N and quantization ratio Qr.
+Strong Law of Loss Degeneration. Given a fixed quantization method, a model architecture
+that can scale its parameters N, change the quantization ratio Qr, and vary its quantization
+block size Qb. Following previous definitions, the optimal (minimum) and expectation of the
+loss degeneration has the following form:
+δopt(N, Qr, Qb) = CeAQrN −γN (Qb + d)γc ,
+(18)
+E[∆(N, Qr, Qb)] = C′eA′QrN −γ′
+N (Qb + d′)γ′
+c ,
+(19)
+where A, A′, C, C′, γN, γ′
+N, d, d′, γc, and γ′
+c are constant coefficients that depend on the
+quantization method.
+For the strong scaling law, when fixing the quantization block size Qb, the granularity scaling effect
+(Qb + d)γc can be absorbed into the constant C in the weak law, indicating the effectiveness of the
+weak law for the case where Qb is fixed.
+3
+EXPERIMENTS
+3.1
+SETUP
+Models and benchmarks
+We evaluate a range of model families, including LLaMA Touvron
+et al. (2023); Dubey et al. (2024a), Qwen-1.5 Bai et al. (2023) and Qwen-3 Qwen Team (2025),
+at sizes ranging from 60M to 14B. Besides these models, to collect the mixed quantization results
+at small-scale models for extrapolation, we followed the Chinchilla scaling law and pretrained a
+series of LLaMA-like models consisting of N ∈{60M, 200M, 400M, 600M, 1.1B} parameters on
+FineWeb (Lozhkov et al., 2024), a high-quality pretraining dataset released by HuggingFace. We
+refer to these models as CLM series models to differentiate them from the vanilla Meta LLaMA
+models. More details are available in Appendix A. We choose Qwen-1.5 and Qwen-3 to validate our
+experimental results, enabling detailed analysis of the proposed scaling laws. We subsample a set
+of 1000 entries from the SlimPajama Soboleva et al. (2023) dataset for evaluation, which is another
+open-sourced pretraining dataset, as the perplexity/pretraining loss on SlimPajama better captures
+the performance of these base models compared with downstream tasks (Dubey et al., 2024b).
+Quantization methods
+We mainly use MXINT Rouhani et al. (2023), and HQQ Badri & Shaji
+(2023) at various bit-widths and block sizes for low-precision formats, and BF16 as the high-
+5
+
+
+Preprint, Under Review
+precision format. Specifically, if not mentioned specifically, by default, all our experiments are
+performed under weight-and-activation quantization with MXINT-4. We also include weight-and-
+activation quantized MXINT-2, weight-only quantized MXINT-4, and weight-only HQQ with 4
+bit-widths and 64 block sizes to verify that our scaling laws apply to other data formats. We choose
+HQQ because it is a calibration-free method that achieves state-of-the-art performance, simplifying
+our search loop.
+Mixed quantization strategy
+For our primary experiments, we perform quantization at two
+granularities: layer-wise and matmul-wise.
+In the former, the quantization ratio is determined
+by the number of transformer layers cast to low precision.
+In the latter, we consider the
+precision for each individual matrix multiplication.
+We find a solution for Equation (3) by
+searching through random trials of 100 from each quantization configuration. We justify these
+choices in Appendix Appendix B. For clarity, our experiments include a quantization ratio Qr ∈
+{0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.975}. Note that, in each trial, the inner loop of the search conducts
+post-training quantization (PTQ), and the entire search process involves no training.
+Platform and GPU hours
+We perform experiments on a cluster of DGX A100 eight-GPU pods,
+each with 40GB VRAM, with roughly 15k A100 GPU hours in total. We also spend around 1k GPU
+hours tuning search hyper-parameters, such as determining the number of trials and searching the
+loss landscape to determine an appropriate quantization ratio. The pretraining of CLM models takes
+around 1k GPU hours on another DGX H100 eight-GPU pod.
+3.2
+INSIGHTS FROM THE UNIFIED SCALING LAW
+We mainly show results of the layer-wise loss landscape to verify our claims, but the same laws can
+also be applied to matrix multiplication-wise (matmul-wise). We present CLM, Llama, and QWen-3
+in the main texts. All additional results, e.g., matmul-wise and QWen-1.5, are in Appendix D.
+3.2.1
+MODEL SIZE (N) AND QUANTIZATION RATIO (Qr)
+Figure 1 shows the actual and fitted δopt for layer-wise MXINT-4 quantization for CLM series and
+Qwen3. The overall shape of the contour is the same for actual and fitted losses, with the statistics
+of R2 = 0.98. As introduced in Section 2, the loss degeneration scaling law also works for the
+expectation value E(δ),with a R2 = 0.99, indicating the effectiveness of our law for E(∆). The
+corresponding figures and fitted parameters can be seen in Appendix F. From the results in Figure 1,
+we can make the following observations that are in line with our weak law:
+Observation 1: With an increasing N, we can further increase Qr, which is in agreement with our
+combined ratio scaling and parameter scaling terms: eAQrN−γN .
+3.2.2
+QUANTIZATION RATIO (Qr) AND QUANTIZATION BLOCK SIZE (Qb)
+As stated in Section 4, recent LLM quantization methods adopt fine-grained quantization, mean-
+ing tensors are split into small blocks, quantized and then scaled individually. In this part, we
+empirically verify our unified scaling law by performing mixed-precision quantization search at
+blocksize Qb ∈{16, 32, 64, 128, 256}. We present the experiments on CLM series models with
+matrix-multiplication-wise for finer granularities. As shown in Figure 2, the overall shape of the
+contour is the same for actual and fitted losses on δopt, with the statistics R2 = 0.95. From Sec-
+tion 2, the loss degeneration scaling law also works for the expectation value E(δ),with a R2 = 0.98,
+indicating the effectiveness of our law for E(∆). The corresponding figures and fitted parameters
+are in Appendix F. From the results in Figure 1, we can make the following observations that are in
+line with our strong law:
+Observation 2: When the quantization ratio Qr is low, employing a smaller block size Qb is more
+effective in minimizing performance degradation, which agrees with our combined ratio scaling and
+granularity scaling terms: eAQr(Qb + d)γc.
+6
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(b) Qwen-3 Actual Loss
+0
+5
+10
+15
+20
+25
+Actual
+0
+5
+10
+15
+20
+25
+Fitted
+R 2 = 0.9842, MSE = 0.3317
+(c) Weak Law δopt
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(e) Qwen-3 Predicted Loss
+0
+25
+50
+75
+100
+125
+Actual
+0
+25
+50
+75
+100
+125
+Fitted
+R 2 = 0.9958, MSE = 0.9381
+(f) Weak Law δµ
+Figure 1: Weak law experiment results. (a,b,d,e): The actual and fitted loss degeneration contour for the
+layer-wise MXINT4 quantization for CLM and Qwen3 architecture. (a,d): Loss contour w.r.t. model size N
+for the CLM model family. (b,e): Loss contour w.r.t. quantization ratio Qr for the Qwen3 model family. (e, f):
+The fitted versus actual δopt and δµ for all MXINT-4 quantization (layer- and matrix multiplication-wise) for
+CLM, Qwen1.5, and Qwen3. Due to space constraint, we only present N v.s. δ for CLM and Qr v.s. δ in the
+figure, see Appendices C and D for full figures of all results.
+3.3
+EXTENDING TO OTHER QUANTIZATION METHODS
+All our previous experiments consider W-A quantization with MXINT-4 as mentioned in Sec-
+tion 3.1. We also experimented with different quantization settings. For comparison, we showed
+that the loss degeneration scaling law still holds for other arithmetic formats and quantization meth-
+ods. Moreover, as proposed by Dotzel et al. (2024), we consider weight-only quantization (with
+activations kept at 16-bit) for the precision allocation search. The results are presented in Figure 3.
+All three quantization settings follow our scaling law with different fitted parameters. Note that
+changing the precision (MXINT-4 and MXINT-2) will shift the parameters completely, which is dif-
+ferent from the previous precision scaling law in Equation (7). Additional results are in Appendix E.
+Observation 3: Our unified scaling law can be applied to other arithmetic formats.
+3.4
+LESSONS LEARNED
+As discussed in Section 2, our weak scaling law aligns with the precision scaling law when Qr = 1.
+Also, the strong scaling law that introduced the quasi-polynomial term did not deviate our scaling
+law away from the precision scaling law.
+Takeaway 1: Across different Qr values, our unified scaling law agrees asymptotically with previ-
+ously proposed Precision Scaling Laws proposed by Kumar et al. (2024).
+To observe the effect of different quantization ratios Qr when varying model size N, we plot Fig-
+ure 4a based on our unified scaling law on the CLM series model by fixing the δ budget. When
+models are beyond 70B, Qr can be set to beyond 0.9 with less than δ = 0.5 loss degeneration.
+7
+
+
+Preprint, Under Review
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) 200M Actual Loss
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) 1.1B Actual Loss
+0
+10
+20
+30
+40
+50
+Actual
+0
+10
+20
+30
+40
+50
+Fitted
+R 2 = 0.9478, MSE = 3.9496
+(c) Strong law δopt
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+20
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) 200M Predicted Loss
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+1
+2
+3
+4
+5
+6
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) 1.1B Predicted Loss
+0
+20
+40
+60
+Actual
+0
+20
+40
+60
+Fitted
+R 2 = 0.9805, MSE = 2.3825
+(f) Strong law δµ
+Figure 2: Strong law experiment results. (a,b,c,d): The actual and fitted loss degeneration contour for CLM-
+200M and CLM-1.1B w.r.t. block size Qb. Each line corresponds to a fixed quantization ratio (Qr). (e,f): The
+fitted versus actual δopt and δµ. Due to space constraint, we only present N = 200M, 1.1B, see Appendix C
+for full figures of all N blocksize results.
+Takeaway 2: With an increase in model size, the quantization ratio Qr can be set to a high value.
+This is due to the parameter scaling term in Equation (2) accelerating at a much faster rate compared
+to the ratio scaling.
+For different block size granularities Qb when varying model size N, we plot Figure 4b based on
+our unified scaling law on CLM series model. This demonstrates that when the models are
+larger than 50B, the difference between Qb = 128 and Qb = 32 is less than 0.5 in terms
+of loss degeneration δ. This makes us challenge the design choice of the current 128 block size
+utilized in NVIDIA’s Blackwell GPUs for Mixed-Precision Floating-Point (MXFP) arithmetic might
+be unnecessarily large for PTQ LLM inference tasks.
+Takeaway 3: As the model size N becomes sufficiently large, changing the block size Qb may yield
+diminished returns.
+4
+BACKGROUND AND RELATED WORK
+Quantization outliers and mixed quantization
+A weight or activation value is considered an
+outlier when there is a significant deviation from its mean distribution. Activation outliers have
+been observed more frequently in large models (Wei et al., 2022; Zhang et al., 2023a) as cascaded
+layers accumulate quantization errors. In weight-only quantization, weights are mapped to low
+precision (Frantar et al., 2022; Lin et al., 2024). Recent weight-only quantization works focus on
+efficient vector quantization that maps high-precision weight tensors into indices and codebooks,
+such as QuiP (Chee et al., 2024), AQLM (Egiazarian et al., 2024), and QTIP Tseng et al. (2024).
+Meanwhile, weight-activation quantization usually transfers activation magnitudes to weights using
+invertible scale matrices (Xiao et al., 2023) before quantizing both weights and activations (Wei
+et al., 2023; Xiao et al., 2023; Shao et al., 2023). Recent works explore incoherence processing to
+8
+
+
+Preprint, Under Review
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+101
+102
+103
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(a) WA-MXINT-2 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(b) W-MXINT-4 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(c) W-HQQ 4 bit Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+102
+103
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(d) WA-MXINT-2 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(e) W-MXINT-4 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(f) W-HQQ 4 bit Predicted Loss
+Figure 3: Other Arithmetic Formats Results. (a,d) The actual and fitted loss degeneration contour for layer-
+wise Weight-Activation-MXINT-2 (WA-MXINT-2) on CLM architectures. (b,e) The actual and fitted loss
+degeneration contour for layer-wise Weight-only MXINT-4 (W-MXINT-4) on CLM architectures. (c,f) The
+actual and fitted loss degeneration contour for layer-wise Weight-only Weight-only 4bit-HQQ (HQQ-4) on
+CLM architectures. In the figure, each line corresponds to a fixed model size N in billions (B). The fitted
+statistics are presented in Appendix F due to space constraint.
+101
+102
+Model Size (N)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Quantization Ratio (Qr)
+Loss degeneration (δ):
+ 
+0.1
+0.2
+0.5
+1
+(a) N compare to Qr under dfferent fixed δ budget
+0
+20
+40
+60
+80
+100
+Model Size (N)
+0
+1
+2
+3
+4
+Loss Degeneration (δ)
+Block size (Qb):
+ 
+32
+64
+128
+256
+(b) N compare to δ under different fixed Qb.
+Figure 4: Effects of our scaling laws. The effect of our scaling law with (a) effect of quantization ratio Qr
+when changing model size N under a fixed loss degeneration budget δ and (b) effect of blocksize granularities
+Qb on loss degeneration δ when changing N. Both are based on the fitted parameters for CLM series models.
+achieve this, such as SpinQuant (Liu et al., 2024b) and Quarot (Ashkboos et al., 2024). There are also
+works that solve the outlier problem via new number formats to accommodate the dynamic range of
+outliers (Zhang et al., 2023a; Rouhani et al., 2023; Zou et al., 2024). For example, MXINT/MXFP
+(Darvish Rouhani et al., 2020) is a recent standard for hardware-efficient numerical formats. MXINT
+shares an exponent across a block of mantissas (Rouhani et al., 2023), and MXFP shares an exponent
+across a block of MiniFloats, which is already supported in NVIDIA Blackwell. The hardware
+efficiency of these methods often outperforms standard low-precision floating-point computation,
+although custom hardware support is required.
+Scaling laws of LLM training
+Kaplan et al. (2020) showed, through empirical analysis, that
+Transformer performance follows a power law trend. In contrast, Chinchilla Hoffmann et al. (2022)
+argues that existing LLMs are under-trained relative to their size, and parameter count should be
+9
+
+
+Preprint, Under Review
+increased in line with the number of training tokens. The findings from Pearce & Song (2024) later
+explained the discrepancy between Kaplan and Hoffman, reaffirming the validity of the Chinchilla
+scaling laws. A highly relevant study is the recently proposed Scaling Laws for Precisions by Kumar
+et al. (2024). This work focuses on both pre-training and post-training quantization in which all
+parameters within the models are uniformly quantized to a single precision level. We discuss more
+in Section 2 into the relevance of our mixed quantization scaling laws, showing that in extreme
+cases, our unified mixed quantization law simplifies to adhere to the Scaling Laws for Precisions
+(Kumar et al., 2024).
+5
+DISCUSSION, LIMITATION AND CONCLUSION
+Implications on AI inference hardware and systems
+We show that larger models can accommo-
+date increasingly more low-precision components without performance degradation. This validates
+the recent trend of increasing support for low-precision arithmetic computation in hardware such as
+GPUs and TPUs Tirumala & Wong (2024); Choquette (2022). The insight from our unified scaling
+law highlights the need for increased low-precision resources in future hardware devices.
+Extension to further architectures and arithmetic formats
+It is natural to consider whether the
+observed findings in this work extend to larger LLMs, such as 400B ones. Additionally, the same
+trends could be explored in more architectures including MoE models such as DeepSeek (Liu et al.,
+2024a) and Mixtral (Jiang et al., 2024). Finally, further arithmetic formats such as ternary (Chen
+et al., 2024) and additional configurations from the MXINT (Rouhani et al., 2023) standard offer
+opportunities for further exploration. One specific challenge is the quantization approach used in this
+paper is emulated following Zhang et al. (2023b), where it incurs more computation, hence impedes
+the evaluation of larger models (e.g., 400B). A possible future direction would be to test these
+scaling laws on large models using actual MXINT4 and MXFP4 quantization upon the availability
+of compatible hardware.
+Hypotheses on other efficient AI methods
+While we focused primarily on quantization, a clear
+direction for future research involves examining scaling trends for other Efficient AI methods, such
+as sparsity. We hypothesize that the scaling laws for such methods will closely resemble the scaling
+laws for quantization introduced in this work. More broadly, we hypothesize the existence of a
+broader scaling law governing how the ratio of approximate compute to exact compute scales
+with model sizes, and the granularity at which approximate compute is applied.
+Conclusion
+In this paper, we introduce a unified scaling law for PTQ of LLMs, supported by
+thorough experiments. We explore the implications of this law on mixed quantization strategies and
+the selection of quantization block sizes. Our findings provide direction for future LLM quantization
+research and suggest a potential for mixed-quantization LLM inference accelerators.
+10
+
+
+Preprint, Under Review
+REFERENCES
+Anthropic. Claude 3.7 sonnet system card. Technical report, Anthropic, February 2025.
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian Croci, Bo Li, Pashmina Cameron, Martin
+Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman. Quarot: Outlier-free 4-bit inference in
+rotated llms. Advances in Neural Information Processing Systems, 37:100213–100240, 2024.
+Hicham Badri and Appu Shaji.
+Half-quadratic quantization of large machine learning models,
+November 2023. URL https://mobiusml.github.io/hqq_blog/.
+Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge,
+Yu Han, Fei Huang, et al. Qwen technical report. arXiv preprint arXiv:2309.16609, 2023.
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher M De Sa. Quip: 2-bit quantization
+of large language models with guarantees. Advances in Neural Information Processing Systems,
+36, 2024.
+Tianqi Chen, Zhe Li, Weixiang Xu, Zeyu Zhu, Dong Li, Lu Tian, Emad Barsoum, Peisong Wang,
+and Jian Cheng. Ternaryllm: Ternarized large language model. arXiv preprint arXiv:2406.07177,
+2024.
+Jack Choquette. Nvidia hopper gpu: Scaling performance. In 2022 IEEE Hot Chips 34 Symposium
+(HCS), pp. 1–46. IEEE Computer Society, 2022.
+Steve Dai, Rangha Venkatesan, Mark Ren, Brian Zimmer, William Dally, and Brucek Khailany.
+Vs-quant: Per-vector scaled quantization for accurate low-precision neural network inference.
+Proceedings of Machine Learning and Systems, 3:873–884, 2021.
+Bita Darvish Rouhani, Daniel Lo, Ritchie Zhao, Ming Liu, Jeremy Fowers, Kalin Ovtcharov, Anna
+Vinogradsky, Sarah Massengill, Lita Yang, Ray Bittner, et al. Pushing the limits of narrow pre-
+cision inferencing at cloud scale with microsoft floating point. Advances in neural information
+processing systems, 33:10271–10281, 2020.
+Google DeepMind. Gemini 2.5 pro preview, April 2025. Product page.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3. int8 (): 8-bit matrix
+multiplication for transformers at scale. Advances in Neural Information Processing Systems, 35:
+30318–30332, 2022.
+Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, Denis Kuznedelev, Elias Frantar, Saleh Ashk-
+boos, Alexander Borzunov, Torsten Hoefler, and Dan Alistarh. Spqr: A sparse-quantized repre-
+sentation for near-lossless llm weight compression. arXiv preprint arXiv:2306.03078, 2023.
+Jordan Dotzel, Yuzong Chen, Bahaa Kotb, Sushma Prasad, Gang Wu, Sheng Li, Mohamed S Ab-
+delfattah, and Zhiru Zhang. Learning from students: Applying t-distributions to explore accurate
+and efficient formats for llms. arXiv preprint arXiv:2405.03103, 2024.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+arXiv preprint arXiv:2407.21783, 2024a.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+arXiv preprint arXiv:2407.21783, 2024b.
+Vage Egiazarian, Andrei Panferov, Denis Kuznedelev, Elias Frantar, Artem Babenko, and Dan Al-
+istarh. Extreme compression of large language models via additive quantization. arXiv preprint
+arXiv:2401.06118, 2024.
+11
+
+
+Preprint, Under Review
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+Xiangming Gu, Tianyu Pang, Chao Du, Qian Liu, Fengzhuo Zhang, Cunxiao Du, Ye Wang, and
+Min Lin. When attention sink emerges in language models: An empirical view. arXiv preprint
+arXiv:2410.10781, 2024.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom Hen-
+nigan, Eric Noland, Katie Millican, George van den Driessche, Bogdan Damoc, Aurelia Guy,
+Simon Osindero, Karen Simonyan, Erich Elsen, Jack W. Rae, Oriol Vinyals, and Laurent Sifre.
+Training compute-optimal large language models, 2022. URL https://arxiv.org/abs/
+2203.15556.
+Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li, Xianglong Liu, Luca Benini, Michele Magno,
+and Xiaojuan Qi.
+Slim-llm: Salience-driven mixed-precision quantization for large language
+models. arXiv preprint arXiv:2405.14917, 2024.
+Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bam-
+ford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, et al.
+Mixtral of experts. arXiv preprint arXiv:2401.04088, 2024.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child,
+Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language
+models, 2020.
+Shiro Kobayashi and Gerhard P Fettweis. A new approach for block-floating-point arithmetic. In
+1999 IEEE International Conference on Acoustics, Speech, and Signal Processing. Proceedings.
+ICASSP99 (Cat. No. 99CH36258), volume 4, pp. 2009–2012. IEEE, 1999.
+Tanishq Kumar, Zachary Ankner, Benjamin F Spector, Blake Bordelon, Niklas Muennighoff, Man-
+sheej Paul, Cengiz Pehlevan, Christopher Ré, and Aditi Raghunathan. Scaling laws for precision.
+arXiv preprint arXiv:2411.04330, 2024.
+Shiyao Li, Xuefei Ning, Ke Hong, Tengxuan Liu, Luning Wang, Xiuhong Li, Kai Zhong, Guohao
+Dai, Huazhong Yang, and Yu Wang. Llm-mq: Mixed-precision quantization for efficient llm
+deployment. In The Efficient Natural Language and Speech Processing Workshop with NeurIPS,
+volume 9, 2023.
+Wanchao Liang, Tianyu Liu, Less Wright, Will Constable, Andrew Gu, Chien-Chin Huang, Iris
+Zhang, Wei Feng, Howard Huang, Junjie Wang, Sanket Purandare, Gokul Nadathur, and Stratos
+Idreos. Torchtitan: One-stop pytorch native solution for production ready LLM pretraining. In
+The Thirteenth International Conference on Learning Representations, 2025.
+URL https:
+//openreview.net/forum?id=SFN6Wm7YBI.
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+Xiao, Xingyu Dang, Chuang Gan, and Song Han. Awq: Activation-aware weight quantization for
+on-device llm compression and acceleration. Proceedings of Machine Learning and Systems, 6:
+87–100, 2024.
+Lucas D Lingle. Transformer-vq: Linear-time transformers via vector quantization. arXiv preprint
+arXiv:2309.16354, 2023.
+Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao,
+Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report. arXiv preprint
+arXiv:2412.19437, 2024a.
+Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krish-
+namoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm quantiza-
+tion with learned rotations. arXiv preprint arXiv:2405.16406, 2024b.
+Anton Lozhkov, Loubna Ben Allal, Leandro von Werra, and Thomas Wolf. Fineweb-edu: the finest
+collection of educational content, 2024. URL https://huggingface.co/datasets/
+HuggingFaceFW/fineweb-edu.
+12
+
+
+Preprint, Under Review
+Naveen Mellempudi, Sudarshan Srinivasan, Dipankar Das, and Bharat Kaul. Mixed precision train-
+ing with 8-bit floating point. arXiv preprint arXiv:1905.12334, 2019.
+Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia,
+Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, et al. Mixed precision
+training. arXiv preprint arXiv:1710.03740, 2017.
+OpenAI. Openai gpt-4.5 system card. Technical report, OpenAI, February 2025.
+Yeonhong Park, Jake Hyun, SangLyul Cho, Bonggeun Sim, and Jae W Lee. Any-precision llm:
+Low-cost deployment of multiple, different-sized llms. arXiv preprint arXiv:2402.10517, 2024.
+Tim Pearce and Jinyeop Song. Reconciling kaplan and chinchilla scaling laws, 2024. URL https:
+//arxiv.org/abs/2406.12907.
+Qwen Team.
+Qwen3 technical report.
+https://github.com/QwenLM/Qwen3/blob/
+main/Qwen3_Technical_Report.pdf, 2025. Accessed: 2025-05-14.
+Bita Darvish Rouhani, Ritchie Zhao, Venmugil Elango, Rasoul Shafipour, Mathew Hall, Maral Mes-
+makhosroshahi, Ankit More, Levi Melnick, Maximilian Golub, Girish Varatkar, et al. Zhaoxia
+(summer) deng, sam naghshineh, jongsoo park, and maxim naumov. with shared microexponents,
+a little shifting goes a long way. In Proceedings of the 50th Annual International Symposium on
+Computer Architecture, ISCA, pp. 17–21, 2023.
+Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang,
+Peng Gao, Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization for
+large language models. arXiv preprint arXiv:2308.13137, 2023.
+Daria
+Soboleva,
+Faisal
+Al-Khateeb,
+Robert
+Myers,
+Jacob
+R
+Steeves,
+Joel
+Hes-
+tness,
+and
+Nolan
+Dey.
+SlimPajama:
+A
+627B
+token
+cleaned
+and
+dedu-
+plicated
+version
+of
+RedPajama.
+https://www.cerebras.net/blog/
+slimpajama-a-627b-token-cleaned-and-deduplicated-version-of-redpajama,
+2023. URL https://huggingface.co/datasets/cerebras/SlimPajama-627B.
+Xiao Sun, Jungwook Choi, Chia-Yu Chen, Naigang Wang, Swagath Venkataramani, Vijayalak-
+shmi Viji Srinivasan, Xiaodong Cui, Wei Zhang, and Kailash Gopalakrishnan. Hybrid 8-bit float-
+ing point (hfp8) training and inference for deep neural networks. Advances in neural information
+processing systems, 32, 2019.
+Ajay Tirumala and Raymond Wong. Nvidia blackwell platform: Advancing generative ai and ac-
+celerated computing. 2024 IEEE Hot Chips 36 Symposium, pp. 1–33, 2024.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+Albert Tseng, Qingyao Sun, David Hou, and Christopher M De Sa. Qtip: Quantization with trellises
+and incoherence processing. Advances in Neural Information Processing Systems, 37:59597–
+59620, 2024.
+Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao Gong, Shanghang Zhang, Qi Zhang, Feng-
+wei Yu, and Xianglong Liu. Outlier suppression: Pushing the limit of low-bit transformer lan-
+guage models. Advances in Neural Information Processing Systems, 35:17402–17414, 2022.
+Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang, Ruihao Gong, Jinyang Guo, and Xian-
+glong Liu. Outlier suppression+: Accurate quantization of large language models by equivalent
+and optimal shifting and scaling. arXiv preprint arXiv:2304.09145, 2023.
+Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant:
+Accurate and efficient post-training quantization for large language models.
+In International
+Conference on Machine Learning, pp. 38087–38099. PMLR, 2023.
+13
+
+
+Preprint, Under Review
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al.
+Qwen3 technical report.
+arXiv preprint
+arXiv:2505.09388, 2025.
+Shulin Zeng, Jun Liu, Guohao Dai, Xinhao Yang, Tianyu Fu, Hongyi Wang, Wenheng Ma, Hanbo
+Sun, Shiyao Li, Zixiao Huang, et al. Flightllm: Efficient large language model inference with a
+complete mapping flow on fpgas. In Proceedings of the 2024 ACM/SIGDA International Sympo-
+sium on Field Programmable Gate Arrays, pp. 223–234, 2024.
+Cheng Zhang, Jianyi Cheng, Ilia Shumailov, George A Constantinides, and Yiren Zhao. Revis-
+iting block-based quantisation: What is important for sub-8-bit llm inference?
+arXiv preprint
+arXiv:2310.05079, 2023a.
+Cheng Zhang, Jianyi Cheng, Zhewen Yu, and Yiren Zhao. Mase: An efficient representation for
+software-defined ml hardware system exploration. Neurips Workshop Machine Learning for Sys-
+tems 2023, 2023b.
+Cheng Zhang, Jianyi Cheng, George A Constantinides, and Yiren Zhao. Lqer: Low-rank quantiza-
+tion error reconstruction for llms. arXiv preprint arXiv:2402.02446, 2024.
+Lancheng Zou, Wenqian Zhao, Shuo Yin, Chen Bai, Qi Sun, and Bei Yu. Bie: Bi-exponent block
+floating-point for large language models quantization. In Forty-first International Conference on
+Machine Learning, 2024.
+14
+
+
+Preprint, Under Review
+A
+PRE-TRAINING CLM SERIES MODEL
+As discussed in Section 3.1, we pre-trained a series of causal language models (CLMs) to facilitate
+our derivation of mixed quantization scaling laws and corresponding experiments, before we cross-
+validate our scaling laws on other open-source models.
+Table 1: Model architecture of CLMs.
+Model
+Vocab size
+Model dim
+FFN dim
+#Hidden layers
+#Attention heads
+#Key/value heads
+60M
+49152
+384
+1408
+22
+4
+2
+200M
+768
+2688
+24
+12
+4
+400M
+960
+3328
+30
+15
+5
+600M
+1152
+4096
+32
+18
+6
+1.1B
+1536
+5376
+32
+24
+8
+Model architecture and tokenizer
+We adopt the Llama-3 architecture, which incorpo-
+rates group query attention (GQA) and rotary positional embedding (RoPE) (Dubey et al.,
+2024b).
+Table 1 summarizes the model architecture of our CLM series.
+We use
+HuggingFaceTB/cosmo2-tokenizer 1, an open-source tokenizer trained on 1M tokens and
+released by HuggingFace.
+0
+1000
+2000
+3000
+4000
+5000
+Training Steps
+2
+4
+6
+8
+10
+Loss
+Model Size
+60M
+200M
+400M
+1.1B
+Figure 5: Pre-training loss of CLM series.
+Pre-training setup
+We pre-train our models on FineWeb-Edu (Lozhkov et al., 2024), a pre-
+training dataset of cleaned and deduplicated english web data from CommonCrawl. We follow
+Chinchilla (Hoffmann et al., 2022) to determine the number of tokens for pre-training, i.e., multi-
+plying the number of parameters (without embedding layers) by 22. We use the AdamW optimizer
+with a linear learning rate schedule with 20% warmup. The initial learning rate is set to 1e-4 and the
+sequence length is set to 2048. We use various batch sizes for different models, i.e., 96 for 60M, 64
+for 200M, 96 for 400M, 96 for 600M, and 192 for 1.1B. Figure 5 shows the pre-training loss of our
+CLM series. We will open-source our pre-trained models and tokenizer once the paper is accepted.
+Pretraining framework
+We use TorchTitan (Liang et al., 2025), a PyTorch-based distributed
+training framework to pretrain our models. We apply fully sharded data parallel (FSDP) and gradient
+checkpointing to save GPU memory. Eight NVIDIA H200 GPUs were used for pre-training 600M
+and 1.1B models, and eight NVIDIA A100 GPUs were used for pre-training 60M, 200M, and 400M
+models. Before conducting the mixed quantization experiments, we convert the pre-trained models
+from torch distributed format to HuggingFace format.
+1cosmo2-tokenizer: https://huggingface.co/HuggingFaceTB/cosmo2-tokenizer
+15
+
+
+Preprint, Under Review
+B
+DISTRIBUTION FOR SEARCH SPACE
+Figure 6 present the kernel density estimates (KDEs) of the distribution ∆under MXINT-4 layerwise
+quantization, evaluated across varying numbers of trials: 100, 200, 500, and 1000. These KDEs are
+generated using a Gaussian kernel, which may not be the optimal kernel, providing a consistent and
+smooth estimate that is sufficient for comparative analysis.
+We present Figures 6a to 6h, which shows the KDEs of different quantization ratios Qr (from 0.5
+to 0.8) for a fixed model (CLM-1.1B and CLM-200M), whereas Figures 6i to 6p shows the KDEs
+of different model sizes (from 60M to 600M) under fixed Qr(0.5 and 0.6). Across all figures, as the
+sample size increases from 100 to 1000, the estimated distribution tends to remain the same. The
+KDEs generated appear nearly indistinguishable in shape from that of 100. This consistency holds
+throughout different Qr and model sizes.
+These figures suggest that the empirical distribution of ∆can be reliably estimated with as
+few as 100 samples, as presented in Section 3.1. That is, even with relatively small sample sizes,
+the mean (E(∆)) and minimum (δopt) values of ∆can still be well captured. Therefore, from both
+a computational and statistical efficiency perspective, excessive sampling provides diminishing re-
+turns. This insight is particularly valuable since large-scale sampling is computationally expensive.
+C
+LAYER-WISE RESULTS
+As shown in Section 3, Figure 7 and Figure 8 show the actual and fitted loss contour of CLM,
+Qwen1.5, and Qwen3 under MXINT4 layerwise quantization. For each model family we present
+two contours: loss versus model size N and loss versus quantization ratio Qr. Figure 7 shows the
+contour for the minimum value δopt and Figure 8 shows the expectation value δµ. There are a few
+outliers that do not match our fitted contour, which could be caused by the instability of the sampling
+process. In addition, note that the actual losses themselves are estimations.
+D
+MATRIX MULTIPLICATION-WISE RESULTS
+Following the layer-wise results in Section 3, the matrix multiplication-wise with Figure 9 and Fig-
+ure 10 shows the actual and fitted loss contour of CLM, Qwen-1.5, and Qwen-3 under MXINT-4
+matrix multiplication-wise quantization. For each model family, we present two contours: loss
+versus model size N and loss versus quantization ratio Qr. Figure 9 shows the contour for the min-
+imum value δopt and Figure 10 shows the expectation value δµ. As with the layer-wise quantization
+results, a few outliers deviate from the fitted contours due to the variability in the sampling process.
+While Figure 9 and Figure 10 show the effectiveness of the weak law, Figure 11, Figure 12, and
+Figure 13 demonstrate the utility for the strong law. Those three figures show the actual and fitted
+loss contours (both minimum and mean) with respect to block size Qb with different quantization
+ratios Qr for CLM, Qwen-1.5, and Qwen-3. For those figures, our strong law only takes into con-
+sideration losses that are less than 100, since larger losses in perplexity are meaningless under our
+setting (in practical term, these models would not generate anything distinguishable). As a result,
+the fitted contours are not accurate when the actual loss is large, which is acceptable since we do not
+care about those excessive losses.
+E
+OTHER NUMERICAL FORMAT RESULTS
+Figures 14 and 15 present the minimum and mean loss contours with respect to model size N and
+quantization ratio Qr for the CLM, Qwen-1.5, and Qwen-3 models under HQQ quantization. These
+results demonstrate that HQQ is a highly effective quantization method, successfully preserving the
+capabilities of the pre-trained models and maintaining low post-training quantization (PTQ) loss.
+Notably, the fitted contours closely match the empirical data across all model families, indicating that
+our scaling law formulation generalizes well, even under high-performance quantization methods.
+16
+
+
+Preprint, Under Review
+0.5
+1.0
+1.5
+2.0
+2.5
+Data Values
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(a) CLM-1.1B, Qr = 0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Data Values
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(b) CLM-1.1B, Qr = 0.6
+1.5
+2.0
+2.5
+3.0
+Data Values
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(c) CLM-1.1B, Qr = 0.7
+2.0
+2.5
+3.0
+3.5
+Data Values
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(d) CLM-1.1B, Qr = 0.8
+2
+4
+6
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(e) CLM-200M, Qr = 0.5
+2
+4
+6
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(f) CLM-200M, Qr = 0.6
+4
+6
+8
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(g) CLM-200M, Qr = 0.7
+4
+5
+6
+7
+8
+Data Values
+0.0
+0.2
+0.4
+0.6
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(h) CLM-200M, Qr = 0.8
+6
+8
+10
+12
+14
+Data Values
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(i) CLM-60M, Qr = 0.5
+2
+4
+6
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(j) CLM-200M, Qr = 0.5
+1
+2
+3
+4
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(k) CLM-400M, Qr = 0.5
+1
+2
+3
+Data Values
+0.0
+0.2
+0.4
+0.6
+0.8
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(l) CLM-600M, Qr = 0.5
+8
+10
+12
+14
+16
+Data Values
+0.0
+0.1
+0.2
+0.3
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(m) CLM-60M, Qr = 0.6
+2
+4
+6
+Data Values
+0.0
+0.1
+0.2
+0.3
+0.4
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(n) CLM-200M, Qr = 0.6
+1
+2
+3
+4
+Data Values
+0.0
+0.2
+0.4
+0.6
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(o) CLM-400M, Qr = 0.6
+1
+2
+3
+4
+Data Values
+0.0
+0.2
+0.4
+0.6
+0.8
+Density
+Samples:
+ 
+100
+200
+500
+1000
+(p) CLM-600M, Qr = 0.6
+Figure 6: KDE of distribution ∆. Different KDE for different Qr under a fixed models: (a,b,c,d) Changing
+Qr for CLM-1.1B; (e,f,g,h) Changing Qr for CLM-200M. KDE for different model under fixed Qr; (i,j,k,l)
+Changing N for Qr = 0.5; (m,n,o,p) Changing N for Qr = 0.6.
+17
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+14.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+14.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(l) Qwen-3 Predicted Loss
+Figure 7: Layer-wise (δopt) (a,d,g,h) CLM layer-wise results; (b,e,h,k) Qwen-1.5 layer-wise results; (c,f,i,l)
+Qwen-3 layer-wise results.
+18
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+101
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+14.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+14.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(l) Qwen-3 Predicted Loss
+Figure 8: Layer-wise (δµ) (a,d,g,h) CLM layer-wise results; (b,e,h,k) Qwen-1.5 layer-wise results; (c,f,i,l)
+Qwen-3 layer-wise results.
+19
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+101
+Model Size (N)
+10−2
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+101
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−2
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(l) Qwen-3 Predicted Loss
+Figure 9: Matrix Multiplication-wise (δopt) (a,d,g,h) CLM matrix multiplication-wise results; (b,e,h,k) Qwen-
+1.5 matrix multiplication-wise results; (c,f,i,l) Qwen-3 matrix multiplication-wise results.
+20
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+101
+Model Size (N)
+100
+101
+102
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+101
+Model Size (N)
+10−1
+100
+101
+102
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+102
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+102
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+14.0B
+(l) Qwen-3 Predicted Loss
+Figure 10: Matrix Multiplication-wise (δµ) (a,d,g,h) CLM matrix multiplication-wise results; (b,e,h,k) Qwen-
+1.5 matrix multiplication-wise results; (c,f,i,l) Qwen-3 matrix multiplication-wise results.
+21
+
+
+Preprint, Under Review
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+50
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) 60M Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+50
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) 60M Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+10
+20
+30
+40
+50
+60
+70
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) 60M Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+10
+20
+30
+40
+50
+60
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) 60M Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) 200M Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+20
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) 200M Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+5
+10
+15
+20
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(g) 200M Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+5
+10
+15
+20
+25
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(h) 200M Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+12
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(i) 400M Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+12
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(j) 400M Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(k) 400M Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(l) 400M Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(m) 600M Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(n) 600M Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(o) 600M Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2
+4
+6
+8
+10
+12
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(p) 600M Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(q) 1.1B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+1
+2
+3
+4
+5
+6
+Loss Degeneration (δ)
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(r) 1.1B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2
+4
+6
+8
+10
+12
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(s) 1.1B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+2
+4
+6
+8
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(t) 1.1B Predicted (mean)
+Figure 11:
+Strong Law CLM Matrix Multiplication-wise (δopt, δµ) (a,b,e,f,i,j,m,n,q,r) CLM matrix
+multiplication-wise δopt results; (c,d,g,h,k,l,o,p,s,t) CLM matrix multiplication-wise δµ results.
+22
+
+
+Preprint, Under Review
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+200
+400
+600
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) 0.5B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+50
+100
+150
+200
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) 0.5B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+500
+1000
+1500
+2000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) 0.5B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+100
+200
+300
+400
+500
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) 0.5B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) 1.8B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) 1.8B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+20
+40
+60
+80
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(g) 1.8B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+20
+40
+60
+80
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(h) 1.8B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(i) 4B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(j) 4B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+5
+10
+15
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(k) 4B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+20
+25
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(l) 4B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(m) 7B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(n) 7B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5
+10
+15
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(o) 7B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2
+4
+6
+8
+10
+12
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(p) 7B Predicted (mean)
+Figure 12: Strong Law Qwen-1.5 Matrix Multiplication-wise (δopt, δµ) (a,b,e,f,i,j,m,n) Qwen1.5 matrix
+multiplication-wise δopt results; (c,d,g,h,k,l,o,p) Qwen1.5 matrix multiplication-wise δµ results.
+23
+
+
+Preprint, Under Review
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+1000
+2000
+3000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) 0.6B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+100
+200
+300
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) 0.6B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+20000
+40000
+60000
+80000
+100000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) 0.6B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+5000
+10000
+15000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) 0.6B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+100
+200
+300
+400
+500
+600
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) 1.7B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+25
+50
+75
+100
+125
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) 1.7B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+100000
+200000
+300000
+400000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(g) 1.7B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+1000
+2000
+3000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(h) 1.7B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(i) 4B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+20
+40
+60
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(j) 4B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+2000
+4000
+6000
+8000
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(k) 4B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+200
+400
+600
+800
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(l) 4B Predicted (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+20
+40
+60
+80
+100
+120
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(m) 8B Actual (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+10
+20
+30
+40
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(n) 8B Predicted (min)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+100
+200
+300
+400
+500
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(o) 8B Actual (mean)
+50
+100
+150
+200
+250
+Block Size (Qb)
+0
+50
+100
+150
+200
+250
+300
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(p) 8B Predicted (mean)
+Figure 13:
+Strong Law Qwen-3 Matrix Multiplication-wise (δopt, δµ) (a,b,e,f,i,j,m,n) Qwen3 matrix
+multiplication-wise δopt results; (c,d,g,h,k,l,o,p) Qwen3 matrix multiplication-wise δµ results.
+24
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+Model Size (N)
+10−2
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−2
+10−1
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen-3 Predicted Loss
+Figure 14: HQQ (δopt) (a,d,g,h) CLM HQQ results; (b,e,h,k) Qwen-1.5 HQQ results; (c,f,i,l) Qwen-3 HQQ
+results.
+25
+
+
+Preprint, Under Review
+Note that, under these settings, there are some significant outliers for Qwen-3 results, with negativate
+PTQ losses, such negative PTQ losses might be caused by the fact that all Qwen-3 models involved
+in our experiments are partially distilled from larger models as indicated in (Yang et al., 2025),
+invalidating our assumptions in Section 2.
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+100
+4 × 10−1
+6 × 10−1
+2 × 100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen1.5 Actual Loss
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+100
+4 × 10−1
+6 × 10−1
+2 × 100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen1.5 Predicted Loss
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+4 × 10−1
+6 × 10−1
+2 × 100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+4 × 10−1
+6 × 10−1
+2 × 100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen3 Predicted Loss
+Figure 15: HQQ (δµ) (a,d,g,h) CLM HQQ results; (b,e,h,k) Qwen-1.5 HQQ results; (c,f,i,l) Qwen-3 HQQ
+results.
+26
+
+
+Preprint, Under Review
+In contrast, Figures 16 and 17 show the results for MXINT-2 quantization, which performs poorly
+across the board. The loss increases significantly under this setting, suggesting that aggressive
+quantization in both weights and activations severely degrades model quality. Despite the high loss,
+our fitted contours remain aligned with the empirical observations, capturing the underlying loss
+surface accurately.
+10−1
+100
+Model Size (N)
+101
+102
+103
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+101
+102
+103
+104
+105
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+Model Size (N)
+101
+102
+103
+104
+105
+106
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+102
+103
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+101
+102
+103
+104
+105
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+Model Size (N)
+100
+101
+102
+103
+104
+105
+106
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+101
+102
+103
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+101
+102
+103
+104
+105
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+101
+102
+103
+104
+105
+106
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+102
+103
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+101
+102
+103
+104
+105
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+101
+102
+103
+104
+105
+106
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen-3 Predicted Loss
+Figure 16: MXINT-2 (δopt) (a,d,g,h) CLM MXINT-2 results; (b,e,h,k) Qwen-1.5 MXINT-2 results; (c,f,i,l)
+Qwen-3 MXINT-2 results.
+27
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+102
+103
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+103
+104
+105
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+Model Size (N)
+103
+104
+105
+106
+107
+108
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+102
+103
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+104
+105
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+Model Size (N)
+10−1
+101
+103
+105
+107
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+102
+103
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+103
+104
+105
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+103
+104
+105
+106
+107
+108
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+102
+103
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+104
+105
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+101
+103
+105
+107
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen-3 Predicted Loss
+Figure 17: MXINT-2 (δµ) (a,d,g,h) CLM MXINT2 results; (b,e,h,k) Qwen-1.5 MXINT2 results; (c,f,i,l) Qwen-
+3 MXINT2 results.
+28
+
+
+Preprint, Under Review
+Figures 18 and 19 display the loss contours for MXINT-4 weight-only quantization. This method
+shows moderate performance. It incurs a smaller degradation in loss than MXINT-2. The fitted
+contours once again align well with actual measurements, reinforcing the robustness of our scaling
+law across varying quantization granularities and levels of aggressiveness. Similar to the HQQ
+quantization, the effectiveness of MXINT-4 weight-only quantization and the distillation training
+process of Qwen-3 explains the outliers for Qwen-3 figures.
+10−1
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen-1.5 Actual Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen-3 Actual Loss
+10−1
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+10−1
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen-1.5 Predicted Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen-3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen-1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen-3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+Loss Degeneration (δ)
+0.06
+0.2
+0.4
+0.6
+1.1
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen-1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen-3 Predicted Loss
+Figure 18: MXINT-4 Weight-only (δopt) (a,d,g,h) CLM MXINT-4 Weight-only results; (b,e,h,k) Qwen-1.5
+MXINT4 Weight-only results; (c,f,i,l) Qwen-3 MXINT-4 Weight-only results.
+29
+
+
+Preprint, Under Review
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(a) CLM Actual Loss
+100
+Model Size (N)
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(b) Qwen1.5 Actual Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(c) Qwen3 Actual Loss
+10−1
+100
+Model Size (N)
+100
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(d) CLM Predicted Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(e) Qwen1.5 Predicted Loss
+100
+Model Size (N)
+10−1
+100
+101
+Loss Degeneration (δ)
+Qr:
+ 
+ 
+0.5
+0.6
+0.7
+0.8
+0.9
+0.95
+0.975
+(f) Qwen3 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(g) CLM Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(h) Qwen1.5 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(i) Qwen3 Actual Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+100
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.06B
+0.2B
+0.4B
+0.6B
+1.1B
+(j) CLM Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.5B
+1.8B
+4.0B
+7.0B
+(k) Qwen1.5 Predicted Loss
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Quantization Ratio (Qr)
+10−1
+100
+101
+Loss Degeneration (δ)
+Model Size:
+ 
+ 
+0.6B
+1.7B
+4.0B
+8.0B
+(l) Qwen3 Predicted Loss
+Figure 19: MXINT4 Weight-only (δµ) (a,d,g,h) CLM MXINT4 Weight-only results; (b,e,h,k) Qwen-1.5 MX-
+INT4 Weight-only results; (c,f,i,l) Qwen-3 MXINT4 Weight-only results.
+30
+
+
+Preprint, Under Review
+F
+FORMULA FITTING
+We report all fitted coefficients and R2 plots in Figures 20 to 37. These include block-wise strong law
+fittings, as well as weak law fittings under layerwise, matrix-multiplication-wise, HQQ, MXINT2,
+and MXINT4 weight-only quantization. Each table reports the coefficients described in Section 2
+from our scaling law equations, and the scatter plots compare predicted and actual PTQ losses to
+evaluate the fitting quality.
+Overall Trends and Implications.
+Across all quantization levels and model families, the R2 plots
+validate the predictive power of our scaling laws. Tight clustering along the diagonal confirms that
+the fitted models not only approximate empirical losses well but also generalize across compression
+levels and model sizes. Exceptions, including negative γN or inflated constants, indicate model-
+instability or ill-posed settings such as distillation pre-training or over-compression.
+Block-wise Strong Law Fitting
+Figures 20–22 display the strong law fits across model families.
+For CLM and Qwen1.5, we observe high-quality fits with consistent scaling exponents. However,
+Qwen3 shows greater variability, with large γc values (e.g., 1.67), indicating strong sensitivity to the
+quantization ratio Qr, likely caused by its distillation-only training pipeline.
+Layerwise and Matrix Multiplication-wise MXINT-4 Fitting
+Figures 29–34 show the layerwise
+and matrix multiplication-wise MXINT4 quantization weak law results in strong, consistent fits
+across CLM and Qwen-1.5.
+HQQ Fitting
+Figures 23–25 demonstrate that HQQ quantization maintains consistently good fits
+across all model families. These weak law results further confirm the strength of HQQ in preserving
+model accuracy after quantization, and they validate that our scaling law generalizes even under
+high-performance quantizers.
+MXINT-2 Fitting
+Figures 26–28 illustrate that MXINT2—our most aggressive quantiza-
+tion—yields degraded fits. This is especially evident for Qwen-1.5, where fitted constants reach
+extreme values (e.g., C = 1181.1), and for Qwen-3, where γN becomes negative (−4.62), indi-
+cating that MXINT-2 quantization is not ideal. Despite this, the R2 plots still show approximate
+alignment, suggesting that the weak law scaling structure is partially preserved.
+MXINT-4 Weight-only Fitting
+Figures 35-37 confirm that weight-only MXINT-4 quantization
+achieves a balanced tradeoff: it reduces parameter precision with less impact on performance com-
+pared to MXINT2. Fit quality remains strong with reasonable coefficients. These trends validate
+that restricting quantization to weights alone preserves much of the original loss landscape structure,
+and our weak law accurately tracks this behavior across CLM, Qwen-1.5, and Qwen-3.
+C
+0.0028
+A
+5.2055
+γN
+0.7651
+d
+13.6320
+γc
+0.4741
+0
+20
+40
+Actual
+0
+10
+20
+30
+40
+50
+Fitted
+R 2 = 0.9597, MSE = 3.0368
+C
+0.0345
+A
+3.2462
+γN
+0.7150
+d
+5.4028
+γc
+0.4273
+0
+20
+40
+60
+Actual
+0
+20
+40
+60
+Fitted
+R 2 = 0.9822, MSE = 2.1621
+Figure 20: CLM Strong Law. The left two are for δopt and The right two are for δµ
+.
+31
+
+
+Preprint, Under Review
+C
+0.0001
+A
+11.3016
+γN
+1.2086
+d
+-12.2589
+γc
+0.5670
+0
+20
+40
+60
+80
+Actual
+0
+20
+40
+60
+80
+Fitted
+R 2 = 0.9511, MSE = 7.1556
+C
+0.0036
+A
+6.5570
+γN
+1.4627
+d
+-5.4784
+γc
+0.8237
+0
+20
+40
+60
+80
+Actual
+0
+20
+40
+60
+80
+Fitted
+R 2 = 0.9150, MSE = 31.4272
+Figure 21: Qwen-1.5 Strong Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0025
+A
+8.1566
+γN
+0.8181
+d
+-13.1436
+γc
+0.6208
+0
+20
+40
+60
+80
+100
+Actual
+0
+20
+40
+60
+80
+100
+Fitted
+R 2 = 0.7025, MSE = 118.6579
+C
+0.0142
+A
+4.1025
+γN
+1.5909
+d
+-3.7594
+γc
+1.6736
+0
+20
+40
+60
+80
+100
+Actual
+0
+20
+40
+60
+80
+100
+Fitted
+R 2 = 0.8336, MSE = 102.4654
+Figure 22: Qwen-3 Strong Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0522
+A
+2.1631
+γN
+0.6471
+0.5
+1.0
+1.5
+2.0
+2.5
+Actual
+0.5
+1.0
+1.5
+2.0
+2.5
+Fitted
+R 2 = 0.9668, MSE = 0.0136
+C
+0.1583
+A
+1.3561
+γN
+0.5508
+0.5
+1.0
+1.5
+2.0
+2.5
+Actual
+0.5
+1.0
+1.5
+2.0
+2.5
+Fitted
+R 2 = 0.9910, MSE = 0.0041
+Figure 23: HQQ CLM Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.1140
+A
+2.4336
+γN
+0.5063
+0.5
+1.0
+1.5
+Actual
+0.5
+1.0
+1.5
+Fitted
+R 2 = 0.9636, MSE = 0.0066
+C
+0.3863
+A
+1.4557
+γN
+0.4341
+0.5
+1.0
+1.5
+2.0
+Actual
+0.5
+1.0
+1.5
+2.0
+Fitted
+R 2 = 0.9583, MSE = 0.0103
+Figure 24: HQQ Qwen-1.5 Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.1480
+A
+2.7216
+γN
+0.8841
+0
+1
+2
+3
+Actual
+0
+1
+2
+3
+Fitted
+R 2 = 0.9679, MSE = 0.0279
+C
+0.6476
+A
+1.5246
+γN
+0.6990
+0
+1
+2
+3
+4
+Actual
+0
+1
+2
+3
+4
+Fitted
+R 2 = 0.9462, MSE = 0.0748
+Figure 25: HQQ Qwen-3 Weak Law. The left two are for δopt and The right two are for δµ
+.
+32
+
+
+Preprint, Under Review
+C
+0.1407
+A
+9.1365
+γN
+0.0992
+0
+500
+1000
+Actual
+0
+250
+500
+750
+1000
+1250
+Fitted
+R 2 = 0.9707, MSE = 5572.0151
+C
+6.1421
+A
+5.7318
+γN
+0.0821
+0
+500
+1000
+1500
+2000
+Actual
+0
+500
+1000
+1500
+2000
+Fitted
+R 2 = 0.9499, MSE = 21626.7894
+Figure 26: MXINT-2 CLM Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0001
+A
+21.7819
+γN
+0.4173
+0
+50000
+100000
+150000
+Actual
+0
+50000
+100000
+150000
+Fitted
+R 2 = 0.9496, MSE = 101813589.9844
+C
+1181.1395
+A
+5.7997
+γN
+0.3834
+0
+100000
+200000
+300000
+400000
+Actual
+0
+100000
+200000
+300000
+400000
+Fitted
+R 2 = 0.9257, MSE = 1071087221.3411
+Figure 27: MXINT-2 Qwen-1.5 Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0000
+A
+29.2508
+γN
+0.5165
+0.0
+0.5
+1.0
+1.5
+2.0
+Actual
+1e6
+0.0
+0.5
+1.0
+1.5
+2.0
+Fitted
+1e6
+R 2 = 0.9755, MSE = 6177323244.0083
+C
+0.0000
+A
+21.2625
+γN
+-4.6183
+0
+2
+4
+6
+Actual
+1e7
+0
+2
+4
+6
+Fitted
+1e7
+R 2 = 0.9694, MSE = 7200467939934.7119
+Figure 28: MXINT-2 Qwen-3 Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.2187
+A
+2.2312
+γN
+0.8405
+0
+5
+10
+15
+20
+Actual
+0
+5
+10
+15
+20
+Fitted
+R 2 = 0.9840, MSE = 0.4342
+C
+0.6682
+A
+1.4650
+γN
+0.7259
+5
+10
+15
+20
+Actual
+5
+10
+15
+20
+Fitted
+R 2 = 0.9907, MSE = 0.2866
+Figure 29: MXINT-4 Layerwise CLM Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0313
+A
+4.2991
+γN
+0.7828
+0
+5
+10
+15
+20
+Actual
+0
+5
+10
+15
+20
+Fitted
+R 2 = 0.9844, MSE = 0.3014
+C
+0.1862
+A
+2.8693
+γN
+0.7030
+0
+5
+10
+15
+20
+Actual
+0
+5
+10
+15
+20
+Fitted
+R 2 = 0.9929, MSE = 0.2000
+Figure 30: MXINT-4 Matrix Multiplication-wise CLM Weak Law. The left two are for δopt and The right
+two are for δµ
+.
+33
+
+
+Preprint, Under Review
+C
+0.5221
+A
+2.7972
+γN
+0.7188
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Actual
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Fitted
+R 2 = 0.9837, MSE = 0.1662
+C
+1.0190
+A
+2.2913
+γN
+0.7626
+0
+5
+10
+15
+Actual
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Fitted
+R 2 = 0.9770, MSE = 0.3785
+Figure 31: MXINT-4 Layerwise Qwen-1.5 Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0286
+A
+5.9666
+γN
+0.8073
+0
+5
+10
+15
+20
+Actual
+0
+5
+10
+15
+20
+Fitted
+R 2 = 0.9603, MSE = 0.6698
+C
+0.1280
+A
+4.9367
+γN
+1.1931
+0
+10
+20
+30
+Actual
+0
+10
+20
+30
+Fitted
+R 2 = 0.9847, MSE = 1.2728
+Figure 32: MXINT-4 Matrix Multiplication-wise Qwen-1.5 Weak Law. The left two are for δopt and The
+right two are for δµ
+.
+C
+0.8209
+A
+2.3712
+γN
+0.9880
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Actual
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Fitted
+R 2 = 0.9786, MSE = 0.2726
+C
+1.5107
+A
+1.9349
+γN
+0.9487
+0
+5
+10
+15
+Actual
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+Fitted
+R 2 = 0.9783, MSE = 0.4021
+Figure 33: MXINT-4 Layerwise Qwen-3 Weak Law. The left two are for δopt and The right two are for δµ
+.
+C
+0.0412
+A
+6.0802
+γN
+0.9921
+0
+5
+10
+15
+20
+25
+Actual
+0
+5
+10
+15
+20
+25
+Fitted
+R 2 = 0.9940, MSE = 0.2138
+C
+0.3569
+A
+5.0608
+γN
+1.9352
+0
+25
+50
+75
+100
+125
+Actual
+0
+25
+50
+75
+100
+125
+Fitted
+R 2 = 0.9970, MSE = 3.1558
+Figure 34: MXINT-4 Matrix Multiplication-wise Qwen-3 Weak Law. The left two are for δopt and The right
+two are for δµ
+.
+C
+0.0089
+A
+4.4940
+γN
+0.6818
+0
+1
+2
+3
+4
+5
+Actual
+0
+1
+2
+3
+4
+5
+Fitted
+R 2 = 0.9790, MSE = 0.0266
+C
+0.0749
+A
+2.6608
+γN
+0.6197
+0
+2
+4
+6
+Actual
+0
+1
+2
+3
+4
+5
+6
+Fitted
+R 2 = 0.9920, MSE = 0.0147
+Figure 35: Weight-only MXINT-4 CLM Weak Law. The left two are for δopt and The right two are for δµ
+.
+34
+
+
+Preprint, Under Review
+C
+0.0032
+A
+7.1464
+γN
+0.9663
+0
+2
+4
+6
+Actual
+0
+2
+4
+6
+Fitted
+R 2 = 0.9478, MSE = 0.1370
+C
+0.1179
+A
+3.8872
+γN
+1.3831
+0
+5
+10
+Actual
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+Fitted
+R 2 = 0.9915, MSE = 0.1125
+Figure 36: Weight-only MXINT-4 Qwen-1.5 Weak Law. The left two are for δopt and The right two are for
+δµ
+.
+C
+0.0188
+A
+5.9150
+γN
+1.1251
+0.0
+2.5
+5.0
+7.5
+10.0
+Actual
+0
+2
+4
+6
+8
+10
+Fitted
+R 2 = 0.9552, MSE = 0.3542
+C
+0.3990
+A
+4.0875
+γN
+1.9460
+0
+20
+40
+60
+Actual
+0
+10
+20
+30
+40
+50
+60
+Fitted
+R 2 = 0.9977, MSE = 0.5785
+Figure 37: Weight-only MXINT-4 Qwen-3 Weak Law. The left two are for δopt and The right two are for δµ
+.
+G
+FURTHER EXPLANATION FOR OUR ESTIMATION OF E(∆) AND min(∆)
+As discussed in Section 2, we are interested in two parameters of the discrete random variable ∆:
+E(∆) and min(∆), which represent the mean and minimum (optimal) values of ∆. In the weak
+law, they are denoted as δopt(N, Qr) and E[∆(N, Qr)]. In the strong law, they are denoted as
+δopt(N, Qr, Qb) and E[∆(N, Qr, Qb)].
+We estimate those two parameters with the following two estimator. Given a list of i.i.d. discrete
+random variables {∆i}n
+i=1. We denote the unbiased estimator of E(∆) as
+En =
+Pn
+i=1 ∆i
+n
+,
+(20)
+and the biased estimator of min(∆) as
+Mn = min({∆i : i = 1, · · · , n}) .
+(21)
+En is an unbiased estimator as
+E(En) −E(∆) =
+Pn
+i=1 E(∆i)
+n
+−E(∆)
+= E(∆) −E(∆)
+= 0 .
+(22)
+On the other hand, Mn is a biased estimator. Without loss of generality, we will calculate the bias
+of M ′
+n = max({∆i : i = 1, · · · , n}) with respect to max(∆). Since {∆i}n
+i=1 are i.i.d,
+Pr(M ′
+n < x) =
+n
+Y
+i=1
+Pr(∆i < x)
+= F n(x−) ,
+(23)
+where F is the cdf of ∆and x−= max({x′ : x′ < x ∧Pr(∆= x′)̸ = 0} ∪−∞). Hence the
+expectation of M ′
+n is
+E(M ′
+n) =
+X
+x
+x Pr(M ′
+n = x)
+=
+X
+x
+x Pr(M ′
+n ≤x ∧M ′
+n ≮x)
+=
+X
+x
+x(F n(x) −F n(x−)) .
+(24)
+35
+
+
+Preprint, Under Review
+As
+X
+x
+(F n(x) −F n(x−)) = F n(max(∆)) −F n(−∞) = 1 −0 = 1 ,
+(25)
+E(M ′
+n) is a re-weighting of different x-s and the weight for max(∆) is not 1, hence E(M ′
+n) <
+max(∆). However, as n →∞, (F n(x) −F n(x−)) →0 for all x̸ = max(∆), so
+E(M ′
+n)
+d−→max(∆) as n →∞,
+(26)
+making {M ′
+n}∞
+i=1 asymptotically unbiased. Recall notations from Section 2, given n realizations
+{δi}n
+i=1 of the random variables {∆i}n
+i=1,
+µδ =
+Pn
+i=1 δi
+n
+(27)
+and
+δmin = min({δi : i = 1, · · · , n})
+(28)
+are our final estimation of the mean and minimum of ∆. Our weak and strong law are designed to fit
+those estimations. To be specific, each fitting of the weak or the strong law tries to fit separately on
+µδ and δmin, which is also why each of our laws has two separate parts for expectation and minimum
+values.
+H
+ADDITIONAL RELATED WORK
+In addition to the backgrounds presented in Section 4, we further discuss the related work on mixed
+precision. Specifically, we categorize the work under the following three topics: mixed-precision
+quantization, mixed-precision inference, and mixed-precision training.
+Mixed-precision quantization
+Mixed precision approaches involve partitioning a model’s pa-
+rameters into both high-precision and low-precision components, which have been shown to better
+preserve model performance relative to uniform quantization. This is primarily seen in models that
+exhibit different sensitivities to quantization at various layers. Some mixed-precision LLM quanti-
+zation work adopts the concept of weight salience to guide the search for fine-grained bit allocation.
+The first-order (Li et al., 2023) or second-order weight gradient (Huang et al., 2024) has been used
+to form such salience metrics, such that salient layers are left in higher precision while the rest are
+cast to low precision. There are also works performing the search in an end-to-end style with the
+quantized model performance as the objective, such as the accuracy on a downstream task (Zhang
+et al., 2023a). In both cases, mixed precision can be seen as a promising approach to provide a loss-
+less reduction in LLM memory requirements, reducing average bit widths below levels achievable
+through uniform quantization.
+Mixed-precision inference
+Mixed-precision inference methods targeting GPUs usually adopt reg-
+ular mixed-precision strategies and computation patterns; The authors of GPTQ3.int8() (Dettmers
+et al., 2022) decompose the matrix multiplication in every linear layer into two sub-matrix-
+multiplications based on the activation magnitudes, achieving a 2-3× inference speedup by casting
+the low-magnitude sub-matrix to low precision. SpQR (Dettmers et al., 2023) represents a weight
+matrix with grouped 3-bit integers and less than 1% sensitive weight elements with FP16 values,
+achieving a 2× speedup compared to a quantized and sparse PyTorch baseline. These approaches
+enable reducing model size, but additional careful treatment is needed to improve inference through-
+put. For example, in (Li et al., 2023), mixed precision LLM quantization at 2-bit and 3-bit showed
+no speedup compared to 4-bit, due to less efficient utilization of memory bandwidth. On the other
+hand, Any-Precision LLM (Park et al., 2024) achieves throughput scaling at various precisions by
+providing CUDA kernels with a novel weight packing approach following a bitplane layout, achiev-
+ing 1.3-1.8× speedup on mobile and edge devices. Additionally, works such as FlightLLM achieve
+high throughput by leveraging custom hardware designs (Zeng et al., 2024).
+Mixed-precision training
+Mixed-precision quantization has also been adopted in training to re-
+duce the large memory footprint of gradient descent, which requires the storage of optimizer states
+and gradients in addition to forward activations. It has been shown that the training process can
+36
+
+
+Preprint, Under Review
+tolerate aggressive quantization and correct quantization noise in some components. (Micikevicius
+et al., 2017) is the pioneering work proposing the storage of all weights, activations, and gradients
+in FP16, while updating a copy of weights in FP32. This work also proposed scaling up the for-
+ward pass loss and unscaling the gradient before the weight update to avoid under-utilization of
+the FP16 representable range, leading to half the memory requirement and speed-ups of 2-6× rela-
+tive to FP32 training. Recently, more aggressive quantization has been studied for mixed-precision
+training. (Mellempudi et al., 2019) trains models with E5M2 FP8, maintaining a master copy of
+the weights in FP16, and dynamically adjusting the scaling factor every few iterations. Hybrid-
+FP8 (Sun et al., 2019) improves FP8 training by using E4M3 for forward propagation and E5M2
+for backward propagation, leading to matching performance to models trained with FP32. Popular
+implementations of FP8 mixed-precision training like TransformerEngine 2 have achieved a training
+acceleration of around 3-4× compared to FP16 mixed-precision training.
+2TransformerEngine: https://github.com/NVIDIA/TransformerEngine.
+37

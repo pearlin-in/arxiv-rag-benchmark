@@ -1,0 +1,1604 @@
+Scaling Law for Quantization-Aware Training
+Mengzhao Chen1,2, Chaoyi Zhang2, Jing Liu2, Yutao Zeng2, Zeyue Xue1,
+Zhiheng Liu1, Yunshui Li2, Jin Ma2, Jie Huang2, Xun Zhou2,†, Ping Luo1,†
+1The University of Hong Kong, 2ByteDance Seed
+†Corresponding authors
+Abstract
+Large language models (LLMs) demand substantial computational and memory resources, creating
+deployment challenges. Quantization-aware training (QAT) addresses these challenges by reducing
+model precision while maintaining performance. However, the scaling behavior of QAT, especially
+at 4-bit precision (W4A4), is not well understood. Existing QAT scaling laws often ignore key
+factors such as the number of training tokens and quantization granularity, which limits their
+applicability. This paper proposes a unified scaling law for QAT that models quantization error
+as a function of model size, training data volume, and quantization group size. Through 268
+QAT experiments, we show that quantization error decreases as model size increases, but rises
+with more training tokens and coarser quantization granularity. To identify the sources of W4A4
+quantization error, we decompose it into weight and activation components. Both components
+follow the overall trend of W4A4 quantization error, but with different sensitivities. Specifically,
+weight quantization error increases more rapidly with more training tokens. Further analysis
+shows that the activation quantization error in the FC2 layer, caused by outliers, is the primary
+bottleneck of W4A4 QAT quantization error. By applying mixed-precision quantization to address
+this bottleneck, we demonstrate that weight and activation quantization errors can converge to
+similar levels. Additionally, with more training data, weight quantization error eventually exceeds
+activation quantization error, suggesting that reducing weight quantization error is also important
+in such scenarios. These findings offer key insights for improving QAT research and development.
+Date: May 21, 2025
+1
+Introduction
+The emergence of large language models (LLMs)[15, 24, 35] revolutionizes natural language processing (NLP),
+enabling advances in tasks from text generation to complex reasoning. However, their large parameter sizes
+make them computationally intensive and memory-demanding[43, 46], creating challenges for deployment.
+Quantization [36, 42], which reduces the precision of model weights and activations, addresses these challenges
+by lowering memory usage and computational cost. Post-training quantization (PTQ)[3, 26, 42] achieves near-
+lossless accuracy at moderate precision, such as W8A8 (8-bit weights and activations), but struggles to maintain
+accuracy at lower precisions like W4A4[25]. In contrast, quantization-aware training (QAT) [6, 27, 28, 32]
+incorporates quantization during training, allowing models to adapt to reduced precision and supporting more
+aggressive compression. However, the scaling behavior of QAT at ultra-low bit-widths (e.g., W4A4) remains
+underexplored, limiting the design of efficient quantized LLMs.
+1
+arXiv:2505.14302v1  [cs.LG]  20 May 2025
+
+
+100M
+1B
+10B
+Model Size
+10B
+100B
+1T
+10T
+Training Tokens
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+Quantization Error Contour (G=32)
+(a) W4A4G32
+100M
+1B
+10B
+Model Size
+10B
+100B
+1T
+10T
+Training Tokens
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+Quantization Error Contour (G=256)
+(b) W4A4G256
+Figure 1
+Quantization error contour based on the proposed unified QAT scaling law. The quantization
+error decreases as the model size increases, but increases with both the number of training tokens and with coarser
+quantization granularity.
+Scaling laws [16, 19] have proven instrumental in understanding LLMs performance as a function of model
+size, dataset size, and computational resources. Foundational works, such as the Kaplan scaling law [19] and
+the refined Chinchilla scaling law [16], provide predictive models for optimizing LLM training strategies in full-
+precision settings. Recent efforts have extended these frameworks to account for model quantization [12, 20, 31],
+with some studies examining PTQ [20, 31] and others proposing QAT-specific scaling laws [12, 20]. However,
+existing QAT scaling laws [12, 20] typically focused on either parameters count or fixed quantization settings,
+often neglecting critical factors such as number of training tokens or the granularity of quantization. Empirical
+observations (see Figure 4) indicate that quantization error can increase dramatically with larger training
+datasets and coarser quantization groups. Yet, prior works [12, 20] have not provided a unified framework
+that accounts for the interplay between all these factors, reducing their practical utility for real-world model
+design and training.
+In this paper, we address these limitations by presenting a unified scaling law for QAT. Our model explicitly
+describes how quantization error depends on model size, the number of training tokens, and quantization
+granularity. Given that W8A8 quantization achieves nearly lossless performance [10, 24, 36], we focus our
+analysis on W4A4 QAT. We conduct 268 QAT experiments and show that quantization error decreases as
+model size increases, but increases with larger training datasets and coarser quantization granularity. Figure 1
+shows the contours of quantization error in loss according to our proposed QAT scaling law. Our main
+contributions are as follows:
+• Unified QAT scaling law: We propose a mathematical model for QAT quantization error, capturing its
+dependence on model size, dataset size, and quantization group size.
+• Empirical validation: Through systematic experiments, we show that quantization error decreases with
+larger models but increases with more training tokens and coarser quantization.
+• Quantization error decomposition: We decompose quantization error into weight and activation components,
+and find that weight quantization error is more sensitive to number of training tokens. We also identify
+activation quantization—especially in the FC2 layer of the feed-forward network—as the main bottleneck
+for W4A4 QAT.
+• Bottleneck layer analysis: We show that activation quantization error in FC2 mainly arises from outlier
+values that 4-bit quantization cannot capture. By keeping the bottleneck layer at 8-bit precision during
+W4A4 QAT, we demonstrate that weight and activation quantization errors contribute almost equally to the
+total error at a data-to-parameter ratio of 100. With larger data-to-parameter ratios, weight quantization
+error surpasses activation error. This highlights the importance of considering both weight and activation
+components in future QAT algorithm design.
+2
+
+
+2
+Related Works
+Scaling Law of LLMs. Scaling laws provide a general framework for understanding how model performance
+changes with resources, guiding both architecture and training strategy design. The Kaplan scaling law [19]
+first described how model size, dataset size, and compute relate to performance. Later, the Chinchilla scaling
+law [16] refined this by emphasizing the balance between model parameters (N) and training data tokens
+(D) for optimal performance under a fixed compute budget. Recent research extends scaling laws to model
+compression, including quantization [11, 23]. Studies on PTQ scaling laws [20, 31, 32] find that PTQ error
+decreases as model size increases, but increases with larger training datasets, implying that models trained
+on more data may need higher precision. Other works on QAT scaling laws [12, 20] show that quantization
+error mainly depends on model size. Building on these studies, our work explores QAT in greater depth and
+proposes a unified scaling law that considers model size, training data size, and quantization granularity.
+Quantization of LLMs. Quantization reduces the computational and memory costs of serving LLMs. Current
+PTQ methods [42] perform well at 8-bit precision, often achieving near-lossless results (e.g., W8A8 quantization).
+However, lowering the bit-width to 4-bit (e.g., W4A4) with PTQ usually leads to significant performance
+drops [5, 25, 36]. This accuracy loss limits the adoption of efficient 4-bit matrix multiplication (GEMM)
+kernels [22] for LLM inference. QAT [6, 27] addresses this by training models with quantization applied,
+which helps recover accuracy at low bit-widths. The BitNet series [28, 40] shows that QAT outperforms PTQ,
+especially at very low bit-widths, though a gap remains compared to full-precision models. Understanding
+scaling behavior under QAT is therefore important for designing better QAT strategies.
+3
+Preliminaries
+Classical scaling law. The Chinchilla scaling law [16] models the final loss (L) using model size (N) and
+number of training tokens(D):
+L(N, D) = A
+N α + B
+Dβ + E,
+(1)
+where A, α, B, β, and E are fitted constants, listed in Table 1. Section C in the Appendix explains the fitting
+process.
+Existing QAT scaling law. Previous studies [12, 20] modify Eq.(1) by introducing an effective parameter
+multiplier (EPM) on N, resulting in:
+L(N, D) =
+A
+(N · eff(C))α + B
+Dβ + E,
+(2)
+where eff(C) ∈[0, 1] denotes the EPM, which depends on the model architecture and compression method. A
+higher value of EPM indicates better preservation of the original (BFloat16 [18]) model performance.
+Proposed QAT Scaling Law. Unlike existing QAT scaling laws that modify the N capacity term in the
+Chinchilla scaling law, we directly model the final loss gap (i.e., the quantization error) between QAT models
+and their BFloat16 counterparts . For instance, the quantization error in the EPM scaling law can be
+calculated through Eq. (2) −Eq. (1):
+δp(N) =
+A
+(N · eff(C))α −A
+N α ,
+(3)
+δp represents the quantization error with p-bit QAT. Eq. (3) shows that previous QAT scaling laws assume
+the quantization error depends only on N and is independent of the data size D. However, our experiments
+(Figure 4b) show that the quantization error between W4A4 QAT and BF16 models increases as the data
+size grows. To address this, we introduce a new quantization error term that depends on both N and D.
+Furthermore, since fine-grained quantization is essential for 4-bit QAT performance [8, 34], we also include
+the quantization granularity G to capture its effect on performance degradation. Thus, our proposed QAT
+scaling law is:
+L(N, D, G) = A
+N α + B
+Dβ + E
+|
+{z
+}
+Chinchilla loss
++
+δp(N, D, G)
+|
+{z
+}
+low-bit QAT effect
+,
+(4)
+3
+
+
+32
+64
+128
+256
+token/channel
+Group Size
+2.88
+2.92
+2.96
+3.00
+3.04
+Loss
+INT4
+FP4
+Baseline
+Figure 2 Integer (INT4) vs. floating-point (FP4)
+in W4A4, 297M model, 50B tokens.
+5e-4
+1e-3
+2e-3
+3e-3
+4e-3
+Learning Rate
+0.055
+0.060
+0.065
+0.070
+0.075
+W4A4
+Figure 3 δW 4A4 at different learning rates, W4A4
+(G = 128) 145M model, 20B tokens.
+where δp(N, D, G) denotes the quantization error for p-bit QAT, as a function of N, D, and G.
+4
+QAT Scaling Law
+This section introduces a unified scaling law for QAT that incorporates model size N, training tokens D, and
+quantization granularity G. Section 4.1 outlines the training setups. Section 4.2 presents the main scaling law
+and reveals an insightful finding distinct from previous studies [12, 20] that the number of training tokens
+D significantly affects QAT error. Section 4.3 analyzes quantization errors from weights and activations
+separately, identifying activation quantization—especially for the FC2 layer’s input—as the main performance
+bottleneck. This finding supports a mixed-precision strategy discussed in Section 4.4. Finally, Section 4.5
+compares our scaling law with previous approaches.
+4.1
+Training Setup
+Models and dataset.
+We train a series of Llama3-style [15] models on the OLMo2-Mix-1124 [30] pre-
+training dataset. Our experiments systematically explore LLM pretraining across parameter sizes N ∈
+{74, 145, 297, 595} million and training token numbers D ∈{10, 20, 50, 100} billion tokens. For validation
+purpose, we also train models with 973M parameters on 100 and 200 billion tokens to verify the extrapolation
+reliability of our scaling law when increasing both model and dataset size. These 268 QAT experiments on
+A100 GPUs consumed 276K GPU-hours in total. Detailed architectural settings for each model are provided
+in Sec F.
+Evaluation metric. Following the Chinchilla scaling law [21], we use the smoothed training loss as an unbiased
+estimate of validation loss for simplicity and consistency.
+Quantization precision. Considering that 8-bit can achieve nearly lossless performance [42, 45] This work
+focuses on 4-bit quantization. We train models under three quantization settings: W4A4, W4A16 (only
+weights quantized to 4-bit), and W16A4 (only activations quantized to 4-bit). The latter two settings help
+decouple the error sources in W4A4.
+Quantization granularity. Quantization granularity G refers to the number of elements in each quantization
+group and is crucial for low-bit quantization [8, 24].
+For each model, we experiment with group sizes
+G ∈{32, 64, 128, 256, per-token/channel}. “Per-token/channel” means per-token quantization for activations
+and per-channel quantization for weights. We exclude per-tensor quantization due to its significant performance
+degradation compared to other granularities in 4-bit scenario, as shown in Figure 14a and Figure 14b.
+Quantizer. We evaluate AbsMax, LSQ [9] and LWC [36] for weight quantization, and AbsMax and LAC [5] for
+activation quantization. We select AbsMax for weight quantization because it offers similar performance to
+other methods, yet is more straightforward in implementation. For activation quantization, LAC outperforms
+AbsMax when the group size is greater than 256. Therefore, we use AbsMax for fine group sizes (G < 256)
+and LAC for coarse group sizes (G ≥256). We provide detailed descriptions of each quantizer and present
+ablation studies in Sec. E.2.
+4
+
+
+74
+145
+298
+594
+Model Size (M)
+0.045
+0.060
+0.075
+0.090
+0.105
+W4A4
+p=W4A4, Data=100B
+Group32
+Group64
+Group128
+Group256
+Token/Channel
+(a) δW 4A4 decreases as model size N
+increases.
+10
+20
+50
+100
+Training Data (B)
+0.045
+0.060
+0.075
+W4A4
+p=W4A4, Model=594M
+Group32
+Group64
+Group128
+Group256
+Token
+(b)
+δW 4A4 increases with a greater
+number of training tokens D.
+Token/Channel
+256
+128
+64
+32
+Group Size
+0.05
+0.06
+0.07
+0.08
+W4A4
+0.037
+p=W4A4, Model=567M, Data=100B
+(c)
+δW 4A4 decreases with smaller
+group sizes G.
+Figure 4 Trend of δW 4A4 with varying N, D, and G. (a) δW 4A4 decreases as model size increases. (b) δW 4A4
+increases with more training tokens. (c) δW 4A4 decreases with smaller group sizes. Note that these trends of δW 4A4
+are consistent across different N, D, and G. For simplicity, we merely plot the model trained with 100B tokens in (a),
+a model size of 594M in (b), and the 594M model trained with 100B tokens in (c).
+Low-precision formats. Low-bit quantization employs either integer (INT) or floating-point (FP) types.
+Figure 2 shows that INT4 matches FP4 performance in group-wise quantization and surpasses FP4 by 0.015 in
+loss for per-channel/token quantization. This advantage stems from INT4’s 16 representable values compared
+to FP4’s 15 [41], with greater impact in coarse-grained quantization. We adopt the integer format for our
+scaling law due to its equivalent or superior performance. We hypothesize that INT and FP exhibit similar
+scaling behavior. Figure 13 verifies that the scaling law fitted to INT4 data also accurately predicts QAT
+error trend for FP4.
+Training hyper-parameters. We follow Olmo2 [30] for training hyper-parameters, detailed in Table 3. One
+key hyper-parameter is the learning rate. For example, BitNet [28] shows ternary models benefit from higher
+learning rates than uncompressed models. In contrast, our focus on 4-bit quantization, which is less aggressive
+than ternary, leads to less sensitivity to learning rate. We compare uncompressed and W4A4 QAT models, as
+shown in Figure 3, observe that the quantization error remains nearly constant (within [0.6, 0.65]) across
+learning rates from 5 × 10−4 to 4 × 10−3. This indicates that 4-bit QAT does not benefit from higher learning
+rates compared to uncompressed models. Therefore, we use the same hyper-parameters for both uncompressed
+and QAT training.
+4.2
+Unified Scaling Law for QAT
+Observation. The ground truth for δW 4A4 is defined as lossbf16 −lossW 4A4, where lossbf16 and lossW 4A4
+denote the final model losses obtained from training with original BFloat16 precision and W4A4 QAT,
+respectively. To better understand δW 4A4, we plot its relationship with N, D, and G in Figure 4. We observe
+three primary trends:
+• Quantization error decrease with increasing model size: Figure 4a shows that δW 4A4 consistently decreases
+as model size increases, across different quantization granularities. For example, when model size grows
+from 74M to 594M, δW 4A4 decreases by an average of 34% across all granularities.
+• Quantization error increase with more training tokens: Figure 4b indicates that δW 4A4 increases as the
+number of training tokens grows. Specifically, increasing the training tokens from 10B to 100B results in an
+average increase of 22% in δW 4A4 across different granularities.
+• Quantization error decrease with finer quantization granularity: As illustrated in Figure 4c, δW 4A4
+decreases as quantization granularity becomes finer. The difference in δW 4A4 between the coarsest and finest
+quantization granularities is 0.037, which is nearly half the quantization error of the coarsest quantization
+granularity.
+Proposed scaling law for QAT quantization error. Existing QAT scaling laws [12, 20] account only for model
+size N, overlooking the effects of training data volume D and quantization granularity G. To enhance the
+5
+
+
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+Actual 
+W4A4
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+Predicted 
+W4A4
+Predicted vs Actual 
+W4A4
+(MSE: 0.003334, R2: 0.944169)
+Model Size
+74 M
+145 M
+298 M
+594 M
+Validation (973M)
+y=x
+Figure 5 Fitting performance of δW 4A4 scaling
+laws.
+0.04
+0.06
+0.08
+0.10
+0.12
+W4A16 +
+W16A4
+0.04
+0.06
+0.08
+0.10
+0.12
+W4A4
+Group32
+Group64
+Group128
+Group256
+Token/Channel
+y=0.906x
+Figure 6 Quantization error decomposi-
+tion. δW 4A4 = k(δW 16A4 + δW 4A16).
+prediction of QAT quantization error, we propose a comprehensive formula based on our observations:
+δp(N, D, G) = k · DγD · (log2(G))γG
+N γN
+,
+(5)
+where k, γN, γD and γG > 0 are fitted parameters. We incorporate a logarithmic term for G, as G = 1 (no
+quantization) yields δp = 0. The magnitudes of γN, γD and γG reflect the sensitivity of the quantization error
+δp to N, D and G, respectively. The formula indicates that δp increases with D and G but decreases with N.
+Table 1 Fitted hyperparameters and their values in our proposed QAT error scaling law.
+Type
+Constant
+Value
+Type
+Constant
+Value
+Chinchilla
+E
+1.9279
+δW 4A4
+k
+0.1582
+A
+237.7042
+γN
+0.2186
+α
+0.3022
+γD
+0.0745
+B
+596.2490
+γG
+0.7779
+β
+0.3022
+δW 4A16
+k
+0.2522
+δW 16A4
+k
+0.1004
+γN
+0.3589
+γN
+0.1816
+γD
+0.1610
+γD
+0.0331
+γG
+0.3533
+γG
+0.9812
+δW 4A4
+(FC2 input 8-bit)
+k
+0.3519
+δW 16A4
+(FC2 input 8-bit)
+k
+0.1273
+γN
+0.2637
+γN
+0.2347
+γD
+0.0964
+γD
+0.0827
+γG
+0.3407
+γG
+0.4491
+Fitting and validation. We fit Eq.(5) to the ground truth W4A4 quantization error (δW 4A4) obtained from
+80 W4A4 QAT runs. Table1 lists the fitted parameters, and Figure 5 compares the actual and predicted
+δW 4A4. As shown in Figure 5, Eq. (5) accurately models the observed W4A4 QAT quantization errors. We
+further validate the fitted scaling law by predicting the QAT losses of 973M-parameter models trained with
+{100B, 200B} tokens. The consistently accurate predictions indicate that our proposed QAT scaling law
+generalizes well to larger models and more training data.
+4.3
+Decomposition of Quantization Error: Weight vs. Activation
+Although the unified QAT scaling law in Eq. (5) predicts the overall quantization error for W4A4, it remains
+unclear whether this error mainly arises from weights or activations. Understanding this distinction is essential
+for targeted optimization. In practice, for a model trained with W4A4 QAT, we cannot directly measure
+the individual contributions of weight and activation quantization errors. For example, simply disabling
+6
+
+
+74
+145
+298
+594
+Model Size (M)
+0.024
+0.032
+0.040
+0.048
+W4A16
+p=W4A16, Data=100B
+Group32
+Group64
+Group128
+Group256
+Token/Channel
+(a)
+δW 4A16 decreases as model size
+increases.
+10
+20
+50
+100
+Training Data (B)
+0.0125
+0.0150
+0.0175
+0.0200
+0.0225
+W4A16
+p=W4A16, Model=594M
+Group32
+Group64
+Group128
+Group256
+Token
+(b)
+δW 4A16 increases with a greater
+number of training tokens.
+Token/Channel
+256
+128
+64
+32
+Group Size
+0.019
+0.020
+0.021
+0.022
+0.023
+W4A16
+0.004
+p=W4A16, Model=567M, Data=100B
+(c)
+δW 4A16 decreases with smaller
+group sizes.
+74
+145
+298
+594
+Model Size (M)
+0.030
+0.045
+0.060
+0.075
+W16A4
+p=W16A4, Data=100B
+Group32
+Group64
+Group128
+Group256
+Token/Channel
+(d)
+δW 16A4 decreases as model size
+increases.
+10
+20
+50
+100
+Training Data (B)
+0.03
+0.04
+0.05
+0.06
+W16A4
+p=W16A4, Model=594M
+Group32
+Group64
+Group128
+Group256
+Token
+(e)
+δW 16A4 increases with a greater
+number of training tokens.
+Token/Channel
+256
+128
+64
+32
+Group Size
+0.032
+0.040
+0.048
+0.056
+W16A4
+0.033
+p=W16A4, Model=567M, Data=100B
+(f)
+δW 16A4 decreases with smaller
+group sizes.
+Figure 7 (a)-(c) δW 4A16 and (d)-(f) δW 16A4 trend with varying N, D and G.
+quantization in a W4A4 QAT model does not restore the performance of the original unquantized model and
+may even decrease accuracy further. This occurs because quantization is integrated into the QAT training
+process, and model parameters adapt to quantization errors during training. To analyze the sources of
+quantization error in a W4A4 QAT model, we train two additional QAT models: one with W4A16 and
+another with W16A4.
+Rationale for error decomposition. As shown in Figure 6, the final quantization error of W4A4 (δW 4A4) can
+be closely approximated by summing the quantization errors from W4A16 and W16A4 (δW 4A16 + δW 16A4).
+The observed coefficient between δW 4A4 and δW 4A16 + δW 16A4 is 0.906. This strong correlation suggests that
+we can effectively analyze δW 4A4 by separately examining the δW 4A16 and δW 4A4.
+How do δW 4A16 and δW 16A4 change with N, D and G? Section 4.2 examines how δW 4A4 varies with model size
+N, number of training tokens D, and quantization granularity G. It is important to see if δW 4A16 and δW 16A4
+follow similar patterns. To investigate this, we plot δW 4A16 and δW 16A4 against N, D and G in Figure 7, and
+report the fitted QAT scaling law parameters in Table 1. The results show that both δW 4A16 and δW 16A4
+follow trends consistent with δW 4A4, but the degree of sensitivity differs between them:
+• δW 4A16 decreases faster than δW 16A4 as model size increases: The parameter γN measures sensitivity to
+model size. For δW 4A16, γN is 0.3589, higher than 0.1816 for δW 16A4. This means weight quantization error
+decreases more rapidly with larger model size than activation quantization error. As shown in Figure 7 (a)
+and (d), when model size increases from 74M to 594M, δW 4A16 drops by 51% on average, while δW 16A4
+decreases by 34%.
+• δW 4A16 increases faster than δW 16A4 as the number of training tokens increases: The parameter γD measures
+sensitivity to training tokens. For δW 4A16, γD is 0.1610, much larger than 0.0331 for δW 16A4. Thus, weight
+quantization error increases more sharply with more training tokens than activation quantization error.
+As shown in Figure 7 (b) and (e), increasing training tokens from 10B to 100B raises δW 4A16 by 43% on
+average, but only increases δW 16A4 by 12%.
+• δW 16A4 is more sensitive to quantization granularity than δW 4A16: The parameter γG measures sensitivity
+to quantization granularity. For δW 16A4, γG is 0.9821, much higher than 0.3533 for δW 4A16. This shows
+7
+
+
+102
+103
+Model Size (M)
+101
+102
+103
+Training Tokens (B)
+W16A4/
+W4A16 (G=32)
+D:N=100
+D:N=500
+D:N=1000
+R=1.67x
+R=1.34x
+R=1.20x
+102
+103
+Model Size (M)
+W16A4/
+W4A16 (G=256)
+D:N=100
+D:N=500
+D:N=1000
+R=2.25x
+R=1.80x
+R=1.62x
+0.75
+1.05
+1.35
+1.65
+1.95
+2.25
+2.55
+2.85
+3.15
+R=
+W16A4/
+W4A16
+(a) Comparison of δW 16A4 and δW 4A16.
+102
+103
+Model Size (M)
+101
+102
+103
+Training Tokens (B)
+W16A4/
+W4A16 (G=32)
+D:N=100
+D:N=500
+D:N=1000
+R=1.05x
+R=0.91x
+R=0.85x
+102
+103
+Model Size (M)
+W16A4/
+W4A16 (G=256)
+D:N=100
+D:N=500
+D:N=1000
+R=1.10x
+R=0.96x
+R=0.89x
+0.65
+0.80
+0.95
+1.10
+1.25
+1.40
+1.55
+R=
+W16A4/
+W4A16
+(b) Comparison of δW 16A4 (FC2 input 8-bit) and δW 4A16.
+Figure 8 Weight and activation quantization errors comparisons. We report heatmaps of R = δW 16A4
+δW 4A16 across D
+and N, with group sizes 32 and 256. Larger R indicates greater activation quantization error compared to weights.
+QKV Proj
+O Proj
+FC1 Proj
+FC2 Proj
+Input of Linear Layer
+0
+20
+40
+60
+80
+100
+120
+Average Kurtosis
+BF16
+W4A4
+(a) Kurtosis comparisons.
+32
+64
+128
+256 token/channel
+Group Size
+0.03
+0.04
+0.05
+0.06
+0.07
+Loss
+20.5%
+29.2%
+37.5%
+42.9%
+47.3%
+W4A4
+W4A4 (FC2 input 8-bits)
+(b) Quantization errors comparisons.
+Figure 9 Comparison of kurtosis and quantization errors. (a) Kurtosis of input activations across different linear
+layers. (b) Quantization error comparison with 8-bit FC2 input. The model size is 595M, the number of training
+tokens is 100B, and the group size in (a) is 128.
+that activation quantization error is much more sensitive to granularity, likely due to outliers. As shown in
+Figure 7 (c) and (f), the gap in δW 16A4 between the coarsest and finest granularity is 0.031, nearly eight
+times larger than the corresponding gap for δW 4A16.
+Which contributes more to quantization error, δW 4A16 or δW 16A4? Both weight and activation quantization
+errors depend on D, N and G. To compare their contributions, we examine δW 4A16 and δW 16A4 across
+different parameter values, including fixed data-to-parameter ratios D
+N , as models with similar D
+N often show
+comparable convergence levels [16]. Figure 8a shows heatmaps of R = δW 16A4
+δW 4A16 . Across all tested D
+N ratios and
+group sizes G, R is consistently greater than 1, indicating that activation quantization error generally exceeds
+weight quantization error. However, the value of R varies with different settings:
+• R decreases as D
+N increases, because δW 4A16 grows faster with D than δW 16A4. For example, with G = 32,
+R drops from 1.67 at D
+N = 100 to 1.20 at D
+N = 1000.
+• R increases as group size G increases, since δW 16A4 is more sensitive to quantization granularity. For
+instance, at D
+N = 1000, R rises from 1.20 when G = 32 to 1.62 when G = 256.
+Practical implications. These results show that as D
+N increases, the main source of quantization error shifts
+from activations to weights. However, δW 16A4 remains larger than δW 4A16 even at high D
+N and fine granularity
+(G = 32), and the gap widens with coarser quantization. Therefore, activation quantization error is usually
+the dominant factor in W4A4 quantization (as R > 1), highlighting the importance of optimizing activation
+quantization to improve W4A4 QAT performance.
+8
+
+
+4.4
+Mitigating Activation Quantization Error in FC2 Proj Input
+Since activation quantization error is the main bottleneck in W4A4 QAT, as shown in the previous section,
+it is important to understand why activations are harder to quantize than weights and how to address this
+issue. A major reason is the presence of outliers in large language models, which make activation quantization
+more difficult [42]. This problem is well known in post-training quantization (PTQ), where outliers can cause
+significant performance drops. Although QAT applies quantization during the entire training process and acts
+as a regularizer to suppress activation outliers [29], some challenges remain, especially in certain layers.
+Persistent outliers in FC2 Proj input with QAT. Kurtosis [7, 26, 29] measures the “tailedness” of a distribution,
+with higher values indicating more outliers. Figure 9a shows that QAT effectively reduces outliers in the input
+activations of the QKV Proj, O Proj, and FC1 Proj layers, so further outlier suppression is not needed for
+these layers. However, even though QAT lowers the kurtosis of the FC2 Proj input from 123 to 89, this value
+is still significantly higher than in other layers. The high kurtosis means that the FC2 Proj input remains
+prone to large quantization errors, making it a key contributor to the activation quantization bottleneck
+described in Sec. 4.3. The main reason for this high kurtosis is that the FC2 Proj input comes from the
+output of the SwiGLU [37] module. The gating mechanism and non-linear transformations in SwiGLU create
+a complex activation distribution that amplifies outliers [44]. As a result, even with QAT regularization, the
+FC2 Proj input remains sensitive to outliers and is the main source of activation quantization error in W4A4
+QAT models.
+Mixed-precision approach. To study the W4A4 scaling law without the activation bottleneck, it is necessary
+to reduce quantization error in the FC2 Proj input. This can be achieved by using higher quantization
+precision or outlier suppression strategies [3, 42]. Since 8-bit quantization achieves near-lossless training [24],
+we use a simple approach: quantizing the FC2 Proj input to 8 -bit (denoted as “FC2 input 8-bit”). While
+other outlier suppression methods [3, 5, 42] could also be considered, 8-bit quantization provides an upper
+bound on the improvements possible. This approach offers a general and robust baseline for understanding
+the potential of the W4A4 QAT scaling law without the activation bottleneck.
+Impact on quantization error. Figure 9b shows that using 8-bit FC2 inputs significantly reduces quantization
+error, especially for coarse-grained quantization, which is more sensitive to outliers. For example, with W4A4
+QAT, 8-bit FC2 lowers quantization error by 20.5% for G = 32 and by 42.9% for G = 256. This demonstrates
+that 8-bit FC2 Proj inputs effectively reduce both the overall activation quantization error and its sensitivity
+to granularity. Table 1 further supports this, showing that the parameter γG for δW 16A4 decreases from 0.9812
+to 0.4471 when using 8-bit FC2 Proj inputs. Figure 8b illustrates that, under 8-bit FC2 inputs, δW 16A4 and
+δW 4A16 become similar in magnitude, with their ratio R ranging from 0.85 to 1.10 for D
+N ratios between 100
+and 1000, and for group sizes G = 32 and G = 256.
+Practical implications. For practitioners, the main takeaway is that special treatment of the FC2 Proj
+input—through mixed-precision quantization or targeted outlier suppression—is crucial for maximizing low-bit
+QAT performance. Once the FC2 Proj input bottleneck is removed, further improvements to W4A4 QAT
+should focus on jointly optimizing both weight and activation quantization errors, as their effects become
+similar. This suggests a shift in QAT development from mainly activation-focused methods [32, 42] to
+approaches that balance both error sources.
+4.5
+Comparisons with Other QAT Scaling Laws
+We compare our proposed QAT scaling law (Eq. (5)) with existing scaling laws [12, 20]. Previous meth-
+ods [12, 20] do not account for quantization granularity G, so they require separate curves for each
+G ∈{32, 64, 128, 256, per-channel/token} for fair comparison. In contrast, our scaling law models differ-
+ent granularities with a single curve. As shown in Table 2, our approach reduces the relative error from 19.3%
+to 5.2% for W4A16 QAT and from 8.5% to 4.7% for W4A4 QAT. The larger improvement for W4A16 is
+due to δW 4A16 increasing more rapidly with D than δW 16A4. Overall, including D in δp improves prediction
+9
+
+
+Table 2 Comparison with other scaling laws. “Num” indicates the number of scaling laws fitted. “Relative Error”
+represents the difference between the predicted and actual quantization errors.
+Method
+N
+D
+G
+δp
+Precision
+Num. of δp
+Relative Error
+[12] [20]
+✓
+×
+×
+Eq. (3)
+W4A16
+5
+19.3%
+W4A4
+5
+8.5%
+Ours
+✓
+✓
+✓
+Eq. (5)
+W4A16
+1
+5.2%
+W4A4
+1
+4.7%
+accuracy, and modeling G increases adaptability to different quantization granularities.
+5
+Conclusions
+This paper proposes a comprehensive scaling law for 4-bit QAT of LLMs, integrating model size, training
+dataset size, and quantization granularity. The new QAT scaling law is more practical, as it jointly models N,
+G, and D, and achieves more accurate predictions than previous approaches. We also show that processing
+the FC2 input with 8-bit in W4A4 QAT significantly reduces both quantization error and sensitivity to
+quantization granularity. Furthermore, our analysis shows that, after applying 8-bit quantization to the FC2
+input in W4A4 QAT, weight and activation quantization errors contribute almost equally to the total error.
+This result suggests that future QAT algorithms should also investigate weight quantization error, rather
+than focusing solely on activation outliers as previous methods do.
+10
+
+
+References
+[1] Joshua Ainslie, James Lee-Thorp, Michiel De Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sang-
+hai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint
+arXiv:2305.13245, 2023.
+[2] Yongqi An, Xu Zhao, Tao Yu, Ming Tang, and Jinqiao Wang. Systematic outliers in large language models. arXiv
+preprint arXiv:2502.06415, 2025.
+[3] Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L Croci, Bo Li, Martin Jaggi, Dan Alistarh, Torsten Hoefler,
+and James Hensman. Quarot: Outlier-free 4-bit inference in rotated llms. arXiv preprint arXiv:2404.00456, 2024.
+[4] Weilin Cai, Juyong Jiang, Fan Wang, Jing Tang, Sunghun Kim, and Jiayi Huang. A survey on mixture of experts
+in large language models. IEEE Transactions on Knowledge and Data Engineering, 2025.
+[5] Mengzhao Chen, Yi Liu, Jiahao Wang, Yi Bin, Wenqi Shao, and Ping Luo. Prefixquant: Eliminating outliers by
+prefixed tokens for large language models quantization. arXiv preprint arXiv:2410.05265, 2024.
+[6] Mengzhao Chen, Wenqi Shao, Peng Xu, Jiahao Wang, Peng Gao, Kaipeng Zhang, and Ping Luo. Efficientqat:
+Efficient quantization-aware training for large language models. arXiv preprint arXiv:2407.11062, 2024.
+[7] Lawrence T DeCarlo. On the meaning and use of kurtosis. Psychological methods, 2(3):292, 1997.
+[8] Tim Dettmers and Luke Zettlemoyer. The case for 4-bit precision: k-bit inference scaling laws. In International
+Conference on Machine Learning, pages 7750–7774. PMLR, 2023.
+[9] Steven K Esser, Jeffrey L McKinstry, Deepika Bablani, Rathinakumar Appuswamy, and Dharmendra S Modha.
+Learned step size quantization. arXiv preprint arXiv:1902.08153, 2019.
+[10] Maxim Fishman, Brian Chmiel, Ron Banner, and Daniel Soudry. Scaling fp8 training to trillion-token llms. arXiv
+preprint arXiv:2409.12517, 2024.
+[11] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training quantization for
+generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+[12] Elias Frantar, Utku Evci, Wonpyo Park, Neil Houlsby, and Dan Alistarh. Compression scaling laws: Unifying
+sparsity and quantization. arXiv preprint arXiv:2502.16440, 2025.
+[13] Samir Yitzhak Gadre, Georgios Smyrnis, Vaishaal Shankar, Suchin Gururangan, Mitchell Wortsman, Rulin Shao,
+Jean Mercat, Alex Fang, Jeffrey Li, Sedrick Keh, et al. Language models scale reliably with over-training and on
+downstream tasks. arXiv preprint arXiv:2403.08540, 2024.
+[14] Donald Goldfarb. Mathematics of computation. American Mathematical Society, 24:23, 1970.
+[15] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle,
+Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama 3 herd of models. arXiv preprint
+arXiv:2407.21783, 2024.
+[16] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Training compute-optimal large language
+models. arXiv preprint arXiv:2203.15556, 2022.
+[17] Peter J. Huber. Robust Estimation of a Location Parameter. The Annals of Mathematical Statistics, 35(1):73 –
+101, 1964. doi: 10.1214/aoms/1177703732. URL https://doi.org/10.1214/aoms/1177703732.
+[18] Dhiraj Kalamkar, Dheevatsa Mudigere, Naveen Mellempudi, Dipankar Das, Kunal Banerjee, Sasikanth Avancha,
+Dharma Teja Vooturi, Nataraj Jammalamadaka, Jianyu Huang, Hector Yuen, et al. A study of bfloat16 for deep
+learning training. arXiv preprint arXiv:1905.12322, 2019.
+[19] Jared Kaplan, Sam McCandlish, T. J. Henighan, Tom B. Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec
+Radford, Jeff Wu, and Dario Amodei. Scaling laws for neural language models. ArXiv, abs/2001.08361, 2020.
+URL https://api.semanticscholar.org/CorpusID:210861095.
+[20] Tanishq Kumar, Zachary Ankner, Benjamin F Spector, Blake Bordelon, Niklas Muennighoff, Mansheej Paul, Cengiz
+Pehlevan, Christopher Ré, and Aditi Raghunathan. Scaling laws for precision. arXiv preprint arXiv:2411.04330,
+2024.
+11
+
+
+[21] Houyi Li, Wenzheng Zheng, Jingcheng Hu, Qiufeng Wang, Hanshan Zhang, Zili Wang, Yangshijie Xu, Shuigeng
+Zhou, Xiangyu Zhang, and Daxin Jiang. Predictable scale: Part i–optimal hyperparameter scaling law in large
+language model pretraining. arXiv preprint arXiv:2503.04715, 2025.
+[22] Muyang Li, Yujun Lin, Zhekai Zhang, Tianle Cai, Xiuyu Li, Junxian Guo, Enze Xie, Chenlin Meng, Jun-Yan Zhu,
+and Song Han. Svdqunat: Absorbing outliers by low-rank components for 4-bit diffusion models. arXiv preprint
+arXiv:2411.05007, 2024.
+[23] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, and Song Han. Awq: Activation-aware weight
+quantization for llm compression and acceleration. arXiv preprint arXiv:2306.00978, 2023.
+[24] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report. arXiv preprint arXiv:2412.19437, 2024.
+[25] Ruikang Liu, Yuxuan Sun, Manyi Zhang, Haoli Bai, Xianzhi Yu, Tiezheng Yu, Chun Yuan, and Lu Hou.
+Quantization hurts reasoning? an empirical study on quantized reasoning models. arXiv preprint arXiv:2504.04823,
+2025.
+[26] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krishnamoorthi, Vikas
+Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm quantization with learned rotations. arXiv
+preprint arXiv:2405.16406, 2024.
+[27] Zechun Liu, Changsheng Zhao, Hanxian Huang, Sijia Chen, Jing Zhang, Jiawei Zhao, Scott Roy, Lisa Jin,
+Yunyang Xiong, Yangyang Shi, et al. Paretoq: Scaling laws in extremely low-bit llm quantization. arXiv preprint
+arXiv:2502.02631, 2025.
+[28] Shuming Ma, Hongyu Wang, Lingxiao Ma, Lei Wang, Wenhui Wang, Shaohan Huang, Li Dong, Ruiping Wang,
+Jilong Xue, and Furu Wei. The era of 1-bit llms: All large language models are in 1.58 bits. arXiv preprint
+arXiv:2402.17764, 2024.
+[29] Aniruddha Nrusimha, Mayank Mishra, Naigang Wang, Dan Alistarh, Rameswar Panda, and Yoon Kim. Mitigating
+the impact of outlier channels for language model quantization with activation regularization. arXiv preprint
+arXiv:2404.03605, 2024.
+[30] Team OLMo, Pete Walsh, Luca Soldaini, Dirk Groeneveld, Kyle Lo, Shane Arora, Akshita Bhagia, Yuling Gu,
+Shengyi Huang, Matt Jordan, et al. 2 olmo 2 furious. arXiv preprint arXiv:2501.00656, 2024.
+[31] Xu Ouyang, Tao Ge, Thomas Hartvigsen, Zhisong Zhang, Haitao Mi, and Dong Yu. Low-bit quantization favors
+undertrained llms: Scaling laws for quantized llms with 100t training tokens. arXiv preprint arXiv:2411.17691,
+2024.
+[32] Andrei Panferov, Jiale Chen, Soroush Tabesh, Roberto L Castro, Mahdi Nikdan, and Dan Alistarh. Quest: Stable
+training of llms with 1-bit weights and activations. arXiv preprint arXiv:2502.05003, 2025.
+[33] Houwen Peng, Kan Wu, Yixuan Wei, Guoshuai Zhao, Yuxiang Yang, Ze Liu, Yifan Xiong, Ziyue Yang, Bolin Ni,
+Jingcheng Hu, et al. Fp8-lm: Training fp8 large language models. arXiv preprint arXiv:2310.18313, 2023.
+[34] Bita Darvish Rouhani, Ritchie Zhao, Ankit More, Mathew Hall, Alireza Khodamoradi, Summer Deng, Dhruv
+Choudhary, Marius Cornea, Eric Dellinger, Kristof Denolf, et al. Microscaling data formats for deep learning.
+arXiv preprint arXiv:2310.10537, 2023.
+[35] ByteDance Seed. Seed1.5-thinking: Advancing superb reasoning models with reinforcement learning. arXiv
+preprint arXiv:2504.13914, 2025.
+[36] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Peng Gao,
+Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization for large language models. arXiv
+preprint arXiv:2308.13137, 2023.
+[37] Noam Shazeer. Glu variants improve transformer. arXiv preprint arXiv:2002.05202, 2020.
+[38] Xingwu Sun, Shuaipeng Li, Ruobing Xie, Weidong Han, Kan Wu, Zhen Yang, Yixing Li, An Wang, Shuai Li,
+Jinbao Xue, et al. Scaling laws for floating point quantization training. arXiv preprint arXiv:2501.02423, 2025.
+[39] Albert Tseng, Tao Yu, and Youngsuk Park. Training llms with mxfp4. arXiv preprint arXiv:2502.20586, 2025.
+[40] Hongyu Wang, Shuming Ma, and Furu Wei. Bitnet a4. 8: 4-bit activations for 1-bit llms.
+arXiv preprint
+arXiv:2411.04965, 2024.
+12
+
+
+[41] Ruizhe Wang, Yeyun Gong, Xiao Liu, Guoshuai Zhao, Ziyue Yang, Baining Guo, Zhengjun Zha, and Peng Cheng.
+Optimizing large language model training using fp4 quantization. arXiv preprint arXiv:2501.17116, 2025.
+[42] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and
+efficient post-training quantization for large language models. In International Conference on Machine Learning,
+pages 38087–38099. PMLR, 2023.
+[43] Zhihang Yuan, Yuzhang Shang, Yang Zhou, Zhen Dong, Zhe Zhou, Chenhao Xue, Bingzhe Wu, Zhikai Li,
+Qingyi Gu, Yong Jae Lee, et al. Llm inference unveiled: Survey and roofline model insights. arXiv preprint
+arXiv:2402.16363, 2024.
+[44] Pengle Zhang, Jia Wei, Jintao Zhang, Jun Zhu, and Jianfei Chen. Accurate int8 training through dynamic
+block-level fallback. arXiv preprint arXiv:2503.08040, 2025.
+[45] Xingyu Zheng, Yuye Li, Haoran Chu, Yue Feng, Xudong Ma, Jie Luo, Jinyang Guo, Haotong Qin, Michele Magno,
+and Xianglong Liu. An empirical study of qwen3 quantization. arXiv preprint arXiv:2505.02214, 2025. URL
+https://arxiv.org/abs/2505.02214.
+[46] Zixuan Zhou, Xuefei Ning, Ke Hong, Tianyu Fu, Jiaming Xu, Shiyao Li, Yuming Lou, Luning Wang, Zhihang
+Yuan, Xiuhong Li, et al. A survey on efficient inference for large language models. arXiv preprint arXiv:2404.14294,
+2024.
+13
+
+
+Appendix
+A
+Limitations
+This paper proposes a unified QAT scaling law and primarily focuses on experiments with 4-bit dense models.
+One limitation is that we do not conduct experiments on the MoE [4] architecture. Since MoE models contain
+more weight parameters but similar activation sizes, they may exhibit a different ratio of weight to activation
+quantization error compared to dense models. Additionally, our analysis mainly centers on W4A4 quantization.
+While some recent works explore extremely low-bit QAT, such as ternary quantization [28, 32], investigating
+unified scaling laws for these settings is also valuable. Finally, the largest training compute consumed for
+our proposed QAT scaling law in this study is to train a 595M parameter model trained over 100B tokens.
+Intuitively, the accuracy of scaling law extrapolation would be further improved by increasing both the model
+size and the number of training tokens.
+B
+Broader Impact
+This paper presents work whose goal is to advance the compression and acceleration of large language models.
+There are many potential societal consequences of our work, none of which we feel must be specifically
+highlighted here.
+C
+Chinchilla Scaling Law
+2.2
+2.4
+2.6
+2.8
+3.0
+3.2
+Actual Loss
+2.2
+2.4
+2.6
+2.8
+3.0
+3.2
+Predicted Loss
+Predicted vs Actual Loss
+(MSE: 0.001472, R2: 0.982040)
+Model Size
+145 M
+298 M
+594 M
+973 M
+2.8 B
+6.5 B
+12.7 B
+Figure 10 Fitting performance of chinchilla scaling laws. The size of the data point is proportional to training
+data size D.
+Our QAT scaling law builds on the classical Chinchilla scaling law [16], as defined in Eq. (1). Following the
+original methodology [16], we estimate the parameters (E, A, α, B, β) by minimizing the Huber loss [17]
+between the predicted and observed log losses, using the L-BFGS algorithm [14]. Chinchilla scaling law [16]
+observes that the scaling exponents α and β are approximately equal, which suggests that one should scale
+N and D equally as compute increases. Therefore, we also set α = β, in line with previous studies [13, 20].
+For our experiments, we train models with sizes ranging from 145M to 2.8B parameters. To improve the
+extrapolation of the scaling law fit, we include 6.5B and 12.7B parameter models, which we obtain from
+the official OLMO-2-7B1 and OLMO-2-13B2 releases. As shown in Figure 10, the empirical training losses
+closely match the predicted losses, achieving a mean squared error (MSE) of 0.0014 and an R2 of 0.982,
+which indicates a highly accurate fit. It is important to note that our proposed QAT scaling law (Eq. (5))
+1https://huggingface.co/allenai/OLMo-2-1124-7B
+2https://huggingface.co/allenai/OLMo-2-1124-13B
+14
+
+
+directly models the quantization error. As a result, it is compatible with any scaling law related to the final
+loss [13, 16, 19]. In this paper, we choose to use the Chinchilla scaling law for consistency with previous QAT
+scaling law studies [12, 20].
+D
+Fitting Performance of the Proposed Scaling Law Across Different Precisions
+Figure 5 in the main paper illustrates the fitting performance of the proposed scaling law (Eq.(5)) in the W4A4
+precision setting. In this section, we further present the fitting results for W4A16 and W16A4 precisions in
+Figure11, which achieve mean squared errors (MSE) of 0.001 and 0.003, respectively. These results demonstrate
+the effectiveness of the proposed unified QAT scaling law across different precision configurations. Additionally,
+we show the fitting performance for W16A4 and W4A4 precisions with the FC2 input quantized to 8-bit in
+Figure 12.
+0.015
+0.020
+0.025
+0.030
+0.035
+0.040
+0.045
+0.050
+Actual 
+W4A16
+0.015
+0.020
+0.025
+0.030
+0.035
+0.040
+0.045
+0.050
+Predicted 
+W4A16
+Predicted vs Actual 
+W4A16
+(MSE: 0.001358, R2: 0.958029)
+Model Size
+74 M
+145 M
+298 M
+594 M
+y=x
+(a) δW 4A16.
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+Actual 
+W16A4
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+Predicted 
+W16A4
+Predicted vs Actual 
+W16A4
+(MSE: 0.003561, R2: 0.902289)
+Model Size
+74 M
+145 M
+298 M
+594 M
+y=x
+(b) δW 16A4.
+Figure 11 Fitting performance of proposed scaling law on δW 4A16 and δW 16A4.
+0.015
+0.020
+0.025
+0.030
+0.035
+0.040
+0.045
+Actual 
+W16A4
+0.015
+0.020
+0.025
+0.030
+0.035
+0.040
+0.045
+Predicted 
+W16A4
+Predicted vs Actual 
+W16A4
+(MSE: 0.002306, R2: 0.767255)
+Model Size
+74 M
+145 M
+298 M
+594 M
+y=x
+(a) δW 16A4 (FC2 input 8-bit).
+0.03
+0.04
+0.05
+0.06
+0.07
+Actual 
+W4A4
+0.03
+0.04
+0.05
+0.06
+0.07
+Predicted 
+W4A4
+Predicted vs Actual 
+W4A4
+(MSE: 0.002184, R2: 0.939389)
+Model Size
+74 M
+145 M
+298 M
+594 M
+y=x
+(b) δW 4A4 (FC2 input 8-bit).
+Figure 12 Fitting performance of proposed scaling laws on δW 16A4 and δW 4A4 scaling laws with FC2 Proj inputs as
+8-bit.
+E
+Quantization Implementation Details and Types
+15
+
+
+E.1
+Quantization Types
+There are two main types of model quantization: integer (INT) and floating-point (FP) quantization.
+Integer Quantization. In integer quantization, continuous values are uniformly mapped to discrete integer
+values. Mathematically, for a given matrix X, the quantization process is defined as:
+XINT = clamp
+
+⌊X
+s ⌉, Qmin, Qmax
+
+(6)
+where ⌊·⌉denotes the rounding operation, and s is the scaling factor. Here, XINT represents the quantized
+integer tensor, and X denotes the original full-precision tensor. After rounding, a clipping operation ensures
+that the quantized values remain within the range [Qmin, Qmax], where Qmin = −2b−1 and Qmax = 2b−1 −1,
+with b being the number of quantization bits. To recover an approximate real value, the quantized tensor can
+be dequantized by multiplying by the scaling factor s:
+ˆX = XINT × s,
+(7)
+Floating-Point Quantization. Floating-point representation is more complex than the integer format. Each
+floating-point number consists of three components: the sign bit (S), the exponent (E), and the mantissa (M).
+This format is typically denoted as ExMy, where x and y indicate the number of bits allocated to the exponent
+and mantissa, respectively. The sign bit determines whether the number is positive or negative. The exponent
+defines the range of representable values, while the mantissa determines the precision. A floating-point number
+is decoded as:
+Value = (−1)S × (1.M) × 2E−bias
+(8)
+In this paper, we focus on 4-bit quantization and adopt the E2M1 FP4 format, following previous works [38, 41].
+For a given matrix X, the quantization process is:
+XFP = MAP
+X
+s
+
+,
+(9)
+where s is the scaling factor for normalization, and MAP() denotes mapping the normalized values to the
+nearest floating-point values defined by Eq. (8). Similar to integer quantization, the values can be dequantized
+to approximate real values by multiplying by s:
+ˆX = XFP × s,
+(10)
+Scaling Behavior. Consistent with previous work [20], we hypothesize that the scaling behavior for INT and
+FP formats can be described by the same functional form. There are two pieces of evidence supporting this
+assumption. First, Figure 2 shows that the performance gap between FP4 and INT4 is negligible in the 4-bit
+setting. Second, Figure 13 demonstrates that the scaling law fitted on INT4 data also accurately predicts
+QAT error for FP4.
+E.2
+Quantizer
+The quantization format defines the representation space for discrete values. Both integer (INT) and floating-
+point (FP) formats require a scaling factor to normalize continuous values into a discrete range. Different
+quantizers employ distinct methods to compute the scaling factor s, which is shared within a quantization
+group. For simplicity, we consider X as a quantization group here.
+AbsMax. The AbsMax quantizer computes the scaling factor using the absolute maximum value, given by
+M
+max(|X|), where M represents the maximum discrete value (e.g., M = 8 for INT4, M = 6 for E2M1 FP4).
+LWC and LAC. The LWC [36] and LAC [5] quantizers extend AbsMax by introducing learnable clipping factors
+for weight and activation quantization, respectively. Their scaling factor is computed as
+M
+max(|X|)·γ , where γ is
+16
+
+
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+Actual 
+W4A4
+0.04
+0.05
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+Predicted 
+W4A4
+Predicted vs Actual 
+W4A4 (FP4)
+(MSE: 0.004058, R2: 0.923085)
+Model Size
+145 M
+298 M
+y=x
+Figure 13 The QAT scaling law, fitted for INT4 quantization, also accurately models the quantization error of FP4
+quantization.
+32
+64
+128
+256
+channel
+tensor
+Group Size
+3.04
+3.06
+3.08
+3.10
+3.12
+Loss
+LSQ
+LWC
+AbsMax
+Baseline
+(a) Weight quantizer ablation.
+32
+64
+128
+256
+token
+tensor
+Group Size
+3.05
+3.10
+3.15
+3.20
+3.25
+3.30
+Loss
+LAC
+AbsMax
+Baseline
+(b) Activation quantizer ablation.
+Figure 14 Quantizer ablation studies for 145M model with 50B tokens.
+a learnable clipping factor. LWC assigns a unique γ per weight group, while LAC shares γ across the same
+group index for different tokens to enhance deployability.
+LSQ. The LSQ [9] quantizer treats the scaling factor as a directly learnable parameter.
+Ablation of different quantizer. As shown in Figure 14, activation quantization is more sensitive to quantizer
+choice than weight quantization, primarily due to outliers in activation distributions [2]. For example, all
+three weight quantizers achieve similar final loss, with differences less than 0.003 across most granularities
+except per-tensor. Thus, we set the weight quantizer to AbsMax, as we do not use per-tensor quantization.
+However, for activations, LAC significantly outperforms AbsMax when group size exceeds 256. Therefore, we
+use AbsMax for activation quantization with fine group sizes (< 256), and LAC for activations with coarse
+group sizes (≥256).
+F
+Model Architecture
+We select the Llama-3 [15] style model for our experiments due to its wide adoption. As shown in Figure 15,
+each transformer block in the Llama-3 style model contains four linear layers: QKV Proj, O Proj, FC1 Proj,
+and FC2 Proj. Additionally, the Llama-3 style model employs Group Query Attention (GQA)[1] for the
+self-attention module and SwiGLU[37] for the feed-forward module. Table 3 presents the detailed architectural
+settings of the models used.
+17
+
+
+QKV Proj
+RMS Norm
+GQA
+O Proj
+SwiGLU
+RMS Norm
+FC2 Proj
+FC1 Proj
+Figure 15 Illustration of Llama-3-style [15] transformer block. Note that QKV Proj can be divided into three separate
+layers, and FC1 Proj can be split into two layers.
+Table 3 Model architecture and training hyper-parameters.
+Model Size
+74M
+145M
+297M
+595M
+973M
+2.8B
+Layers
+12
+12
+12
+24
+16
+28
+Hidden Size
+768
+1024
+1536
+1536
+2048
+3072
+FFN Hidden Size
+2048
+3072
+4096
+4096
+8192
+8192
+Attention Heads
+16
+16
+24
+24
+32
+24
+KV Heads
+4
+4
+6
+6
+8
+8
+Batch Size (# Sequence)
+256
+256
+512
+512
+512
+512
+Max LR
+1.5e-3
+1.0e-3
+8e-4
+6e-4
+6e-4
+6e-4
+Min LR
+0.1 × Max LR
+Optimizer
+AdamW (β1 = 0.9, β2 = 0.95)
+Weight Decay
+0.1
+Clip Grad Norm
+1.0
+LR Schedule
+Cosine
+Warmup Steps
+500
+Sequence Length
+2048
+G
+Quantization Error Contour
+Figure 1 shows the contour plot of W4A4 QAT quantization using the proposed QAT scaling law in Eq. (5).
+For clarity, we restate Eq. (5):
+δp(N, D, G) = k · DγD · (log2(G))γG
+N γN
+.
+We plot the contour by fixing G. Let C = k · (log2(G))γG, so Eq. (5) simplifies to:
+δp(N, D, G) = C · DγD · N −γN .
+18
+
+
+Each contour line represents a constant quantization error, i.e., δp(N, D) = z0:
+C · DγD · N −γN = z0.
+Taking the base-10 logarithm of both sides, we have:
+log10(C) + γD log10(D) −γN log10(N) = log10(z0)
+γD log10(D) −γN log10(N) = log10(z0) −log10(C)
+γD log10(D) + (−γN) log10(N) = const
+Let x = log10(N) and y = log10(D). The contour equation becomes:
+γDy −γNx = const
+or equivalently,
+y = γN
+γD
+x + const′
+Thus, in the (log10 N, log10 D) space, the contours are straight lines. The slope of each contour line is γN
+γD .
+H
+Scaling with Efficient Parameter Multiplier
+To improve the practicality of the proposed QAT scaling law, we extend it to the efficient parameter multiplier
+(EPM) (Eq. (2)) [12, 20], which quantifies the impact of quantization on the model’s effective parameter count.
+Previous studies [12, 20] treat eff(C) as a constant determined by the model architecture and quantization
+type, independent of model size and the number of training tokens. In contrast, we model the quantization
+error δp instead of directly modeling eff(C). However, we can derive the value of eff(C) by solving the following
+equation:
+A
+N α + B
+Dβ + E + δp(N, D, G)
+|
+{z
+}
+Loss with QAT (Eq. (4))
+=
+A
+(N · eff(C))α + B
+Dβ + E
+|
+{z
+}
+Loss without QAT (Eq. (2))
+.
+(11)
+From this, we obtain:
+eff(C) =
+
+A
+A + δp(N, D, G) · N α
+ 1
+α
+.
+(12)
+By substituting δp with Eq. (5), the final expression for eff(C) is:
+eff(C) =
+
+A
+A + k · DγD · (log2(G))γG · N α−γN
+ 1
+α
+,
+(13)
+where N, D, and G are variables, and A, k, α, γD, γG, and γN are constants. Eq. (13) shows that eff(C)
+decreases as D and G increase. Furthermore, the relationship between eff(C) and N depends on the difference
+α −γN. Although the quantization error decreases as the model size increases, with γN indicating the rate of
+this decrease, the speed at which the loss decreases also slows down with larger model sizes, as represented by
+α. This explains why the relationship between EPM and N depends on α −γN. Since α > γN in the W4A4
+scenario (as shown in Table 1), eff(C) also decreases as N increases. As shown in Figure 16a, the EPM for
+W4A4 exceeds 0.5 in most cases, indicating that W4A4 QAT achieves a better trade-off than even lossless
+W8A8. Additionally, Figure 16b demonstrates that setting the FC2 input to 8 bits significantly improves
+EPM, increasing it by 0.06 to 0.14 across different values of N and D.
+Practical implications. Our results show that EPM is sensitive to model size, training data, and quantization
+granularity. EPM serves as a practical metric for evaluating the effective capacity of quantized models under
+19
+
+
+100M
+1B
+10B
+Model Size
+10B
+100B
+1T
+10T
+Training Tokens
+0.54
+0.56
+0.58
+0.60
+0.62
+0.64
+0.66
+0.68
+0.70
+0.72
+0.74
+0.76
+Efficient Parameter Multiplier Contour (G=128)
+(a) EPM contour
+100M
+1B
+10B
+Model Size
+10B
+100B
+1T
+10T
+Training Tokens
+0.68
+0.70
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+Efficient Parameter Multiplier Contour (G=128)
+(b) EPM contour (w/ FC2 input 8-bit)
+Figure 16
+Efficient parameter multiplier (EPM) contour for W4A4 QAT. EPM of W4W4 QAT consistently
+outperform 0.5, and setting FC2 inputs as 8bit significantly improve the EPM with
+different settings. It also helps predict when resource-intensive quantization methods, such as fine-grained or
+mixed-precision quantization, are worthwhile. While these methods can improve EPM, they also increase
+inference overhead. EPM therefore helps balance the trade-off between higher effective capacity and additional
+computational cost.
+I
+More Analysis and Discussions
+Difference with existing PTQ scaling law. Previous PTQ scaling laws [20, 31] and the proposed QAT scaling
+law in this study confirm that quantization error increases with more training data, but differences exist.
+In PTQ, quantization occurs only post-training, causing a rapid increase in error as training data grows,
+resulting in higher loss for models with more data compared to those with less. In contrast, QAT integrates
+quantization throughout the training process, leading to a slower error increase rate. Consequently, in QAT,
+as the number of training tokens increases, the final loss decreases, but the loss gap with full-precision training
+widens.
+Optimal QAT bit-width. The Kumar QAT scaling law [20] identifies 8-bit precision as Pareto-optimal for QAT
+on LLMs. However, later studies [12, 32] show that 4-bit QAT can be optimal. We find that this difference
+is mainly due to the quantization granularity used in Kumar [20], where activation quantization is set to
+per-tensor. As shown in Figure 14b, using an AbsMax quantizer with per-tensor granularity causes significant
+performance loss—0.24 degradation compared to the Bfloat16 baseline—due to activation outliers. Figure 14b
+also shows that fine-grained quantization or clipping-based quantizers (such as LAC) can reduce the negative
+impact of outliers, making 4-bit quantization more competitive. This paper focuses on how quantization
+error changes with model size, training tokens, and quantization granularity, rather than finding the optimal
+QAT bit-width. However, our results also support that 4-bit QAT can provide a better trade-off. Following
+previous works [12, 20], we assume the computational cost of 8-bit QAT is twice that of 4-bit QAT, and that
+8-bit QAT achieves lossless performance compared to Bfloat16. Therefore, 4-bit QAT is preferable when EPM
+> 0.5, and 8-bit QAT is preferable otherwise. As shown in Figure 16a, the EPM for W4A4 is consistently
+above 0.5, indicating that 4-bit QAT achieves a better trade-off than 8-bit QAT.
+Connection with FQT. QAT focuses on accelerating inference by quantizing only the forward pass during
+training, without improving training efficiency itself.
+Fully Quantized Training (FQT) extends this by
+quantizing both forward and backward passes, speeding up both training and inference. Recent work shows
+that FQT at 8-bit precision achieves nearly lossless accuracy [10, 24, 33], and some studies report promising
+results at 4 bits [38, 39, 41]. However, since 4-bit QAT already causes accuracy loss even without quantized
+backward propagation, 4-bit FQT remains a challenge. Our work also lays the groundwork for future research
+on 4-bit FQT.
+Ablation studies about D. The main difference between our scaling law and existing methods [12, 20] is that
+20
+
+
+Table 4 Ablation study of incorporating D in Eq. (5) across various precisions.
+Precision
+Ablation
+Relative Error
+W4A4
+w/o D
+8.6%
+w/ D
+4.7%
+W4A16
+w/o D
+13.8%
+w/ D
+5.2%
+we recognize δp increases with D and explicitly include D in the scaling law. Table 4 shows ablation results
+for removing D from Eq. (5). Excluding D reduces prediction accuracy for both W4A4 and W4A16: the
+relative error for W4A4 rises from 4.7% to 8.6%, and for W4A16 from 5.2% to 13.8%. These results highlight
+the necessity of including D in the QAT scaling law.
+21

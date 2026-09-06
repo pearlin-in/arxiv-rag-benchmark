@@ -1,0 +1,2338 @@
+Causal Mechanism Reduction:
+Mechanism Replacement for Neural Network
+Pruning and Abstraction
+Amir Asiaee
+Vanderbilt University Medical Center
+Nashville, TN
+amir.asiaeetaheri@vumc.org
+Abstract
+Which internal mechanisms of a neural network can be replaced while preserving
+the computation it performs? This question has two versions: structured pruning
+asks for smaller deployable networks, while causal abstraction asks for high-level
+models that commute with interventions. We introduce causal mechanism reduction
+(CMR), a framework for mechanism replacement that treats a trained network as a
+deterministic structural causal model and replaces selected internal variables by
+constants or affine functions of retained variables. These replacements compile
+exactly into smaller dense networks through bias and weight folding, and they
+induce reduced causal models that can be tested with interchange interventions.
+We derive a unified second-order replacement-risk objective with special cases
+that recover mean replacement, variance-based pruning, logit-distortion scoring,
+and affine neuron merging. A margin-based certificate connects logit distortion
+to interchange-intervention agreement, giving a formal link between compression
+error and abstraction fidelity. The framework also identifies a basic invariance
+requirement for mechanism scores: functionally identical ReLU networks should
+induce the same reduction. In exact positive-scaling reparameterizations, variance-
+based pruning violates this requirement, with kept-set Jaccard collapsing to the
+chance level for the budget (about one third), while our logit-distortion score is
+exactly invariant.
+In experiments, CMR variants are competitive with VBP under matched fine-
+tuning of DeiT-Tiny on ImageNet-100, where final-block FFN pruning is largely
+recovered by fine-tuning. The clearer separation appears in the invariance and
+interchange tests: CMR-Logit preserves kept sets under reparameterization and
+consistently improves distributional fidelity under interchange interventions, with
+small, directionally consistent interchange-accuracy gains. CMR thus provides a
+common object for pruning, compilation, and causal-abstraction verification.
+1
+Introduction
+Neural networks are often simplified after training. In compression, the simplified model should
+be smaller and faster without losing predictive behavior. In causal abstraction and mechanistic
+interpretability, the simplified model should preserve how internal variables support behavior under
+interventions. These goals are usually studied separately, but they share a basic question: which
+internal mechanisms can be replaced without changing what the network does?
+The common operation is mechanism replacement. A pruning method may replace a hidden unit
+by a constant and fold the resulting contribution into the next bias; an abstraction method may
+Preprint.
+arXiv:2602.24266v2  [cs.LG]  6 Jul 2026
+
+
+keep a subset of internal variables and ask whether interventions on those variables commute with
+the original computation. In this view, structured pruning and causal abstraction differ less in the
+operation they perform than in the fidelity metric they demand: deployable task behavior for pruning,
+interchange-intervention agreement for abstraction.
+We formalize this operation as causal mechanism reduction. Given a trained feedforward network
+viewed as a deterministic structural causal model (SCM) [31], we replace selected units by constants
+or by affine functions of retained units. The same reduced object has two readings. Computationally,
+it compiles exactly into a smaller dense network through bias and weight folding. Causally, it defines
+an explicit reduced SCM whose state map is the projection onto retained activations and whose
+fidelity can be checked under interchange interventions [1, 12].
+This is not only a change of vocabulary. A unified second-order replacement-risk theorem (Theorem 1)
+shows that mean replacement, variance-based pruning (VBP) [3], logit-distortion scoring, and affine
+neuron merging [20] are all special cases of the same local quadratic objective. A margin-based
+interchange-fidelity certificate (Theorem 2) then connects one tractable surrogate, expected squared
+logit distortion, to class-level agreement under interchange interventions. The same replacement
+score can therefore be read both as a compression criterion and as a proposal for a verifiable causal
+abstraction.
+The formalism also reveals a concrete failure mode of an existing pruning heuristic. ReLU networks
+admit exact function-preserving rescalings: multiplying a hidden unit by a positive scalar and
+dividing its outgoing weights by the same scalar leaves the network function unchanged. A behavioral
+reduction criterion should not identify different mechanisms in two such networks. VBP is not
+invariant to this transformation because activation variance changes with scale; logit distortion is
+invariant. In our stress test, exact ReLU scaling reparameterizations on [0.01, 100] drive VBP’s
+kept-set Jaccard to chance-level overlap (0.35 against a random-subset floor of ≈1/3) across
+functionally identical networks, while CMR-Logit remains at Jaccard 1.0, with downstream effects
+on interchange-intervention agreement and distributional fidelity.
+Empirically, the results are deliberately two-sided. On DeiT-Tiny final-block FFN pruning after
+transfer to ImageNet-100, all methods land within 0.7 top-1 points of the 84.62 baseline after matched
+fine-tuning (most cells slightly above it), including random pruning; this indicates that the CMR
+variants are competitive with VBP in a modern transformer setting, but also shows that top-1 accuracy
+is saturated in this protocol. The clearest method signal appears in the invariance stress test, while
+interchange-intervention experiments on CIFAR-10 ConvNet and ResNet-56 / CIFAR-100 verify that
+compiled reductions can be evaluated as approximate causal abstractions, not only as compressed
+predictors.
+Contributions.
+• A unified replacement primitive. We define constant and affine mechanism replacements that
+compile into smaller dense networks and induce explicit reduced SCMs that can be verified under
+interchange interventions.
+• Theory connecting pruning scores to abstraction fidelity. We prove a unified replacement-
+risk theorem that recovers VBP, Logit-MSE / CMR-Logit, and affine weighted-least-squares
+(WLS) scoring as special cases, and a margin-based certificate connecting logit distortion to
+interchange-intervention agreement.
+• Evidence for when the abstraction lens matters. We show a large reparameterization-invariance
+failure for VBP, verify compiled reductions under interchange interventions, and compare CMR
+variants with VBP, magnitude, random, and DepGraph baselines across DeiT-Tiny / ImageNet-100,
+CIFAR-10 ConvNet, and ResNet-56 / CIFAR-100.
+Notation and roadmap.
+Section 2 places the work relative to causal abstraction, structured pruning,
+and second-order compression. Section 3 defines mechanism replacement for deterministic neural
+SCMs, including interventional risk and exact compilation. Section 4 presents the replacement-risk
+theorem, the interchange-fidelity certificate, and the invariance result. Section 5 reports the invariance
+stress test, modern transformer benchmark, and interchange-fidelity study. Section 6 discusses
+limitations.
+2
+
+
+2
+Related Work and Positioning
+Causal abstraction and mechanistic interpretability.
+Causal abstraction asks when a high-
+level structural causal model (SCM) commutes with a low-level one under interventions [1, 32];
+approximate abstraction allows graded mismatch between low- and high-level models [2]. Interchange
+interventions turn this criterion into a neural-network test by swapping internal states and measuring
+interchange-intervention accuracy (IIA) [12]. Interchange-intervention training shows that behavioral
+accuracy can miss mechanistic failures [13]. Later work studies distributed alignment search and
+frames causal abstraction as a formal language for mechanistic interpretability [14, 15]. Here,
+abstraction is constructive: we search over restricted mechanism replacements that produce an
+explicit reduced SCM and verify the compiled model under interchange interventions.
+Alignment-map complexity.
+Recent critiques sharpen the role of the abstraction map. With
+sufficiently expressive nonlinear alignment maps, high IIA can be uninformative even for randomly
+initialized networks [36]. CMR avoids this failure mode by fixing the maps: the state map is the fixed
+projection onto retained activations, the intervention map is the identity on retained coordinates, and
+the reported IIA is tied to the margin certificate of Theorem 2 rather than to a learned alignment.
+Structured and activation-statistic pruning.
+Structured pruning removes units, channels, heads,
+or blocks, yielding smaller dense computations rather than sparse masks. Classical compression
+pipelines combine pruning with quantization and coding [16]; structured CNN methods remove filters
+or channels using magnitude, sparsity-inducing gates, or Taylor criteria [19, 25, 26, 30]. Variance-
+based pruning (VBP) removes low-variance MLP units and folds mean activations into downstream
+biases [3]; mean replacement, neuron merging, dependency-aware pruning, and submodular structured
+pruning use related selection and replacement principles [6, 8, 9, 20]. CMR treats these operations as
+instances of mechanism replacement: constant replacement recovers mean folding and VBP under
+stationarity and uniform curvature, while affine replacement connects to neuron merging and soft
+interventions in causal models [28]. Beyond a new score, this yields a shared objective that exposes
+when an activation statistic is invariant, when it is fragile, and when the reduced network should be
+read as an approximate abstraction.
+Second-order and modern transformer pruning.
+Classical second-order pruning methods such
+as Optimal Brain Damage and Optimal Brain Surgeon use Taylor expansions in weight space
+[17, 23]. Modern variants scale this idea by approximating or inverting curvature for large networks,
+including WoodFisher, OBC/GPTQ/SparseGPT, and Hessian-diagonal tooling [5, 7, 10, 11, 34].
+Recent transformer and LLM pruning methods such as Wanda, LLM-Pruner, fast BERT pruning, and
+X-Pruner provide strong practical baselines for weight, channel, or block removal [22, 27, 35, 40];
+attention-head pruning shows that many transformer heads can be removed with small behavioral
+loss [29, 39]. CMR targets a different object: it scores activation mechanisms and their replacements,
+compiles the selected interventions by bias or weight folding, and gives the resulting dense network
+an explicit interventional semantics.
+3
+Problem Setup: Mechanism Replacement
+3.1
+Networks as deterministic SCMs
+Let fθ : X →Rq be a trained feedforward network with fixed parameters θ. Given a task loss ℓ:
+Rq ×Y →R≥0 and a calibration set Dcal = {(xs, ys)}n
+s=1, define L(θ) := n−1 Pn
+s=1 ℓ(fθ(xs), ys).
+(We overload ℓas the task loss and as a layer index; the loss always carries arguments, and layer
+indices appear as sub- or superscripts.) For layer ℓ∈[L] with width dℓ, let a(ℓ)(x) ∈Rdℓdenote the
+post-nonlinearity activation vector and let a(0)(x) := x. The calibration activations are A(ℓ) ∈Rn×dℓ
+with A(ℓ)
+s,j := a(ℓ)
+j (xs). For a unit j, write aj := A(ℓ)
+:,j , with layer superscripts omitted when clear; let
+¯aj := n−11⊤
+n aj and Var[aj] := n−1∥aj −¯aj1n∥2
+2.
+A feedforward network is also viewed here as a deterministic SCM over its internal activations.
+The exogenous input is X, the endogenous variables are the activations {a(ℓ)
+j }ℓ,j, and the structural
+equations are the forward computations z(ℓ) = W (ℓ)a(ℓ−1) + b(ℓ) and a(ℓ) = σ(ℓ)(z(ℓ)). This SCM
+3
+
+
+view is not a claim that the network recovers exogenous real-world causes. It supplies intervention
+semantics for a deterministic computation graph.
+3.2
+Replacement, risk, and compilation
+CMR modifies this SCM by replacing selected internal mechanisms with the trained weights held
+fixed. For a unit j in layer ℓ, the constant replacement do(a(ℓ)
+j
+:= c) severs the incoming edges to that
+unit and sends the constant c to all downstream consumers. More generally, fix a retained set K ⊆[dℓ]
+and a replaced set S = [dℓ] \ K. A replacement class Φ maps retained activations to replacements
+for AS: constants use ϕ(As,K) = c, while affine replacements use ϕ(As,K) = β + BAs,K or a
+restricted parent subset.
+For a single constant intervention, let f do(ℓ,j:=c)
+θ
+be the intervened network and define Lℓ,j(c) :=
+n−1 Pn
+s=1 ℓ(f do(ℓ,j:=c)
+θ
+(xs), ys). The corresponding effect is ∆Lℓ,j(c) := Lℓ,j(c) −L(θ). Struc-
+tured compression can therefore be posed as a constrained intervention-selection problem:
+min
+I⊆[L]×[d•], |I|=k
+{c(ℓ,j)}(ℓ,j)∈I
+Ldo(I,c).
+(1)
+The exact objective is expensive to search directly, so Section 4 derives the local replacement-risk
+proxy used for scoring.
+Proposition 1 (Bias-folding equivalence). Consider layer ℓwith output a(ℓ) ∈Rdℓ, followed by
+an affine transformation u = Wa(ℓ) + b, where W ∈Rm×dℓand b ∈Rm. Suppose unit j is
+clamped to constant c. Define W ′ := W:,\j ∈Rm×(dℓ−1) and b′ := b + cW:,j. Then, for all a(ℓ)
+\j ,
+Wa(ℓ) + b|a(ℓ)
+j
+=c = W ′a(ℓ)
+\j + b′.
+For a set S of constant replacements, the same folding accumulates as b′ = b + P
+j∈S cjW:,j and
+W ′ = W:,\S. Affine replacements fold analogously by redistributing the replaced unit’s outgoing
+column onto the parent columns and bias. Thus CMR can be read in two ways: as a logical
+intervention in the neural SCM and as a smaller dense network with no runtime masking (Figure 1).
+All proofs and longer derivations for the main-text statements are collected in Appendix A.
+4
+Theory: Replacement Risk, Fidelity, and Invariance
+4.1
+Unified replacement risk
+The central score is a local approximation to the loss incurred by replacing mechanisms at a fixed
+layer. For a replaced set S and retained set K = [dℓ] \ S, write the replacement perturbation on
+sample s as δs := ϕ(As,K) −As,S.
+Theorem 1 (Unified replacement-risk decomposition). Fix a layer ℓ, a retained set K ⊆[dℓ], a
+replaced set S = [dℓ] \ K, a replacement class Φ (constants, affine functions of AK, or learned
+mechanisms), and a discrepancy d on logits or task loss that is twice differentiable at the observed
+activations. The second-order local replacement-risk proxy has the quadratic form
+QS(ϕ) = Es
+h
+g⊤
+s,Sδs + 1
+2 δ⊤
+s Hs,S δs
+i
+,
+δs := ϕ(As,K) −As,S.
+Under block-diagonal or diagonal curvature, QS decomposes across replaced mechanisms, yielding
+independent per-unit or per-group scores. The constant, affine, VBP [3], logit-distortion, and
+neuron-merging [20] cases follow as named special cases.
+For single-unit constant replacement A(ℓ)
+s,j 7→c, the proxy is minimized by
+c⋆
+ℓ,j = h⊤aj −1⊤
+n g
+1⊤
+n h
+,
+(2)
+provided 1⊤
+n h > 0. Under samplewise gradient stationarity (gs = 0 for all s) and uniform positive
+curvature, this reduces to mean replacement and ranking by activation variance, recovering VBP.
+4
+
+
+Under squared logit distortion with downstream logits affine in unit j, the same theorem gives
+c⋆= ¯aj and slogit
+ℓ,j
+= Var[aj] ∥W:,j∥2
+2. For affine replacement, the minimizer is a curvature-weighted
+least-squares fit; for block-diagonal curvature, group scores add and a size-k replacement set is
+selected by the bottom-k scores. Table 1 summarizes these cases and the corresponding methods.
+The assumptions are local: the network is fixed, the computation graph is deterministic and feedfor-
+ward, replacements are constants or affine functions of retained variables, downstream consumers
+are affine when we claim exact folding, and diagonal or block-diagonal curvature is used for scoring
+rather than for compilation or verification.
+4.2
+Interchange-fidelity certificate
+Replacement risk is a cheap candidate score; causal-abstraction verification asks whether the reduced
+model commutes with the original under interchange interventions [1, 12]. For an interchange
+intervention I on retained coordinates, the state map τ is projection onto retained activations and the
+intervention map ω applies the corresponding low-level intervention. The following certificate links
+expected logit distortion to IIA when the low-level intervened model has margin.
+Theorem 2 (Margin-based interchange-fidelity certificate). Let zI
+L(x) denote the low-level network’s
+logit vector under interchange intervention I, and let zω(I)
+H
+(x) denote the compiled high-level model’s
+logits under the corresponding intervention ω(I). Define the interchange margin as mI(x) :=
+zI
+L,y(x)(x) −maxy′̸=y(x) zI
+L,y′(x), where y(x) := arg maxy zI
+L,y(x). Then for every ϵ > 0,
+Pr
+
+ˆyω(I)
+H
+(x)̸ = ˆyI
+L(x)
+
+≤Pr
+
+mI(x) ≤2ϵ
+
++ Pr
+
+∥zω(I)
+H
+(x) −zI
+L(x)∥∞> ϵ
+
+.
+By Markov’s inequality, the second term is bounded by E
+
+∥zω(I)
+H
+(x) −zI
+L(x)∥2
+∞
+
+/ϵ2, which is upper-
+bounded by the expected squared logit distortion D2 of the compiled model under the verification
+distribution.
+The CMR-Logit score estimates D2 when the calibration distribution matches the interchange
+marginal on the replaced units and cross-unit distortion terms are accounted for; the experiments
+evaluate the certificate with the empirically measured joint D2.
+Equivalently, if D2 is the unnormalized expected squared logit distortion and M(t) := Pr[mI(x) ≤
+t], then for every ϵ > 0, IIA ≥1 −M(2ϵ) −D2/ϵ2. When mI(x) ≥γ almost surely, this gives
+IIA ≥1 −4D2/γ2. The margin term is the unavoidable failure mode: near decision boundaries, no
+small logit-distortion guarantee can certify class agreement.
+4.3
+Reparameterization invariance
+ReLU networks admit exact function-preserving symmetries: for any s > 0, multiplying a hidden
+unit’s activations by s and dividing its outgoing weights by s leaves the network function unchanged.
+Variance is not invariant to this transformation; expected squared logit distortion is invariant.
+Proposition 2 (ReLU scaling invariance of CMR-Logit). Let fθ be a feedforward ReLU network,
+and let j be a hidden unit in layer ℓwith post-ReLU activation aj(x) and outgoing weight column
+Wℓ+1,:,j. For any s > 0, scale the incoming weights and bias of unit j by s, so that its activation
+becomes a′
+j(x) = saj(x) for all x, and scale its outgoing column by W ′
+ℓ+1,:,j = s−1Wℓ+1,:,j. Then
+the network function is unchanged for every input x. Under this transformation,
+Var[a′
+j] · ∥W ′
+ℓ+1,:,j∥2
+2 = Var[aj] · ∥Wℓ+1,:,j∥2
+2,
+so the CMR-Logit ranking is preserved exactly, up to global normalization constants. By contrast,
+Var[a′
+j] = s2Var[aj]; with independent positive scalings across units, variance-based rankings can
+be changed arbitrarily among units with nonzero variance.
+5
+Experiments
+We organize the empirical evaluation around three claims: (1) coordinate-invariance separates methods
+on functionally identical networks (Section 5.1); (2) CMR is competitive on a modern transformer
+pruning benchmark, where matched fine-tuning makes top-1 accuracy a saturated recovery metric
+5
+
+
+1. Low-level SCM
+2. Score replacements
+3. Compile
+4. Evaluate
+replaced
+S
+retained
+K
+τ(a) = aK
+constant
+aj ←cj
+affine
+aj ←β + BaP
+rank by
+QS(ϕ)
+smaller dense
+network MH
+no masks at inference
+compressed predictor
+accuracy, FLOPs
+Mω(I)
+L
+MI
+H
+τ
+causal abstraction
+IIA, KL, margins
+τ(Mω(I)
+L
+(x)) ≈MI
+H(τ(x))
+One primitive: replace mechanisms.  Two readings: a compiled dense network and a reduced SCM.
+Figure 1: Mechanism replacement overview. A low-level network is viewed as a deterministic
+SCM over activations. A retained set K defines the projection τ, while replaced units S are assigned
+constant or affine mechanisms that fold into a smaller dense network. We evaluate both compiled
+task behavior and commutativity under interchange interventions.
+Table 1: Known structured-pruning and abstraction-discovery methods as special cases of the unified
+replacement-risk objective (Theorem 1). Replacement objective × replacement class × score formula
+× method recovered.
+Replacement objective
+Replacement class Score formula
+Method recovered
+uniform curvature, samplewise stationarity constant
+Var(aj)
+mean replacement [8] / VBP [3]
+squared logit distortion
+constant
+Var(aj) ∥W:,j∥2
+2
+Logit-MSE / CMR-Logit
+supervised CE local risk
+constant
+curvature-weighted score CMR-Const
+supervised / logit local risk
+affine
+weighted residual
+CMR-Affine, neuron merging [20]
+next-layer reconstruction
+affine / full set
+reconstruction residual
+submodular pruning [6]
+(Section 5.2); and (3) the compiled reductions behave as approximate abstractions under interchange
+interventions (Section 5.3). We close with diagnostics that show when local scores are reliable and
+when retraining or recomputation dominates the ranking signal.
+Methods.
+We evaluate three variants of CMR (CMR-Const, CMR-Logit, CMR-Affine) and compare
+them with variance-based pruning [3], magnitude pruning, and the structural-pruning baseline
+DepGraph [9]. A random selector serves as an unstructured recovery reference. Table 1 maps the
+methods and related baselines to special cases of Theorem 1.
+Compute.
+DeiT-Tiny experiments use a single NVIDIA RTX 4500 Ada (24 GB VRAM, CUDA
+13.0); all reported throughput numbers are measured on this device. ConvNet and ResNet experiments
+use cached checkpoints and run on CPU, which is sufficient for these smaller workloads and ensures
+the interchange-intervention budget is held constant across methods within each experiment (R =
+2000 swaps per cell for verification and the off-diagonal diagnostic, R = 1000 for the affine ablation,
+R = 500 for the calibration-shift study).
+Metrics.
+Compression experiments report retained fraction ρ, top-1/top-5 accuracy after any
+matched fine-tuning, parameters, multiply-accumulate operations (MACs), and measured through-
+put. Abstraction experiments report interchange-intervention accuracy (IIA; higher is better) and
+KL divergence between the original and reduced intervention logits (lower is better). The invari-
+ance stress test reports the Jaccard overlap between the kept sets selected before and after an exact
+function-preserving reparameterization.
+5.1
+Reparameterization-invariance stress test
+Proposition 2 predicts that CMR-Logit rankings are unchanged under exact ReLU positive scaling,
+while VBP rankings depend on the absolute activation scale. This is the controlled setting in which
+method choice matters most: the paired networks compute the same function, so a changed kept set
+reflects coordinate dependence rather than behavioral structure. The two cached models are a small
+convolutional CIFAR-10 classifier with a 256-unit penultimate representation and a ResNet-56 trained
+on CIFAR-100 whose post-GAP representation has 64 channels; both are scored at the penultimate-
+6
+
+
+Table 2: Kept-set stability under exact ReLU reparameterization. Jaccard overlap is measured
+between the kept set selected on the original network and the kept set selected on a functionally
+identical positively-scaled network (mean ± sd over ten seeds); bold marks the best Jaccard in each
+row. Each kept set retains half the units; the chance floor for two independent random half-subsets is
+≈1/3 (measured random selector: 0.333 ± 0.030 ConvNet, 0.356 ± 0.092 ResNet-56).
+Model
+Scale range
+CMR-Logit
+VBP
+magnitude
+CIFAR-10 ConvNet
+[0.01, 100]
+1.000 ± 0.000
+0.346 ± 0.021
+0.359 ± 0.027
+CIFAR-10 ConvNet
+[0.1, 10]
+1.000 ± 0.000
+0.371 ± 0.024
+0.378 ± 0.027
+ResNet-56 / CIFAR-100
+[0.01, 100]
+1.000 ± 0.000
+0.374 ± 0.037
+0.352 ± 0.049
+ResNet-56 / CIFAR-100
+[0.1, 10]
+1.000 ± 0.000
+0.389 ± 0.038
+0.361 ± 0.052
+[0.01,100]
+[0.1,10]
+scale range
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Kept-set Jaccard
+CMR-Affine
+CMR-Const
+CMR-Logit
+VBP
+magnitude
+random
+[0.01,100]
+[0.1,10]
+scale range
+0.2
+0.3
+0.4
+0.5
+0.6
+IIA at p=0.5
+[0.01,100]
+[0.1,10]
+scale range
+2
+4
+6
+8
+10
+KL at p=0.5
+Figure 2: Reparameterization stress test. CMR-Logit is invariant under exact positive scaling,
+while VBP and magnitude rankings change substantially across functionally identical networks.
+Curves pool three model populations (CIFAR-10 ConvNet, ResNet-56 / CIFAR-100, and an untrained
+ResNet-20 control), so plotted values differ from the per-model rows of Table 2; the random selector’s
+spread reflects independent re-draws, not scale dependence.
+representation–head interface. For each seed, unit-wise scalings sj ∼LogUniform(smin, smax) are
+applied as aj 7→sjaj, W:,j 7→W:,j/sj at the representation–head interface, i.e., the transformation
+that an exact ReLU rescaling of unit j induces on the cached activations and head weights; the
+maximum logit difference between original and rescaled models is below 10−5 in every cell, a
+numerical sanity check on the identity. Each cell keeps half the units (128 of 256 on the ConvNet,
+32 of 64 on ResNet-56), with ten scaling draws over five (ConvNet) and three (ResNet-56) trained
+checkpoints.
+On the CIFAR-10 ConvNet [21] at [0.01, 100], CMR-Logit has kept-set Jaccard 1.000 ± 0.000 across
+ten seeds while VBP has Jaccard 0.346 ± 0.021 (Table 2; Figure 2), statistically indistinguishable
+from the chance floor: the expected Jaccard of two independent random half-subsets is ≈1/3, and
+the measured random selector gives 0.333 ± 0.030. At the narrower [0.1, 10], CMR-Logit remains
+exactly invariant and VBP remains scale-dependent. The same pattern appears on ResNet-56 [18]
+/ CIFAR-100, where CMR-Logit is again exactly invariant and VBP has Jaccard 0.374 ± 0.037 at
+[0.01, 100] (random floor 0.356±0.092), so under the strongest scaling range VBP’s kept-set overlap
+falls to chance level. This is not merely label instability: at keep = 128 on the CIFAR-10 ConvNet
+under the strongest scaling range, the downstream CMR-Logit IIA gap over VBP is +0.131 and the
+KL gap is −0.362.
+5.2
+Modern pruning benchmark
+We initialize DeiT-Tiny from ImageNet-1K pretrained weights [38] and fine-tune it for five epochs
+on ImageNet-100 [37] (the standard 100-class subset of ImageNet-1K [33], ≈127K train / 5K val)
+to a baseline of top-1 / top-5 84.62/97.32. We then prune the final transformer block’s feed-forward
+(FFN) intermediate units at keep fractions {0.75, 0.50, 0.25} using each scoring method and apply a
+matched ten-epoch fine-tune (identical optimizer, schedule, and initialization from the same baseline
+checkpoint; mini-batch order varies per cell). Scores are computed from class-token activations of
+the final-block FFN on a fixed calibration set of n = 1024 images, using the block’s down-projection
+output as a local logit surrogate for the CMR variants; the pruned projections act on all tokens at
+deployment. Each cell is a single seed. Throughput is measured in half precision over five timed
+7
+
+
+Table 3: ImageNet-100 top-1 after matched fine-tuning. DeiT-Tiny final-block FFN pruning at
+retained fraction ρ; baseline top-1 is 84.62; bold marks the best top-1 in each column.
+Method
+ρ = 0.75
+ρ = 0.50
+ρ = 0.25
+CMR-Logit
+85.16
+84.78
+84.88
+CMR-Affine
+84.70
+85.04
+85.16
+CMR-Const
+84.66
+84.66
+84.96
+VBP
+84.50
+85.00
+84.70
+magnitude
+84.70
+84.78
+84.62
+random
+84.68
+84.82
+85.30
+sweeps of 1024 validation images after two warmup sweeps; evaluation uses a direct 224 × 224
+resize, applied identically to baseline and pruned models.
+After fine-tuning, all six methods finish within 0.7 top-1 points of the baseline (Table 3 and Figure 3a;
+pruned models 5.32–5.47M parameters, 1.04–1.06G MACs, throughput 7.4–7.8K img/s on the
+RTX 4500 Ada). Before fine-tuning, the picture is sharper: CMR-Logit, VBP, magnitude, and random
+preserve baseline accuracy zero-shot (top-1 83.2–84.6), CMR-Const drops moderately (71.6–76.1),
+and CMR-Affine collapses to near-chance (2.6–4.4); the matched fine-tune recovers every method,
+which is precisely why the post-fine-tuning grid saturates. This makes the benchmark a recovery
+and deployment-viability test rather than a statistically reliable ranking test. Among non-random
+selectors, CMR-Logit is highest at keep = 0.75 (85.16 vs. VBP 84.50), while CMR-Affine is highest
+at keep = 0.50 and 0.25 (85.04 and 85.16, against VBP’s 85.00 and 84.70). CMR-Const also slightly
+exceeds VBP at the most aggressive setting (84.96 vs. 84.70).
+Random pruning followed by matched fine-tuning is competitive, including the best single cell in
+the grid (85.30 at keep = 0.25), suggesting that the final DeiT-Tiny FFN has enough redundant
+expansion capacity for ten epochs of fine-tuning to recover from many reasonable selections. We
+therefore use ImageNet-100 to show that CMR variants remain competitive with VBP on a modern
+transformer, and use the invariance stress test (Section 5.1) for the clear method-choice separation.
+On cached ResNet-56 / CIFAR-100 without fine-tuning, CMR-Logit and VBP prune the post-GAP
+representation; DepGraph physically removes stage-three residual channels and propagates through
+to the classifier, with channels ranked by classifier-input column norm and the dependency graph
+used for propagation (single seed, no fine-tuning). At keep 0.75/0.50/0.25, CMR-Logit top-1
+is 0.670/0.534/0.284, VBP 0.672/0.526/0.286, DepGraph 0.253/0.065/0.020. DepGraph gives
+larger parameter and MAC reductions but at a different deployment budget; a matched-budget
+fine-tuned comparison under DepGraph’s native group-norm importance is left to future work.
+5.3
+Interventional self-abstraction verification
+We verify compiled reductions under R = 2000 Bernoulli interchange interventions at p = 0.5
+on cached CIFAR-10 ConvNet and ResNet-56 / CIFAR-100 checkpoints (Table 4 and Figure 3b;
+five seeds per cell, over five ConvNet and three ResNet-56 trained checkpoints). On the CIFAR-10
+ConvNet, CMR-Logit lies on the interchange-fidelity / compression frontier with IIA/KL 0.858/0.082
+at keep 0.75, 0.675/0.431 at keep 0.50, and 0.483/1.034 at keep 0.25. VBP is close behind on cell
+means at the first two keep fractions, though the paired per-seed IIA deltas are small (+0.007 ± 0.016
+at keep 0.75, +0.009 ± 0.017 at keep 0.50) and not individually significant, and ResNet-56 /
+CIFAR-100 shows the same small CMR-Logit edge at keep 0.75 and 0.50. A powered MNIST [24]
+baseline with ten-seed paired bootstrap CIs (Appendix B.2) matches this pattern qualitatively: the
+IIA edge is small and not significant, while the KL edge is significant; a Boolean-circuit sanity check
+(Appendix B.3) confirms CMR-Logit recovers the ground-truth compositional structure.
+CMR-Const shows a useful failure mode for local risk scores. When each replaced unit’s optimal
+constant is fitted independently, simultaneously folding the constants ignores cross-unit curvature
+interactions. Jointly refitting the constants over the replaced block at compile time mitigates the
+worst interaction; the corrected CMR-Const IIA on the CIFAR-10 ConvNet is 0.720/0.582/0.455
+at keep 0.75/0.50/0.25. This is below CMR-Logit but above the uncorrected constant-replacement
+failure mode, and it matches the off-diagonal curvature diagnostic in Section 5.4. CMR-Affine is
+8
+
+
+Table 4: Interventional verification summary. Each cell reports IIA/KL for compiled reductions,
+means over five seeds; higher IIA and lower KL are better. Bold marks per-model, per-column
+winners for each metric.
+Model
+Method
+ρ = 0.75
+ρ = 0.50
+ρ = 0.25
+CIFAR-10 ConvNet
+CMR-Logit
+0.858/0.082
+0.675/0.431
+0.483/1.034
+CIFAR-10 ConvNet
+VBP
+0.850/0.087
+0.666/0.447
+0.456/1.077
+CIFAR-10 ConvNet
+CMR-Const
+0.720/0.356
+0.582/0.730
+0.455/1.185
+ResNet-56 / CIFAR-100
+CMR-Logit
+0.628/0.697
+0.369/1.842
+0.159/3.232
+ResNet-56 / CIFAR-100
+VBP
+0.620/0.714
+0.361/1.880
+0.152/3.224
+ResNet-56 / CIFAR-100
+CMR-Const
+0.538/0.944
+0.303/2.207
+0.128/3.436
+1.035
+1.040
+1.045
+1.050
+1.055
+1.060
+1.065
+MACs (G)
+84.5
+84.6
+84.7
+84.8
+84.9
+85.0
+85.1
+85.2
+85.3
+ImageNet-100 top-1 after FT (%)
+0.25
+0.50
+0.75
+0.25
+0.50
+0.75
+0.25
+0.50
+0.75
+0.25
+0.50
+0.75
+0.25
+0.50
+0.75
+0.25
+0.50
+0.75
+CMR-Affine
+CMR-Const
+CMR-Logit
+VBP
+magnitude
+random
+(a) ImageNet-100 pruning.
+Top-1 after
+matched fine-tuning versus MACs; labels mark
+the FFN keep fraction.
+0.3
+0.4
+0.5
+0.6
+0.7
+representation reduction
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+IIA
+CMR-Affine
+CMR-Const
+CMR-Logit
+VBP
+magnitude
+random
+0.3
+0.4
+0.5
+0.6
+0.7
+representation reduction
+0
+2
+4
+6
+8
+10
+12
+KL
+(b) Interventional verification. IIA and KL under inter-
+change interventions; the x-axis is representation reduction
+1 −ρ. Curves pool the CIFAR-10 ConvNet, ResNet-56 /
+CIFAR-100, and an untrained ResNet-20 control; per-model
+values are in Table 4. The CMR-Affine curve shows the
+no-fine-tuning instability discussed in Section 6.
+Figure 3: Pruning and abstraction behavior. The ImageNet-100 benchmark establishes modern-
+transformer recovery under matched fine-tuning, while interchange verification tests whether compiled
+reductions behave as approximate high-level causal models.
+unstable in this no-fine-tuning regime (ConvNet IIA 0.388/0.282/0.217, below the random selector’s
+0.723/0.538/0.378); we quantify and discuss this in Section 6.
+5.4
+Ablations and diagnostics
+The ablations isolate three sources of variation that could otherwise be mistaken for method effects.
+First, calibration sensitivity is modest for CMR-Logit. Under a class-subset calibration shift (calibrate
+on classes 0–4, evaluate on 1,024 held-out CIFAR-10 test images under R = 500 interchange
+interventions), CMR-Logit has KL 0.472/0.480 at calibration sizes n = 500/2000, compared with
+0.616/0.599 for VBP. CMR-Affine is more data-dependent in the cached full-distribution sweep: at
+keep 128, test accuracy rises from 86.37 at n = 500 to 87.25 at n = 10,000, explaining why affine
+replacement is fragile in small calibration regimes; on ImageNet-100 the compiled affine model itself
+collapses zero-shot, and its recovery there is attributable to the matched fine-tune (Section 5.2).
+Second, affine parent selection is not the bottleneck in the small ConvNet setting. Pearson, output-
+weight-aware Pearson, and random parent sets have nearly identical mean IIA at keep 0.5 (Ap-
+pendix B.1), while larger parent sets without sufficient regularization can worsen KL. Third, the local
+one-shot approximation is stressed by cross-unit curvature: the mean off-diagonal Hessian-mass ratio
+across random 32-unit blocks of the 256-dimensional penultimate CIFAR-10 ConvNet representation
+is 0.849. In that setting, iterative recomputation of the CMR-Const scores improves IIA from 0.584
+to 0.614 at keep 0.5 and reduces KL from 0.710 to 0.597. Appendix B.5 reports the corresponding
+score, compile, and verify wall-clock breakdown.
+6
+Discussion and Limitations
+The empirical results distinguish three questions that are often conflated in pruning papers. ImageNet-
+100 asks whether mechanism replacement remains viable in a modern transformer under matched
+fine-tuning; it does, but the top-1 metric is saturated enough that method rankings are not reliable.
+9
+
+
+The reparameterization stress test asks whether a score respects the function computed by the network
+rather than the coordinates used to represent it; here the separation is sharp. Interchange verification
+asks whether the compiled reduction behaves like an approximate high-level causal model; this is
+where the abstraction interpretation becomes testable rather than metaphorical.
+This perspective also clarifies CMR’s contribution. The primitive is not “delete a unit”, but “replace a
+mechanism and measure the behavioral cost.” Different choices of replacement class and discrepancy
+recover variance-based pruning, logit-distortion scoring, constant replacement, affine merging, and
+constructive causal abstraction as points in the same design space. The benefit is that the assumptions
+behind each score become explicit and can be tested against invariance, compilation, and interchange
+fidelity; no single score dominates every benchmark.
+Locality and curvature.
+The unified replacement-risk theorem of Theorem 1 is stated for a single
+layer or block. Multi-layer iterative reduction requires recomputing activations after each replacement
+and re-scoring downstream layers; our off-diagonal diagnostic shows why this matters. The diagonal
+or block-diagonal curvature approximation makes scoring cheap and additive, but cross-unit curvature
+matters. Iterative recomputation is the natural extension when the one-shot approximation is too
+coarse, and our diagnostic results show that it can improve interchange fidelity.
+Replacement capacity.
+Affine replacement is more expressive than constant replacement, but the
+extra capacity is not automatically useful. On small cached vision models it can overfit the calibration
+signal or optimize a metric that does not translate into low interchange KL. With matched fine-tuning,
+as in the DeiT-Tiny / ImageNet-100 experiment, the same replacement class can recover and become
+competitive, though the recovery there is attributable to the fine-tune itself, which also rescues random
+pruning, and the compiled affine model is near-chance zero-shot. We therefore view CMR-Affine as
+a data- and metric-dependent option rather than a uniformly preferred selector.
+Causal semantics.
+The causal model in this paper is a computational structural causal model
+over neural activations. Its interventions are interventions on the network computation graph,
+and its abstraction claim is commutativity under a fixed state map and corresponding interchange
+interventions [1, 12]. We do not claim that the reduced model recovers exogenous real-world causal
+variables. It is a reduced neural SCM whose variables may support interpretation, but whose formal
+guarantee concerns computational behavior.
+7
+Conclusion
+We introduced causal mechanism reduction, a mechanism-replacement view of neural network
+reduction that unifies structured pruning and constructive causal abstraction. The unified replacement-
+risk theorem recovers several existing scores as special cases, the folding results make the reductions
+deployable as smaller dense networks, and the margin-based certificate connects logit distortion to
+interchange fidelity. Empirically, the main lesson is that coordinate dependence is not a cosmetic issue:
+functionally identical ReLU networks can induce different variance-based reductions, while logit-
+distortion scoring is invariant and preserves better interchange behavior. Mechanism replacement
+therefore offers both compression and causal-abstraction research a common object to optimize,
+compile, and verify.
+References
+[1] Sander Beckers and Joseph Y. Halpern. Abstracting causal models. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 33, pages 2678–2685, 2019. doi: 10.1609/aaai.
+v33i01.33012678.
+[2] Sander Beckers, Frederick Eberhardt, and Joseph Y. Halpern. Approximate causal abstraction.
+In Proceedings of The 35th Uncertainty in Artificial Intelligence Conference, volume 115 of
+Proceedings of Machine Learning Research, pages 606–615. PMLR, 2020.
+[3] Uranik Berisha, Jens Mehnert, and Alexandru Paul Condurache. Variance-based pruning for
+accelerating and compressing trained networks. In Proceedings of the IEEE/CVF International
+Conference on Computer Vision (ICCV), 2025.
+[4] Michael Cogswell, Faruk Ahmed, Ross Girshick, Larry Zitnick, and Dhruv Batra. Reducing
+overfitting in deep networks by decorrelating representations. arXiv preprint arXiv:1511.06068,
+2015.
+10
+
+
+[5] Felix Dangel, Frederik Künstner, and Philipp Hennig. BackPACK: Packing more into backprop.
+In International Conference on Learning Representations (ICLR), 2020.
+[6] Marwa El Halabi, Suraj Srinivas, and Simon Lacoste-Julien. Data-efficient structured pruning
+via submodular optimization. In Advances in Neural Information Processing Systems 35
+(NeurIPS), 2022.
+[7] Mohamed Elsayed, Homayoon Farrahi, Felix Dangel, and A. Rupam Mahmood. Revisiting
+scalable Hessian diagonal approximations for applications in reinforcement learning. In Pro-
+ceedings of the 41st International Conference on Machine Learning (ICML), volume 235 of
+Proceedings of Machine Learning Research, pages 12448–12468. PMLR, 2024.
+[8] Utku Evci, Nicolas Le Roux, Pablo Castro, and Léon Bottou. Mean replacement pruning, 2018.
+OpenReview submission to ICLR 2019.
+[9] Gongfan Fang, Xinyin Ma, Mingli Song, Michael Bi Mi, and Xinchao Wang. DepGraph:
+Towards any structural pruning. In IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 16091–16101, 2023.
+[10] Elias Frantar and Dan Alistarh. SparseGPT: Massive language models can be accurately pruned
+in one-shot. In Proceedings of the 40th International Conference on Machine Learning (ICML),
+volume 202 of Proceedings of Machine Learning Research, pages 10323–10337. PMLR, 2023.
+[11] Elias Frantar, Sidak Pal Singh, and Dan Alistarh. Optimal brain compression: A framework for
+accurate post-training quantization and pruning. In Advances in Neural Information Processing
+Systems 35 (NeurIPS), 2022.
+[12] Atticus Geiger, Hanson Lu, Thomas Icard, and Christopher Potts. Causal abstractions of neural
+networks. In Advances in Neural Information Processing Systems, 2021.
+[13] Atticus Geiger, Zhengxuan Wu, Hanson Lu, Josh Rozner, Elisa Kreiss, Thomas Icard, Noah D.
+Goodman, and Christopher Potts. Inducing causal structure for interpretable neural networks.
+In Proceedings of the 39th International Conference on Machine Learning, volume 162 of
+Proceedings of Machine Learning Research, pages 7324–7338. PMLR, 2022.
+[14] Atticus Geiger, Zhengxuan Wu, Christopher Potts, Thomas Icard, and Noah D. Goodman.
+Finding alignments between interpretable causal variables and distributed neural representations.
+In Proceedings of the Third Conference on Causal Learning and Reasoning (CLeaR), volume
+236 of Proceedings of Machine Learning Research, pages 160–187. PMLR, 2024.
+[15] Atticus Geiger, Duligur Ibeling, Amir Zur, Maheep Chaudhary, Sonakshi Chauhan, Jing Huang,
+Aryaman Arora, Zhengxuan Wu, Noah D. Goodman, Christopher Potts, and Thomas Icard.
+Causal abstraction: A theoretical foundation for mechanistic interpretability. Journal of Machine
+Learning Research, 26(83):1–64, 2025.
+[16] Song Han, Huizi Mao, and William J. Dally. Deep compression: Compressing deep neural net-
+works with pruning, trained quantization and huffman coding. In 4th International Conference
+on Learning Representations (ICLR), 2016.
+[17] Babak Hassibi and David G. Stork. Second order derivatives for network pruning: Optimal
+brain surgeon. In Advances in Neural Information Processing Systems 5 (NeurIPS), pages
+164–171, 1992.
+[18] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. In IEEE Conference on Computer Vision and Pattern Recognition (CVPR), pages
+770–778, 2016. doi: 10.1109/CVPR.2016.90.
+[19] Yihui He, Xiangyu Zhang, and Jian Sun. Channel pruning for accelerating very deep neural
+networks. In IEEE International Conference on Computer Vision (ICCV), pages 1398–1406.
+IEEE Computer Society, 2017. doi: 10.1109/ICCV.2017.155.
+[20] Woojeong Kim, Suhyun Kim, Mincheol Park, and Geonseok Jeon. Neuron merging: Compen-
+sating for pruned neurons. In Advances in Neural Information Processing Systems 33 (NeurIPS),
+2020.
+11
+
+
+[21] Alex Krizhevsky. Learning multiple layers of features from tiny images. Technical report,
+University of Toronto, 2009.
+[22] Woosuk Kwon, Sehoon Kim, Michael W. Mahoney, Joseph Hassoun, Kurt Keutzer, and Amir
+Gholami. A fast post-training pruning framework for transformers. In Advances in Neural
+Information Processing Systems, 2022.
+[23] Yann LeCun, John S. Denker, and Sara A. Solla. Optimal brain damage. In Advances in Neural
+Information Processing Systems 2 (NeurIPS), pages 598–605, 1989.
+[24] Yann LeCun, Léon Bottou, Yoshua Bengio, and Patrick Haffner. Gradient-based learning
+applied to document recognition. Proceedings of the IEEE, 86(11):2278–2324, 1998. doi:
+10.1109/5.726791.
+[25] Hao Li, Asim Kadav, Igor Ður ¯danovi´c, Hanan Samet, and Hans Peter Graf. Pruning filters
+for efficient convnets. In 5th International Conference on Learning Representations (ICLR).
+OpenReview.net, 2017.
+[26] Zhuang Liu, Jianguo Li, Zhiqiang Shen, Gao Huang, Shoumeng Yan, and Changshui Zhang.
+Learning efficient convolutional networks through network slimming. In IEEE International
+Conference on Computer Vision (ICCV), pages 2755–2763. IEEE Computer Society, 2017. doi:
+10.1109/ICCV.2017.298.
+[27] Xinyin Ma, Gongfan Fang, and Xinchao Wang. LLM-Pruner: On the structural pruning of large
+language models. Advances in Neural Information Processing Systems, 2023.
+[28] Riccardo Massidda, Atticus Geiger, Thomas Icard, and Davide Bacciu. Causal abstraction with
+soft interventions. In Proceedings of the Second Conference on Causal Learning and Reasoning
+(CLeaR), volume 213 of Proceedings of Machine Learning Research, pages 68–87. PMLR,
+2023.
+[29] Paul Michel, Omer Levy, and Graham Neubig. Are sixteen heads really better than one? In
+Advances in Neural Information Processing Systems 32 (NeurIPS), pages 14014–14024, 2019.
+[30] Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila, and Jan Kautz. Pruning convolutional
+neural networks for resource efficient inference. In International Conference on Learning
+Representations (ICLR), 2017.
+[31] Judea Pearl. Causality: Models, Reasoning, and Inference. Cambridge University Press, 2
+edition, 2009.
+[32] Paul K. Rubenstein, Sebastian Weichwald, Stephan Bongers, Joris M. Mooij, Dominik Janzing,
+Moritz Grosse-Wentrup, and Bernhard Schölkopf. Causal consistency of structural equation
+models. In Proceedings of the 33rd Conference on Uncertainty in Artificial Intelligence (UAI),
+2017.
+[33] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng
+Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C. Berg, and Li Fei-Fei.
+ImageNet large scale visual recognition challenge. International Journal of Computer Vision,
+115(3):211–252, 2015. doi: 10.1007/s11263-015-0816-y.
+[34] Sidak Pal Singh and Dan Alistarh. WoodFisher: Efficient second-order approximation for neural
+network compression. In Advances in Neural Information Processing Systems 33 (NeurIPS),
+2020.
+[35] Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter. A simple and effective pruning
+approach for large language models. In International Conference on Learning Representations
+(ICLR), 2024.
+[36] Denis Sutter, Julian Minder, Thomas Hofmann, and Tiago Pimentel. The non-linear representa-
+tion dilemma: Is causal abstraction enough for mechanistic interpretability? In Advances in
+Neural Information Processing Systems 38 (NeurIPS), 2025. Spotlight.
+12
+
+
+[37] Yonglong Tian, Dilip Krishnan, and Phillip Isola. Contrastive multiview coding. In European
+Conference on Computer Vision (ECCV), 2020.
+[38] Hugo Touvron, Matthieu Cord, Matthijs Douze, Francisco Massa, Alexandre Sablayrolles, and
+Hervé Jégou. Training data-efficient image transformers & distillation through attention. In
+International Conference on Machine Learning (ICML), volume 139 of Proceedings of Machine
+Learning Research, pages 10347–10357. PMLR, 2021.
+[39] Elena Voita, David Talbot, Fedor Moiseev, Rico Sennrich, and Ivan Titov. Analyzing multi-head
+self-attention: Specialized heads do the heavy lifting, the rest can be pruned. In Proceedings
+of the 57th Annual Meeting of the Association for Computational Linguistics (ACL), pages
+5797–5808. Association for Computational Linguistics, July 2019. doi: 10.18653/v1/P19-1580.
+[40] Lu Yu and Wei Xiang. X-Pruner: eXplainable pruning for vision transformers. In IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), pages 24355–24363, 2023.
+13
+
+
+A
+Proofs and Extended Derivations
+Roadmap.
+This appendix separates the load-bearing derivations from optional extensions. Ap-
+pendix A.1 derives the single-unit quadratic proxy, Appendix A.2 recovers mean replacement and
+VBP as special cases, Appendix A.3 gives the multi-unit additivity and off-diagonal diagnostic, and
+Appendix A.4 records the Taylor-remainder controls. Appendix A.5 then gives the proofs for the
+main-text theorem, certificate, folding claim, and invariance claim. Appendix A.6 is an optional
+grouped mechanism extension for attention heads; it is not used by the main experiments.
+A.1
+Quadratic Proxy for Interventional Risk
+Exactly evaluating the interventional risk Lℓ,j(c) requires a forward pass through the modified
+network for each candidate constant c. We now derive a computationally efficient second-order
+approximation that admits closed-form optimization over c and yields an interpretable unit importance
+score.
+A.1.1
+Single-Unit Constant Intervention
+Fix layer ℓand unit j. The hard intervention do(a(ℓ)
+j
+:= c) replaces the stochastic activation vector
+aj ∈Rn (across calibration samples) with the constant vector c1n. Define the induced perturbation:
+δ(c) := c1n −aj ∈Rn.
+(3)
+Samplewise sensitivity.
+Let Ls := ℓ(fθ(xs), ys) denote the loss on sample s. We define the
+per-sample gradient and curvature with respect to the scalar activation A(ℓ)
+s,j:
+gs :=
+∂Ls
+∂A(ℓ)
+s,j
+,
+hs :=
+∂2Ls
+∂(A(ℓ)
+s,j)2 ,
+(4)
+and collect these into vectors g, h ∈Rn. Since the empirical risk decomposes as a sum over
+independent samples, the Hessian of L(θ) with respect to the activation column aj is diagonal:
+∂2L
+∂aj∂a⊤
+j
+= 1
+nDiag(h).
+(5)
+Second-order proxy.
+Expanding Lℓ,j(c) to second order around the observed activations yields:
+∆ℓ,j(c) := Lℓ,j(c) −L(θ) ≈1
+ng⊤δ(c) +
+1
+2n δ(c)⊤Diag(h) δ(c).
+(6)
+This quadratic proxy is exact when the loss is quadratic in the activations; otherwise, the approxima-
+tion error is controlled by the magnitude of third-order derivatives (Appendix A.4).
+A.1.2
+Optimal Constant and Importance Score
+We now derive closed-form expressions for the optimal intervention constant and the resulting
+minimal loss increase.
+Proposition 3 (Optimal intervention constant). Assume 1⊤
+n h > 0 (positive total curvature). The
+unique minimizer of the quadratic proxy (6) over c ∈R is:
+c⋆
+ℓ,j = h⊤aj −1⊤
+n g
+1⊤
+n h
+=
+Pn
+s=1 hs · A(ℓ)
+s,j
+Pn
+s=1 hs
+|
+{z
+}
+curvature-weighted mean
+−
+Pn
+s=1 gs
+Pn
+s=1 hs
+|
+{z
+}
+gradient correction
+.
+(7)
+Proof. Define the scaled objective Q(c) := n · ∆ℓ,j(c). Substituting δ(c) = c1n −aj:
+Q(c) = g⊤(c1n −aj) + 1
+2(c1n −aj)⊤Diag(h)(c1n −aj).
+14
+
+
+The first-order condition Q′(c) = 0 gives:
+1⊤
+n g + c · 1⊤
+n h −h⊤aj = 0
+=⇒
+c⋆= h⊤aj −1⊤
+n g
+1⊤
+n h
+.
+The second derivative Q′′(c) = 1⊤
+n h > 0 confirms this is a minimum.
+Proposition 4 (Unit importance score). The minimized proxy loss increase defines the importance
+score:
+sℓ,j := min
+c∈R ∆ℓ,j(c) = ∆ℓ,j(c⋆
+ℓ,j).
+(8)
+This admits the closed form:
+sℓ,j =
+1
+2na⊤
+j Diag(h)aj −1
+ng⊤aj −(h⊤aj −1⊤
+n g)2
+2n · 1⊤
+n h
+.
+(9)
+Proof. Substitute c⋆
+ℓ,j from (7) into (6). Writing δ⋆:= c⋆1n −aj and using the identity (c⋆)21⊤
+n h =
+(h⊤aj −1⊤
+n g)2/(1⊤
+n h), algebraic simplification yields (9).
+Remark 1 (Interpretation). The score sℓ,j quantifies the irreducible loss degradation from pruning
+unit j: the best-case impact after optimally choosing the replacement constant. Units with low scores
+are prime candidates for removal.
+Selection rule.
+For a target sparsity of k units within layer ℓ, a greedy one-shot strategy selects the
+k units with smallest scores {sℓ,j}dℓ
+j=1 and applies their corresponding optimal constants {c⋆
+ℓ,j}.
+A.2
+Recovering Known Scores
+We now show that several established pruning heuristics emerge as special cases of our interventional
+framework under specific scoring assumptions. These assumptions are sub-cases of the unified
+assumption set in Section 4; they are used to rank candidate replacements, not to justify the exact
+compilation step.
+A.2.1
+Mean Replacement Pruning
+The simplest structured pruning heuristic replaces each pruned unit’s activation with its empirical
+mean ¯aj := 1
+n1⊤
+n aj. We show this is optimal under natural stationarity conditions.
+Lemma 1 (Optimality of mean replacement). Suppose the following conditions hold for unit (ℓ, j):
+(i) Samplewise gradient stationarity: gs = 0 for all s ∈[n] (every per-sample gradient vanishes at
+the observed activations);
+(ii) Uniform curvature: hs = α for all s ∈[n], for some α > 0.
+Then c⋆
+ℓ,j = ¯aj, and the importance score simplifies to:
+sℓ,j = α
+2 · Var[aj],
+where
+Var[aj] := 1
+n
+n
+X
+s=1
+ A(ℓ)
+s,j −¯aj
+2.
+(10)
+Proof. Under conditions (i)–(ii), equation (7) reduces to:
+c⋆= α · 1⊤
+n aj −0
+α · n
+= 1
+n1⊤
+n aj = ¯aj.
+With g = 0 the linear term of the proxy vanishes identically, so the proxy (6) becomes ∆ℓ,j(c) ≈
+α
+2n∥δ(c)∥2
+2, a pure quadratic in c. Minimizing over c at c = ¯aj yields sℓ,j =
+α
+2n
+P
+s(A(ℓ)
+s,j −¯aj)2 =
+α
+2 Var[aj].
+15
+
+
+Remark 2 (When do the conditions hold?). Condition (i) holds exactly at a critical point of the
+empirical risk with respect to the unit’s activations (per-sample activations are independent coor-
+dinates, so a critical point forces every gs to vanish), and approximately for well-trained networks
+where per-sample gradients are small. Condition (ii) is reasonable for losses with approximately
+constant curvature (e.g., squared error) or as a first-order approximation when curvature variation is
+small. Under the weaker mean-stationarity condition 1⊤
+n g = 0, the minimizer is still c⋆= ¯aj, but
+the minimized score acquires the unit-dependent correction −n−1g⊤aj, so ranking by variance is
+recovered only when this correction vanishes (e.g., g empirically uncorrelated with aj).
+A.2.2
+Variance-Based Pruning as a Limiting Case
+We now establish a formal equivalence between our framework and variance-based pruning (VBP)
+[3].
+Theorem 3 (Recovery of VBP). Under the conditions of Lemma 1, ranking units by the interventional
+importance score sℓ,j is equivalent to ranking by activation variance Var[aj]. Consequently, variance-
+based pruning with mean replacement is recovered as a special case of the interventional proxy
+(6).
+Proof. By Lemma 1, sℓ,j = α
+2 Var[aj] where α > 0 is constant across units within a layer. Since
+ranking is invariant to positive affine transformations, rank(sℓ,j) = rank(Var[aj]).
+Interpretation.
+VBP prunes units with low activation variance: units whose outputs are nearly
+constant across inputs and thus carry little information. Our causal perspective reveals that this is
+optimal precisely when the loss landscape has uniform curvature: low-variance units can be replaced
+by their mean with minimal interventional effect.
+A.2.3
+Beyond Uniform Curvature: The General Case
+When curvature varies across samples, the optimal intervention constant departs from the simple
+mean. Decomposing (7):
+c⋆
+ℓ,j =
+¯a(h)
+j
+|{z}
+curvature-weighted
+mean
+−
+¯g
+¯h
+|{z}
+gradient
+correction
+,
+(11)
+where we define the curvature-weighted statistics:
+¯a(h)
+j
+:=
+P
+s hsA(ℓ)
+s,j
+P
+s hs
+,
+¯g := 1
+n
+X
+s
+gs,
+¯h := 1
+n
+X
+s
+hs.
+This reveals two sources of departure from mean replacement:
+(a) Curvature weighting: Samples with higher curvature hs (steeper local loss landscape) con-
+tribute more to the optimal constant, prioritizing accurate reconstruction on “sensitive” inputs.
+(b) Gradient correction: Nonzero average gradient ¯g shifts the optimal constant away from the
+weighted mean, exploiting first-order structure to reduce loss.
+Remark 3 (Computational cost). Computing c⋆
+ℓ,j and sℓ,j for all units in layer ℓrequires O(n · dℓ)
+operations given precomputed gradients and Hessian diagonals, linear in both sample count and
+layer width.
+A.2.4
+Explicit Remainder Bounds for ReLU Networks
+Proposition 6 bounds the Taylor approximation error in terms of the Hessian Lipschitz constant ρ.
+For ReLU networks, we can derive an explicit expression for ρ in terms of architectural parameters.
+Assumption 1 (Bounded ReLU network). Consider an L-layer ReLU network with:
+(A1) Weight matrices satisfying ∥W (ℓ)∥2 ≤Mℓand ∥W (ℓ)∥F ≤Fℓ
+(A2) Inputs bounded as ∥x∥2 ≤R
+16
+
+
+(A3) Loss function ℓwith bounded third derivative in the logit vector: the operator (injective) norm
+of the third-derivative tensor of ℓwith respect to the logits is at most κ (for cross-entropy with
+bounded logits, κ = O(1))
+(A4) The intervention segment considered remains inside one ReLU activation-pattern region;
+segments that cross region boundaries incur an additional Hessian-jump contribution not
+tracked here.
+Theorem 4 (Local Hessian Lipschitz constant for ReLU networks). Under Assumption 1, the
+interventional risk Lℓ,j(c) for unit j in layer ℓhas Hessian Lipschitz constant bounded by:
+ρℓ,j ≤κ ·
+ 
+L
+Y
+m=ℓ+2
+Mm
+!3
+· ∥W (ℓ+1)
+:,j
+∥3
+2,
+(12)
+with the empty product equal to 1 when ℓ+ 1 = L.
+Proof. The loss as a function of a(ℓ)
+j
+composes: (i) the downstream network fℓ+1:L mapping a(ℓ)
+j
+to
+output, and (ii) the loss function ℓ.
+Step 1: Downstream Jacobian. For ReLU networks, the Jacobian of layer m output w.r.t. layer ℓ
+activation is:
+∂a(m)
+∂a(ℓ)
+j
+=
+ 
+m
+Y
+m′=ℓ+1
+D(m′)W (m′)
+!
+ej =
+ 
+m
+Y
+m′=ℓ+2
+D(m′)W (m′)
+!
+D(ℓ+1)W (ℓ+1)
+:,j
+,
+where D(m′) = diag(1[z(m′) > 0]) is the ReLU gradient (diagonal, entries in {0, 1}). Thus, since
+the selector ej extracts column j of W (ℓ+1):
+
+∂a(m)
+∂a(ℓ)
+j
+
+2
+≤∥W (ℓ+1)
+:,j
+∥2·
+m
+Y
+m′=ℓ+2
+∥W (m′)∥2 = ∥W (ℓ+1)
+:,j
+∥2·
+m
+Y
+m′=ℓ+2
+Mm′.
+Step 2: Chain rule for third derivative.
+Within a fixed activation-pattern region the downstream map a(ℓ)
+j
+7→fθ is affine, so its own second
+and third derivatives vanish and the chain rule leaves exactly one term: writing J := ∂fθ/∂a(ℓ)
+j
+∈Rq,
+∂3L
+∂(a(ℓ)
+j )3 =
+X
+p,q′,r
+∂3ℓ
+∂zp∂zq′∂zr
+JpJq′Jr,
+
+∂3L
+∂(a(ℓ)
+j )3
+ ≤κ∥J∥3
+2.
+Step 3: Lipschitz constant. Within a fixed ReLU activation-pattern region, the downstream map
+is affine in a(ℓ)
+j , so the Hessian varies only through the smooth loss derivative. On such a region,
+applying Step 1 with m = L:
+ρ = sup
+
+∂3L
+∂(a(ℓ)
+j )3
+ ≤κ ·
+ 
+L
+Y
+m=ℓ+2
+Mm
+!3
+· ∥W (ℓ+1)
+:,j
+∥3
+2.
+This is (12).
+Corollary 1 (Layer-wise remainder scaling). For unit j in layer ℓwith optimal intervention c⋆
+j, under
+Assumption 1, the Taylor remainder satisfies:
+|R3| ≤
+κ
+6n
+ 
+L
+Y
+m=ℓ+2
+Mm
+!3
+∥W (ℓ+1)
+:,j
+∥3
+2 ·
+
+n
+
+(c⋆
+j −¯aj)2 + Var[aj]
+3/2
+.
+(13)
+The bracket reduces to Var[aj] exactly when c⋆
+j = ¯aj, which holds for CMR-Logit and under the
+samplewise-stationarity, uniform-curvature conditions of Lemma 1.
+Remark 4 (Depth dependence). The bound (12) grows exponentially with depth (L −ℓ) due to the
+product of spectral norms. This suggests:
+(a) The quadratic proxy is more accurate for units in later layers (smaller L −ℓ).
+(b) Networks with spectral normalization (Mℓ= 1) have depth-independent bounds.
+17
+
+
+Practical computation.
+For a trained network, ∥W (ℓ)∥2 can be computed via power iteration, and
+κ depends on the loss (e.g., κ = O(1) for cross-entropy with bounded logits). This yields a checkable
+bound on proxy accuracy.
+A.3
+Multi-Unit Interventions and the Off-Diagonal Diagnostic
+Thus far, we have analyzed single-unit interventions. In practice, compression requires selecting and
+intervening on multiple units simultaneously. We now extend the quadratic proxy to this setting and
+characterize when optimal selection decomposes into independent per-unit decisions.
+A.3.1
+Joint Quadratic Proxy
+Let S ⊆[dℓ] denote a subset of units to prune, with intervention constants cS = (cj)j∈S ∈R|S|.
+Define the stacked perturbation vector:
+δS(cS) := vec
+ {cj1n −aj}j∈S
+
+∈Rn|S|,
+where vec(·) concatenates the per-unit perturbations. The joint second-order expansion is:
+∆ℓ,S(cS) ≈1
+n g⊤
+S δS(cS) +
+1
+2n δS(cS)⊤HS δS(cS),
+(14)
+where gS ∈Rn|S| is the stacked gradient and HS ∈Rn|S|×n|S| is the Hessian with respect to the
+stacked activation matrix A(ℓ)
+:,S.
+The coupling challenge.
+The Hessian HS generally contains off-diagonal blocks Hjk capturing
+interactions between units j and k. These cross-unit couplings arise from shared downstream paths
+and make joint optimization over (S, cS) computationally intractable for large layers.
+A.3.2
+Decoupling via Diagonal Curvature
+For scoring, a standard approximation in second-order pruning [17, 23] drops cross-unit curvature
+interactions:
+HS ≈blockdiag
+ Diag(hj)
+
+j∈S.
+(15)
+Under this approximation, each unit’s contribution to the loss is locally independent.
+Theorem 5 (Additivity and optimal selection). Assume the scoring Hessian is replaced by the
+block-diagonal structure (15). Then:
+(i) Additivity: The joint proxy decomposes as a sum of single-unit proxies:
+∆ℓ,S(cS) ≈
+X
+j∈S
+∆ℓ,j(cj).
+(16)
+(ii) Separable optimization: The optimal constants minimize independently:
+min
+cS∈R|S| ∆ℓ,S(cS) =
+X
+j∈S
+min
+cj∈R ∆ℓ,j(cj) =
+X
+j∈S
+sℓ,j.
+(17)
+(iii) Greedy optimality: For a budget of k units, the subset minimizing the proxy is:
+S⋆=
+arg min
+S⊆[dℓ], |S|=k
+X
+j∈S
+sℓ,j = bottom-k
+ {sℓ,j}dℓ
+j=1
+
+.
+(18)
+Proof. (i) Under (15), both the linear term g⊤
+S δS and the quadratic form δ⊤
+S HSδS decompose across
+units, yielding (16).
+(ii) With no cross-unit terms, minimization over cS separates into |S| independent scalar minimiza-
+tions, each solved by Proposition 3.
+(iii) Since the minimized objective is a sum of independent scalar scores, the optimal size-k subset
+consists of the k smallest summands.
+18
+
+
+Remark 5 (Computational complexity). Under diagonal curvature, selecting k units from a layer
+of width dℓrequires: (a) O(n · dℓ) to compute all scores {sℓ,j}, and (b) O(dℓlog k) to extract the
+bottom-k via a partial sort. This is linear in layer size, tractable even for wide layers.
+Proposition 5 (Off-diagonal curvature diagnostic). Let B be a block of b candidate units, let
+HB ∈Rb×b be the curvature matrix used for a block-level quadratic score, and write HB = DB+EB
+with DB := diag(HB) and EB := HB −DB. Define
+ρoff(B) := ∥EB∥F
+∥HB∥F
+,
+with ρoff(B) = 0 when HB = 0. For any block perturbation δB ∈Rb, the additivity error made by
+using DB instead of HB satisfies
+
+1
+2δ⊤
+BHBδB −1
+2δ⊤
+BDBδB
+ ≤1
+2 ρoff(B) ∥HB∥F ∥δB∥2
+2.
+If additionally HB is positive semidefinite (as for Gauss–Newton or Fisher curvature) and HB ⪰µBI
+on the span of the considered perturbations, with µB > 0, then
+
+1
+2δ⊤
+BHBδB −1
+2δ⊤
+BDBδB
+ ≤ρoff(B) κF (B)
+1
+2δ⊤
+BHBδB
+
+,
+κF (B) := ∥HB∥F
+µB
+≤
+√
+b λmax(HB)
+µB
+.
+Proof. The two quadratic scores differ only in the off-diagonal term:
+1
+2δ⊤
+BHBδB −1
+2δ⊤
+BDBδB = 1
+2δ⊤
+BEBδB.
+By Cauchy–Schwarz and ∥EB∥2 ≤∥EB∥F ,
+
+1
+2δ⊤
+BEBδB
+ ≤1
+2∥EB∥2∥δB∥2
+2 ≤1
+2∥EB∥F ∥δB∥2
+2 = 1
+2ρoff(B)∥HB∥F ∥δB∥2
+2.
+If HB ⪰µBI on the relevant span, then ∥δB∥2
+2 ≤µ−1
+B δ⊤
+BHBδB, which gives the relative bound. The
+final inequality follows from ∥HB∥F ≤
+√
+bλmax(HB) for a positive semidefinite b × b matrix.
+When is diagonal curvature plausible?
+The approximation (15) is exact for the quadratic score
+when the mixed second derivatives between replaced units vanish. For an affine readout with squared
+logit distortion, this corresponds to orthogonal output-weight columns for the replaced units. More
+generally, it is an approximation whose quality is measured by Proposition 5; weakly correlated unit
+sensitivities, sometimes encouraged by decorrelating regularizers [4], make the diagnostic small.
+A.4
+Third-Order Remainder Bound
+The quadratic proxy (6) truncates a Taylor expansion at second order. We now quantify the approxi-
+mation error under standard smoothness conditions.
+Proposition 6 (Third-order remainder bound). For sample s, write ℓs(u) := ℓ
+ f do(ℓ,j:=u)
+θ
+(xs), ys
+
+for the per-sample loss as a function of the intervened activation. Suppose each ℓs has ρ-Lipschitz
+second derivative on the segment [min(A(ℓ)
+s,j, c), max(A(ℓ)
+s,j, c)]:
+ℓ′′
+s(u) −ℓ′′
+s(v)
+ ≤ρ|u −v|,
+∀u, v in the segment, ∀s ∈[n].
+Then the proxy error satisfies:
+∆ℓ,j(c) −
+ 1
+ng⊤δ(c) + 1
+2nδ(c)⊤Diag(h)δ(c)
+ ≤
+ρ
+6n ∥δ(c)∥3
+2.
+(19)
+Proof. Apply the integral form of Taylor’s remainder to each sample around its observed activation
+A(ℓ)
+s,j, with δs(c) = c −A(ℓ)
+s,j:
+ℓs(c) = ℓs(A(ℓ)
+s,j) + gs δs(c) + 1
+2hs δs(c)2 + R3,s,
+|R3,s| ≤ρ
+6 |δs(c)|3,
+by the per-sample Lipschitz condition. Averaging over samples, the proxy error is n−1 P
+s |R3,s| ≤
+ρ
+6n
+P
+s |δs(c)|3 =
+ρ
+6n∥δ(c)∥3
+3 ≤
+ρ
+6n∥δ(c)∥3
+2, using ∥x∥3 ≤∥x∥2. This is (19).
+19
+
+
+Corollary 2 (Perturbation norm at the optimal constant). For every constant c, the perturbation norm
+satisfies the identity ∥δ(c)∥2
+2 = n
+
+(c −¯aj)2 + Var[aj]
+
+, minimized at c = ¯aj with value nVar[aj].
+At the optimal intervention c⋆
+ℓ,j, therefore, ∥δ(c⋆)∥2 =
+q
+n[(c⋆
+ℓ,j −¯aj)2 + Var[aj]], which equals
+p
+nVar[aj] exactly when c⋆
+ℓ,j = ¯aj (CMR-Logit; samplewise stationarity with uniform curvature).
+Thus for low-variance units (prime pruning candidates) whose optimal constants stay near the mean,
+the cubic remainder is small.
+Practical implications.
+The bound (19) suggests that the quadratic proxy is most accurate precisely
+for the units we wish to prune: those with low activation variance and hence small ∥δ(c⋆)∥2. For
+high-variance units (which we retain), proxy accuracy matters less since they are not candidates for
+removal.
+A.5
+Proofs for Main Theory and Named Special Cases
+Proof of Theorem 2.
+Proof. Fix an input and interchange intervention pair (x, I), and abbreviate
+zL := zI
+L(x),
+zH := zω(I)
+H
+(x),
+∆z := zH −zL,
+y := ˆyI
+L(x).
+Suppose mI(x) > 2ϵ and ∥∆z∥∞≤ϵ. For every y′̸ = y,
+zH,y −zH,y′ = (zL,y −zL,y′) + (∆zy −∆zy′) ≥mI(x) −|∆zy| −|∆zy′| > 2ϵ −2ϵ = 0.
+Thus y remains the unique top class for the high-level intervened model, so disagreement is impossible
+on the event {mI(x) > 2ϵ} ∩{∥∆z∥∞≤ϵ}. Equivalently,
+{ˆyω(I)
+H
+(x)̸ = ˆyI
+L(x)} ⊆{mI(x) ≤2ϵ} ∪{∥∆z∥∞> ϵ}.
+Taking probabilities over the verification distribution on (x, I) and applying the union bound gives
+the stated event inequality.
+For the second term, Markov’s inequality applied to the nonnegative random variable ∥∆z∥2
+∞yields
+Pr[∥∆z∥∞> ϵ] ≤E[∥∆z∥2
+∞]
+ϵ2
+.
+Since ∥∆z∥2
+∞≤∥∆z∥2
+2 ≤q∥∆z∥2
+∞, the unnormalized squared logit-distortion objective D2 :=
+E[∥zω(I)
+H
+(x) −zI
+L(x)∥2
+2] gives
+Pr[∥∆z∥∞> ϵ] ≤D2
+ϵ2 .
+If CMR-Logit is reported as the per-logit mean ¯D2 := q−1D2, the bound is q ¯D2/ϵ2.
+IIA consequence of the margin certificate.
+Proof. The first display is the theorem plus the Markov bound. Optimizing over ϵ gives the variational
+certificate. If mI(x) ≥γ almost surely, then M(2ϵ) = 0 for every ϵ < γ/2; take the limit as ϵ
+increases to γ/2.
+Proof of Proposition 1.
+Proof. Decompose the affine consumer by isolating column j:
+Wa(ℓ) + b = W:,ja(ℓ)
+j
++ W:,\ja(ℓ)
+\j + b.
+Under the intervention a(ℓ)
+j
+= c, the first term is the constant cW:,j, which absorbs into the bias. This
+gives W:,\ja(ℓ)
+\j + (b + cW:,j).
+20
+
+
+Proof of Theorem 1.
+Proof. For a calibration sample s, freeze the retained activations As,K and view the downstream
+discrepancy as a function of the coordinates to be replaced:
+rs(u) := Ds(Fℓ→L(As,K, u)) ,
+u ∈R|S|,
+where Fℓ→L denotes the deterministic downstream computation from layer ℓto logits or to the scalar
+task loss, depending on the choice of d. For logit distortion, Ds(z) = d(z, Fℓ→L(As,K, As,S)); for
+supervised task loss, Ds(z) = ℓ(z, ys). Define
+gs,S := ∇rs(As,S),
+Hs,S := ∇2rs(As,S).
+For any replacement ϕ ∈Φ, write δs = ϕ(As,K) −As,S. Taylor’s theorem gives
+rs(As,S + δs) −rs(As,S) = g⊤
+s,Sδs + 1
+2δ⊤
+s Hs,Sδs + Rs(δs),
+where Rs is the third-order remainder. Dropping Rs and averaging over s gives the displayed
+quadratic proxy QS(ϕ). If the downstream map is affine in AS and d is a quadratic logit distortion,
+the remainder is zero and the expression is exact.
+Now let G be a partition of S into replacement mechanisms, for example single units or predefined
+groups. If Hs,S = blockdiag(Hs,G)G∈G and δs = (δs,G)G∈G, then
+g⊤
+s,Sδs + 1
+2δ⊤
+s Hs,Sδs =
+X
+G∈G
+ g⊤
+s,Gδs,G + 1
+2δ⊤
+s,GHs,Gδs,G
+
+.
+Averaging over samples yields QS(ϕ) = P
+G∈G QG(ϕG). Diagonal curvature is the special case in
+which every group has size one. Positive semidefiniteness is only needed to interpret the resulting
+quadratic scores as convex scoring objectives and to ensure uniqueness when the curvature is positive
+on the replacement subspace.
+Optimal constant.
+Proof. With S = {j}, the perturbation is δs = c −A(ℓ)
+s,j, the sample gradient is gs, and the sample
+curvature is hs. The proxy Q{j} is exactly the scalar quadratic in (6). Its first-order condition and
+positive total curvature condition are those of Proposition 3.
+VBP recovery.
+Proof. Under samplewise stationarity and uniform curvature, (2) gives c⋆
+ℓ,j = ¯aj. Substituting
+this constant into the proxy gives sℓ,j = (α/2)Var[aj] by Lemma 1. Since α/2 is positive and
+common across units in the layer, the ranking agrees with activation variance, which is precisely
+Theorem 3.
+CMR-Logit score.
+Proof. Assume the map from the layer-ℓactivations to the logits is affine in unit j with coefficient
+column W:,j (exact at the last layer, or within a fixed ReLU activation-pattern region; elsewhere the
+score is the corresponding next-layer surrogate). Then the logit perturbation induced by replacing
+unit j with c is
+∆zs(c) = W:,j(c −A(ℓ)
+s,j).
+Thus the squared logit distortion is
+∥∆zs(c)∥2
+2 = ∥W:,j∥2
+2(c −A(ℓ)
+s,j)2.
+At the original activation the first derivative of this discrepancy is zero, and the curvature with
+respect to A(ℓ)
+s,j is the sample-independent scalar 2∥W:,j∥2
+2. Therefore (2) gives c⋆= ¯aj. Averaging
+the minimized distortion over samples gives ∥W:,j∥2
+2n−1 P
+s(A(ℓ)
+s,j −¯aj)2, which is the displayed
+score.
+21
+
+
+Affine WLS score and folding.
+Proof. The affine special case of Theorem 1 for a single replaced unit j with parent set P ⊆K
+minimizes, over θ = (θ0, θP ), the curvature-weighted ridge objective
+QP (θ) = g⊤(ΦP θ −a) + 1
+2 (ΦP θ −a)⊤D (ΦP θ −a) + λ
+2 ∥θ∥2
+2,
+where ΦP := [1n, A:,P ] is the design matrix, a := aj, D := Diag(h), and λ ≥0 is an optional
+ridge parameter. Differentiate QP with respect to θ:
+∇θ = Φ⊤
+P g + Φ⊤
+P D(ΦP θ −a) + λθ.
+Setting this gradient to zero gives the normal equations. When |P| = 0, the design matrix is 1n, and
+the scalar normal equation gives the constant in (2), with the usual ridge modification when λ > 0.
+For folding, write the next affine consumer as u = WKaK + Wjaj + b. Replacing aj by θ0 + θ⊤
+P aP
+gives u = WKaK + Wjθ⊤
+P aP + (b + Wjθ0), so the parent columns and bias can be updated exactly
+as in Proposition 1.
+Multi-unit additivity.
+Proof. The block-diagonal part of Theorem 1 gives a sum of independent group objectives. For
+single-unit blocks, each summand is the single-unit score sℓ,j from Proposition 4. Minimizing a sum
+of independent scalar scores subject only to the cardinality constraint |S| = k selects the k smallest
+scores, as stated in Theorem 5.
+Proof of Proposition 2.
+Proof. Positive homogeneity of ReLU gives ReLU(su) = s ReLU(u) for every s > 0, so scaling
+the incoming affine parameters of unit j by s changes its activation from aj(x) to saj(x). The
+contribution of this unit to the next preactivation is unchanged because (s−1Wℓ+1,:,j)(saj(x)) =
+Wℓ+1,:,jaj(x). All other units and parameters are fixed, hence every subsequent activation and the
+final function fθ(x) are unchanged. The variance and norm transform as Var[saj] = s2Var[aj] and
+∥s−1Wℓ+1,:,j∥2
+2 = s−2∥Wℓ+1,:,j∥2
+2, proving the product invariance. Applying different scalings to
+different units leaves all CMR-Logit scores fixed but multiplies VBP scores by arbitrary positive
+factors, so any strict ordering of nonzero-variance units can be realized by a suitable choice of
+scalings.
+A.6
+Optional Extension: Multi-Head Attention
+This subsection is an optional extension of the mechanism-replacement formalism, not a load-bearing
+claim for the main experiments. Modern transformer architectures rely on multi-head attention
+(MHA) as a core computational primitive; the same intervention logic can treat attention heads as
+grouped mechanisms for structured pruning.
+A.6.1
+Attention as a Structural Causal Model
+Multi-head attention mechanism.
+Consider an MHA layer with H heads operating on input
+X ∈RT ×d (sequence length T, embedding dimension d). Each head h ∈[H] computes:
+headh(X) = softmax
+ 
+XW Q
+h (XW K
+h )⊤
+√dk
+!
+XW V
+h
+∈RT ×dv,
+(20)
+where W Q
+h , W K
+h ∈Rd×dk and W V
+h ∈Rd×dv are the query, key, and value projections for head h.
+The heads are concatenated and projected:
+MHA(X) = Concat(head1, . . . , headH)W O =
+H
+X
+h=1
+headh(X)W O
+h ,
+(21)
+where W O ∈RHdv×d and W O
+h ∈Rdv×d denotes the block of W O corresponding to head h.
+22
+
+
+SCM structure.
+The MHA layer induces an SCM where:
+• Exogenous: Input embeddings X ∼DX
+• Endogenous: Head outputs {headh(X)}H
+h=1 and attention patterns {Ah(X)}H
+h=1
+• Structural equations: Defined by (20)–(21)
+Heads contribute additively to the layer output via (21), which keeps the intervention analysis
+tractable.
+A.6.2
+Hard Interventions on Attention Heads
+Definition 1 (Head intervention). For head h, a constant intervention do(headh := C) replaces the
+head’s output with a fixed matrix C ∈RT ×dv, severing its dependence on X:
+MHAdo(h:=C)(X) = CW O
+h +
+X
+h′̸=h
+headh′(X)W O
+h′.
+(22)
+The zero intervention do(headh := 0) corresponds to head removal.
+Vectorized notation.
+For a calibration set of n sequences, let Hh ∈Rn×T ×dv denote the stacked
+head outputs. Flattening to hh := vec(Hh) ∈RnT dv, the intervention do(headh := C) induces
+perturbation:
+δh(C) := 1n ⊗vec(C) −hh ∈RnT dv.
+(23)
+A.6.3
+Quadratic Proxy for Head Removal
+Proposition 7 (Head importance score). Define the per-sample, per-position, per-dimension gradient
+and curvature:
+gs,t,i :=
+∂Ls
+∂[headh]t,i
+,
+ηs,t,i :=
+∂2Ls
+∂[headh]2
+t,i
+,
+(24)
+with vectorized forms gh, ηh ∈RnT dv. Under the diagonal scoring approximation, the quadratic
+proxy for intervening on head h with constant C is:
+∆h(C) ≈1
+ng⊤
+h δh(C) + 1
+2nδh(C)⊤Diag(ηh)δh(C).
+(25)
+For head removal (pruning), the natural intervention is C = 0:
+Proposition 8 (Head removal score). The interventional risk increase from removing head h (setting
+C = 0) under the quadratic proxy is:
+sremove
+h
+:= ∆h(0) ≈−1
+ng⊤
+h hh + 1
+2nh⊤
+h Diag(ηh)hh.
+(26)
+Under samplewise gradient stationarity (gh = 0) and uniform curvature (ηs,t,i = α), this simplifies
+to:
+sremove
+h
+= α
+2 · 1
+n∥hh∥2
+2 = α
+2 · Es
+
+∥headh(Xs)∥2
+F
+
+.
+(27)
+Proof. Substituting C = 0 into (25) with δh(0) = −hh yields (26). Under the stated conditions,
+the first term −1
+ng⊤
+h hh vanishes (samplewise gradient stationarity; note 1⊤gh = 0 alone would not
+suffice, since the perturbation −hh is sample-dependent) and the second term becomes α
+2n∥hh∥2
+2.
+Remark 6 (Interpretation). Equation (27) reveals that under idealized conditions, head importance
+is proportional to the expected squared Frobenius norm of its output: heads producing larger-
+magnitude outputs are more important. This is consistent with empirical observations that “dead”
+heads (near-zero output) can be safely pruned [29, 39].
+23
+
+
+A.6.4
+Optimal Constant Intervention for Heads
+Rather than removing a head entirely, we can replace it with an optimal constant matrix.
+Proposition 9 (Optimal head constant). Assume Pn
+s=1 ηs,t,i > 0 for every position–dimension pair
+(t, i). The optimal constant intervention C⋆∈RT ×dv minimizing (25) satisfies, elementwise:
+C⋆
+t,i =
+Pn
+s=1 ηs,t,i · [headh(Xs)]t,i −Pn
+s=1 gs,t,i
+Pn
+s=1 ηs,t,i
+.
+(28)
+Under uniform curvature and per-coordinate gradient stationarity (P
+s gs,t,i = 0), C⋆
+t,i =
+1
+n
+Pn
+s=1[headh(Xs)]t,i, the sample mean at each position.
+Proof. The proxy (25) is separable across the Tdv output dimensions under the diagonal scoring
+approximation. Each dimension reduces to the scalar problem of Proposition 3.
+A.6.5
+Bias Folding for Attention Heads
+Proposition 10 (Head removal via output projection folding). To implement do(headh := C), modify
+the MHA layer as follows:
+(i) Remove head h’s parameters (W Q
+h , W K
+h , W V
+h ) and the corresponding block W O
+h .
+(ii) For a position-constant intervention C = 1T c⊤with c ∈Rdv, add the constant contribution to
+the downstream bias: b′ := b + (W O
+h )⊤c. A position-dependent C contributes the T × d matrix
+CW O
+h , which is not a bias vector; implementing it requires a fixed sequence length T and a
+stored T × d additive buffer. In particular, the position-dependent optimum C⋆of Proposition 9
+is foldable only after averaging over positions.
+For head removal (C = 0), simply delete the head’s parameters with no bias update.
+Computational savings.
+Removing k heads from an H-head MHA layer reduces:
+• Query/Key/Value projections: (H −k)/H of original FLOPs
+• Attention computation: (H −k)/H of original FLOPs
+• Output projection: (H −k)/H of original parameters and FLOPs
+The savings are linear in the number of pruned heads.
+B
+Additional Experimental Results
+B.1
+Ablations and diagnostics (full)
+Affine parent selection.
+On CIFAR-10 ConvNet at keep 0.5, the mean IIA over parent selectors is
+0.264 for Pearson, 0.265 for output-weight-aware Pearson, and 0.266 for random; random additionally
+has lower KL. Selector identity has no measurable effect on interchange agreement under the corrected
+affine WLS solve, and the supervised affine variant is dominated by CMR-Logit at the same budget.
+This is consistent with the affine corollary providing extra capacity rather than a strong inductive bias.
+Calibration size and shift.
+CMR-Affine accuracy at keep 128 improves from 0.864 to 0.872 as
+calibration size grows from 500 to 10000. Under a class-subset calibration shift (calibrate on classes
+0–4 only; evaluate on 1,024 held-out test images spanning all classes, under R = 500 interchange
+interventions), CMR-Logit KL is 0.472/0.480 at n = 500/2000, against 0.616/0.599 for VBP; the
+logit-distortion criterion therefore transfers better across calibration distributions than the variance
+criterion.
+24
+
+
+Keep
+Method
+Test Acc.
+IIA (p=0.5)
+KL (p=0.5)
+384
+Logit-MSE
+0.981 ± 0.002
+0.952 ± 0.006
+0.035 ± 0.007
+VBP
+0.981 ± 0.002
+0.951 ± 0.004
+0.038 ± 0.007
+cwvar
+0.981 ± 0.002
+0.930 ± 0.011
+0.084 ± 0.023
+256
+Logit-MSE
+0.980 ± 0.001
+0.782 ± 0.006
+0.578 ± 0.020
+VBP
+0.979 ± 0.002
+0.776 ± 0.010
+0.609 ± 0.026
+cwvar
+0.980 ± 0.002
+0.732 ± 0.012
+0.861 ± 0.087
+Table 5: MNIST baseline summary (mean ± std over seeds 0–9).
+Table 6: Boolean circuit interchange-fidelity at keep = 32 and 16 (out of 64). CMR-Logit / Logit-
+MSE matches VBP on IIA and wins on KL at keep = 32, and is essentially tied at keep = 16; both
+clearly beat random.
+Keep
+Method
+Test Acc.
+IIA (p=0.5)
+KL (p=0.5)
+32
+Logit-MSE
+1.000 ± 0.001
+0.927 ± 0.020
+0.172 ± 0.092
+VBP
+0.989 ± 0.024
+0.923 ± 0.025
+0.234 ± 0.149
+cwvar
+0.981 ± 0.042
+0.864 ± 0.025
+0.527 ± 0.251
+Random
+0.921 ± 0.075
+0.794 ± 0.058
+1.013 ± 0.354
+16
+Logit-MSE
+0.987 ± 0.029
+0.814 ± 0.029
+0.806 ± 0.202
+VBP
+0.951 ± 0.050
+0.827 ± 0.033
+0.790 ± 0.212
+cwvar
+0.928 ± 0.067
+0.752 ± 0.019
+1.234 ± 0.216
+Random
+0.768 ± 0.114
+0.710 ± 0.067
+1.509 ± 0.559
+Off-diagonal
+curvature
+diagnostic.
+The
+mean
+off-diagonal
+Frobenius
+ratio
+∥HB −
+diag(HB)∥F /∥HB∥F = 0.849 on random CIFAR-10 ConvNet blocks (50 random 32-unit blocks of
+the 256-dimensional penultimate representation per seed, three seeds, n = 2000 calibration samples);
+cross-unit interaction is therefore substantial at the layer scale tested. Proposition 5’s relative error
+bound is therefore not tight in this regime; iterative recompute of the CMR-Const scores (a two-step
+256 →192 →128 schedule), which avoids the additivity assumption by re-scoring after each prune
+step, outperforms one-shot scoring at keep 0.5 (IIA 0.614 versus 0.584, KL 0.597 versus 0.710).
+B.2
+Powered MNIST baseline with paired tests
+In the standard (non-reparameterized) setting, CMR-Logit has a small but consistent edge over VBP on
+a two-hidden-layer 784–512–512–10 MNIST MLP, pruning the 512-unit penultimate layer, evaluated
+under the same R = 2000 Bernoulli interchange protocol over ten seeds. In the table, CMR-Logit
+appears under its predecessor name Logit-MSE, and cwvar denotes the curvature-weighted constant-
+replacement score of Proposition 4, the predecessor of CMR-Const. Table 5 summarizes mean ±
+standard deviation; paired bootstrap CIs at keep = 384 give ∆IIA(CMR-Logit −VBP) = +0.0007
+[−0.0037, +0.0052], not significant; at keep = 256, ∆IIA = +0.0056 [−0.00085, +0.0123], also
+not significant, but ∆KL = −0.031 [−0.042, −0.019] is significant (lower KL is better).
+The qualitative interpretation is consistent with the small CMR-Logit edge reported on the CIFAR-10
+ConvNet in Section 5.3: the abstraction lens does not provide a large IIA win in the standard setting,
+but is consistently better on logit fidelity. The reparameterization stress test (Section 5.1) is where the
+gap becomes large, not the standard setting.
+B.3
+Boolean circuit sanity check
+We test the discovery procedure on a controlled three-layer Boolean MLP trained to fit y =
+XOR(AND(x1, x2), OR(x3, x4)) from x ∈{0, 1}8, where the four irrelevant input coordinates
+x5, . . . , x8 are independent Bernoulli(1/2). The trained MLP has two hidden layers of 64 units each,
+with pruning targeting the 64-unit penultimate layer; the calibration set is n = 2000 inputs drawn
+from a 4,096-point dataset with an 80/20 train/test split (Table 6). Six seeds, R = 2000 Bernoulli
+swaps at p = 0.5.
+25
+
+
+Table 7: Affine −constant deltas at keep ∈{64, 128} on MNIST with paired bootstrap 95% CIs
+and seed counts. Positive ∆means affine is larger; for IIA and Test acc., positive is better; for KL,
+positive is worse.
+keep
+r
+ridge
+metric
+∆(95% CI)
+seeds
+p
+64
+4
+10−4
+IIA (p=0.5)
+0.0490 [0.0338, 0.0653]
+10
+0.000
+64
+4
+10−4
+KL (p=0.5)
+1.2275 [1.1261, 1.3275]
+10
+0.000
+64
+4
+10−4
+acc
+0.0564 [0.0315, 0.0855]
+10
+0.004
+64
+4
+10−2
+IIA (p=0.5)
+0.0519 [0.0378, 0.0668]
+10
+0.000
+64
+4
+10−2
+KL (p=0.5)
+0.8086 [0.7022, 0.9076]
+10
+0.000
+64
+4
+10−2
+acc
+0.0564 [0.0320, 0.0847]
+10
+0.003
+64
+16
+10−4
+IIA (p=0.5)
+0.0387 [0.0207, 0.0571]
+10
+0.004
+64
+16
+10−4
+KL (p=0.5)
+1.9373 [1.7361, 2.1020]
+10
+0.000
+64
+16
+10−4
+acc
+0.0588 [0.0334, 0.0895]
+10
+0.004
+64
+16
+10−2
+IIA (p=0.5)
+0.0506 [0.0359, 0.0664]
+10
+0.000
+64
+16
+10−2
+KL (p=0.5)
+1.1775 [1.0215, 1.3148]
+10
+0.000
+64
+16
+10−2
+acc
+0.0588 [0.0334, 0.0893]
+10
+0.004
+128
+4
+10−4
+IIA (p=0.5)
+0.0130 [0.0075, 0.0184]
+10
+0.002
+128
+4
+10−4
+KL (p=0.5)
+0.6867 [0.6483, 0.7243]
+10
+0.000
+128
+4
+10−4
+acc
+0.0048 [0.0022, 0.0076]
+10
+0.008
+128
+4
+10−2
+IIA (p=0.5)
+0.0148 [0.0098, 0.0199]
+10
+0.000
+128
+4
+10−2
+KL (p=0.5)
+0.4629 [0.4019, 0.5224]
+10
+0.000
+128
+4
+10−2
+acc
+0.0051 [0.0025, 0.0079]
+10
+0.007
+128
+16
+10−4
+IIA (p=0.5)
+0.0112 [0.0036, 0.0189]
+10
+0.025
+128
+16
+10−4
+KL (p=0.5)
+0.9836 [0.9079, 1.0482]
+10
+0.000
+128
+16
+10−4
+acc
+0.0052 [0.0025, 0.0081]
+10
+0.008
+128
+16
+10−2
+IIA (p=0.5)
+0.0138 [0.0076, 0.0199]
+10
+0.002
+128
+16
+10−2
+KL (p=0.5)
+0.6082 [0.5335, 0.6795]
+10
+0.000
+128
+16
+10−2
+acc
+0.0054 [0.0027, 0.0082]
+10
+0.005
+CMR-Logit (= Logit-MSE in predecessor notation) and VBP are essentially tied on this controlled
+task, both with high IIA at keep = 32 (∼0.93). CMR-Logit attains lower KL (0.172 vs 0.234) and
+higher Test accuracy (1.000 vs 0.989) at keep = 32. At more aggressive keep = 16, VBP edges out
+CMR-Logit by 0.013 IIA, while CMR-Logit retains a Test accuracy advantage. Random pruning
+loses substantially at both budgets, confirming that the task is non-trivial.
+B.4
+Affine vs. constant comparison at aggressive sparsity
+The affine corollary of Theorem 1 adds capacity but is metric-dependent: it can improve interchange
+agreement at aggressive budgets while degrading KL fidelity. Table 7 reports paired-test deltas
+∆(affine −constant) over ten seeds with R = 2000 swaps, on the predecessor MNIST setup at keep
+∈{64, 128} and parent count r ∈{4, 16} with two ridge levels.
+At keep = 64 with r = 16 and ridge 10−2, the affine variant gains ∆IIA = +0.0506
+[+0.0359, +0.0664] and ∆Test acc. = +0.0588 [+0.0334, +0.0893], but pays ∆KL = +1.18
+[+1.02, +1.31] (worse). The trade-off is sharp: aggressive structured pruning benefits from affine
+capacity on class-level metrics, but the higher-capacity replacement also amplifies distributional
+distortion. This is the empirical version of the metric dependence flagged in Section 6.
+B.5
+Wall-clock timing breakdown
+Table 8 decomposes the discovery procedure into score, compile, and verify stages on the predecessor
+MNIST setup, averaged over seeds with 95% bootstrap CIs.
+Scoring is a one-pass operation independent of replacement class (∼0.18 s for n = 2000). Constant
+compilation is essentially free (< 0.1 ms). Affine compilation requires solving the curvature-weighted
+normal equations from the affine special case of Theorem 1 and runs in 0.20–0.32 s; the result is
+amortized across all subsequent verify passes. At this last-layer budget, scoring and affine compilation
+26
+
+
+Table 8: CMR stage timings on MNIST, mean ± standard deviation with 95% bootstrap CIs. Score is
+a single forward pass over the calibration set; compile is the bias / weight folding step; verify is one
+R = 2000 interchange-intervention pass over precomputed penultimate features (only the compiled
+head is re-evaluated per swap).
+keep
+step
+variant
+mean ± std
+95% CI
+128
+compile
+affine
+0.3151 ± 0.0280 s
+[0.2990, 0.3336] s
+256
+compile
+affine
+0.2007 ± 0.0164 s
+[0.1915, 0.2120] s
+128
+compile
+const
+0.0000841 ± 0.0000055 s
+[0.0000807, 0.0000875] s
+256
+compile
+const
+0.0000751 ± 0.0000079 s
+[0.0000703, 0.0000800] s
+all
+score
+logit_mse
+0.1844 ± 0.0455 s
+[0.1645, 0.2163] s
+128
+verify
+affine
+0.004165 ± 0.000368 s
+[0.003944, 0.004399] s
+256
+verify
+affine
+0.005842 ± 0.001113 s
+[0.005237, 0.006600] s
+128
+verify
+const
+0.006269 ± 0.001389 s
+[0.005558, 0.007218] s
+256
+verify
+const
+0.007750 ± 0.000831 s
+[0.007222, 0.008256] s
+dominate total wall-clock; verification is cheap (< 8 ms for R = 2000) because the interchange
+swaps re-evaluate only the compiled head on precomputed penultimate features.
+C
+Broader Impacts
+This work is primarily foundational. A positive impact is that mechanism replacement can make
+neural-network reduction more inspectable: reduced models are compiled artifacts whose behavior
+can be checked under interchange interventions, rather than only smaller networks with similar
+accuracy. A potential negative impact is overinterpretation: a reduced computational SCM may be
+mistaken for a real-world causal explanation or used as evidence of safety in settings where the
+validation distribution is too narrow. We therefore emphasize the locality of the assumptions, the fixed
+computational meaning of the state map, and the need for task-specific validation before deployment.
+27

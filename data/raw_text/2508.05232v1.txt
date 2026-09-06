@@ -1,0 +1,1395 @@
+Cross-LoRA: A Data-Free LoRA Transfer Framework across
+Heterogeneous LLMs
+Feifan Xia1,2, Mingyang Liao1,3, Yuyang Fang4, Defang Li1, Yantong Xie1,5, Weikang Li3, Yang
+Li1∗, Deguo Xia1, Jizhou Huang1
+1Baidu Inc
+2Imperial College London
+3Peking University
+4Zhejiang University
+5Carnegie Mellon University
+{xiafeifan, liaomingyang, lidefang, xieyantong, liyang164, xiadeguo, huangjizhou01}@baidu.com
+feifan.xia23@imperial.ac.uk, 2301210317@stu.pku.edu.cn, wavejkd@pku.edu.cn,
+fangyuyang@zju.edu.cn, yantongx@andrew.cmu.edu
+Abstract
+Traditional
+parameter-efficient
+fine-tuning
+(PEFT)
+methods such as LoRA are tightly coupled with the
+base model architecture, which constrains their ap-
+plicability across heterogeneous pretrained large lan-
+guage models (LLMs). To address this limitation, we
+introduce Cross-LoRA, a data-free framework for
+transferring LoRA modules between diverse base mod-
+els without requiring additional training data. Cross-
+LoRA consists of two key components: (a) LoRA-
+Align, which performs subspace alignment between
+source and target base models through rank-truncated
+singular value decomposition (SVD) and Frobenius-
+optimal linear transformation, ensuring compatibility
+under dimension mismatch; and (b) LoRA-Shift,
+which applies the aligned subspaces to project source
+LoRA weight updates into the target model parame-
+ter space. Both components are data-free, training-
+free, and enable lightweight adaptation on a commod-
+ity GPU in 20 minutes. Experiments on ARCs, OBQA
+and HellaSwag show that Cross-LoRA achieves rel-
+ative gains of up to 5.26% over base mod-
+els. Across other commonsense reasoning benchmarks,
+Cross-LoRA maintains performance comparable to
+that of directly trained LoRA adapters.
+Introduction
+Large Foundation Models (LFMs) such as GPT-4,
+LLaMA-3, Qwen2.5, and Gemma-2 have become the
+cornerstone of modern artificial intelligence, delivering
+state-of-the-art performance across diverse domains,
+particularly natural language processing [OpenAI et al.
+2024, Qwen et al. 2025, Team et al. 2024]. Owing to
+their strong capabilities, fine-tuning LFMs for down-
+stream tasks has become the prevalent strategy. How-
+ever, conventional fine-tuning generally requires saving
+a new checkpoint of comparable size to the original
+model for each task, resulting in substantial storage de-
+mands and memory overhead as model scale and task
+diversity increase.
+∗Corresponding author
+Figure 1: Overview of the Cross-LoRA framework.
+The figure illustrates the process of transferring a
+LoRA adapter from a source model to a target model.
+It highlights the rank-truncated SVD decomposition
+of source and target bases, subspace alignment via
+Frobenius-optimal projection, and the generation of
+target-compatible LoRA updates.
+To address this challenge, Parameter-Efficient Fine-
+Tuning (PEFT)
+[Xu et al. 2023] methods have been
+widely adopted. Among them, Low-Rank Adaptation
+(LoRA) [Hu et al. 2021], DoRA [Liu et al. 2024], and
+LoRA+ [Hayou et al. 2024] are particularly effective,
+representing weight updates as low-rank matrices to re-
+duce the number of trainable parameters. These designs
+achieve strong task performance with relatively modest
+computational cost.
+Nevertheless, LoRA suffers from a key limitation: its
+dependency on the base model. A LoRA adapter fine-
+tuned on one model cannot be directly applied to an-
+other without retraining. This issue becomes especially
+problematic when the base model is replaced or dep-
+recated, as the associated LoRA adapters must either
+be retrained or discarded. Retraining is often infeasible
+due to the unavailability of the original fine-tuning data
+and the high computational cost of additional tuning.
+This raises a crucial question:
+arXiv:2508.05232v1  [cs.LG]  7 Aug 2025
+
+
+Question: Can we transfer LoRA adapters
+trained on one base model to another, with-
+out requiring any training data or additional
+fine-tuning?
+We propose Cross-LoRA, a data-free and training-
+free framework for transferring LoRA adapters across
+heterogeneous
+large
+language
+models.
+Cross-LoRA
+introduces two key components: LoRA-Align, which
+performs rank-truncated SVD–based subspace align-
+ment and Frobenius-optimal linear transformation to
+ensure compatibility across dimension mismatches; and
+LoRA-Shift, which projects the aligned source LoRA
+weight updates into the target model parameter space.
+Our contributions can be summarized as follows:
+1. Data-free and training-free LoRA transfer at LLM
+scale. To our knowledge, Cross-LoRA is the first
+framework enabling LoRA migration across hetero-
+geneous large language models without requiring ac-
+cess to the original training data or additional fine-
+tuning.
+2. Efficient alignment mechanism tailored for LLMs.
+We introduce a Frobenius-optimal subspace align-
+ment approach with rank-truncated singular value
+decomposition (SVD), which ensures numerical sta-
+bility under dimension mismatch and enables prac-
+tical, lightweight transfer on autoregressive LLMs
+without the need for costly computation or retrain-
+ing.
+3. Robust
+generalization
+across
+architectures
+and
+model families. Cross-LoRA demonstrates strong
+transferability across heterogeneous base models,
+such as Qwen, LLaMA, and Gemma. It is architec-
+ture agnostic and plug and play, requiring no modi-
+fication to the tokenizer or the internal structure of
+the base model.
+Related Work
+Transferring knowledge between models has long been a
+central goal in machine learning. A common approach
+is Knowledge Distillation [Hinton et al. 2015], where
+a smaller “student” learns to mimic a more power-
+ful “teacher.” Later studies examined its convergence
+and generalization [Phuong and Lampert 2021, Kaplun
+et al. 2022]. The student acquires the teacher’s behavior
+through training on this dataset, thus obtaining W0 or
+a W0-equivalent when base models differ.
+Using original or synthetic data as a proxy for trans-
+ferring delta weights has also shown viability. Trans-
+LoRA [Wang et al. 2025] generates synthetic data from
+the source model combined with a trained LoRA, then
+uses this data to perform LoRA training on the target
+model. This method has proven effective across model
+families, yet proxy data may fail to represent the origi-
+nal distribution, and the transfer process requires train-
+ing time comparable to fine-tuning the original LoRA.
+To
+reduce
+reliance
+on
+data
+and
+training,
+Lo-
+RASuite [Li et al. 2025] compares subspaces between
+the source and target models and constructs a transfer
+matrix, followed by lightweight fine-tuning on the tar-
+get. While efficient, it is limited to same-architecture
+transfers (e.g., small-to-large within a model family)
+and still requires partial access to target model gra-
+dients.
+In contrast, LoRA-X [Farhadzadeh et al. 2025a]
+avoids both data dependency and training. It proposes
+a subspace-constrained alternative to LoRA that can
+align with the subspaces across different models. How-
+ever, it requires specially designed adapters and has
+thus far been primarily applied to diffusion models.
+ProLoRA [Farhadzadeh et al. 2025b] further removes
+this constraint by enabling training-free transfer of
+standard LoRA adapters. It decomposes LoRA weights
+into subspace and null-space components, projecting
+them into the target model’s structure without any data
+or training. Though more general, its application re-
+mains focused on text-to-image diffusion models.
+In summary, existing methods either rely on proxy
+data and training(Trans-LoRA, LoRASuite), or are
+adapter- or domain-specific (LoRA-X, ProLoRA). We
+aim to bridge this gap with a general, training-free
+transfer method for standard LoRA adapters, applica-
+ble to Large Language Models.
+Method
+Problem Formulation
+Traditional
+parameter-efficient
+fine-tuning
+(PEFT)
+methods such as LoRA are highly effective but intrin-
+sically tied to the base model, preventing direct reuse
+across heterogeneous architectures. Inspired by LoRA-
+X [Farhadzadeh et al. 2025a], which demonstrated data-
+free transfer for diffusion models with structurally sim-
+ilar backbones, we extend this idea to heterogeneous
+large language models (LLMs) and propose a general
+framework for transferring LoRA modules without ac-
+cess to training data or further optimization.
+Formally, let the source base model weight be Ws ∈
+Rm×n and the corresponding LoRA update be ∆Ws ∈
+Rm×n. Given a target base model weight Wt ∈Rm′×n′,
+our objective is to construct a target-compatible LoRA
+update ∆Wt ∈Rm′×n′ such that the adapted target
+model retains the knowledge encoded by ∆Ws, without
+requiring original data or further training.
+Framework Overview: Cross-LoRA
+Cross-LoRA consists of two complementary compo-
+nents:
+LoRA-Align. We perform subspace alignment be-
+tween source and target base models using rank-
+truncated singular value decomposition (SVD). This re-
+solves dimensional mismatches and identifies a shared
+subspace for LoRA transfer.
+
+
+Figure 2: Overall framework of Cross-LoRA. The source base model (left) provides LoRA updates ∆Ws trained on
+a specific task. In Step 1, rank-truncated SVD is applied to both source and target base weights to extract compact
+subspaces. Lora-Align computes Frobenius-optimal linear transformations to align the source subspaces with the
+target. In Step 2, Lora-Shift projects the source LoRA updates into the aligned target subspace, yielding target-
+compatible LoRA weights ∆Wt. The process requires no access to training data and runs efficiently on commodity
+GPUs.
+LoRA-Shift. We project the source LoRA update
+∆Ws into the aligned subspace to obtain a target-
+compatible update ∆Wt. This transformation is both
+data-free and training-free.
+Mathematical Formulation
+SVD
+Decomposition.
+We first compute rank-r
+truncated SVDs for the source and target base weights:
+Ws ≈UsΣsV ⊤
+s
+(1)
+Wt ≈UtΣtV ⊤
+t
+(2)
+where Us ∈Rm×r, Vs ∈Rn×r, and similarly for Ut, Vt.
+The truncated singular vectors capture the dominant
+directions of the parameter spaces.
+Subspace Alignment.
+To establish subspace com-
+patibility, we construct Frobenius-optimal linear trans-
+forms that align the source and target bases:
+ˆPU = arg min
+P
+∥PUs −Ut∥2
+F
+(3)
+ˆPV = arg min
+P
+∥PVs −Vt∥2
+F
+(4)
+These least-squares problems admit closed-form so-
+lutions and remain stable even when Us or Vs is
+rank-deficient. In practice, we solve them using ef-
+ficient batched routines (e.g., torch.linalg.lstsq).
+The aligned subspaces are then defined as:
+˜Us = ˆPUUs
+(5)
+˜Vs = ˆPV Vs
+(6)
+Frobenius Projection.
+We then project the source
+LoRA update ∆Ws into the aligned target subspace:
+∆Wt = ˜Us
+  ˜U ⊤
+s ∆Ws ˜Vs
+ ˜V ⊤
+s
+(7)
+This operation minimizes the Frobenius norm ∥∆Ws −
+∆Wt∥F under the aligned latent basis, enabling adap-
+tation to the target model geometry without requiring
+training data or explicit pseudo-inverses.
+Complexity and Efficiency
+We analyze the computational complexity and ac-
+curacy implications of rank-truncated SVD in Cross-
+LoRA.
+Let the base weight
+W0 ∈Rm×n
+have singular value decomposition (SVD):
+W0 = UΣV ⊤,
+with truncated form
+W (r)
+0
+= UrΣrV ⊤
+r .
+By the Eckart–Young–Mirsky theorem [MIRSKY
+1960], W (r)
+0
+is the best rank-r approximation of W0 un-
+der the Frobenius norm.
+Since a LoRA update can be written as
+∆Ws = BsAs,
+with rank(∆Ws) ≤r, it can be expressed in the trun-
+cated subspace as
+∆Ws ≈UrCV ⊤
+r ,
+C ∈Rr×r.
+
+
+Algorithm 1 Cross-LoRA Transfer via Subspace Pro-
+jection
+Input: LoRA update ∆Ws, source weights Ws, target
+weights Wt
+Parameter: Truncated rank r
+Output:
+Transferred
+update
+∆Wt
+1: Initialize empty ∆Wt and counters.
+2: for each LoRA parameter k in ∆Ws do
+3:
+Determine base key b from k.
+4:
+if b /∈Ws or b /∈Wt then
+5:
+continue
+6:
+end if
+7:
+Compute rank-r SVDs for Ws[b], Wt[b].
+8:
+Derive aligned basis ˜Us, ˜Vs via least-squares.
+9:
+if k is a left LoRA weight then
+10:
+Project: ∆Wt[k] ←˜Us( ˜U ⊤
+s ∆Ws[k])
+11:
+else
+12:
+Project: ∆Wt[k] ←(∆Ws[k] ˜Vs) ˜V ⊤
+s
+13:
+end if
+14:
+Cast to FP16 and update statistics.
+15: end for
+16: return ∆Wt
+Projecting into the truncated subspace gives
+[
+∆Ws = Ur
+ U ⊤
+r ∆WsVr
+
+V ⊤
+r .
+The resulting error is
+E = ∥∆Ws −[
+∆Ws∥F
+≈0,
+since discarded singular directions contribute negligibly
+when r is chosen at least as large as the LoRA rank
+(typically 16–64).
+Truncation reduces the time complexity from
+O(mn · min(m, n))
+(full SVD)
+to
+O(rmn)
+(truncated SVD),
+and memory cost from
+O(mn)
+to
+O(r(m + n)).
+This efficiency enables transfer on a single 8GB GPU
+within 20 minutes. Previous spectral studies show that
+the first r = 320 singular values capture over 99% of
+the Frobenius norm energy.
+Method
+Time
+Memory
+F.N. Energy
+Full-rank
+O(mn·min)
+O(mn)
+100%
+Truncated (r≪min)
+O(rmn)
+O(r(m + n))
+≥99%
+Table 1: Computational and representational trade-off
+between full-rank and rank-truncated SVD in Cross-
+LoRA. Truncation substantially reduces time and mem-
+ory complexity while retaining at least 99% of the
+Frobenius norm energy, as detailed in Appendix C.
+Experiments
+This section evaluates the effectiveness of Cross-LoRA
+for training-free LoRA transfer across heterogeneous
+large language models (LLMs). We first describe the
+experimental setup and then present results on multi-
+ple NLP benchmarks.
+Experiment Setup
+We evaluate the effectiveness of Cross-LoRA across
+multiple large language models (LLMs) and benchmark
+datasets. Our goal is to assess whether Cross-LoRA can
+transfer LoRA adapters trained on a source model to a
+heterogeneous target model without requiring any ad-
+ditional training or access to the original fine-tuning
+data.
+Models.
+We select four representative instruction-
+tuned LLMs as the base models for our exper-
+iments: LLaMA-3.2-3B, Qwen2.5-1.5B, Qwen2.5-3B,
+and Gemma-2-2B. These models cover both decoder-
+only architectures and different model families, enabling
+evaluation of transferability across heterogeneous base
+models.
+Datasets.
+We
+benchmark
+performance
+on
+four
+widely used NLP tasks: ARC-c, ARC-e, OpenBookQA,
+and HellaSwag [Clark et al. 2018, Mihaylov et al. 2018,
+Zellers et al. 2019]. These tasks are standard in eval-
+uating reasoning, knowledge retrieval, and common-
+sense understanding, providing a comprehensive view
+of model performance under transfer.
+Baselines.
+We compare three settings: (1) the Base
+Model, evaluated without any LoRA adapters; (2)
+Trained LoRA, where adapters are directly fine-tuned
+on the target model for each dataset. This training pro-
+cess follows common practices in prior PEFT transfer
+studies [Liang et al. 2025]; and (3) Transferred LoRA
+(Cross-LoRA), where adapters fine-tuned on a source
+model are transferred to the target model using our
+framework, without any training data or fine-tuning.
+This comparison allows us to quantify the relative util-
+ity of Cross-LoRA, highlighting both its advantages and
+limitations in zero-shot adaptation settings.
+Implementation.
+Cross-LoRA
+employs
+rank-
+truncated
+SVD
+and
+Frobenius-optimal
+subspace
+alignment to map LoRA weight updates into the
+target model space. All experiments are executed on a
+single NVIDIA V100 GPU. No additional training or
+optimization is performed on the transferred adapters.
+A detailed description of the setup is provided in
+Appendix A.
+Main Results
+Table 2 presents the results of Cross-LoRA across
+four QA benchmarks. We compare transferred adapters
+against
+base
+models
+and
+directly
+trained
+LoRA
+adapters, reporting accuracy and relative gains. Over-
+all, transferred adapters yield consistent improvements
+
+
+Model
+Adapter
+Training
+Arc-c (Acc.)
+Arc-e (Acc.)
+OpenBookQA (Acc.)
+HellaSwag (Acc.)
+LLaMA-3.2-3B
+Base Model
+No
+0.6838
+0.8260
+0.7260
+0.5657
+Trained LoRA
+Yes
+0.7082 (+3.57%)
+0.8229 (-0.38%)
+0.7200 (-0.83%)
+0.6092 (+7.69%)
+Transferred LoRA
+No
+0.7065 (+3.32%)
+0.8331 (+0.86%)
+0.7260 (+0.00%)
+0.5667 (+0.18%)
+Gemma-2-2B
+Base Model
+No
+0.7144
+0.8269
+0.7120
+0.5254
+Trained LoRA
+Yes
+0.7355 (+2.95%)
+0.8345 (+0.92%)
+0.7220 (+1.40%)
+0.5100 (-2.93%)
+Transferred LoRA
+No
+0.7520 (+5.26%)
+0.8289 (+0.24%)
+0.7120 (+0.00%)
+0.5254 (+0.00%)
+Qwen2.5-3B
+Base Model
+No
+0.8129
+0.9061
+0.8000
+0.6040
+Trained LoRA
+Yes
+0.8172 (+0.53%)†
+0.9061 (+0.00%)
+0.8020 (+0.25%)†
+0.6125 (+1.41%)†
+Transferred LoRA
+No
+0.8130 (+0.01%)
+0.9063 (+0.02%)†
+0.8000 (+0.00%)
+0.6028 (-0.20%)
+Qwen2.5-1.5B
+Base Model
+No
+0.7338
+0.8483
+0.7440
+0.4980
+Trained LoRA
+Yes
+0.7457 (+1.62%)
+0.8485 (+0.02%)
+0.7500 (+0.81%)
+0.5180 (+4.02%)
+Transferred LoRA
+No
+0.7372 (+0.46%)
+0.8485 (+0.02%)
+0.7460 (+0.27%)
+0.4995 (+0.30%)
+Table 2: Performance comparison of Cross-LoRA with base models and directly trained LoRA adapters across four
+benchmarks. Transferred adapters are data-free and training-free. The best results per dataset are marked with †.
+Percentage change is relative to the corresponding base model.
+over base models, achieving an average relative gain
+of +0.848%, closely approaching the +0.976% gain
+from trained LoRA. Notably, the best observed gains
+are +5.26% on ARC-c and +3.32% on ARC-
+e, demonstrating the effectiveness of training-free sub-
+space alignment in recovering task-specific knowledge.
+Compared to trained LoRA, transferred adapters de-
+liver competitive results. On ARC-e and OpenBookQA,
+Cross-LoRA matches or slightly exceeds the trained
+counterpart on multiple architectures. On HellaSwag,
+performance varies more across models, with some con-
+figurations showing minor drops. This variation sug-
+gests architecture-dependent transfer fidelity, especially
+in tasks requiring fine-grained reasoning.
+These findings indicate that Cross-LoRA enables effi-
+cient adapter transfer in both homogeneous and hetero-
+geneous settings, offering a practical alternative when
+fine-tuning data or computational resources are limited.
+While minor performance gaps remain in specific tasks,
+the results suggest room for further refinement, such as
+lightweight post-transfer adaptation.
+Effect of Subspace Alignment
+To further understand the contribution of subspace
+alignment, we compare Cross-LoRA against a linear in-
+terpolation baseline, as well as base and directly trained
+LoRA adapters. The results, reported in Table 3, are ob-
+tained when transferring a LoRA trained on Qwen2.5-
+1.5B into LLaMA-3.2-3B. The interpolation baseline
+adjusts LoRA weights through direct dimension match-
+ing without subspace projection, while Cross-LoRA ap-
+plies rank-truncated SVD and Frobenius-optimal align-
+ment.
+The results demonstrate that simple interpolation
+provides little benefit and in some cases degrades per-
+formance relative to the base model. By contrast, Cross-
+LoRA consistently improves accuracy on ARC-c and
+ARC-e, reaching 0.7065 and 0.8331 respectively, which
+is close to or above the directly trained LoRA. The gain
+is particularly evident compared to interpolation, high-
+lighting the necessity of subspace alignment in captur-
+ing transferable task-specific knowledge. On HellaSwag,
+both methods achieve only marginal improvements over
+the base model, suggesting that the task requires finer-
+grained reasoning that may not be fully preserved by
+projection alone.
+Method
+ARC-c (Acc.)
+ARC-e (Acc.)
+Base
+0.6838
+0.8260
+Base + Trained LoRA
+0.7082
+0.8229
+Interpolation Baseline
+0.6820
+0.8320
+Cross-LoRA (Projection)
+0.7065
+0.8331
+Table 3: Impact of subspace alignment when trans-
+ferring from Qwen2.5-1.5B to LLaMA-3.2-3B. Cross-
+LoRA employs Frobenius projection, whereas the in-
+terpolation baseline directly resizes weights.
+Taken together, these findings confirm that the
+Frobenius-optimal projection in Cross-LoRA is essen-
+tial for effective transfer. While direct interpolation fails
+to preserve critical structure, subspace alignment en-
+ables the transferred LoRA to approach the perfor-
+mance of direct fine-tuning, validating the design choice
+of aligning singular vector subspaces during transfer.
+Ablation Studies
+Rank of Cross-Lora
+Figure 3 illustrates the effect of adapter rank on Cross-
+LoRA performance, evaluated on ARC-C and ARC-
+E benchmarks. We observe a consistent trend that
+accuracy improves as the adapter rank increases for
+both trained and transferred LoRA. This aligns
+with the intuition that low-rank approximations
+restrict representational capacity, whereas higher
+ranks provide richer subspaces to capture task-relevant
+features. However, this accuracy gain comes with in-
+creased storage cost: the LoRA checkpoint size
+grows from 3.7MB at r = 80 to 32.4MB at r = 320,
+
+
+(a)
+(b)
+Figure 3: Effect of adapter rank on Cross-LoRA per-
+formance. Results on ARC-C and ARC-E demonstrate
+that higher adapter ranks consistently improve accu-
+racy for both trained and transferred LoRA adapters.
+Notably, transferred LoRA exhibits smaller perfor-
+mance degradation at low ranks compared to directly
+trained LoRA, highlighting the robustness of Cross-
+LoRA under resource-constrained settings.
+highlighting a trade-off between accuracy and effi-
+ciency.
+Notably, transferred LoRA even surpasses di-
+rectly trained LoRA on the target model in
+some cases, as shown in Figure 3b. This phenomenon
+can be explained by differences in training dynamics
+across models. Certain target models, even under the
+same training recipe, may fail to converge or overfit,
+limiting their ability to extract effective features from
+the dataset. In contrast, the source model may better
+capture task-relevant information during LoRA fine-
+tuning, which Cross-LoRA can then efficiently trans-
+fer to the target. This suggests that Cross-LoRA
+can leverage source models better suited to a
+given dataset or domain to improve weaker tar-
+get models.
+At lower ranks, such as r = 80, both trained and
+transferred LoRA experience performance degradation.
+Notably, the decline is less severe for transferred
+LoRA, indicating that the Frobenius-optimal pro-
+jection mechanism of Cross-LoRA provides additional
+robustness under low-rank constraints. This high-
+lights a key advantage of Cross-LoRA: it main-
+tains competitive performance even with signifi-
+cantly reduced adapter size, making it particularly
+suitable for resource-constrained scenarios.
+Cross Model Transferability
+To further evaluate the generalization capability of
+Cross-LoRA, we examine the effectiveness of transfer-
+ring adapters across different large language models.
+Figure 4 reports the average percentage change relative
+to the corresponding base models, aggregated across
+ARC-C, ARC-E, and OpenBookQA.
+The results reveal clear trends regarding the role of
+architectural similarity. Transfers between models with
+highly aligned configurations show consistent improve-
+ments. For instance, both LLaMA-3.2-3B and Qwen2.5
+Figure 4: Cross-model transferability heatmap of Cross-
+LoRA. Each cell reports the average percentage change
+in accuracy across ARC-C, ARC-E, and OpenBookQA,
+relative to the corresponding base models. Trans-
+fers between models with similar architectures (e.g.,
+LLaMA-3.2-3B and Qwen2.5-1.5B, both using GQA
+and SwiGLU) yield stronger gains, while transfers in-
+volving models with architectural mismatches (e.g.,
+Gemma-2-2B with MHA and GeLU) show weaker im-
+provements.
+models employ grouped-query attention (GQA, 1KV),
+SwiGLU activation, and RMSNorm normalization.
+This structural alignment explains the stable positive
+transfer between these models, such as LLaMA-3.2-3B
+→
+Qwen2.5-1.5B
+(+0.38%)
+and
+Qwen2.5-1.5B
+→
+LLaMA-3.2-3B
+(+1.66%).
+These
+findings
+indicate
+that selecting GQA + SwiGLU + RMSNorm
+models as source models is particularly effective for
+Cross-LoRA.
+In contrast, when transferring from Gemma-2-2B,
+which employs multi-head attention (MHA) with multi-
+KV and a mixed GeLU/SwiGLU activation scheme,
+the benefits are less consistent. While Gemma-2-2B →
+LLaMA-3.2-3B yields a notable +2.63% improvement,
+reverse transfer or transfers to other targets show
+limited gains (e.g., Qwen2.5-3B →Gemma-2-2B at
++0.01%). This highlights that attention mechanism
+differences can hinder subspace alignment, limiting the
+robustness of the projection.
+We also observe non-symmetric behaviors in trans-
+ferability. For example, Qwen2.5-3B →LLaMA-3.2-3B
+exhibits a slight negative effect (-0.20%), despite simi-
+lar parameter counts. This suggests that differences in
+hidden layer width or attention head distributions can
+challenge the Frobenius projection, even when overall
+
+
+model scales are close.
+Overall, these results indicate that Cross-LoRA
+transfer is more stable and beneficial when the source
+model shares the GQA, SwiGLU, and RMSNorm design
+with the target. This architecture-agnostic yet practi-
+cally guided choice enables robust transfer performance
+across heterogeneous LLMs.
+Discussion and Future Work
+Cross-LoRA demonstrates that data-free and training-
+free transfer of LoRA adapters is feasible at the scale
+of large language models. By leveraging rank-truncated
+SVD and Frobenius-optimal subspace alignment, it
+effectively projects task-specific updates across het-
+erogeneous architectures while maintaining efficiency
+on commodity GPUs. The framework consistently
+improves over base models and delivers performance
+comparable to directly trained LoRA adapters, while
+reducing computational and memory requirements to
+enable transfer on a single 8GB GPU within 20 minutes.
+Despite these advantages, several limitations remain.
+First, Cross-LoRA does not fully close the gap with
+directly trained adapters in certain reasoning-heavy
+tasks, such as HellaSwag, indicating that some task-
+specific signals are lost during projection. Second, the
+effectiveness of transfer is sensitive to architectural mis-
+matches. In particular, differences in attention mecha-
+nisms (e.g., grouped-query vs. multi-head attention) or
+activation functions (e.g., SwiGLU vs. ReLU) can re-
+duce alignment quality. Our experiments indicate that
+source models equipped with grouped-query attention
+(GQA), SwiGLU activations, and RMSNorm normal-
+ization provide stronger transferability, suggesting that
+architectural choices substantially influence alignment
+effectiveness. Third, the current framework performs
+one-shot projection without any post-transfer adapta-
+tion, which may limit performance when the source and
+target distributions diverge significantly.
+An additional insight from our analysis is the quan-
+tification of LoRA transferability across heterogeneous
+LLM architectures. Together with the plug-and-play
+nature of Cross-LoRA, this suggests a new paradigm:
+training LoRA adapters on a “learner” model well-
+suited for a given domain, and then transferring them
+to a “receiver” model for deployment, without requiring
+access to the original training data. This could sub-
+stantially reduce the cost of LoRA-based adaptation
+and accelerate knowledge sharing across model families.
+Future work could explore several directions. Hy-
+brid approaches that combine data-free projection
+with lightweight task-agnostic adaptation may help re-
+cover residual task-specific performance. Extending the
+method to larger-scale models (e.g., 13B or 70B parame-
+ters) and multimodal architectures is another promising
+avenue. Automated strategies for layer-wise or subspace
+selection could further reduce computational overhead.
+Finally, a more rigorous theoretical analysis of projec-
+tion error and its correlation with downstream perfor-
+mance would provide deeper insights into the robust-
+ness and limitations of Cross-LoRA.
+Conclusion
+We present Cross-LoRA, a simple yet effective frame-
+work for data-free and training-free transfer of LoRA
+adapters across heterogeneous language models. By
+aligning subspaces with truncated SVD and applying
+Frobenius-optimal projection, Cross-LoRA enables fast
+and reliable adapter migration without requiring origi-
+nal training data.
+Experiments on multiple reasoning benchmarks show
+that Cross-LoRA achieves consistent improvements
+over base models and matches the performance of di-
+rectly trained LoRA adapters, while completing trans-
+fer in minutes on a single 8GB GPU. These results high-
+light the practicality of Cross-LoRA for low-resource
+and real-world deployment scenarios.
+We
+believe
+Cross-LoRA
+offers
+a
+scalable
+and
+lightweight alternative to conventional fine-tuning, and
+we hope it serves as a foundation for future research on
+modular, transferable, and architecture-agnostic adap-
+tation in large language models.
+References
+Armen Aghajanyan, Luke Zettlemoyer, and Sonal
+Gupta.
+Intrinsic Dimensionality Explains the Ef-
+fectiveness of Language Model Fine-Tuning, Decem-
+ber 2020. URL http://arxiv.org/abs/2012.13255.
+arXiv:2012.13255 [cs].
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord.
+Think
+you
+have
+Solved
+Question
+An-
+swering? Try ARC, the AI2 Reasoning Challenge,
+March 2018.
+URL http://arxiv.org/abs/1803.
+05457. arXiv:1803.05457 [cs].
+Carl Eckart and Gale Young.
+The approximation of
+one matrix by another of lower rank. Psychometrika, 1
+(3):211–218, September 1936. ISSN 1860-0980. doi: 10.
+1007/BF02288367. URL https://doi.org/10.1007/
+BF02288367.
+Farzad
+Farhadzadeh,
+Debasmit
+Das,
+Shubhankar
+Borse, and Fatih Porikli. LoRA-X: Bridging Founda-
+tion Models with Training-Free Cross-Model Adapta-
+tion, February 2025a. URL http://arxiv.org/abs/
+2501.16559. arXiv:2501.16559 [cs].
+Farzad
+Farhadzadeh,
+Debasmit
+Das,
+Shubhankar
+Borse, and Fatih Porikli.
+Zero-Shot Adaptation of
+Parameter-Efficient Fine-Tuning in Diffusion Mod-
+els, May 2025b. URL http://arxiv.org/abs/2506.
+04244. arXiv:2506.04244 [cs].
+Soufiane Hayou, Nikhil Ghosh, and Bin Yu. LoRA+:
+Efficient Low Rank Adaptation of Large Models,
+July 2024. URL http://arxiv.org/abs/2402.12354.
+arXiv:2402.12354 [cs].
+
+
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+Dis-
+tilling the Knowledge in a Neural Network, March
+2015.
+URL
+http://arxiv.org/abs/1503.02531.
+arXiv:1503.02531 [stat].
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen. LoRA: Low-Rank Adaptation of Large
+Language Models, October 2021. URL http://arxiv.
+org/abs/2106.09685. arXiv:2106.09685 [cs].
+Gal Kaplun, Eran Malach, Preetum Nakkiran, and Shai
+Shalev-Shwartz.
+Knowledge Distillation: Bad Models
+Can Be Good Role Models, March 2022. URL http:
+//arxiv.org/abs/2203.14649. arXiv:2203.14649 [cs].
+Olga Kovaleva, Alexey Romanov, Anna Rogers, and
+Anna Rumshisky. Revealing the Dark Secrets of BERT,
+September 2019. URL http://arxiv.org/abs/1908.
+08593. arXiv:1908.08593 [cs].
+Yanan Li, Fanxu Meng, Muhan Zhang, Shiai Zhu,
+Shangguang Wang, and Mengwei Xu. LoRASuite: Effi-
+cient LoRA Adaptation Across Large Language Model
+Upgrades, May 2025.
+URL http://arxiv.org/abs/
+2505.13515. arXiv:2505.13515 [cs].
+Zhiyuan Liang, Dongwen Tang, Yuhao Zhou, Xu-
+anlei Zhao, Mingjia Shi, Wangbo Zhao, Zekai Li,
+Peihao Wang, Konstantin Schürholt, Damian Borth,
+Michael M. Bronstein, Yang You, Zhangyang Wang,
+and Kai Wang.
+Drag-and-Drop LLMs: Zero-Shot
+Prompt-to-Weights, June 2025. URL http://arxiv.
+org/abs/2506.16406. arXiv:2506.16406 [cs].
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo
+Molchanov,
+Yu-Chiang
+Frank
+Wang,
+Kwang-
+Ting
+Cheng,
+and
+Min-Hung
+Chen.
+DoRA:
+Weight-Decomposed
+Low-Rank
+Adaptation,
+July
+2024.
+URL
+http://arxiv.org/abs/2402.09353.
+arXiv:2402.09353 [cs].
+Ilya Loshchilov and Frank Hutter. Decoupled Weight
+Decay Regularization, January 2019.
+URL http://
+arxiv.org/abs/1711.05101. arXiv:1711.05101 [cs].
+Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish
+Sabharwal. Can a Suit of Armor Conduct Electricity?
+A New Dataset for Open Book Question Answering,
+September 2018. URL http://arxiv.org/abs/1809.
+02789. arXiv:1809.02789 [cs].
+L. MIRSKY.
+SYMMETRIC GAUGE FUNCTIONS
+AND UNITARILY INVARIANT NORMS. The Quar-
+terly Journal of Mathematics, 11(1):50–59, January
+1960.
+ISSN 0033-5606.
+doi: 10.1093/qmath/11.1.50.
+URL https://doi.org/10.1093/qmath/11.1.50.
+OpenAI, Josh Achiam, Steven Adler, Sandhini Agar-
+wal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+man, Diogo Almeida, Janko Altenschmidt, Sam Alt-
+man, Shyamal Anadkat, Red Avila, Igor Babuschkin,
+Suchir Balaji, Valerie Balcom, Paul Baltescu, Haiming
+Bao, Mohammad Bavarian, Jeff Belgum, Irwan Bello,
+Jake Berdine, Gabriel Bernadett-Shapiro, Christopher
+Berner, Lenny Bogdonoff, Oleg Boiko, Madelaine Boyd,
+Anna-Luisa Brakman, Greg Brockman, Tim Brooks,
+Miles Brundage, Kevin Button, Trevor Cai, Rosie
+Campbell, Andrew Cann, Brittany Carey, Chelsea Carl-
+son, Rory Carmichael, Brooke Chan, Che Chang, Fo-
+tis Chantzis, Derek Chen, Sully Chen, Ruby Chen, Ja-
+son Chen, Mark Chen, Ben Chess, Chester Cho, Casey
+Chu, Hyung Won Chung, Dave Cummings, Jeremiah
+Currier, Yunxing Dai, Cory Decareaux, Thomas De-
+gry, Noah Deutsch, Damien Deville, Arka Dhar, David
+Dohan, Steve Dowling, Sheila Dunning, Adrien Ecof-
+fet, Atty Eleti, Tyna Eloundou, David Farhi, Liam
+Fedus, Niko Felix, Simón Posada Fishman, Juston
+Forte, Isabella Fulford, Leo Gao, Elie Georges, Chris-
+tian Gibson, Vik Goel, Tarun Gogineni, Gabriel Goh,
+Rapha Gontijo-Lopes, Jonathan Gordon, Morgan Graf-
+stein, Scott Gray, Ryan Greene, Joshua Gross, Shixi-
+ang Shane Gu, Yufei Guo, Chris Hallacy, Jesse Han,
+Jeff Harris, Yuchen He, Mike Heaton, Johannes Hei-
+decke, Chris Hesse, Alan Hickey, Wade Hickey, Pe-
+ter Hoeschele, Brandon Houghton, Kenny Hsu, Shengli
+Hu, Xin Hu, Joost Huizinga, Shantanu Jain, Shawn
+Jain, Joanne Jang, Angela Jiang, Roger Jiang, Haozhun
+Jin, Denny Jin, Shino Jomoto, Billie Jonn, Heewoo
+Jun, Tomer Kaftan, Łukasz Kaiser, Ali Kamali, In-
+gmar Kanitscheider, Nitish Shirish Keskar, Tabarak
+Khan, Logan Kilpatrick, Jong Wook Kim, Christina
+Kim, Yongjik Kim, Jan Hendrik Kirchner, Jamie Kiros,
+Matt Knight, Daniel Kokotajlo, Łukasz Kondraciuk,
+Andrew Kondrich, Aris Konstantinidis, Kyle Kosic,
+Gretchen Krueger, Vishal Kuo, Michael Lampe, Ikai
+Lan, Teddy Lee, Jan Leike, Jade Leung, Daniel Levy,
+Chak Ming Li, Rachel Lim, Molly Lin, Stephanie Lin,
+Mateusz Litwin, Theresa Lopez, Ryan Lowe, Patricia
+Lue, Anna Makanju, Kim Malfacini, Sam Manning,
+Todor Markov, Yaniv Markovski, Bianca Martin, Katie
+Mayer, Andrew Mayne, Bob McGrew, Scott Mayer
+McKinney, Christine McLeavey, Paul McMillan, Jake
+McNeil, David Medina, Aalok Mehta, Jacob Menick,
+Luke Metz, Andrey Mishchenko, Pamela Mishkin, Vin-
+nie Monaco, Evan Morikawa, Daniel Mossing, Tong
+Mu, Mira Murati, Oleg Murk, David Mély, Ashvin
+Nair, Reiichiro Nakano, Rajeev Nayak, Arvind Nee-
+lakantan, Richard Ngo, Hyeonwoo Noh, Long Ouyang,
+Cullen O’Keefe, Jakub Pachocki, Alex Paino, Joe
+Palermo, Ashley Pantuliano, Giambattista Parascan-
+dolo, Joel Parish, Emy Parparita, Alex Passos, Mikhail
+Pavlov, Andrew Peng, Adam Perelman, Filipe de
+Avila Belbute Peres, Michael Petrov, Henrique Ponde
+de Oliveira Pinto, Michael, Pokorny, Michelle Pokrass,
+Vitchyr H. Pong, Tolly Powell, Alethea Power, Boris
+Power, Elizabeth Proehl, Raul Puri, Alec Radford,
+Jack Rae, Aditya Ramesh, Cameron Raymond, Francis
+Real, Kendra Rimbach, Carl Ross, Bob Rotsted, Henri
+Roussez, Nick Ryder, Mario Saltarelli, Ted Sanders,
+Shibani Santurkar, Girish Sastry, Heather Schmidt,
+David Schnurr, John Schulman, Daniel Selsam, Kyla
+Sheppard, Toki Sherbakov, Jessica Shieh, Sarah Shoker,
+Pranav Shyam, Szymon Sidor, Eric Sigler, Maddie
+Simens, Jordan Sitkin, Katarina Slama, Ian Sohl, Ben-
+jamin Sokolowsky, Yang Song, Natalie Staudacher, Fe-
+
+
+lipe Petroski Such, Natalie Summers, Ilya Sutskever,
+Jie Tang, Nikolas Tezak, Madeleine B. Thompson,
+Phil Tillet, Amin Tootoonchian, Elizabeth Tseng, Pre-
+ston Tuggle, Nick Turley, Jerry Tworek, Juan Fe-
+lipe Cerón Uribe, Andrea Vallone, Arun Vijayvergiya,
+Chelsea Voss, Carroll Wainwright, Justin Jay Wang,
+Alvin Wang, Ben Wang, Jonathan Ward, Jason Wei,
+C. J. Weinmann, Akila Welihinda, Peter Welinder, Ji-
+ayi Weng, Lilian Weng, Matt Wiethoff, Dave Willner,
+Clemens Winter, Samuel Wolrich, Hannah Wong, Lau-
+ren Workman, Sherwin Wu, Jeff Wu, Michael Wu, Kai
+Xiao, Tao Xu, Sarah Yoo, Kevin Yu, Qiming Yuan,
+Wojciech Zaremba, Rowan Zellers, Chong Zhang, Mar-
+vin Zhang, Shengjia Zhao, Tianhao Zheng, Juntang
+Zhuang, William Zhuk, and Barret Zoph. GPT-4 Tech-
+nical Report, March 2024. URL http://arxiv.org/
+abs/2303.08774. arXiv:2303.08774 [cs].
+Mary Phuong and Christoph H. Lampert.
+To-
+wards Understanding Knowledge Distillation, May
+2021.
+URL
+http://arxiv.org/abs/2105.13093.
+arXiv:2105.13093 [cs].
+Qwen,
+An
+Yang,
+Baosong
+Yang,
+Beichen
+Zhang,
+Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li,
+Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin,
+Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang,
+Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang,
+Keming Lu, Keqin Bao, Kexin Yang, Le Yu, Mei Li,
+Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men, Runji
+Lin, Tianhao Li, Tianyi Tang, Tingyu Xia, Xingzhang
+Ren, Xuancheng Ren, Yang Fan, Yang Su, Yichang
+Zhang, Yu Wan, Yuqiong Liu, Zeyu Cui, Zhenru Zhang,
+and Zihan Qiu.
+Qwen2.5 Technical Report, Jan-
+uary 2025. URL http://arxiv.org/abs/2412.15115.
+arXiv:2412.15115 [cs].
+Gemma
+Team,
+Morgane
+Riviere,
+Shreya
+Pathak,
+Pier Giuseppe Sessa, Cassidy Hardin, Surya Bhu-
+patiraju, Léonard Hussenot, Thomas Mesnard, Bobak
+Shahriari,
+Alexandre
+Ramé,
+Johan
+Ferret,
+Peter
+Liu,
+Pouya
+Tafti,
+Abe
+Friesen,
+Michelle
+Casbon,
+Sabela
+Ramos,
+Ravin
+Kumar,
+Charline
+Le
+Lan,
+Sammy Jerome, Anton Tsitsulin, Nino Vieillard, Piotr
+Stanczyk, Sertan Girgin, Nikola Momchev, Matt Hoff-
+man, Shantanu Thakoor, Jean-Bastien Grill, Behnam
+Neyshabur, Olivier Bachem, Alanna Walton, Aliaksei
+Severyn, Alicia Parrish, Aliya Ahmad, Allen Hutchi-
+son, Alvin Abdagic, Amanda Carl, Amy Shen, Andy
+Brock, Andy Coenen, Anthony Laforge, Antonia Pater-
+son, Ben Bastian, Bilal Piot, Bo Wu, Brandon Royal,
+Charlie Chen, Chintu Kumar, Chris Perry, Chris Welty,
+Christopher A. Choquette-Choo, Danila Sinopalnikov,
+David Weinberger, Dimple Vijaykumar, Dominika Ro-
+gozińska, Dustin Herbison, Elisa Bandy, Emma Wang,
+Eric Noland, Erica Moreira, Evan Senter, Evgenii El-
+tyshev, Francesco Visin, Gabriel Rasskin, Gary Wei,
+Glenn Cameron, Gus Martins, Hadi Hashemi, Hanna
+Klimczak-Plucińska, Harleen Batra, Harsh Dhand, Ivan
+Nardini, Jacinda Mein, Jack Zhou, James Svensson,
+Jeff Stanway, Jetha Chan, Jin Peng Zhou, Joana Car-
+rasqueira, Joana Iljazi, Jocelyn Becker, Joe Fernandez,
+Joost van Amersfoort, Josh Gordon, Josh Lipschultz,
+Josh Newlan, Ju-yeong Ji, Kareem Mohamed, Kar-
+tikeya Badola, Kat Black, Katie Millican, Keelin Mc-
+Donell, Kelvin Nguyen, Kiranbir Sodhia, Kish Greene,
+Lars Lowe Sjoesund, Lauren Usui, Laurent Sifre, Lena
+Heuermann, Leticia Lago, Lilly McNealus, Livio Bal-
+dini Soares, Logan Kilpatrick, Lucas Dixon, Luciano
+Martins, Machel Reid, Manvinder Singh, Mark Iver-
+son, Martin Görner, Mat Velloso, Mateo Wirth, Matt
+Davidow, Matt Miller, Matthew Rahtz, Matthew Wat-
+son, Meg Risdal, Mehran Kazemi, Michael Moynihan,
+Ming Zhang, Minsuk Kahng, Minwoo Park, Mofi Rah-
+man, Mohit Khatwani, Natalie Dao, Nenshad Bardoli-
+walla, Nesh Devanathan, Neta Dumai, Nilay Chauhan,
+Oscar Wahltinez, Pankil Botarda, Parker Barnes, Paul
+Barham, Paul Michel, Pengchong Jin, Petko Georgiev,
+Phil Culliton, Pradeep Kuppala, Ramona Comanescu,
+Ramona Merhej, Reena Jana, Reza Ardeshir Rokni,
+Rishabh Agarwal, Ryan Mullins, Samaneh Saadat,
+Sara Mc Carthy, Sarah Cogan, Sarah Perrin, Sébastien
+M. R. Arnold, Sebastian Krause, Shengyang Dai, Shruti
+Garg, Shruti Sheth, Sue Ronstrom, Susan Chan, Tim-
+othy Jordan, Ting Yu, Tom Eccles, Tom Hennigan,
+Tomas Kocisky, Tulsee Doshi, Vihan Jain, Vikas Ya-
+dav, Vilobh Meshram, Vishal Dharmadhikari, War-
+ren Barkley, Wei Wei, Wenming Ye, Woohyun Han,
+Woosuk Kwon, Xiang Xu, Zhe Shen, Zhitao Gong,
+Zichuan Wei, Victor Cotruta, Phoebe Kirk, Anand
+Rao, Minh Giang, Ludovic Peran, Tris Warkentin, Eli
+Collins, Joelle Barral, Zoubin Ghahramani, Raia Had-
+sell, D. Sculley, Jeanine Banks, Anca Dragan, Slav
+Petrov, Oriol Vinyals, Jeff Dean, Demis Hassabis, Koray
+Kavukcuoglu, Clement Farabet, Elena Buchatskaya, Se-
+bastian Borgeaud, Noah Fiedel, Armand Joulin, Kath-
+leen Kenealy, Robert Dadashi, and Alek Andreev.
+Gemma 2: Improving Open Language Models at a Prac-
+tical Size, October 2024.
+URL http://arxiv.org/
+abs/2408.00118. arXiv:2408.00118 [cs].
+Runqian Wang, Soumya Ghosh, David Cox, Diego
+Antognini, Aude Oliva, Rogerio Feris, and Leonid
+Karlinsky.
+Trans-lora: Towards data-free transfer-
+able parameter-efficient finetuning, May 2025.
+URL
+https://arxiv.org/abs/2405.17258. arXiv preprint
+arXiv:2405.17258.
+Lingling Xu, Haoran Xie, Si-Zhao Joe Qin, Xiaohui Tao,
+and Fu Lee Wang.
+Parameter-Efficient Fine-Tuning
+Methods for Pretrained Language Models: A Critical
+Review and Assessment, December 2023. URL http:
+//arxiv.org/abs/2312.12148. arXiv:2312.12148 [cs].
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. HellaSwag: Can a Machine
+Really Finish Your Sentence?, May 2019. URL http:
+//arxiv.org/abs/1905.07830. arXiv:1905.07830 [cs].
+
+
+Appendix A. Additional Experimental
+Details
+Datasets
+We evaluate Cross-LoRA on four widely used natural
+language understanding benchmarks, each targeting
+different aspects of reasoning and commonsense knowl-
+edge.
+ARC-Challenge
+(ARC-C): A benchmark de-
+signed to test grade-school science reasoning ability.
+The dataset is composed of approximately 1.2k train-
+ing examples and 1k evaluation questions, requiring
+multi-step reasoning beyond simple fact retrieval [Clark
+et al. 2018].
+ARC-Easy (ARC-E): A companion benchmark
+to ARC-C with around 2.2k training examples. Unlike
+ARC-C, its questions are more straightforward, relying
+on direct factual recall. Together with ARC-C, it
+provides a balanced assessment of reasoning diffi-
+culty [Clark et al. 2018].
+OpenBookQA: A benchmark focused on open-
+domain science knowledge with roughly 5k training
+questions. It requires combining information from a
+small science textbook (“open book”) with general
+commonsense reasoning [Mihaylov et al. 2018].
+HellaSwag: A large-scale commonsense inference
+benchmark with about 39k validation examples. It
+challenges models with adversarially filtered multiple-
+choice questions designed to be trivial for humans yet
+difficult for language models [Zellers et al. 2019].
+These datasets cover diverse reasoning challenges and
+scales, making them suitable to rigorously assess the
+generalization ability of Cross-LoRA.
+LoRA Training Recipe
+We trained LoRA adapters [Hu et al. 2021] across
+all four benchmarks, maintaining consistency in opti-
+mizer [Loshchilov and Hutter 2019], learning rate, and
+dropout, while adjusting training steps for dataset size.
+Table 4 summarizes the settings used.
+Setting
+ARC-C
+ARC-E
+OBQA
+HellaSwag
+Batch Size
+16
+16
+16
+16
+Optimizer
+AdamW
+AdamW
+AdamW
+AdamW
+Learning Rate
+1e-5
+1e-5
+1e-5
+1e-5
+Training Steps
+600
+600
+600
+300
+Weight Decay
+0.1
+0.1
+0.1
+0.1
+Max Grad Norm
+1.0
+1.0
+1.0
+1.0
+LoRA Alpha
+32
+32
+32
+32
+LoRA Dropout
+0.1
+0.1
+0.1
+0.1
+LoRA Bias
+None
+None
+None
+None
+LoRA Rank
+16
+16
+16
+16
+Table 4: LoRA training recipe across ARC-C, ARC-E,
+OBQA, and HellaSwag.
+Cross-LoRA Transferring
+For Cross-LoRA transfer, we applied adapters on a wide
+set of target modules:
+Target Modules
+Rank
+LoRA Alpha
+q_proj, v_proj, k_proj, o_proj,
+gate_proj, up_proj, down_proj
+320
+64
+Table 5: Cross-LoRA transferring configuration.
+Appendix B. Experiment Hardware
+We provide details of the hardware used for Cross-
+LoRA experiments. Batch experiments were carried out
+on NVIDIA Tesla V100 GPUs, while additional small-
+scale experiments were conducted on RTX 4090 for
+comparison.
+Based on these results, we conservatively infer that
+Cross-LoRA should complete transfer in under 20 min-
+utes on edge devices with 8GB GPU memory.
+Setting
+V100
+RTX 4090
+OS
+Ubuntu 22.04.1
+Ubuntu 22.04.1
+CPU
+Intel(R) Xeon(R) Platinum 8352V CPU @ 2.10GHz
+GPU
+NVIDIA Tesla V100 32GB NVIDIA RTX 4090 24GB
+CUDA Version
+11.8
+11.8
+Cross-LoRA
+Transfer Time
+349.287s
+564.043s
+Cross-LoRA
+Memory Cost
+5508MB
+2291MB
+Table 6: Hardware platforms and Cross-LoRA transfer
+cost.
+Appendix C. Detailed Derivation of
+Rank-Truncated SVD
+We
+analyze
+the
+approximation
+quality
+of
+rank-
+truncated singular value decomposition (SVD) as em-
+ployed in Cross-LoRA.
+Preliminaries
+Consider a weight matrix W0 ∈R3072×3072 with singu-
+lar value decomposition:
+W0 = UΣV ⊤,
+where Σ = diag(σ1, σ2, . . . , σ3072) and σ1 ≥σ2 ≥· · · ≥
+0. The rank-r truncated approximation of W0 is:
+W (r)
+0
+= UrΣrV ⊤
+r ,
+where Ur, Vr contain the top-r singular vectors, and
+Σr = diag(σ1, . . . , σr). By the Eckart–Young–Mirsky
+theorem [Eckart and Young 1936, MIRSKY 1960], W (r)
+0
+minimizes the Frobenius norm error among all rank-r
+matrices:
+∥W0 −W (r)
+0
+∥2
+F =
+3072
+X
+i=r+1
+σ2
+i .
+
+
+The fraction of Frobenius energy retained is defined
+as:
+η(r) =
+Pr
+i=1 σ2
+i
+P3072
+i=1 σ2
+i
+.
+LoRA Updates in the Truncated Subspace
+Given a LoRA update ∆Ws = BsAs with rank(∆Ws) ≤
+r, it can be approximated in the truncated subspace as:
+∆Ws ≈UrCV ⊤
+r ,
+C ∈Rr×r.
+Projecting into the subspace yields:
+[
+∆Ws = Ur(U ⊤
+r ∆WsVr)V ⊤
+r ,
+with corresponding Frobenius reconstruction error:
+E2 = ∥∆Ws −[
+∆Ws∥2
+F =
+3072
+X
+i=r+1
+σ2
+i .
+Numerical Illustration
+Empirical analyses suggest that low-rank approxima-
+tions are sufficient for strong performance. Aghajanyan
+et al. [Aghajanyan et al. 2020] showed that tuning only
+200 intrinsic dimensions retains roughly 90% down-
+stream accuracy, implying η(200) ≈0.9. Moreover,
+spectral studies [Kovaleva et al. 2019] reveal rapid sin-
+gular value decay in transformers, which can be ap-
+proximated by a geometric decay σ2
+i
+≈σ2
+1ρ i, with
+ρ ∈[0.92, 0.97].
+Under this assumption:
+η(r) ≈1 −ρr.
+For r = 320 and ρ = 0.94:
+η(320) ≈1 −(0.94)320 ≈1 −e−19.8 ≈0.999999998.
+Even for ρ = 0.97:
+η(320) ≈1 −(0.97)320 ≈0.99994.
+Thus, in typical transformer layers, rank-320 trunca-
+tion retains at least 99% of the Frobenius norm energy.
+The reconstruction error is bounded by:
+E2 = (1 −η(320)) · ∥W0∥2
+F ,
+so E ≤
+√
+0.001 ≈0.031.
+Conclusion
+These results justify that rank-320 truncation preserves
+nearly all semantically meaningful structure in W0.
+Given that LoRA updates themselves are rank-16 or
+lower, the approximation error is negligible in practice.
+This explains why Cross-LoRA achieves performance
+comparable to directly trained LoRA adapters.

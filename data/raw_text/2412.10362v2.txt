@@ -1,0 +1,2114 @@
+OP-LoRA: The Blessing of Dimensionality with Overparameterized
+Low-Rank Adaptation
+Piotr Teterwak1
+Kate Saenko1
+Bryan A. Plummer1
+Ser-Nam Lim2
+1Boston University
+2University of Central Florida
+Learned embedding
+MLP
+a.)    Low-rank Adapter 
+b.) OP-LoRA  (Ours)
+Input
+Output
+LoRA-Tuned SDXL 
+(Prior)
+OP-LoRA-Tuned 
+SDXL(Ours)
+c.) Performance Improvements
+Weight
+B
+Generated
+Weights
+-“A man with purple hair and green eyes”
+Pretrained 
+Weight
+Weight
+A
+Input
+Output
+Weight
+B
+Pretrained 
+Weight
+Weight
+A
+Purple Eyes
+Green Eyes
+Figure 1. Overparameterizing low-rank adapters at training time improves performance. (a) A standard Low-
+Rank Adapter learns two rank-reduced matrices (A and B) that are added to the frozen base weights. (b) Our proposed
+OP-LoRA predicts the adapter weights from an MLP and a learned embedding. (c) Visual results of image generation on
+Stable Diffusion XL, showing qualitative improvements in generated images using our method compared to standard LoRA,
+in addition to being more faithful to the text prompt. (d) Performance in vision-language tasks, with OP-LoRA showing
+accuracy gains over LoRA across training epochs.
+Abstract
+Low-rank adapters (LoRA) enable finetuning of large
+models with only a small number of parameters. How-
+ever, they often suffer from an ill-conditioned loss land-
+scape, leading to difficult optimization. Prior work ad-
+dresses these challenges by aligning adapter updates
+with full finetuning gradients via custom optimizers,
+but these methods lack the flexibility to accommodate
+new adapter architectures and are computationally ex-
+pensive.
+We instead introduce OP-LoRA, a novel
+method which replaces each LoRA adapter with weights
+predicted by an extra MLP, which is discarded af-
+ter training.
+This temporarily allows additional pa-
+rameters during training to improve optimization, yet
+requires less wall time than custom optimizers and
+zero extra cost at inference time because the MLP is
+discarded.
+Crucially, extending OP-LoRA to other
+adapters is as simple as modifying the size of the predic-
+tion head for each new adapter type. We show that OP-
+LoRA allows the optimization to adaptively increase or
+decrease step size, improving performance and decreas-
+ing sensitivity to learning rate.
+On both small and
+large-scale LoRA tuning tasks, we observe consistent
+performance gains of OP-LoRA relative to LoRA and
+its variants.
+We achieve especially notable improve-
+ments in image generation, with OP-LoRA CMMD
+scores improving by up to 15 points relative to LoRA.
+This allows OP-LoRA to achieve the performance of
+LoRA with half of the inference parameters.
+1. Introduction
+Finetuning large foundation models for specific tasks
+can provide significant performance gains but is com-
+putationally intensive, with risks of catastrophic for-
+getting [2, 6, 40]. Methods utilizing low-rank adapters
+(LoRA) [16, 17, 29, 32, 35, 53] address these chal-
+lenges by modifying the model in rank-constrained
+ways (Fig. 1a). Beyond reducing finetuning cost, this
+low-rank structure is now crucial for scalable infer-
+ence, as systems such as S-LoRA [44] show that thou-
+sands of task-specific LoRA adapters can be served
+concurrently on a single base model with only small
+arXiv:2412.10362v2  [cs.LG]  31 May 2026
+
+
+overhead. However, low-rank adapters can make op-
+timization harder by creating uneven curvature in the
+loss landscape (Section 3). Even when optimized with
+AdamW [23, 31], which preconditions gradients, poorly
+conditioned loss landscapes can still pose a prob-
+lem [10]. These issues manifest during LoRA training
+as high sensitivity to learning rates, as shown by Bi-
+derman et al. [2] and confirmed in Section 3.3.
+The most successful attempts to address this is-
+sue are custom optimizers such as LoRA-Pro [49] and
+ScaledAdamW [52], which aim to align the LoRA up-
+date with that of full finetuning.
+However, in im-
+plementation, they are complex and difficult to ex-
+tend to new LoRA variants (see Limitations of Wang
+et al. [49]). For example, adapting these optimizers to
+DoRA [29] is non-trivial due to weight normalization,
+which complicates the projection of full finetuning gra-
+dients. They also tend to be more expensive to run
+than standard optimizers, requiring matrix inversions
+and expensive optimizations. In our testing using au-
+thors’ code, wall time of ScaledAdamW is 15% longer
+than that of OP-LoRA, and LoRA-Pro is up to 14x
+longer (Section 4.4) when finetuning LLaMA on Com-
+monsense Reasoning tasks. These limitations highlight
+the need for alternative optimization strategies that are
+both effective and architecture-agnostic.
+Instead of relying on specialized optimizers, we pro-
+pose a fundamentally different and more flexible ap-
+proach, which we call OP-LoRA (Overparameterized
+Low-Rank Adaptation). OP-LoRA uses a small MLP
+as a hypernetwork [15] to predict the low-rank adapter
+matrices at train time only (Figure 1b). In contrast
+to other hypernetworks [36, 40], we do not condition
+on the input sample in any way.
+This allows us to
+discard the MLP at inference time, making inference
+and storage costs equal to that of standard LoRA at
+the same rank. Such low-rank inference footprints are
+particularly important in modern deployments, where
+systems like S-LoRA [44] rely on the small size of LoRA
+adapters to serve thousands of customized models on
+shared hardware.
+Interestingly, OP-LoRA preserves
+the representational capacity of standard LoRA: any
+adapter produced by the MLP can be expressed exactly
+by conventional LoRA parameters. Yet, despite hav-
+ing no additional expressive power, OP-LoRA achieves
+improved performance. We show that this “blessing of
+dimensionality” arises from its enhanced ability to nav-
+igate complex loss landscapes through an acceleration
+mechanism (Section 3.2).
+Integration of OP-LoRA takes only a few lines of
+code and generalizes to any LoRA variant. For exam-
+ple, our OP-DoRA extension of DoRA simply adds a
+second MLP head to predict its extra adapter weights,
+something which would be difficult to do with custom
+optimizers. OP-LoRA outperforms standard variants
+by 1-6% on natural language tasks and up to 15 CMMD
+points on image generation tasks (Section 4).
+We summarize our contributions as follows:
+• We introduce OP-LoRA, a novel yet easy-to-
+implement reparameterization of LoRA that uses an
+MLP to predict adapter weights instead of learning
+them directly. After training, the MLP is discarded
+so zero additional storage or inference costs are in-
+curred.
+• We show that OP-LoRA navigates loss landscapes
+better than standard LoRA due to a built-in accel-
+eration mechanism (Section 3.2).
+• We empirically validate OP-LoRA on a large range
+of tasks including image and text generation and
+show consistent performance gains on both, and a
+large improvement in adapting Stable Diffusion rel-
+ative to standard LoRA (Section 4).
+More generally, we believe that train-time over-
+parameterization represents a promising yet underex-
+plored paradigm in model training, and we hope that
+our work will catalyze further work.
+2. Related Work
+Low-rank finetuning: Low-rank finetuning, specif-
+ically with LoRA (Low-Rank Adaptation) [21], has
+emerged as a powerful approach for adapting pre-
+trained models with minimal additional parameters.
+A number of follow ups have emerged, improving
+performance.
+AdaLoRA [53] prunes weights during
+training. DoRA [29] adds a magnitude scaling vector
+to the updated matrix.
+RoSA [35] adds a sparse
+weight update to the low-rank update, but requires
+a full-finetuning pass to compute the weight mask.
+OLoRA [4] and PiSSA [32] ease optimization by
+initializing LoRA orthogonally. However, they remove
+important pre-trained components from the frozen
+base weights. Another approach is to make the LoRA
+optimization trajectory similar to that of full finetun-
+ing: LoRA-GA [48] initializes LoRA parameters to an
+SVD approximation of the full-finetuning gradient,
+while LoRA-Pro [49] and ScaledAdamW [52] project
+full-tuning gradients onto the LoRA subspace. Both
+have computational overhead resulting in extended
+training times: LoRA-Pro requires expensive compu-
+tations in gradient projection while LoRA-GA requires
+a full-finetuning pass similar to RoSA. Deep LoRA [50]
+learns an over-parameterized LoRA first before com-
+pressing it, leveraging the over-parameterization for
+improved training.
+However, the compression is an
+expensive process, and therefore impractical at scale.
+
+
+Reparameterization
+with
+hypernetworks: Ha
+et al. [15] generate weights of an LSTM and CNN
+from a neural network, introducing the concept of
+HyperNetworks.
+However, their focus is relaxing
+weight sharing in LSTMs and reducing parameter
+count in convolutional networks for image classifica-
+tion.
+In contrast, we leverage over-parameterization
+for improved performance.
+HyperDreamBooth [40]
+generates initializations for LoRA parameters from
+an input image.
+Instead, we learn our parameter-
+generating MLP with a learned parameter vector
+as input.
+HyperLoader [36] uses a hypernetwork to
+generate adapters, but shares parameters between
+layers and tasks. We show that this shared structure
+severely reduces performance in Table 3.
+Convergence Properties of Neural Networks:
+Understanding the convergence behavior of neural
+networks has been a subject of significant research
+interest [11, 34]. Du et al. [11] find that gradient
+descent can find global optima in ResNets. Huang
+et al. [19] find that optimizers are biased to flat
+minima in overparameterized models, and coin the
+term the “blessing of dimensionality”. Most relevant
+to OP-LoRA, though,
+is Arora et al. [1]’s work
+showing that stacking linear layers can function as
+an implicit acceleration mechanism in gradient descent.
+3.
+Methodology:
+Overparameterized
+LoRA (OP-LoRA)
+Low-Rank Adaptation (LoRA) has become a popular
+strategy for finetuning large models, allowing adapta-
+tion to new tasks by learning a low-rank matrix fac-
+torization of weight updates. With LoRA, finetuning
+a model layer’s weight matrix W0 ∈Rd×d is achieved
+by learning an additive low-rank update ∆W such that
+the adapted weights W are given by:
+W = W0 + ∆W = W0 + BA,
+where A ∈Rr×d and B ∈Rd×r are learned low-rank
+matrices, with r ≪d, reducing the number of pa-
+rameters to learn.
+However, LoRA introduces chal-
+lenges during optimization. While the original param-
+eter space has curvature defined by the Hessian HW ,
+the LoRA A matrix has the transformed Hessian, rep-
+resented as a composition of functional operators:
+HA = B⊤◦HW ◦B.
+This transformation affects the condition number of
+the optimization problem in the A-space. Even if the
+original Hessian HW is well-conditioned and symmetric
+positive definite (a reasonable assumption near local
+minima), the reparameterized Hessian can become ill-
+conditioned depending on the singular values of B. In
+particular, the condition number κ(HA) satisfies:
+κ(B)2
+κ(HW ) ≤κ(HA) ≤κ(B)2 · κ(HW )
+where κ(·) denotes the spectral condition number. A
+higher condition number indicates a greater ratio be-
+tween the largest and smallest curvatures of the loss
+landscape. In practice, higher condition numbers lead
+to slower convergence and greater sensitivity to learn-
+ing rates. These bounds imply that even if HW is well
+conditioned, poor conditioning in B alone can lead to
+difficulty in optimizing A, since they drive up both up-
+per and lower bounds.
+Biderman et al. [2] observe
+that LoRA is sensitive to learning rate, which we con-
+firm in Section 3.3. The full derivation of this result, is
+provided in the Supplementary Materials. In Section
+3.2 and 3.3, we show OP-LoRA can dynamically adjust
+step size and perform an adaptive line search, overcom-
+ing the optimization difficulties of standard LoRA. In
+Section 7.1 of the Supplementary Materials, we analyze
+gradient properties of the Hessian of a trained model,
+and find evidence for OP-LoRA being less sensitive to
+poor conditioning than LoRA.
+3.1. Predicting LoRA Weights
+In order to avoid the optimization difficulties of train-
+ing LoRA discussed in Section 3, we avoid directly opti-
+mizing A and B by introducing a two-layer MLP which
+takes as input z and predicts the entries of A and B.
+Because the additional parameters are discarded after
+training, they do not increase finetuning capac-
+ity. Instead, this is a way of reshaping the optimiza-
+tion landscape, making it easier to optimize. This is
+an important distinction with other methods of adding
+parameters to the finetuning procedure like increasing
+LoRA rank. Concretely, we generate A and B as flat-
+tened matrices via:
+A
+B
+
+= W2(ReLU(W1z + c1)) + c2
+where z is the learned input vector to the MLP, W
+and c correspond to learned weights and biases, and
+A ∈Rr×d and B ∈Rd×r are the generated matrices.
+Once finetuning is complete, the MLP can be dis-
+carded, retaining only the low-rank matrices A and B
+for inference and storage. Furthermore, as in standard
+LoRA, A and B can be merged with the pre-trained
+model’s weights by adding ∆W = BA to the relevant
+layer weights (Equation 3). Although the MLP is com-
+pact in depth, it predicts a high-dimensional output,
+
+
+Figure 2. Optimization behavior of LoRA and OP-LoRA for Rotated MNIST classification: a.) Training loss
+achieved by LoRA and OP-LoRA as a function of the learning rate, showing that OP-LoRA attains lower loss across a
+wide range of learning rates and remains robust even at suboptimal step sizes. (b) and (c) Parameter-update trajectories
+overlaid on the training loss surface at (b) the optimal learning rate and (c) a low learning rate. In both cases, OP-LoRA
+descends more directly towards lower loss (yellow contours) than LoRA.
+the size of the LoRA parameters, increasing its param-
+eter count. For instance, an MLP with a hidden dimen-
+sion of 32 scales the number of trainable parameters by
+approximately 32. This makes OP-LoRA particularly
+advantageous in settings where inference resources are
+constrained, but sufficient memory is available during
+training. Further, because the MLP is small relative to
+a typical base model, wall-time penalties are not large.
+For more details on computational cost, see Section 4.4.
+3.2. Optimization benefits of OP-LoRA
+Arora et al. [1] prove that increasing depth by replac-
+ing linear layers with products of matrices, which has
+the same expressive power as a single matrix due to
+the linear nature of the transformation, leads to faster
+convergence. Although we focus on re-parameterizing
+with an MLP instead of increasing depth, we employ
+the same theoretical framework to examine OP-LoRA’s
+enhanced training dynamics below. While we consider
+the linear case here for clarity, we extend the analysis
+to the MLP case in the Supplementary Materials.
+Consider the OP-LoRA reformulation of parame-
+ter vector v with a two-layer MLP, defined as v =
+W2(ReLU(W1z + c1)) + c2. We can then assign vec-
+tor h = ReLU(W1z + c1), and for clarity of deriva-
+tion, we treat h as a free parameter vector; this cor-
+responds to only updating the bias in the first layer
+of the MLP. We also merge bias parameters into the
+parameter matrices W for ease of notation, assuming
+a constant value is appended to z and h. This leaves
+us with the simpler reparameterization form v = W2h,
+where v ∈Rp, W2 ∈Rp×k, h ∈Rk and p is the size
+of generated parameter vector v and k is the hidden
+dimension of the MLP re-parameterization.
+The update rule for W2 and h with learning rate η
+is given by:
+W(t+1)
+2
+= W(t)
+2
+−η∇W2,
+h(t+1) = h(t) −η∇h
+Then, the parameter vector v becomes:
+v(t+1) = W(t+1)
+2
+h(t+1) =
+
+W(t)
+2
+−η∇W2
+ 
+h(t) −η∇h
+
+Expanding the product, we have:
+v(t+1) = W(t)
+2 h(t) −η∇W2h(t) −ηW(t)
+2 ∇h +η2∇W2∇h
+Following [1, 52], we ignore the higher order term since
+the learning rate η is assumed to be small and therefore
+the term shrinks to 0. By definition, v = W2h, so:
+v(t+1) = v(t) −η∇W2h(t) −ηW(t)
+2 ∇h
+By substituting chain-rule expansions of ∇W2 and ∇h,
+the new value for v becomes:
+∇W2 = ∇vhT ,
+∇h = WT
+2 ∇v.
+v(t+1) = v(t)−
+η ∥h(t)∥2∇v(t)
+|
+{z
+}
+trainable learning rate
+−η W(t)
+2
+ (W(t)
+2 )T ∇v
+
+|
+{z
+}
+adaptive line search
+This reveals two key properties of the optimization
+trajectory under OP-LoRA. First, OP-LoRA intro-
+duces a dynamic learning rate scaling factor, ∥h(t)∥2.
+From the update rule ∇h = (W(t)
+2 )T ∇v, we see that
+∥h(t)∥2 grows when the gradient descent direction is
+positively aligned with W(t)
+2
+and shrinks otherwise. In
+
+
+DoRA
+OP-DoRA(Ours)
+LoRA
+OP-LoRA(Ours)
+“A man with a 
+hoodie and 
+sunglasses ”
+Ground Truth
+“A painting of 
+genre still life”
+Naruto
+WikiArt-Monet
+PiSSA
+LoRA-GA
+LoRA-Pro
+ScaledAdamW
+Figure 3. Comparison of generated images across different low-rank finetuning methods of SD-XL for two
+datasets: Naruto (upper) and Claude Monet-style painting (lower). Each row shows outputs from a specific model config-
+uration based on ground truth captions. For the Naruto prompt, OP-LoRA and OP-DoRA effectively capture the presence
+of a hoodie, and generally generate higher fidelity images. For the Monet-style paintings, OP-LoRA and OP-Dora offer
+more realistic scenes.
+the special case where k = 1, the vector h becomes a
+scaling factor for the single column vector W2 which
+represents the direction of parameter vector v. Con-
+sequently, if the optimizer overshoots a minimum, the
+sign of the gradient update for h flips, and the effec-
+tive learning rate decreases, but if consecutive updates
+align, it increases. In the more general k > 1 setting,
+there are k such scalar factors (one for each column in
+W(t)
+2 ) and each can increase or decrease independently,
+and the overall learning rate becomes scaled by ∥h(t)∥2
+. We refer to ∥h(t)∥2 as the trainable learning rate.
+Second,
+OP-LoRA adds an extra update term
+W(t)
+2
+ (W(t)
+2 )T ∇v
+
+, which shifts parameters along the
+already learned directions W(t)
+2 , in proportion to the
+gradient’s projection onto those directions.
+When
+k = 1, this can be seen as a gradient step in a line-
+search, along the direction of the current state of v,
+and naturally biases the updates toward directions al-
+ready taken.
+However, if ∇v suddenly changes to a
+new and orthogonal direction, the final term immedi-
+ately vanishes, causing the effective step size to shrink
+right away and the update to suddenly shift towards
+the current gradient. For k > 1, v becomes a weighted
+sum over each column of W(t)
+2 , and the parameter
+update is biased toward any directions in W(t)
+2
+on
+which the gradient has nonzero projection.
+We re-
+fer to W(t)
+2
+ (W(t)
+2 )T ∇v
+
+as adaptive line search.
+Together, the adaptive line search and trainable
+learning rate suggest that OP-LoRA has an improved
+ability to navigate complex loss landscapes. While the
+overall trainable learning rate dynamically updates to
+the given problem, the adaptive line search can rapidly
+search the subspace spanned by W2. In Section 3.3, we
+explore how this improves performance.
+3.3. MNIST Case Study
+To illustrate the advantages of OP-LoRA, we start
+with a small scale study on MNIST, showing that OP-
+LoRA converges to better loss and also is less sensi-
+tive to learning rate. We use a two-layer MLP f(x)
+with hidden dimension 512.
+We train f on MNIST
+for 30 epochs to nearly 0 training loss. This consti-
+tutes our base model, which we freeze before continued
+LoRA tuning on Rotated MNIST to create an adap-
+tation task. We finetune the frozen f with LoRA and
+OP-LoRA adapters of rank r = 4, but this time on
+the new task of Rotated MNIST, where each MNIST
+sample is randomly rotated before classification.
+We find two main results. First, we find that OP-
+LoRA achieves lower training loss than LoRA. In Fig-
+ure 2, we can see that train loss for LoRA reaches 0.59,
+vs 0.54 for OP-LoRA. Second, we find that OP-LoRA
+is much less sensitive to learning rates than LoRA (Fig-
+ure 2 a.), with losses staying relatively low even with
+learning rates two to three orders of magnitude smaller
+than optimal. The learning rate sensitivity of standard
+LoRA corroborates the findings in [2] (See Figure S1
+of Biderman et al. [2]). Qualitatively, we plot the op-
+timization trajectory of both LoRA and OP-LoRA in
+Figure 2 b.) and c.). Interestingly, for learning rates
+which are three orders of magnitude lower than op-
+timal, OP-LoRA makes good progress, demonstrating
+OP-LoRA’s ability to accelerate training. We highlight
+that this is despite both methods being optimized with
+Adam, an optimizer with adaptive learning rates and
+a momentum term to help with slow learning.
+We do additional analysis on the gradient properties
+of the Hessian using power iteration in Supplementary
+Materials Section 7.1, where we find that gradient norm
+in the direction of highest curvature is much higher for
+OP-LoRA than standard LoRA. This empirically sug-
+
+
+Table 1.
+Finetuning Stable Diffusion:
+CMMD on
+Naruto[5] and WikiArt[12] (lower is better).
+Method
+Naruto
+WArt
+Avg (↓)
+W/ grad. alignment
+LoRA-GAr=4 [48]
+15.2
+43.7
+29.5
+LoRA-Pror=4 [49]
+20.9
+32.4
+26.7
+SAdamWr=4 [52]
+21.9
+30.5
+26.2
+W/out grad. alignment
+PiSSAr=4 [32]
+29.7
+43.2
+36.5
+LoRAr=4 [17]
+23.7
+47.9
+35.8
+DoRAr=4 [29]
+17.2
+49.8
+33.5
+OP-DoRAr=4 (ours)
+11.9
+46.6
+29.3
+OP-LoRAr=4 (ours)
+9.6
+31.7
+20.7
+gests that OP-LoRA may be less sensitive to poor con-
+ditioning than LoRA, since it can minimize loss effec-
+tively even when high curvature requires a small learn-
+ing rate.
+This is consistent with the view that OP-
+LoRA adaptively reshapes the LoRA loss landscape for
+better and faster optimization through reparameteriza-
+tion.
+4. Experiments
+In this section, we show performance on three differ-
+ent tasks. We start by finetuning Stable Diffusion [37]
+in Section 4.1.
+Low-rank finetuning offers particu-
+lar advantages in this context, especially since indi-
+vidual users often have only a few images for model
+specialization, making regularization with low-rank up-
+dates particularly valuable. Additionally, storage con-
+cerns are significant, as users may want to save nu-
+merous specialized model variants.
+This means that
+it is beneficial for any over-parameterization scheme
+to be training only, to minimize storage costs for the
+end user. In Section 4.2, we move onto visual ques-
+tion answering with a VL-BART [6] model, where we
+demonstrate that OP-LoRA and OP-DoRA show con-
+sistent improvements over their standard counterparts.
+Finally, we show results of a finetuned LLaMA [46]
+model on Commonsense reasoning tasks in Section 4.3.
+This is another common PEFT use-case, where full
+finetuning is too expensive and fully-fine tuned mod-
+els become cumbersome to store. Finally, in Supple-
+mentary Materials Section 7, we show results for im-
+proving VeRA [24], Mix-of-Show [14], DreamBooth [39]
+subject-driven generation, and Matrix Factorization
+with MLP over-parameterization.
+Details are in the
+Supplementary Materials.
+Table 2. VQA evaluation with VL-BART: Measuring
+accuracy on VQA[13], GQA[20], and NLVR[45]. OP-LoRA
+and OP-DoRA outperform their non-overparameterized
+counterparts by around 1%.
+Method
+VQAv2 GQA NLVR Avg (↑)
+Full FT
+66.9
+56.7
+73.7
+65.8
+LoRAr=128 [17]
+65.5
+53.9
+72.0
+63.8
+OP-LoRAr=128 (ours)
+65.6
+54.9
+73.0
+64.5
+DoRAr=128 [29]
+65.8
+54.9
+72.4
+64.4
+OP-DoRAr=128 (ours)
+66.4
+55.1
+74.0
+65.2
+4.1. Finetuning Stable Diffusion
+We finetune Stable Diffusion XL [37] for two datasets,
+a Claude Monet subset of Wiki-Art [12] and Blip-
+Captioned Naruto Images [5], and evaluate using MMD
+distances over CLIP embeddings.
+Datasets:
+WikiArt [12] is a dataset of around
+80000 pieces of artwork labeled with artist, genre, and
+style. We filter by Claude Monet, leaving 1334 images,
+with text captions of the form ‘A painting of genre
+⟨⟩’. Importantly, the artist name is not mentioned in
+the caption, so the style must be learned.
+Naruto
+BLIP Captions [5] is a dataset of 1221 anime images
+from the Japanese manga series Naruto, captioned by
+BLIP [27].
+Finetuning protocol: We train for two epochs and
+we target only the attention layers in the U-Net in
+Stable Diffusion XL 1.0.
+We use rank r = 4 and
+OP-LoRA MLP width 32.
+We choose a number of
+baselines in addition to LoRA intended to make op-
+timization easier. LoRA-GA [48], LoRA-Pro [49] and
+ScaledAdamW [52] leverage full finetuning gradient
+information, while PiSSA [32] initializes to principal
+components.
+DoRA adds a weight normalization to
+LoRA in order to improve the learning ability of LoRA.
+We extend OP-LoRA to OP-DoRA by adding an ad-
+ditional prediction head to generate the weight scaling
+factors alongside the low-rank matrices.
+Evaluation Protocol: We generate a new image for
+each training caption and compute the CLIP Maxi-
+mum Mean Discrepancy [22] (CMMD) distance, which
+measures MMD over CLIP [38] scores. Lower CMMD
+indicates higher quality generations. Jayasumana et al.
+[22] show CMMD aligns better with human raters than
+FID or Inception Score.
+Results: We present CMMD scores in Tab. 1. Two in-
+teresting trends emerge. First, OP-LoRA outperforms
+OP-DoRA on both the Naruto and WikiArt datasets.
+We attribute this to the increased ease of overfitting
+with DoRA. Second, OP-LoRA and OP-DoRA, achieve
+
+
+Table 3. Finetuning on commonsense reasoning datasets [18]: OP-LoRA and OP-DoRA outperform their stan-
+dard counterparts on LLaMA-7B [46], and are on par with the complex custom optimizers such as LoRA-Pro [49] and
+ScaledAdamW [52] despite not leveraging information about the full FT gradient. When combined with ScaledAdamW,
+OP-LoRA can match standard ScaledAdamW performance with half the inference parameters.
+Method
+Train
+Par.
+Inf
+Par. BoolQ PIQA SIQA HSwag WinoG ARC-E ARC-C OBQA AVG
+W/ grad alignment
+LoRA-Pror=32 [49]
+0.83
+0.83
+69.6
+81.6
+77.7
+84.4
+80.3
+81.7
+65.5
+80.2
+77.6
+SAdamWr=32 [52]
+0.83
+0.83
+70.7
+82.3
+78.2
+83.3
+79.6
+82.6
+66.4
+78.6
+77.7
+SAdamWr=16 [52]
+0.41
+0.41
+69.9
+81.5
+77.3
+82.5
+79.2
+81.4
+65.2
+76.8
+76.7
+OP-SAdamWr=16(Ours)
+13.5
+0.41
+69.9
+81.9
+77.8
+84.6
+81.1
+80.1
+65.5
+80.4
+77.7
+W/Out grad alignment
+DeepLoRAr=32 [50]
+0.83
+0.83
+66.7
+78.8
+59.8
+39.6
+51.7
+41.6
+32.8
+39.8
+51.4
+HLoaderr=32 [36]
+0.83
+0.83
+61.5
+48.5
+43.5
+36.3
+54.3
+26.2
+32.1
+31.8
+41.8
+AdaLoRAr=32 [53]
+1.25
+0.83
+67.4
+80.7
+77.0
+47.3
+79.6
+81.4
+64.8
+76.2
+71.8
+DoRAr=32 [29]
+0.84
+0.84
+65.3
+65.6
+76.9
+81.2
+78.8
+79.4
+64.0
+78.3
+73.7
+LoRAr=32 [17]
+0.83
+0.83
+67.5
+80.8
+78.2
+83.4
+80.4
+78.0
+62.6
+79.1
+76.3
+OP-LoRA(Ours)r=32
+27.4
+0.83
+69.0
+81.4
+77.9
+85.7
+79.2
+80.5
+64.4
+78.6
+77.1
+OP-DoRA(Ours)r=32
+27.7
+0.84
+67.2
+82.0
+76.3
+86.5
+81.4
+81.5
+65.3
+80.3
+77.5
+LoRAr=16 [17]
+0.41
+0.41
+69.9
+77.8
+75.1
+72.1
+55.8
+77.1
+62.2
+78.0
+70.9
+OP-LoRA(Ours)r=16
+13.5
+0.41
+70.3
+83.1
+77.7
+77.7
+79.1
+78.9
+63.9
+78.8
+76.2
+substantially improved scores over their standard coun-
+terparts.
+Specifically, OP-LoRA achieves a CMMD
+score of 9.6 on the Naruto dataset, compared to 23.7 for
+LoRA, and similarly, OP-DoRA scores 11.9 compared
+to DoRA’s 17.2. On the WikiArt dataset, OP-LoRA
+also shows a substantial gain with a score of 31.7 com-
+pared to 47.9 for LoRA. Furthermore, OP-LoRA out-
+performs other baseline methods on average, including
+state-of-the-art optimizers such as LoRA-Pro [49] and
+ScaledAdamW [52] which leverage information about
+the full-finetuning gradient. This suggests that follow-
+ing the full-finetuning gradient as closely as possible
+is not the only way for parameter efficient adapters to
+perform well, and different approaches are worth ex-
+ploring.
+We also show samples of generated images
+in Fig. 3, where we compare LoRA to OP-LoRA and
+DoRA to OP-DoRA. We can overall see much higher
+quality for the over-parameterized variants.
+For ex-
+ample, OP-LoRA and OP-DoRA capture the hoodie,
+while LoRA and DoRA do not. The still life setting
+for OP-LoRA is more complex, with flowers. Finally,
+DoRA seems to generate a somewhat degenerate image
+in the second row, while OP-LoRA and OP-DoRA do
+not. We provide many random samples in the Supple-
+mentary Materials. We also extend these experiments
+to DreamBooth [39] subject-driven generation in Sup-
+plementary Materials Section 7.3, where OP-LoRA im-
+proves subject fidelity over LoRA without sacrificing
+text alignment.
+4.2. Visual Question Answering Experiments
+Datasets: VQAv2 [13] and GQA [20] are both vi-
+sual question answering datasets. NLVRv2 [45] is a
+visual reasoning dataset, answering a True/False ques-
+tion about a pair of images. Finetuning and evalua-
+tion protocol: We follow Liu et al. [29] in our finetun-
+ing protocol. We finetune VL-BART [7] in multi-task
+way. VL-BART composes a CLIP-ResNET101 [38] and
+Bart Base [26] model, and trains all tasks jointly with
+a language-modeling loss. We finetune for 20 epochs
+with rank r = 128, targeting only Q and K matri-
+ces in attention layers, while also training biases. We
+use MLP hidden layers size 4, based on our experi-
+ments in Section 4.4.
+Results: We present results
+in Tab. 2. We can reach a similar conclusion for the
+vision-language task as for the image generation task;
+OP-LoRA and OP-DoRA improve over their counter-
+parts. The roughly 1% improvement achieved by the
+OP variants matches the gains from LoRA to DoRA.
+4.3. Commonsense Reasoning Experiments
+Datasets:
+The Commonsense task consists of 8
+sub-tasks, with about 170k training sequences total.
+BoolQ [8] is a yes/no question-answering dataset.
+PIQA [3] requires physical knowledge to answer.
+SIQA [42] is about social reasoning for humans. Hel-
+laSwag [51] asks the model to complete the context
+with a sentence. WinoGrande [41] asks the model
+to fill in the blank. ARC-E and ARC-C [9] are easy
+and hard variants of multiple choice science questions.
+
+
+Table 4. GPU Memory and wall time cost: Evaluated
+on CommonSense Reasoning with an H100 HBM3 GPU.
+The increased memory usage is manageable, and Wall Time
+is faster than alternatives.
+Method
+GPU Mem
+Time
+LoRA [17]
+44 GB
+3.5 H
+OP-LoRA
+69 GB
+4 H
+ScaledAdamW [52]
+44 GB
+4.5 H
+LoRA-Pro [49]
+46 GB
+56 H
+OBQA [33] asks multiple choice questions requiring
+strong comprehension skills of context.
+Finetuning and evaluation protocol:
+We fol-
+low Liu et al. [29] and train with all datasets jointly
+for 3 epochs, but evaluate each dataset independently.
+We use r = 32 and MLP width 32.
+In addition
+to baselines intended to make optimization easier by
+leveraging full finetuning gradient information (LoRA-
+Pro [49], SAdamW [52] and OP-SAdamW), we also
+compare to the AdaLoRA [53], DeepLoRA [50], and
+HyperLoader [36].
+OP-SAdamW adds MLP overpa-
+rameterization to OP-LoRA by inserting gradient pro-
+jections from ScaledAdamW to the backward pass into
+the generating MLP. AdaLoRA dynamically allocates
+parameters to different layers, useful for PEFT training
+of large scale models. Like OP-LoRA, DeepLoRA [50]
+is motivated by overparameterization. In its concep-
+tion, it trains an over-parameterized adapter and com-
+presses it, but this process is too expensive for large
+models.
+Therefore,
+Yaras et al. [50] simply add
+a third square matrix to the LoRA adapter, there-
+fore training a product of three matrices.
+Hyper-
+Loader is similar to OP-LoRA, but shares param-
+eters between LoRA-generating MLPs, and is used
+to test the necessity of decoupling parameters.
+Re-
+sults Tab. 3 presents the results of our experiments,
+where both OP-LoRA and OP-DoRA consistently out-
+perform their non-overparameterized counterparts by
+1-4%.
+Moreover, OP-LoRA nearly matches LoRA-
+Pro and ScaledAdamW, but with lower training time
+(4h vs 56h for LoRA-Pro). Although ScaledAdamW
+and LoRA-Pro slightly outperform OP-LoRA on com-
+monsense reasoning, they substantially underperform
+on image generation (Section 4.1), and combining
+ScaledAdamW with OP-LoRA reaches the same per-
+formance with half the inference parameters due
+to lower rank. This enables substantially lower infer-
+ence storage and serving costs [43]. Interestingly, Hy-
+perLoader, which shares MLP parameters between lay-
+ers, performs very poorly, supporting our design choice
+to decouple parameters between LoRA adapters.
+Figure 4. Effect of MLP hidden layer size for OP-
+DoRA: Performance follows an inverted U-shape for VL-
+Bart. For Commonsense reasoning, size 1 is too little but
+otherwise the trend is flat.
+4.4. OP-LoRA Analysis
+Computational Costs: OP-LoRA introduces extra
+train-time parameters that are discarded at inference,
+so there’s no added deployment cost.
+On an H100
+HBM3 GPU finetuning LLaMA-7B for 3 epochs with
+rank = 32, standard LoRA uses 44 GB whereas OP-
+LoRA uses 69 GB, slowing training by only about 15%.
+By contrast, ScaledAdamW takes around 4.5 h, and
+LoRA-Pro’s heavier computations extend training to
+around 56 h.
+OP-LoRA is around 10% faster than
+ScaledAdamW and more than 10x faster than LoRA-
+Pro.
+Inference costs can also be decreased; one can
+achieve the same predictive performance with half the
+parameters (Table 3).
+Ablating MLP Width: We study how much to over-
+parameterize by varying MLP hidden layer size for OP-
+DoRA on VL-BART and Commonsense Reasoning. In
+Fig. 4 we see an inverted U-shape for VL-BART; too
+little width is insufficient but too much degrades per-
+formance. For commonsense benchmarks, size 1 is too
+small but otherwise the trend is flat.
+5. Conclusion
+We introduce OP-LoRA, an MLP-based reparameteri-
+zation of LoRA. By leveraging over-parameterization
+we accelerate training without additional inference
+overhead. Our experiments across diverse tasks demon-
+strate that OP-LoRA consistently improves perfor-
+mance over LoRA, with especially notable gains in im-
+age generation where OP-LoRA improves CMMD by
+up to 15 points. Crucially, the additional parameters
+are discarded after training, so OP-LoRA incurs zero
+extra cost at inference time and can even reduce infer-
+ence costs by matching standard LoRA performance
+at half the rank.
+We believe that train-time over-
+parameterization represents a promising paradigm in
+model training, and we hope that our work will inspire
+broader investigation into its applications.
+
+
+References
+[1] Sanjeev Arora, Nadav Cohen, and Elad Hazan. On the
+optimization of deep networks: Implicit acceleration
+by overparameterization. In International conference
+on machine learning, pages 244–253. PMLR, 2018. 3,
+4
+[2] Dan Biderman, Jacob Portes, Jose Javier Gonza-
+lez Ortiz, Mansheej Paul, Philip Greengard, Connor
+Jennings, Daniel King, Sam Havens, Vitaliy Chiley,
+Jonathan Frankle, Cody Blakeney, and John Patrick
+Cunningham. LoRA learns less and forgets less. Trans-
+actions on Machine Learning Research, 2024. Featured
+Certification. 1, 2, 3, 5
+[3] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin
+Choi, et al. Piqa: Reasoning about physical common-
+sense in natural language. In Proceedings of the AAAI
+conference on artificial intelligence, pages 7432–7439,
+2020. 7
+[4] Kerim B¨uy¨ukaky¨uz.
+Olora:
+Orthonormal low-rank
+adaptation of large language models. arXiv preprint
+arXiv:2406.01775, 2024. 2
+[5] Eole Cervenka.
+Naruto blip captions.
+https:
+//huggingface.co/datasets/lambdalabs/naruto-
+blip-captions/, 2022. 6, 8, 9, 10, 11, 12
+[6] Jaemin Cho, Jie Lei, Hao Tan, and Mohit Bansal. Uni-
+fying vision-and-language tasks via text generation. In
+International Conference on Machine Learning, pages
+1931–1942. PMLR, 2021. 1, 6, 18
+[7] Jaemin Cho, Jie Lei, Hao Tan, and Mohit Bansal. Uni-
+fying vision-and-language tasks via text generation. In
+Proceedings of the 38th International Conference on
+Machine Learning, pages 1931–1942. PMLR, 2021. 7
+[8] Christopher Clark, Kenton Lee, Ming-Wei Chang,
+Tom Kwiatkowski,
+Michael Collins,
+and Kristina
+Toutanova. Boolq: Exploring the surprising difficulty
+of natural yes/no questions. In Proceedings of the 2019
+Conference of the North American Chapter of the As-
+sociation for Computational Linguistics: Human Lan-
+guage Technologies, Volume 1 (Long and Short Pa-
+pers), pages 2924–2936, 2019. 7
+[9] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar
+Khot,
+Ashish Sabharwal,
+Carissa Schoenick,
+and
+Oyvind Tafjord. Think you have solved question an-
+swering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457, 2018. 7
+[10] Rudrajit
+Das,
+Naman
+Agarwal,
+Sujay
+Sanghavi,
+and Inderjit S Dhillon.
+Towards quantifying the
+preconditioning
+effect
+of
+adam.
+arXiv
+preprint
+arXiv:2402.07114, 2024. 2
+[11] Simon Du, Jason Lee, Haochuan Li, Liwei Wang, and
+Xiyu Zhai. Gradient descent finds global minima of
+deep neural networks. In International conference on
+machine learning, pages 1675–1685. PMLR, 2019. 3
+[12] Hugging Face and Huggan. Wikiart dataset. https:
+//huggingface.co/datasets/huggan/wikiart, 2023.
+Accessed: 2024-11-08. 6, 13, 14, 15, 16, 17
+[13] Yash Goyal,
+Tejas Khot,
+Douglas Summers-Stay,
+Dhruv Batra, and Devi Parikh. Making the v in vqa
+matter: Elevating the role of image understanding in
+visual question answering. In Proceedings of the IEEE
+conference on computer vision and pattern recognition,
+pages 6904–6913, 2017. 6, 7
+[14] Yuchao Gu, Xintao Wang, Jay Zhangjie Wu, Yujun
+Shi, Yunpeng Chen, Zihan Fan, Wuyou Xiao, Rui
+Zhao, Shuning Chang, Weijia Wu, et al. Mix-of-show:
+Decentralized low-rank adaptation for multi-concept
+customization of diffusion models. Advances in Neu-
+ral Information Processing Systems, 36:15890–15902,
+2023. 6, 8
+[15] David Ha, Andrew M. Dai, and Quoc V. Le. Hypernet-
+works. In International Conference on Learning Rep-
+resentations, 2017. 2, 3
+[16] Soufiane Hayou, Nikhil Ghosh, and Bin Yu. Lora+:
+Efficient low rank adaptation of large models. In Forty-
+first International Conference on Machine Learning,
+2024. 1
+[17] Edward J Hu, yelong shen, Phillip Wallis, Zeyuan
+Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen.
+LoRA: Low-rank adaptation of large
+language models.
+In International Conference on
+Learning Representations, 2022. 1, 6, 7, 8
+[18] Zhiqiang Hu, Lei Wang, Yihuai Lan, Wanyu Xu, Ee-
+Peng Lim, Lidong Bing, Xing Xu, Soujanya Poria,
+and Roy Lee.
+Llm-adapters: An adapter family for
+parameter-efficient fine-tuning of large language mod-
+els. In Proceedings of the 2023 conference on empirical
+methods in natural language processing, pages 5254–
+5276, 2023. 7
+[19] W. Ronny Huang, Zeyad Emam, Micah Goldblum,
+Liam Fowl, Justin K. Terry, Furong Huang, and Tom
+Goldstein. Understanding generalization through visu-
+alizations. In Proceedings on ”I Can’t Believe It’s Not
+Better!” at NeurIPS Workshops, pages 87–97. PMLR,
+2020. 3
+[20] Drew A Hudson and Christopher D Manning. Gqa: A
+new dataset for real-world visual reasoning and com-
+positional question answering. In Proceedings of the
+IEEE/CVF conference on computer vision and pattern
+recognition, pages 6700–6709, 2019. 6, 7
+[21] Minyoung Huh,
+Hossein Mobahi,
+Richard Zhang,
+Brian Cheung, Pulkit Agrawal, and Phillip Isola. The
+low-rank simplicity bias in deep networks.
+Transac-
+tions on Machine Learning Research, 2023. 2
+[22] Sadeep Jayasumana, Srikumar Ramalingam, Andreas
+Veit, Daniel Glasner, Ayan Chakrabarti, and Sanjiv
+Kumar. Rethinking fid: Towards a better evaluation
+metric for image generation.
+In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pat-
+tern Recognition, pages 9307–9315, 2024. 6
+[23] Diederik P. Kingma and Jimmy Ba. Adam: A method
+for stochastic optimization. In International Confer-
+ence on Learning Representations, 2015. 2
+[24] Dawid Jan Kopiczko, Tijmen Blankevoort, and Yuki M
+Asano. Vera: Vector-based random matrix adaptation.
+
+
+In The Twelfth International Conference on Learning
+Representations, 2024. 6
+[25] Jonathan Krause, Michael Stark, Jia Deng, and Li Fei-
+Fei. 3d object representations for fine-grained catego-
+rization. In Proceedings of the IEEE international con-
+ference on computer vision workshops, pages 554–561,
+2013. 6
+[26] Mike Lewis,
+Yinhan Liu,
+Naman Goyal,
+Marjan
+Ghazvininejad, Abdelrahman Mohamed, Omer Levy,
+Veselin Stoyanov, and Luke Zettlemoyer. BART: De-
+noising sequence-to-sequence pre-training for natural
+language generation, translation, and comprehension.
+In Proceedings of the 58th Annual Meeting of the As-
+sociation for Computational Linguistics, pages 7871–
+7880, Online, 2020. Association for Computational
+Linguistics. 7
+[27] Junnan Li, Dongxu Li, Caiming Xiong, and Steven
+Hoi. Blip: Bootstrapping language-image pre-training
+for unified vision-language understanding and genera-
+tion. In ICML, 2022. 6
+[28] Haotian
+Liu,
+Chunyuan
+Li,
+Qingyang
+Wu,
+and
+Yong Jae Lee. Visual instruction tuning. In NeurIPS,
+2023. 18
+[29] Shih-yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo
+Molchanov,
+Yu-Chiang Frank Wang,
+Kwang-Ting
+Cheng,
+and
+Min-Hung
+Chen.
+Dora:
+Weight-
+decomposed low-rank adaptation.
+In Forty-first In-
+ternational Conference on Machine Learning, 2024. 1,
+2, 6, 7, 8
+[30] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Man-
+dar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke
+Zettlemoyer, and Veselin Stoyanov.
+Roberta: A ro-
+bustly optimized bert pretraining approach.
+arXiv
+preprint arXiv:1907.11692, 2019. 6
+[31] Ilya Loshchilov and Frank Hutter. Decoupled weight
+decay regularization. In International Conference on
+Learning Representations, 2019. 2
+[32] Fanxu Meng, Zhaohui Wang, and Muhan Zhang.
+Pissa: Principal singular values and singular vectors
+adaptation of large language models. In Proceedings of
+the 38th Conference on Neural Information Processing
+Systems (NeurIPS), 2024. 1, 2, 6
+[33] Todor Mihaylov,
+Peter Clark,
+Tushar Khot,
+and
+Ashish Sabharwal. Can a suit of armor conduct elec-
+tricity? a new dataset for open book question answer-
+ing.
+In Proceedings of the 2018 Conference on Em-
+pirical Methods in Natural Language Processing, pages
+2381–2391, 2018. 8
+[34] Quynh Nguyen and Matthias Hein. The loss surface of
+deep and wide neural networks. In International con-
+ference on machine learning, pages 2603–2612. PMLR,
+2017. 3
+[35] Mahdi Nikdan, Soroush Tabesh, Elvir Crnˇcevi´c, and
+Dan Alistarh. RoSA: Accurate parameter-efficient fine-
+tuning via robust adaptation.
+In Proceedings of the
+41st International Conference on Machine Learning,
+pages 38187–38206. PMLR, 2024. 1, 2
+[36] Jesus-German Ortiz-Barajas, Helena Gomez-Adorno,
+and
+Thamar
+Solorio.
+Hyperloader:
+Integrating
+hypernetwork-based lora and adapter layers into multi-
+task transformers for sequence labelling.
+arXiv
+preprint arXiv:2407.01411, 2024. 2, 3, 7, 8
+[37] Dustin Podell, Zion English, Kyle Lacey, Andreas
+Blattmann, Tim Dockhorn, Jonas M¨uller, Joe Penna,
+and Robin Rombach. SDXL: Improving latent diffu-
+sion models for high-resolution image synthesis. In The
+Twelfth International Conference on Learning Repre-
+sentations, 2024. 6, 17
+[38] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sas-
+try, Amanda Askell, Pamela Mishkin, Jack Clark, et al.
+Learning transferable visual models from natural lan-
+guage supervision. In International conference on ma-
+chine learning, pages 8748–8763. PMLR, 2021. 6, 7
+[39] Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Yael
+Pritch,
+Michael
+Rubinstein,
+and
+Kfir
+Aberman.
+Dreambooth:
+Fine tuning text-to-image diffusion
+models for subject-driven generation. In Proceedings
+of the IEEE/CVF conference on computer vision and
+pattern recognition, pages 22500–22510, 2023. 6, 7
+[40] Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Wei Wei,
+Tingbo Hou, Yael Pritch, Neal Wadhwa, Michael Ru-
+binstein, and Kfir Aberman. Hyperdreambooth: Hy-
+pernetworks for fast personalization of text-to-image
+models. In Proceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pages
+6527–6536, 2024. 1, 2, 3
+[41] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhaga-
+vatula, and Yejin Choi. Winogrande: An adversarial
+winograd schema challenge at scale. Communications
+of the ACM, 64(9):99–106, 2021. 7
+[42] Maarten Sap, Hannah Rashkin, Derek Chen, Ronan
+Le Bras, and Yejin Choi. Social iqa: Commonsense
+reasoning about social interactions. In Proceedings of
+the 2019 Conference on Empirical Methods in Natural
+Language Processing and the 9th International Joint
+Conference on Natural Language Processing (EMNLP-
+IJCNLP), pages 4463–4473, 2019. 7
+[43] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper,
+Nicholas Lee, Shuo Yang, Christopher Chou, Banghua
+Zhu, Lianmin Zheng, Kurt Keutzer, et al.
+S-lora:
+Serving thousands of concurrent lora adapters. arXiv
+preprint arXiv:2311.03285, 2023. 8
+[44] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper,
+Nicholas Lee, Shuo Yang, Christopher Chou, Banghua
+Zhu, Lianmin Zheng, Kurt Keutzer, et al.
+S-lora:
+Serving thousands of concurrent lora adapters. arXiv
+preprint arXiv:2311.03285, 2023. 1, 2
+[45] Alane Suhr, Stephanie Zhou, Ally Zhang, Iris Zhang,
+Huajun Bai, and Yoav Artzi. A corpus for reasoning
+about natural language grounded in photographs. In
+Proceedings of the 57th Annual Meeting of the Associ-
+ation for Computational Linguistics, pages 6418–6428,
+2019. 6, 7
+
+
+[46] Hugo Touvron, Louis Martin, Kevin Stone, Peter
+Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+Bhosale, et al. Llama 2: Open foundation and fine-
+tuned chat models. arXiv preprint arXiv:2307.09288,
+2023. 6, 7, 18
+[47] Alex Wang, Amanpreet Singh, Julian Michael, Fe-
+lix Hill, Omer Levy, and Samuel Bowman. Glue: A
+multi-task benchmark and analysis platform for nat-
+ural language understanding.
+In Proceedings of the
+2018 EMNLP Workshop BlackboxNLP: Analyzing and
+Interpreting Neural Networks for NLP, pages 353–355,
+2018. 6
+[48] Shaowen Wang, Linxi Yu, and Jian Li. Lora-ga: Low-
+rank adaptation with gradient approximation. In The
+Thirty-eighth Annual Conference on Neural Informa-
+tion Processing Systems, 2024. 2, 6
+[49] Zhengbo Wang, Jian Liang, Ran He, Zilei Wang, and
+Tieniu Tan. LoRA-pro: Are low-rank adapters prop-
+erly optimized? In The Thirteenth International Con-
+ference on Learning Representations, 2025. 2, 6, 7, 8
+[50] Can Yaras, Peng Wang, Laura Balzano, and Qing
+Qu.
+Compressible dynamics in deep overparameter-
+ized low-rank learning & adaptation. In International
+Conference on Machine Learning, pages 56946–56965.
+PMLR, 2024. 2, 7, 8
+[51] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. Hellaswag: Can a machine
+really finish your sentence? In Proceedings of the 57th
+Annual Meeting of the Association for Computational
+Linguistics, pages 4791–4800, 2019. 7
+[52] Fangzhao Zhang and Mert Pilanci. Riemannian pre-
+conditioned lora for fine-tuning foundation models. In
+International Conference on Machine Learning, pages
+59641–59669. PMLR, 2024. 2, 4, 6, 7, 8
+[53] Qingru Zhang, Minshuo Chen, Alexander Bukharin,
+Pengcheng He, Yu Cheng, Weizhu Chen, and Tuo
+Zhao.
+Adaptive budget allocation for parameter-
+efficient fine-tuning.
+In The Eleventh International
+Conference on Learning Representations, 2023. 1, 2,
+7, 8
+[54] Yuhui Zhang, Alyssa Unell, Xiaohan Wang, Dhruba
+Ghosh, Yuchang Su, Ludwig Schmidt, and Serena
+Yeung-Levy.
+Why are visually-grounded language
+models bad at image classification?
+In The Thirty-
+eighth Annual Conference on Neural Information Pro-
+cessing Systems, 2024. 6
+
+
+OP-LoRA: The Blessing of Dimensionality with Overparameterized
+Low-Rank Adaptation
+Supplementary Material
+6. Theoretical Analysis
+6.1. Extension of overparmeterization analysis to
+MLP
+Although our analysis of the optimization benefits of
+OP-LoRA is carried out in the linear case (Section 3.2
+of the main paper), the same principles extend to
+deeper ReLU networks. We formalize this below.
+Lemma 6.1 (First-order expansion of ReLU activa-
+tions). Let h = ReLU(a) with a = W1z. For a pertur-
+bation ∆a, define the activation mask M = 1{W1z>0}.
+Then a first-order Taylor expansion gives
+hnew ≈h + M ⊙∆a.
+Lemma
+6.2 (Expansion of pre-activation pertur-
+bations). Let a = W1z.
+For small perturbations
+∆W1, ∆z,
+a + ∆a = (W1 + ∆W1)(z + ∆z).
+Expanding and subtracting a yields
+∆a = ∆W1z + W1∆z + ∆W1∆z.
+Lemma 6.3 (Form of gradient updates). With gradi-
+ents ∇h, ∇z, the updates take the form
+∆W1 = −η(∇h ⊙M)z⊤,
+∆z = −η∇z.
+Substituting into the expansion of ∆a and dropping sec-
+ond order terms gives
+∆a ≈−η((∇h ⊙M) z⊤z + W1 ∇z).
+Theorem 6.4 (Approximation of activation perturba-
+tions). Combining the previous results,
+∆h ≈−ηM ⊙
+
+(∇h ⊙M) z⊤z + W1 ∇z
+
+.
+Theorem 6.5 (Update rule in the ReLU case). Let v
+be the parameter vector defined as in the main paper.
+Then the update rule is
+v(t+1) = v(t) −η∥h(t)∥2∇v(t)
+−ηW (t)
+2
+
+M ⊙
+
+(W ⊤
+2 ∇v ⊙M) z⊤z + W1∇z
+
+.
+Corollary 6.6 (Comparison to the linear case). In the
+linear case (Section 3.2 of the main paper), the update
+reduces to
+v(t+1) = v(t) −η∥h(t)∥2∇v(t) −ηW (t)
+2 (W (t)⊤
+2
+∇v).
+Thus both cases share two key terms:
+• Trainable learning rate: −∥h(t)∥2∇v, unchanged
+from the linear case.
+• Adaptive line search: an update along the sub-
+space spanned by the current columns of W2.
+Remark 6.7 (Geometric interpretation in the ReLU
+case). The adaptive line search retains the same geo-
+metric role as in the linear case: shifting updates along
+the span of W2. However, the ReLU nonlinearity in-
+duces a composite over-parameterization: the values h
+themselves are generated through an extra layer with
+nonlinearity, and each column of W2 only contributes
+when its corresponding ReLU unit is active. This leads
+to more diverse update directions when different units
+activate across inputs or training steps.
+6.1.1. LoRA Hessian
+We begin with the LoRA reparameterization
+W = W0+BA,
+B ∈Rd×r, A ∈Rr×d, W0 ∈Rd×d.
+Let L(W) denote the loss, and let HW be the Hessian
+of L at W0, viewed as a linear operator mapping per-
+turbations in W to second–order variations of the loss.
+Lemma
+6.8 (Quadratic approximation). For any
+small perturbation ∆W, a second–order Taylor expan-
+sion gives
+L(W0 + ∆W) ≈L(W0) + ⟨∇W L, ∆W⟩
++ 1
+2⟨∆W, HW (∆W)⟩.
+Theorem 6.9 (Effective Hessian with respect to B).
+Fix A and consider variations in B. For a perturba-
+tion ∆B, we have ∆W = ∆BA. The corresponding
+effective curvature operator is
+HB(∆B) = HW (∆BA) A⊤.
+Proof. Substitute ∆W
+= ∆BA into the quadratic
+form:
+1
+2⟨∆W, HW ∆W⟩= 1
+2⟨∆BA, HW (∆BA)⟩
+= 1
+2⟨∆B, HW (∆BA) A⊤⟩,
+which establishes the claim.
+Corollary 6.10 (Operator and matrix forms of HB).
+In operator notation,
+HB = (· A⊤) ◦HW ◦(·A),
+
+
+where (·X) denotes right multiplication by X. In ma-
+trix form,
+HB = (A⊤⊗I)⊤HW (A⊤⊗I),
+I ∈Rd×d.
+Theorem 6.11 (Effective Hessian with respect to A).
+Fix B and consider variations in A. For a perturba-
+tion ∆A, we have ∆W = B∆A. The corresponding
+effective curvature operator is
+HA(∆A) = B⊤HW (B∆A).
+Proof. Substitute ∆W
+= B∆A into the quadratic
+form:
+1
+2⟨∆W, HW ∆W⟩= 1
+2⟨B∆A, HW (B∆A)⟩
+= 1
+2⟨∆A, B⊤HW (B∆A)⟩,
+which establishes the claim.
+Corollary 6.12 (Operator and matrix forms of HA).
+In operator notation,
+HA = B⊤◦HW ◦B.
+In matrix form,
+HA = (I ⊗B⊤) HW (I ⊗B),
+I ∈Rd×d.
+6.1.2. Condition number bounds
+In the main paper we state the following bound on the
+condition number of HA :
+κ(B)2
+κ(HW ) ≤κ(HA) ≤κ(HW ) κ(B)2,
+where κ(·) denotes the spectral condition number. We
+first prove a general bound for quadratic forms of the
+type S⊤HW S, then specialize to the LoRA case S =
+I ⊗B.
+Lemma 6.13 (Spectral bounds for S⊤HW S). Let
+HW ∈Rn×n be symmetric positive definite (SPD), and
+let S ∈Rn×m be full column rank. Denote by λmin(·)
+and λmax(·) the minimal and maximal eigenvalues, and
+by σmin(·) and σmax(·) the minimal and maximal sin-
+gular values. Define
+HS = S⊤HW S.
+Then
+λmin(HW ) σmin(S)2 ≤λmin(HS) ≤λmax(HW ) σmin(S)2,
+λmin(HW ) σmax(S)2 ≤λmax(HS) ≤λmax(HW ) σmax(S)2.
+Proof. For any nonzero x ∈Rm,
+x⊤HSx = x⊤S⊤HW Sx = (Sx)⊤HW (Sx).
+Since HW is SPD,
+λmin(HW ) ∥Sx∥2 ≤(Sx)⊤HW (Sx) ≤λmax(HW ) ∥Sx∥2.
+Using the singular value bounds σmin(S) ∥x∥≤∥Sx∥≤
+σmax(S) ∥x∥, we obtain, for all nonzero x,
+λmin(HW ) σmin(S)2 ∥x∥2 ≤x⊤HSx
+≤λmax(HW ) σmax(S)2 ∥x∥2.
+Taking the minimum over unit vectors x gives
+λmin(HW ) σmin(S)2 ≤λmin(HS)
+≤λmax(HW ) σmin(S)2,
+since ∥Sx∥≥σmin(S)∥x∥holds for all x.
+Taking the maximum over unit vectors x gives
+λmin(HW ) σmax(S)2 ≤λmax(HS)
+≤λmax(HW ) σmax(S)2,
+since ∥Sx∥≤σmax(S)∥x∥holds for all x. This estab-
+lishes the bounds.
+Corollary 6.14 (Condition number of S⊤HW S). Un-
+der the assumptions of Lemma 6.13,
+κ(S)2
+κ(HW ) ≤κ(HS) ≤κ(HW ) κ(S)2,
+where κ(HS)
+=
+λmax(HS)/λmin(HS) and κ(S)
+=
+σmax(S)/σmin(S).
+Proof. From Lemma 6.13, we have
+λmax(HS) ≤λmax(HW ) σmax(S)2,
+λmin(HS) ≥λmin(HW ) σmin(S)2.
+Therefore
+κ(HS) = λmax(HS)
+λmin(HS)
+≤λmax(HW ) σmax(S)2
+λmin(HW ) σmin(S)2
+= κ(HW ) κ(S)2.
+Similarly, Lemma 6.13 also gives
+λmax(HS) ≥λmin(HW ) σmax(S)2,
+λmin(HS) ≤λmax(HW ) σmin(S)2,
+
+
+so
+κ(HS) = λmax(HS)
+λmin(HS)
+≥λmin(HW ) σmax(S)2
+λmax(HW ) σmin(S)2
+= κ(S)2
+κ(HW ).
+This establishes the claimed bounds.
+We now specialize to the LoRA Hessians HA and
+HB.
+Theorem 6.15 (Condition number bounds for HA).
+Assume HW is SPD and B is full rank. Let HA be the
+effective Hessian with respect to A,
+HA = (I ⊗B⊤) HW (I ⊗B).
+Then
+κ(B)2
+κ(HW ) ≤κ(HA) ≤κ(HW ) κ(B)2.
+Proof. Set S = I ⊗B, so that HA = S⊤HW S. The sin-
+gular values of I ⊗B are exactly the singular values of
+B, repeated, so κ(S) = κ(B). Applying Corollary 6.14
+with this choice of S yields the stated bounds.
+Corollary 6.16 (Condition number bounds for HB).
+Assume HW is SPD and A is full rank. Let HB be the
+effective Hessian with respect to B,
+HB = (A⊤⊗I)⊤HW (A⊤⊗I).
+Then
+κ(A)2
+κ(HW ) ≤κ(HB) ≤κ(HW ) κ(A)2.
+Proof. Apply Corollary 6.14 with S = A⊤⊗I, using
+again that κ(A⊤⊗I) = κ(A).
+7. Additional Results
+7.1. Gradient Analysis LoRA and OP-LoRA
+Recall that in the main paper we show
+κ(B)2
+κ(HW ) ≤κ(HA) ≤κ(HW ) κ(B)2,
+where A and B are LoRA matrices, W are the base
+weights, κ(·) denotes the condition number, and H are
+the corresponding Hessians.
+Equation
+(7.1) implies
+that LoRA can exhibit worse Hessian conditioning than
+full finetuning.
+A high Hessian condition number indicates very high
+curvature in some directions relative to others. This
+matters because the step size must be small enough
+to avoid instabilities along the highest-curvature direc-
+tion; the maximal stable learning rate is then limited by
+that direction and may be too small to make progress
+in low-curvature directions.
+This becomes problem-
+atic when the highest-curvature direction has already
+been minimized, but the low-curvature directions still
+require larger learning rates.
+A useful diagnostic is the magnitude of the gradi-
+ent in the direction of the principal singular vector of
+the Hessian of the trainable parameters. Let v be that
+direction (estimated by power iteration) and g the gra-
+dient. If |v⊤g| is relatively large, the loss can still be re-
+duced even with a learning rate small enough to remain
+stable in the largest-curvature direction. Conversely, if
+|v⊤g| ≈0, a large condition number will prevent fur-
+ther decrease of the loss.
+Setup.
+We use the power-iteration method to es-
+timate v and then measure |v⊤g| for a small-scale
+Rotated-MNIST problem.
+Pre-training is performed
+on MNIST and continued training is on Rotated
+MNIST (as in Fig. 2 of the main paper). We report
+the terminal values for LoRA and OP-LoRA.
+Method
+|v⊤g|
+OP-LoRA
+0.42
+LoRA
+0.06
+Table 5. |v⊤g| at the end of training on Rotated MNIST.
+Higher is better (indicates remaining descent along the
+highest-curvature direction).
+Findings.
+OP-LoRA exhibits a much larger |v⊤g| in
+the direction of largest curvature than LoRA (Table 5).
+Empirically, this suggests OP-LoRA may be less sen-
+sitive to poor conditioning than LoRA, because it can
+continue to reduce the loss even when the step size is
+constrained by the highest-curvature direction. Thus,
+even if the OP-LoRA MLP were itself poorly condi-
+tioned, this sensitivity matters less than for LoRA.
+These observations are consistent with the view that
+OP-LoRA adaptively reshapes the LoRA loss land-
+scape via reparameterization, leading to better and
+faster optimization.
+7.2. A Matrix Factorization Case Study
+To verify that the gradient properties of MLP over-
+parameterization results in observable changes, we de-
+sign a controlled matrix factorization experiment com-
+
+
+(a) Loss Curve
+(b) Effective Rank
+(c) Gradient Consistency
+(d) Gradient Norm
+Figure 5. Matrix Factorization (MF) Gradient Analysis: (a) Loss Curve shows the reconstruction error for matrix
+factorization. OP-MF converges better and faster than standard MF. (b) Effective Rank of BA reveals changes in the rank
+of the learned solution. OP-MF learns an effective rank closer to that of the ground-truth SVD solution. (c) Gradient
+Consistency measures the similarity of gradients across iterations. OP-MF is able to make a sudden change in optimization
+direction, while standard MF cannot. (d) Gradient Norm illustrates the scale of gradients. OP-MF is able more quickly
+adjust optimization step size.
+paring MLP-generated low-rank matrices A and B with
+freely learned parameter matrices and measure conver-
+gence and gradients.
+Matrix factorization decomposes a target matrix
+M ∈Rm×n into two lower-dimensional matrices, A ∈
+Rr×n and B ∈Rm×r, where r is the latent dimension
+or rank. This decomposition allows us to approximate
+M by BA. It can be solved exactly with SVD, or as
+in our study, one can use gradient descent to minimize
+the reconstruction error:
+∥M −BA∥2
+F ,
+where ∥· ∥F denotes the Frobenius norm. This resem-
+bles LoRA-tuning, where the pre-trained base weights
+are set to all zeros and the target matrix M is the full
+finetuning gradient matrix, making it an interesting
+proxy problem to study.
+Experimental setup and training protocol: We
+construct a synthetic target matrix M ∈R100×100 with
+entries initialized uniformly at random from 0 to 1. The
+resulting matrix has a poor condition number, defined
+as the ratio between the largest singular value and low-
+est, making the optimization difficult and therefore a
+good test for MLP reparameterization. We train for
+1000 steps with SGD, with linear warmup for 50 steps
+and linear learning rate decay.
+OP-MF Model: The OP-MF model generates matri-
+ces A and B through two separate MLPs. We enforce
+both matrices to be of rank 8. Each MLP receives a
+learned input vector z ∈R128 and processes it through
+two fully connected layers with 32 hidden units and
+ReLU activations, outputting the entries for either A or
+B. The second layer is heavily overparameterized; the
+parameter count is number of hidden units in the MLP
+by the size of the parameter matrix A or B. To align
+with LoRA’s initialization strategy, the MLP for ma-
+trix B is initialized to output zeros, setting the model
+close to a pre-trained state.
+Matrix Factorization(MF) Model: We train a MF
+model with freely learnable matrices A and B, initial-
+ized with random values for A and zeros for B. Again,
+both matrices have rank 8.
+Finding 1: OP-MF rapidly adapts step size and
+direction. We examine the gradients, looking for evi-
+dence that OP-LoRA adaptively changes step size and
+direction. Our results reveal that as predicted, OP-MF
+shows an ability to rapidly adapt step sizes. This can
+be seen in Fig. 5 (d), where the gradient norm experi-
+ences a sharp spike, followed by a collapse, correspond-
+ing to acceleration and slow down in the loss curve in
+Fig. 5 (a). The sudden phase change in gradient norm
+also corresponds to a direction change in trajectory,
+measured by the cosine similarity between gradients at
+10-step intervals in in Fig. 5 (c). Therefore, MLP repa-
+rameterization rapidly changes step size and direction,
+as suggested by the mathematical analysis in Section 3
+of the main paper.
+Finding 2: OP-MF is more effective at reach-
+ing the SVD solution than standard MF trained
+with SGD. In Fig. 5(a), we study the loss curves for
+both the MF model and the OP-MF model. The plot
+tracks MSE loss over 1000 iterations. The red line rep-
+resents the SVD solution as a baseline. Interestingly,
+OP-MF solutions reach the best-case reconstruction er-
+ror achieved with SVD, while Standard-MF cannot.
+In addition to reconstruction error, another way to
+track progress towards a solution in matrix factoriza-
+tion is plotting the effective rank of the predicted ma-
+
+
+trix BA over the course of training. Effective rank ρ is
+defined as
+ρ = exp
+ 
+−
+r
+X
+i=1
+σi log σi
+!
+where σi represents the normalized singular values of
+BA, and r is the rank of the matrix. One would expect
+the effective rank to converge towards the effective rank
+of the ground-truth SVD solution for successful opti-
+mization runs.
+In Fig. 5 (b), we observe the behavior of effective
+rank across iterations for both MF and OP-MF. We
+find that OP-MF can approximate the effective rank
+of the best-case SVD solution much more closely than
+standard MF.
+Finding 3:
+OP-MF composes well with both
+SGD with Momentum and Adam. A natural ques-
+tion is if using standard acceleration methods like SGD
+with Momentum or Adam is enough. In Figure 6 we
+present experiments by adding Momentum to SGD and
+replacing it entirely with Adam, an optimizer that com-
+bines adaptive learning rates with momentum . Both
+Adam and SGD with Momentum improve reconstruc-
+tion error for MF, but neither reach the SVD solu-
+tion. Moreover, OP-MF composes with even best-case
+and advanced optimizers to find the SVD solution even
+faster, indicating their complimentary nature.
+7.3. DreamBooth Subject-Driven Generation
+We extend our image generation experiments to
+DreamBooth [39], finetuning SDXL and evaluating on
+the DreamBench benchmark, which consists of 30 di-
+verse subjects, 25 prompts per subject, and 4 gener-
+ations per prompt. We report CLIP-I (semantic sim-
+ilarity via CLIP embeddings), DINO (fine-grained vi-
+sual similarity via self-supervised features), and CLIP-
+T (text-image alignment).
+Metric
+OP-LoRA
+LoRA
+CLIP-I (subject fidelity)
+0.83
+0.82
+DINO (subject fidelity)
+0.69
+0.65
+CLIP-T (text alignment)
+0.24
+0.25
+Table 6. DreamBench results with SDXL. OP-LoRA im-
+proves subject fidelity (DINO) without sacrificing text
+alignment.
+OP-LoRA outperforms LoRA on fine-grained visual
+similarity (DINO: 0.69 vs 0.65), without sacrificing per-
+formance on more global CLIP semantic similarity and
+text-image alignment. Qualitatively, OP-LoRA better
+preserves subject details like color and patches (Fig. 7).
+7.4. LLaVA Image Classification
+Zhang et al. [54] recently demonstrated that by ap-
+plying simple finetuning to adapters, large multimodal
+models like LLaVA can achieve surprisingly high per-
+formance on a variety of classification tasks. We lever-
+age this finding, replacing full finetuning with LoRA
+and OP-LoRA.
+Datasets:
+We use the Stanford Cars [25] dataset,
+which is a fine-grained dataset of about 8000 training
+examples consisting of 196 classes of cars.
+finetuning and evaluation protocol:
+We follow
+[54], and convert image classification into a captioning
+task by using the format “⟨image⟩What type of object
+is in this photo? ⟨class name ⟩” and training with a
+language modeling objective. We finetune the visual
+projector layers of LLaVA1.5-7B for 50 epochs. We set
+MLP width to 768, since memory resources are not an
+issue for training only the adapter. At evaluation, we
+parse the generations and search for the correct class
+label.
+Results:
+We present the results in Tab. 7.
+OP-
+LoRA consistently outperforms LoRA at both rank
+levels, achieving 83.6% at rank 16 and 87.1% at
+rank 64, compared to 82.8% and 86.3% with LoRA.
+This result further reinforces the efficacy of MLP re-
+parameterization.
+Rank
+LoRA
+OP-LoRA
+16
+82.8
+83.6
+64
+86.3
+87.1
+Table 7. LLaVA1.5-7B Image Classification, Top-1 Accu-
+racy on Stanford Cars [25].
+7.5. Stability of OP-DoRA
+We found that OP-DoRA is more stable than DoRA, as
+shown with standard deviations across 3 runs. We hy-
+pothesize that this is a reflection of decreased learning
+rate sensitivity.
+Method
+Commonsense
+DoRA (r = 32)
+73.7 ± 6.7
+OP-DoRA (r = 32)
+77.5 ± 1.6
+7.6. VeRA and OP-VeRA
+We extend our method to VeRA [24], an ultra–low-
+parameter variant of LoRA, and evaluate on the
+GLUE[47] benchmark using a RoBERTa-base[30] back-
+bone following the setup in [24]. We report results on
+
+
+(a) SGD
+(b) Momentum
+(c) Adam
+Figure 6. Comparing Optimizers. MLP reparameterization accelerates matrix factorization, even with advanced opti-
+mizers.
+(a) LoRA
+(b) OP-LoRA
+(c) Reference subject
+Figure 7. DreamBench: OP-LoRA preserves subject iden-
+tity better, with more accurate color and patches. Prompt:
+A [V] backpack in jungle.
+SST-2, CoLA, and QNLI. We exclude MNLI due
+to computational constraints and therefore also ex-
+cludeMRPC/RTE/STS-B, which are commonly ini-
+tialized from MNLI to mitigate overfitting [17].
+SST-2
+CoLA
+QNLI
+Avg.
+VeRA
+94.0
+59.8
+91.7
+81.8
+OP-VeRA
+94.3
+62.1
+91.5
+82.6
+Table 8. GLUE dev results with RoBERTa-base.
+Averaged over the three tasks, OP-VeRA improves
+upon VeRA by 1.2 points, indicating the generality of
+the proposed optimization.
+7.7. Improving Mix-of-Show with OP-LoRA
+Following Zhang and Pilanci [52] directly, we apply
+Mix-of-Show to a small set of 14 training images of
+Harry Potter.
+We compare standard ScaledAdamW
+and OP-LoRA, keeping all training settings from
+Zhang and Pilanci [52]. In Figure 8, we generate im-
+ages from the learned ¡potter¿ tokens as a prompt. We
+see that OP-LoRA better captures the subject of Harry
+Potter; there are fewer image of two people (not present
+in the training set) and the shape of the face is more
+accurate. Moreover, OP-LoRA generates Harry Potter
+in causal clothing less frequently.
+7.8. Qualitative Stable Diffusion Results
+In the main paper, we show the large quantitative
+gains OP-LoRA/OP-DoRA give in the image gener-
+ation task (Table 1). We now present extensive ran-
+dom generations in Figures 9 though 26, with cap-
+tions from the dataset as input. Several general trends
+emerge.
+First, there is a strong color bias towards
+red, however OP-LoRA and OP-DoRA reduce this dra-
+matically. We attibute this improvement to the over-
+parameterization easing optimization.
+Second, over-
+parameterized LoRA is generates much more diverse
+and more complex scenes. Overall, qualitative results
+match the quantitative metrics.
+8. Training Details
+In this section, we summarize the training settings of
+our main experiments.
+Hardware: Most experiments were done with a single
+H100 80GB HB3 GPU.
+8.1. Initializing the OP-LoRA MLP
+In Section 3, we introduce the MLP used to predict low
+rank parameters as
+A
+B
+
+= W2(ReLU(W1z + c1)) + c2
+We initialize W1 as Kaiming uniform. We also ini-
+talize W2 as Kaiming uniform, except for parameters
+
+
+ScaledAdamW
+OP-LoRA
+Training Data
+Figure 8. OP-LoRA vs ScaledAdamW[52] with Mix-of-Show[14].
+Figure 9. GT Naruto[5] images
+predicting the upsampling matrix B, which are initial-
+ized to zero to make the initialization not change the
+pre-trained model behavior. All biases are initialized
+to 0.
+8.2. Training Hyperparameters
+In Tables 9 through 12 we show training hyperparame-
+ters for experiments. These include batch sizes, learn-
+ing rates, optimizer settings, and other configurations
+for each task. For the main results in the paper, we
+adopt hyperparameters tuned for the LoRA baselines
+and apply the same settings to OP-LoRA, without any
+additional tuning specific to OP-LoRA. Nevertheless,
+OP-LoRA consistently attains strong performance un-
+der these inherited hyperparameters, indicating that it
+is robust and effective even without additional hyper-
+parameter optimization.
+
+
+Figure 10. OP-LoRA Naruto[5] generated images.
+Figure 11. OP-DoRA Naruto[5] results
+
+
+Figure 12. DoRA Naruto[5] generated images
+Figure 13. LoRA Naruto[5] generated images
+
+
+Figure 14. PiSSA Naruto[5] generated images
+Figure 15. LoRA-GA Naruto[5] generated images
+
+
+Figure 16. LoRA-PRO Naruto[5] generated images
+Figure 17. ScaledAdamW Naruto[5] generated images
+
+
+Figure 18. GT Monet WikiArt[12] Images
+Figure 19. OP-LoRA Monet WikiArt[12] Generated Images
+
+
+Figure 20. OP-DoRA Monet WikiArt[12] Generated Images
+Figure 21. DoRA Monet WikiArt[12] Generated Images
+
+
+Figure 22. LoRA Monet WikiArt[12] Generated Images
+Figure 23. PiSSA Monet WikiArt[12] Generated Images
+
+
+Figure 24. LoRA-GA Monet WikiArt[12] Generated Images
+Figure 25. LoRA-Pro Monet WikiArt[12] Generated Images
+
+
+Figure 26. ScaledAdamW Monet WikiArt[12] Generated Images
+Hyperparameters
+All
+Base Model
+Stable Diffusion XL 1.0[37]
+Rank r
+4
+α
+4
+Dropout
+0.0
+Optimizer
+AdamW
+LR
+1e-4
+LR Scheduler
+Constant
+Batch size
+1
+Warmup Steps
+0
+Epochs
+2
+Where
+U-Net Q, K, V, Out
+MLP-Width(OP-LoRA/OP-DoRA)
+32
+Table 9. Training Details for Stable Diffusion Finetuning Experiments.
+
+
+Hyperparameters
+All
+Base Model
+VL-Bart[6]
+Rank r
+128
+α
+128
+Dropout
+0.0
+Optimizer
+AdamW
+LR
+1e-3
+LR Scheduler
+Linear
+Batch size
+300
+Warmup ratio
+0.1
+Epochs
+20
+Where
+Q,K (Bias Also Trained)
+MLP-Width(OP-LoRA/OP-DoRA)
+32(OP-LoRA)/4(OP-DoRA)
+Table 10. Training Details for VL-Bart Finetuning Experiments.
+Hyperparameters
+All
+Base Model
+LLaVA1.5-7B[28]
+Rank r
+64/16
+α
+128/32
+Dropout
+0.0
+Optimizer
+AdamW
+LR
+5e-5
+LR Scheduler
+Cosine
+Batch size
+64
+Warmup Ratio
+0 .03
+Epochs
+50
+Where
+Multimodal Projector
+MLP-Width(OP-LoRA/OP-DoRA)
+768
+Table 11. Training Details for LLaVA Classification Finetuning Experiments.
+Hyperparameters
+All
+Base Model
+LLaMA-7B[46]
+Rank r
+32
+α
+64
+Dropout
+0.05
+Optimizer
+AdamW
+LR
+1e-4
+LR Scheduler
+Linear
+Batch size
+16
+Warmup ratio
+0.03
+Epochs
+3
+Where
+Q,K, V, Up, Down
+MLP-Width(OP-LoRA/OP-DoRA)
+32
+Table 12. Training Details for CommonSense Finetuning Experiments.

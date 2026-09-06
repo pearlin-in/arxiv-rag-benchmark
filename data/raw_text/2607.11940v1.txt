@@ -1,0 +1,2024 @@
+1
+CARE-LoRA: Compressed Activation
+REconstruction for Memory-Efficient LoRA
+Gengyu Zhang, Haiyin Ran, Zhengbao He, Yuhang Liu, Hanling Tian, Zhehao Huang,
+and Xiaolin Huang, Senior Member, IEEE
+Abstract—As the scale of large pre-trained models continues to grow, fine-tuning them under limited memory budgets has become
+increasingly challenging. Low-Rank Adaptation (LoRA), currently one of the most widely adopted parameter-efficient fine-tuning
+(PEFT) methods, mitigates this challenge by optimizing only low-rank adaptation matrices, thereby greatly reducing the number of
+trainable parameters. With the parameter overhead substantially reduced, the activations retained for backpropagation have emerged
+as the primary remaining memory bottleneck during LoRA fine-tuning. To address this, we propose CARE-LoRA, a data-aware
+Compressed Activation REconstruction framework. By exploiting the inherent projection structure of LoRA, CARE-LoRA replaces the
+full input activation with the low-rank compressed activation naturally produced by the LoRA branch. It further computes a lightweight
+reconstruction matrix during the forward pass with negligible additional computation cost, which is used during backpropagation to
+reconstruct the gradient signal, thereby keeping LoRA matrices fully trainable. Extensive experiments across diverse models and
+downstream tasks demonstrate that, while substantially reducing the overall memory footprint, CARE-LoRA achieves competitive or
+even superior performance compared with standard LoRA and representative LoRA variants. Our code is publicly available at
+https://github.com/fishandyu/CARE-LoRA.
+Index Terms—Low-rank adaptation, parameter-efficient fine-tuning, activation compression, large language models.
+✦
+1
+INTRODUCTION
+P
+RETRAINING followed by downstream fine-tuning has
+become a standard recipe for building modern language
+systems. However, full-parameter fine-tuning remains diffi-
+cult under limited GPU memory, because it not only up-
+dates all pretrained weights, but also requires storing their
+gradients, optimizer states, and intermediate activations
+for backpropagation. Parameter-efficient fine-tuning (PEFT)
+mitigates the parameter bottleneck by restricting optimiza-
+tion to a small number of trainable parameters. In PEFT,
+Low-Rank Adaptation (LoRA) has become a deployment-
+friendly and widely used approach: it freezes the pretrained
+backbone, learns only low-rank weight updates, and can
+merge the learned adaptation into the base model without
+extra inference latency [1].
+In practice, although LoRA substantially reduces train-
+able parameters, their gradients, and optimizer states, it
+does not reduce the activation memory required by back-
+propagation, making activations a more prominent bottle-
+neck. This has motivated recent work on reducing the ac-
+tivations saved during LoRA-style fine-tuning. HyC-LoRA
+targets activations buffered for nonlinear operators in LoRA
+training and compresses them via outlier-aware low-bit
+quantization [2]. LoRAct instead reduces activation mem-
+ory by decomposing full activation matrices into compact
+low-rank factors [3]. Gradient checkpointing, a standard
+memory-saving technique, reduces activation memory by
+storing only a subset of intermediate activations and re-
+computing the rest during backpropagation [4]. While ef-
+The authors are with the Institute of Image Processing and Pattern Recog-
+nition, Shanghai Jiao Tong University, Shanghai 200240, China. E-mail:
+{zhang2021jiaoda, rhy2006, lstefanie, yuhangliu, hanlingtian, kinght h,
+xiaolinhuang}@sjtu.edu.cn.
+(Corresponding author: Xiaolin Huang.)
+fective, these methods mainly reduce activation memory
+through generic quantization, decomposition, or recompu-
+tation, rather than exploiting the structural properties of
+LoRA factors.
+A representative approach that exploits this factorized
+structure is LoRA-FA [5], which freezes A and only updates
+B, thereby replacing stored full activations with compressed
+low-rank activations. Although LoRA-FA largely reduces
+the activation memory, its performance is far from satisfac-
+tory. The reason is that when A is fixed, the weight change
+∆W = AB is restricted to the subspace determined by a
+random, non-trained initialization matrix. In other words,
+the adapter obtained by LoRA-FA can only learn how to
+map features from a fixed low-dimensional subspace, but
+the subspace itself cannot be adjusted as in standard LoRA.
+The challenge to overcome this limitation is that on the
+one hand we need to unfreeze A to pursue adaptability
+and on the other hand we have to avoid calculating the
+exact gradient of A to keep the memory efficiency. To
+achieve this goal, we propose a novel method to approx-
+imately reconstruct the backward information. We name
+this method CARE-LoRA, standing for the Compressed
+Activation REconstruction framework for memory-efficient
+low-rank adaptation. It stores the natural compressed ac-
+tivation Z = XA ∈RN×r together with a lightweight
+data-aware reconstruction matrix M ∈Rr×m, where r ≪
+min{m, N}. As a result, its memory overhead is marginally
+higher than LoRA-FA, while recovering much of the perfor-
+mance of standard LoRA by keeping A trainable.
+We evaluate CARE-LoRA across diverse fine-tuning set-
+tings, including natural language understanding, mathe-
+matical reasoning, code generation, instruction following,
+and image generation. Across these settings, our method
+arXiv:2607.11940v1  [cs.LG]  11 Jul 2026
+
+
+2
+Forward Pass
+Backward Passܻ
+ = ܹܺ
+ +ܺܤܣ
+ܩ=߲
+ℒ/߲ܻ
+࡮∈ℝ࢘×࢔
+࡭∈ℝ࢓×ܼ࢘
+=ܺܣ
+ࢄ∈ℝࡺ×࢓
+ܯ=ܼ
+ற߲ܺ
+ℒ߲
+ܤ=ܼ
+⊤ܩܺ
+෠=ܼܯ≈߲ܺ
+ℒ߲
+ܣ≈ܺ෠⊤ܤܩ⊤߲
+ℒ߲ܺ=ܩܹ
++ܤܣ⊤
+Pretrained
+Weights
+ࢃ∈ℝ࢓×࢔
+Frozen
+Saved
+Trainable
+࡮∈ℝ࢘×࢔
+࡭∈ℝ࢓×࢘
+Pretrained
+Weights
+ࢃ∈ℝ࢓×࢔
+Fig. 1. Overview of CARE-LoRA. CARE-LoRA stores the compressed activation Z and a lightweight reconstruction matrix M instead of the full
+activation X, enabling the gradient of A to be reconstructed while keeping both LoRA factors trainable.
+reduces total peak memory by up to roughly 20% relative to
+standard LoRA. At the same rank, it substantially improves
+over LoRA-FA, raising the average score by 4.3 points on
+GLUE [6] and 7.4 points on SuperGLUE [7] at less than 1%
+additional memory. Moreover, reducing memory consump-
+tion allows CARE-LoRA to use a higher rank for stronger
+performance. By increasing the rank, CARE-LoRA further
+surpasses LoRA and representative LoRA variants such as
+DoRA [8] and PiSSA [9]. Notably, CARE-LoRA achieves
+the highest average performance on the Mistral-7B-v0.3 [10]
+fine-tuning tasks while requiring only 1.02× the per-step
+training time of LoRA and still maintaining a lower memory
+footprint than LoRA.
+The main contributions of this work are as follows:
+•
+We revisit the memory bottleneck of LoRA fine-
+tuning and note that, once adapter-side parameters
+are sufficiently reduced, activation storage becomes
+the dominant remaining obstacle.
+•
+We propose CARE-LoRA, a data-aware framework
+that stores compressed activations and a lightweight
+reconstruction matrix, keeping both LoRA factors
+trainable under a near LoRA-FA memory budget. We
+further prove that its projection-down subspace can
+evolve during fine-tuning.
+•
+We show empirically that CARE-LoRA substantially
+outperforms LoRA-FA at the same rank. By rein-
+vesting the saved memory into a higher rank, it
+further surpasses standard LoRA and representative
+variants, achieving a favorable balance of memory
+efficiency, speed, and accuracy across multiple tasks.
+2
+RELATED WORK
+2.1
+Low-Rank Adaptation
+Low-Rank
+Adaptation
+(LoRA)
+is
+a
+widely
+adopted
+parameter-efficient fine-tuning method that freezes the pre-
+trained weight W and learns a low-rank update ∆W = AB,
+where the projection-down matrix A compresses the input
+activation X and the projection-up matrix B expands it
+back, adding no inference cost once merged [1]. Many vari-
+ants improve LoRA from complementary perspectives. On
+the parameter side, AdaLoRA adaptively allocates the rank
+budget across weight matrices [11], while VeRA and LoRA-
+XS reduce trainable parameters further through shared
+frozen random projections [12] or a small trainable core be-
+tween frozen SVD-derived factors [13]. On the optimization
+side, LoRA-GA and PiSSA enhance adapter initialization to
+speed up convergence [9], [14], and DoRA decomposes each
+weight into magnitude and direction [8]. QLoRA instead
+targets the frozen backbone, back-propagating through a
+4-bit quantized model to cut base-weight memory [15].
+Despite these advances, all of them still retain the full
+input activation for backpropagation, leaving the activation
+memory of fine-tuning unaddressed.
+2.2
+Memory-Efficient Fine-Tuning
+During fine-tuning, memory is consumed by the trainable
+parameters, their gradients, optimizer states, and the ac-
+tivations retained for backpropagation. Once parameter-
+efficient methods reduce the first three terms, activation
+becomes the dominant term and scales with batch size
+and sequence length [3]. General-purpose techniques tar-
+get different parts of this budget, recomputing activations
+on the backward pass [4], [16], projecting gradients and
+optimizer states into a low-rank subspace [17], or com-
+pressing stored activations through quantization or low-
+rank projection [18], [19], yet none of them is designed for
+LoRA fine-tuning. Closer to our setting, LoRAct compresses
+the cached activation with an online low-rank decompo-
+sition [3]. HyC-LoRA quantizes the activations buffered
+for nonlinear operators with an outlier-aware scheme [2].
+
+
+3
+Algorithm 1 CARE-LoRA
+Forward Pass
+Backward Pass
+Input: activation X ∈RN×m
+Storage: frozen weight W ∈Rm×n, trainable matrices
+A ∈Rm×r and B ∈Rr×n
+Output: Y ∈RN×n, matrices Z, M to be saved
+1: Z ←XA
+Prepare for backward reconstruction.
+2: M ←Z†X
+Z† implemented as (Z⊤Z + λI)−1Z⊤
+3: ∆Y ←ZB
+4: Y ←XW + ∆Y
+5: Save Z and M, discard X
+6: Continue forward propagation with Y
+Input: upstream gradient G = ∂L/∂Y
+Storage: compressed activation Z ∈RN×r, reconstruction
+matrix M ∈Rr×m
+Output: gradients e∇AL, ∇BL, ∇XL
+1: ∇XL ←G(W + AB)⊤
+2: ∇BL ←Z⊤G
+Exact gradient
+3: b
+X ←ZM
+Activation reconstruction
+4: e∇AL ←b
+X⊤GB⊤
+5: Update A and B with optimizer
+6: Continue backpropagation with ∇XL
+Although both reduce the activation stored during LoRA
+fine-tuning, they do not make good use of the factorized
+structure of LoRA. LoRA-FA instead exploits this, freezing
+the projection-down matrix and training only the projection-
+up matrix, so it does not need to store the full activation
+[5]. However, this restricts the projection-down subspace
+throughout fine-tuning and thus degrades performance. To
+address this limitation, we propose a method that uses
+the compressed activation naturally produced by LoRA to
+reconstruct the gradient for training. Our method not only
+preserves the memory savings of LoRA-FA but also retains
+the performance of standard LoRA, with only negligible
+computational overhead.
+3
+METHOD
+3.1
+Preliminaries
+Consider a linear layer with a frozen pretrained weight
+W
+∈Rm×n. Let X ∈RN×m be the input activation,
+where N denotes the number of tokens in the current batch,
+e.g., batch size times sequence length. LoRA introduces two
+trainable low-rank matrices A ∈Rm×r and B ∈Rr×n, with
+r ≪min(m, n, N), and the adapted linear transformation is
+Y = X(W + AB).
+(1)
+Following common practice, we omit the LoRA scaling
+factor s = α/r for simplicity, since it can be absorbed
+into the low-rank factors A and B without affecting the
+following derivation.
+Denote the upstream gradient by
+G = ∂L
+∂Y ∈RN×n.
+(2)
+The exact LoRA gradients are
+∇BL = A⊤X⊤G = (XA)⊤G,
+(3)
+∇AL = X⊤GB⊤,
+(4)
+∇XL = G(W + AB)⊤.
+(5)
+Eq. (3) shows that the gradient of B only requires an
+intermediate matrix
+Z = XA ∈RN×r.
+(6)
+Since Z is produced by the projection-down matrix A and
+reduces the activation dimension from m to r, it naturally
+serves as a compressed representation of the full activation
+X under the LoRA parameterization.
+In contrast, Eq. (4) shows that the gradient of A still
+depends on the full activation X ∈RN×m. Therefore,
+standard LoRA must retain X during the forward pass if
+both A and B are trainable. LoRA-FA avoids this activation
+dependency by freezing A and updating only B. In this case,
+the backward pass only needs to store Z = XA instead of
+the full activation X. However, the projection-down matrix
+A then remains fixed throughout fine-tuning. CARE-LoRA
+keeps the same compressed activation Z, but reconstructs
+the missing activation signal needed to update A.
+3.2
+Compressed Activation REconstruction
+CARE-LoRA aims to update both LoRA matrices while
+retaining the compressed activation Z instead of the full
+activation X. The key challenge is computing the gradi-
+ent of A. Since ∇AL = X⊤GB⊤, directly reconstructing
+this gradient from Z would require simultaneous access
+to the forward activation X and the backward gradient G,
+which is incompatible with our activation-saving setting. We
+therefore reconstruct X instead and use the reconstructed
+activation for subsequent gradient computation of A.
+Since Z = XA is already computed in the LoRA branch,
+we seek a linear reconstruction matrix
+M ∈Rr×m
+such that the reconstructed activation
+b
+X = ZM
+(7)
+approximates the original activation X. For a fixed batch
+activation X and current LoRA projection-down matrix A,
+we define M ⋆by the least-squares problem
+M ⋆= arg min
+M ∥X −XAM∥2
+F
+= arg min
+M ∥X −ZM∥2
+F .
+(8)
+When Z has full column rank, the closed-form solution is
+M ⋆= (Z⊤Z)−1Z⊤X = Z†X.
+(9)
+Thus, under the Frobenius reconstruction loss, CARE-LoRA
+uses the current batch itself to compute the best linear
+decoder from the compressed activation Z back to X.
+
+
+4
+In practice, directly inverting Z⊤Z is numerically unsta-
+ble, since Z could be rank-deficient or ill-conditioned. We
+therefore use a Tikhonov-regularized version [20]
+M ⋆
+λ = (Z⊤Z + λIr)−1Z⊤X,
+λ > 0.
+(10)
+The regularizer makes the reconstruction numerically stable
+and always well-defined, because Z⊤Z + λIr is positive
+definite for any λ > 0. In our implementation, λ is set to
+a very small value, serving only as a numerical safeguard
+with negligible effect on the least-squares reconstruction.
+For simplicity, we write M for M ⋆
+λ below.
+During the forward pass, CARE-LoRA follows standard
+LoRA, and the difference lies in what is kept for the back-
+ward pass. While X is still available during the forward
+computation, CARE-LoRA uses it once to compute the
+batch-dependent reconstruction matrix M as in Eq. (10),
+then saves only
+Z ∈RN×r
+and
+M ∈Rr×m
+for the LoRA backward pass, and discards the full activation
+X ∈RN×m. Therefore, the saved LoRA activation-related
+tensors scale as O(Nr + mr) instead of O(Nm). Since r ≪
+min(N, m), this is much smaller than storing X.
+During the backward pass, given the upstream gradient
+G = ∂L/∂Y , CARE-LoRA computes the gradient of B
+exactly using the stored matrix Z,
+∇BL = (XA)⊤G = Z⊤G,
+(11)
+which is identical to Eq. (3). The input gradient ∇XL is
+also unchanged from standard LoRA and is computed as in
+Eq. (5). Therefore, CARE-LoRA does not introduce any re-
+construction error into the gradient propagated to previous
+layers.
+The only approximated term is the gradient of A. Since
+Eq. (4) requires the discarded activation X, CARE-LoRA
+uses the reconstructed activation b
+X = ZM in its place:
+e∇AL = b
+X⊤GB⊤= M ⊤ Z⊤(GB⊤)
+.
+(12)
+In our implementation, we compute the last expression in
+Eq. (12) directly, without explicitly constructing the large
+matrix b
+X = ZM ∈RN×m. This avoids forming a full-size
+reconstructed activation and further reduces peak memory.
+Thus, CARE-LoRA reduces activation memory by stor-
+ing Z and M instead of the full activation X, while the only
+approximation introduced during training is the local gra-
+dient used to update A. The update of B and the inter-layer
+gradient propagation remain exact as in standard LoRA.
+Fig. 1 illustrates the forward and backward computation,
+and Algorithm 1 formalizes it in detail.
+3.3
+Adaptation of the Projection-Down Subspace
+The main limitation of LoRA-FA is not only that one of the
+two LoRA matrices is frozen, but that the update subspace
+induced by the projection-down matrix A remains fixed
+throughout fine-tuning. In a LoRA layer with ∆W = AB,
+every column of the low-rank update satisfies
+∆W:,j = AB:,j,
+(13)
+and therefore lies in Col(A). Consequently, once LoRA-
+FA freezes A, the initialization of A determines a fixed
+r-dimensional subspace in which all subsequent updates
+to W must reside, while training B can only adjust the
+coordinates of ∆W within this subspace.
+Since A ∈Rm×r with r ≪m, generically A has full
+column rank r, so its row space is already the entire Rr.
+Therefore, the expressive bottleneck lies in the column space
+Col(A), an r-dimensional subspace of the much larger input
+feature space Rm, determining which input directions are
+retained by the compressed activation Z = XA. To under-
+stand whether CARE-LoRA truly keeps the projection-down
+matrix adaptive, we analyze the evolution of Col(A) below.
+For the following analysis, we let
+U = GB⊤∈RN×r,
+ΣX = X⊤X ∈Rm×m.
+Here U is the upstream gradient after being propagated
+through B⊤, and ΣX is the unnormalized second-moment
+matrix of X, or equivalently the unnormalized batch covari-
+ance when the activations are centered.
+Using the regularized reconstruction matrix in Eq. (10),
+e∇AL in Eq. (12) can be written as
+e∇AL = M ⊤Z⊤GB⊤
+= X⊤Z(Z⊤Z + λIr)−1Z⊤U
+= X⊤XA(A⊤X⊤XA + λIr)−1A⊤X⊤U
+= ΣXAKλ,
+(14)
+where
+Kλ = (A⊤ΣXA + λIr)−1A⊤X⊤U ∈Rr×r.
+(15)
+Eq. (14) exposes the source of subspace adaptation. The
+factor ΣXA first maps the current projection directions
+through the second-moment matrix, while Kλ only forms
+linear combinations of the resulting r directions. Therefore,
+CARE-LoRA can introduce directions outside the current
+column space of A when ΣX maps the current subspace to
+directions not already contained in it, as long as the back-
+ward signal does not cancel these off-subspace components.
+To clearly state this intuition, we let S = Col(A) be the
+current projection-down subspace, and let
+PS ∈Rm×m
+and
+P ⊥
+S = Im −PS
+denote the orthogonal projectors onto S and its comple-
+ment, respectively. Then consider a gradient step on A using
+the reconstructed gradient with learning rate η > 0,
+A+ = A −η e∇AL = A −ηΣXAKλ,
+(16)
+where A+ denotes the updated projection-down matrix.
+Since P ⊥
+S A = 0, we have
+P ⊥
+S A+ = −ηP ⊥
+S ΣXAKλ.
+(17)
+Hence, if
+P ⊥
+S ΣXAKλ̸ = 0,
+(18)
+then A+ has at least one column with a nonzero component
+outside S. Therefore,
+Col(A+) ⊈Col(A),
+(19)
+which implies that the column space of A has changed.
+If A+ remains full column rank, then this change is a
+
+
+5
+movement of the learned r-dimensional projection-down
+subspace.
+The condition in Eq. (18) separates into a data-dependent
+part and a gradient-dependent part. The data-dependent
+part is
+P ⊥
+S ΣXA̸ = 0.
+(20)
+This condition fails if and only if
+Col(ΣXA) ⊆Col(A),
+(21)
+or equivalently, when Col(A) is an invariant subspace of
+ΣX. However, since ΣX = X⊤X is induced by the hetero-
+geneous input data, a randomly initialized r-dimensional
+subspace Col(A) will not in general be invariant under ΣX,
+except for some special cases such as ΣX = cIm.
+The gradient-dependent part concerns whether the right
+factor Kλ cancels the off-subspace component produced by
+ΣXA. Let
+D = P ⊥
+S ΣXA.
+(22)
+When the data-dependent condition holds, we have D̸ = 0.
+The outside component disappears only in the degenerate
+case
+DKλ = 0.
+(23)
+This requires Kλ to be rank-deficient. Otherwise, if Kλ were
+nonsingular, right multiplication by Kλ could not turn a
+nonzero matrix D into zero. Since
+Kλ = (A⊤ΣXA + λIr)−1Z⊤U,
+(24)
+where A⊤ΣXA+λIr is invertible for λ > 0, this can happen
+only when Z⊤U is rank-deficient.
+The rank deficiency of Z⊤U can arise in only three cases.
+First, Z is rank-deficient, i.e., rank(Z) < r. Second, U is
+rank-deficient, i.e., rank(U) < r. These two cases are already
+degenerate: both Z and U are matrices in RN×r, and in
+typical fine-tuning batches we have N ≫r, so they are
+expected to have full column rank under non-degenerate
+activations and backward signals.
+The remaining case is more subtle: both Z and U have
+rank r, but Z⊤U is still singular. This is a nongeneric event.
+In particular, if Z and U are viewed as generic full-column-
+rank matrices in RN×r, then
+Pr
+
+rank(Z⊤U) < r
+ rank(Z) = rank(U) = r
+
+= 0.
+(25)
+Combining the three cases above, under the generic non-
+degenerate setting, Z⊤U is not rank-deficient. Therefore,
+when the data-dependent condition D̸ = 0 holds, we
+generically have DKλ̸ = 0, so the gradient-dependent part
+retains an off-subspace component in the update of A.
+In summary, CARE-LoRA avoids the fixed-subspace lim-
+itation of LoRA-FA. The reconstructed gradient e∇AL =
+ΣXAKλ uses the input second-moment matrix to gener-
+ate data-dependent update directions for A. Under non-
+degenerate activations and backward signals, these direc-
+tions are not restricted to Col(A), allowing the projection-
+down subspace to evolve while keeping the memory benefit
+of avoiding storage of the full activation X.
+3.4
+Memory and Computation Costs
+We next analyze the memory and computation cost intro-
+duced by CARE-LoRA. The analysis focuses on the tensors
+and matrix multiplications specific to the LoRA branch of
+one adapted linear layer. Computation and storage shared
+by standard LoRA and CARE-LoRA, including the frozen-
+weight path of the adapted linear layer and intermediate
+tensors required by non-LoRA operations, are excluded
+from this local comparison.
+Memory Cost. For a LoRA layer with input activation
+X
+∈RN×m, projection-down matrix A ∈Rm×r, and
+projection-up matrix B ∈Rr×n, standard LoRA must retain
+the full activation X in order to compute ∇AL = X⊤GB⊤.
+Thus, the LoRA-side saved activation tensor scales as
+Mact
+LoRA = Nm.
+(26)
+CARE-LoRA keeps both A and B trainable. It saves the
+compressed activation Z ∈RN×r and the reconstruction
+matrix M ∈Rr×m, but discards the full activation X.
+Therefore,
+Mact
+CARE = Nr + rm = r(N + m).
+(27)
+The activation-memory ratio to standard LoRA is
+Mact
+CARE
+Mact
+LoRA
+= r(N + m)
+Nm
+.
+(28)
+Therefore, CARE-LoRA substantially reduces the LoRA-side
+activation storage when the rank r ≪min(m, N).
+As a concrete example, consider fine-tuning T5-Base on
+MNLI with sequence length 256 and batch size 32, so N =
+8192. For a typical hidden-size linear layer with m = 768
+and rank r = 8, the LoRA-side activation-memory ratio of
+CARE-LoRA to standard LoRA is
+8(8192 + 768)
+8192 × 768
+≈1.14%.
+Computation Cost. We count the LoRA-branch matrix-
+multiplication cost for one adapted linear layer up to con-
+stant factors, including both the forward and backward
+passes. In standard LoRA, the LoRA branch involves three
+multiplications with cost Nmr and three multiplications
+with cost Nrn, giving
+TLoRA = 3Nmr + 3Nrn = 3Nr(m + n).
+(29)
+The additional cost of CARE-LoRA mainly comes from
+solving the reconstruction matrix M and using it to compute
+the reconstructed A-gradient, giving
+Textra = 2Nr2 + 2mr2 + r3.
+(30)
+Thus,
+TCARE = TLoRA + Textra.
+(31)
+The computation cost ratio to standard LoRA is
+TCARE
+TLoRA
+= 1 + r(2N + 2m + r)
+3N(m + n)
+.
+(32)
+Since r
+≪min(m, n, N), the additional reconstruction
+terms do not change the dominant order of LoRA-branch
+matrix multiplications. Therefore, CARE-LoRA introduces
+only a small computation overhead compared with standard
+LoRA.
+
+
+6
+TABLE 1
+Results (%) and Memory Usage (MiB) on Fine-Tuning the T5-Base Model on a Subset of GLUE Datasets. Avg. Mem Denotes the Average Peak
+CUDA Memory Usage Across Different Tasks.
+Method
+MNLI
+QNLI
+SST-2
+CoLA
+MRPC
+Avg.
+Avg. Mem
+LoRA (r = 8)
+85.89±0.02
+93.10±0.08
+94.80±0.13
+60.39±2.07
+92.04±0.33
+85.24±0.48
+6310.66
+LoRAct (r = 8)
+85.85±0.14
+93.16±0.05
+94.92±0.52
+59.55±0.81
+92.22±0.32
+85.14±0.06
+5185.06
+LoRA-FA (r = 8)
+84.61±0.16
+92.76±0.12
+94.34±0.18
+46.08±1.28
+87.05±0.95
+80.97±0.40
+4988.06
+CARE-LoRA (r = 8)
+85.59±0.11
+93.19±0.13
+94.46±0.40
+60.46±1.66
+92.41±0.45
+85.22±0.29
+5019.37
+TABLE 2
+Results (%) and Memory Usage (MiB) on Fine-Tuning the T5-Base Model on a Subset of SuperGLUE Datasets. Avg. Mem Denotes the Average
+Peak CUDA Memory Usage Across Different Tasks.
+Method
+BoolQ
+CB
+COPA
+RTE
+WiC
+Avg.
+Avg. Mem
+LoRA (r = 8)
+81.01±0.51
+88.03±3.34
+70.00±3.00
+81.47±1.37
+68.55±0.09
+77.81±0.32
+7274.58
+LoRAct (r = 8)
+81.48±0.53
+87.44±1.79
+70.67±1.53
+80.63±0.75
+69.17±0.86
+77.88±0.60
+5964.20
+LoRA-FA (r = 8)
+79.14±0.18
+76.44±4.92
+58.00±2.00
+72.32±0.55
+68.13±0.59
+70.81±1.00
+5759.73
+CARE-LoRA (r = 8)
+81.00±0.68
+90.03±1.40
+70.00±1.00
+80.99±0.55
+68.86±0.36
+78.18±0.50
+5791.07
+For the same T5-Base setting, taking m = n = 768
+and r = 8 as an example, the additional LoRA-branch
+computation cost of CARE-LoRA over standard LoRA is
+8(2 × 8192 + 2 × 768 + 8)
+3 × 8192(768 + 768)
+≈0.38%.
+4
+EXPERIMENTS
+We evaluate CARE-LoRA on three categories of fine-tuning
+tasks. For natural language understanding (NLU), we fine-
+tune T5-Base [21] on GLUE [6] and SuperGLUE [7]. For
+natural language generation (NLG), we fine-tune Mistral-7B-
+v0.3 [10] for mathematical reasoning, code generation, and
+instruction following. For diffusion-based image generation, we
+fine-tune SD3-Medium [22] on DreamBooth [23]. Together,
+these tasks cover diverse domains, model architectures, and
+sequence lengths ranging from 256 to 2048 tokens, provid-
+ing a comprehensive assessment of CARE-LoRA across a
+broad range of fine-tuning scenarios.
+4.1
+Baselines
+We mainly compare the following methods:
+•
+LoRA [1] applies low-rank adaptation to all linear
+layers of the frozen backbone.
+•
+LoRAct [3] compresses cached activations via low-
+rank decomposition. We apply it only to LoRA layers
+to match CARE-LoRA under a comparable memory
+budget.
+•
+LoRA-FA [5] freezes A and updates only B to avoid
+storing full activations.
+•
+CARE-LoRA (ours) keeps both A and B trainable
+while avoiding storing full activations.
+For a fair comparison, all methods use the same
+backbone,
+training
+data,
+target
+modules,
+optimizer
+(AdamW [24]), learning rate, precision, batch size, and train-
+ing steps within each task, implemented in a unified PEFT-
+based codebase [25]. In the LLM fine-tuning experiments,
+we additionally report CARE-LoRA at r = 16, which is still
+more memory-efficient than LoRA and LoRAct at r = 8.
+The only method-specific hyperparameter is decomposition
+rank k of LoRAct, set to 64 for T5-Base and 128 for Mistral-
+7B-v0.3. All results are averaged over three common seeds
+(0, 21, 42) with standard deviation reported. The best result
+in each column is boldfaced and the second-best is under-
+lined. Additional analyses are presented later in this section.
+4.2
+Results on Natural Language Understanding
+Setting. We fine-tune T5-Base on five widely used tasks
+from each of GLUE (MNLI, QNLI, SST-2, CoLA, MRPC) and
+SuperGLUE (BoolQ, CB, COPA, RTE, WiC), following the
+original text-to-text formulation. We report each task’s stan-
+dard metric, accuracy for most tasks, Matthews correlation
+for CoLA, and F1 for MRPC and CB. Following the protocol
+described in Sec. 4.1, all methods use rank r = 8. Results are
+summarized in Tables 1 and 2.
+Results. At the same rank, CARE-LoRA achieves strong
+performance while keeping a memory footprint close to
+LoRA-FA. On GLUE, CARE-LoRA obtains an average score
+of 85.22, essentially matching standard LoRA at 85.24 and
+outperforming LoRA-FA by 4.25 points. On SuperGLUE,
+CARE-LoRA achieves the best average score of 78.18, im-
+proving over LoRA and LoRAct while surpassing LoRA-FA
+by 7.37 points. In terms of memory, CARE-LoRA reduces
+average peak memory by about 20% on both GLUE and
+SuperGLUE relative to LoRA, while requiring less than
+1% additional memory compared with LoRA-FA. These
+results show that the reconstructed update of A effectively
+mitigates the fixed-subspace limitation of LoRA-FA without
+giving up its activation-memory advantage.
+4.3
+Results on Large Language Models
+Setting. We evaluate CARE-LoRA on Mistral-7B-v0.3 across
+three tasks: mathematical reasoning, code generation, and
+instruction following. Each task focuses on a specific ca-
+pability and uses well-established datasets and metrics for
+training and evaluation, as detailed below:
+
+
+7
+TABLE 3
+Results (%) and Memory Usage (MiB) on Fine-Tuning the Mistral-7B-v0.3 Model on Three LLM Fine-Tuning Tasks. Avg. Mem Denotes the
+Average Peak CUDA Memory Usage Across Different Tasks.
+Method
+Math
+Code
+Instruct
+Overall
+GSM8K
+HumanEval
+Prompt-Strict
+Instruction-Strict
+Avg.
+Avg. Mem
+LoRA (r = 8)
+71.22±0.70
+42.89±2.54
+45.22±1.23
+55.64±0.42
+53.74±0.50
+29214.27
+PiSSA (r = 8)
+71.44±0.19
+41.46±2.44
+45.04±0.47
+55.92±0.70
+53.47±0.76
+29208.54
+DoRA (r = 8)
+70.99±0.46
+43.90±2.79
+46.03±0.92
+56.28±0.69
+54.30±1.13
+30701.65
+LoRAct (r = 8)
+70.91±0.43
+43.50±0.70
+44.24±1.05
+55.00±0.57
+53.41±0.51
+25185.51
+LoRA-FA (r = 8)
+67.65±0.57
+40.85±0.61
+39.49±2.03
+51.48±2.00
+49.87±0.76
+24214.74
+CARE-LoRA (r = 8)
+70.68±0.12
+42.68±2.20
+44.49±0.28
+54.64±0.14
+53.12±0.46
+24469.27
+CARE-LoRA (r = 16)
+71.82±0.23
+43.29±1.61
+46.27±0.77
+56.47±0.52
+54.47±0.20
+24948.65
+TABLE 4
+Results (%) and Memory Usage (MiB) on Fine-Tuning Diffusion Model SD3-Medium on DreamBooth, Averaged Over Ten Subjects and Three
+Seeds. Avg. Mem Denotes the Average Peak CUDA Memory Usage.
+Method
+DINO
+CLIP-I
+CLIP-T
+Avg.
+Avg. Mem
+LoRA (r = 8)
+43.18±0.11
+69.18±0.25
+28.01±0.05
+46.79±0.11
+9882.30
+CARE-LoRA (r = 16)
+43.40±0.15
+69.29±0.37
+28.00±0.11
+46.89±0.16
+8630.47
+•
+Mathematical
+reasoning.
+We
+fine-tune
+on
+a
+100k subset of MetaMathQA [26] with sequence
+length under 512 tokens and report accuracy on
+GSM8K [27].
+•
+Code generation. We fine-tune on a 100k subset of
+OpenCodeInstruct [28] with sequence length under
+1024 tokens and report pass@1 on HumanEval [29].
+•
+Instruction following. We fine-tune on a 50k subset
+of SmolTalk [30] with sequence length under 2048
+tokens and report prompt-level and instruction-level
+strict accuracy on IFEval [31].
+Here, we additionally compare against two widely used
+LoRA variants that target performance improvement rather
+than memory efficiency. DoRA [8] decomposes pretrained
+weights into magnitude and direction, and we use its
+memory-saving version in our experiments. PiSSA [9] ini-
+tializes the LoRA factors from the principal components
+of the pretrained weight via SVD. Since CARE-LoRA re-
+duces activation memory, the saved memory can be rein-
+vested into a higher rank. We therefore additionally evaluate
+CARE-LoRA at r = 16 as a performance-oriented setting for
+comparison with other baselines.
+Results. Table 3 reports results on Mistral-7B-v0.3. At
+r
+= 8, CARE-LoRA achieves competitive performance
+compared with standard LoRA while substantially reducing
+peak memory. At r = 16, CARE-LoRA achieves the highest
+overall average of 54.47 and leads all methods on GSM8K,
+Prompt-Strict, and Instruction-Strict, while also outperform-
+ing LoRA on HumanEval. DoRA achieves the second-best
+overall average, yet CARE-LoRA requires 18.7% less peak
+memory. LoRA-FA attains the lowest memory footprint by
+freezing A throughout fine-tuning, but CARE-LoRA uses
+only 3% more memory while improving the overall average
+by 4.6 points. Excluding LoRA-FA, CARE-LoRA at r = 16
+achieves the best accuracy while using less peak memory
+than every baseline.
+4.4
+Results on Diffusion Models
+Setting. We fine-tune SD3-Medium on DreamBooth per-
+sonalization. We select ten subjects fixed prior to training
+(dog, dog2, cat, backpack, bear plushie, can, candle, colorful
+sneaker, duck toy, and teapot), covering both live subjects
+and a diverse range of common object categories, so that
+conclusions are not tied to a single subject type. A separate
+adapter is trained per subject, and personalization quality is
+measured by DINO [32] and CLIP-I [33] for subject fidelity
+and CLIP-T for text alignment, averaged across subjects and
+seeds. Following the higher-rank setting studied above, we
+compare standard LoRA at r = 8 with CARE-LoRA at
+r = 16 to test whether the saved activation memory can also
+be used effectively in diffusion-transformer fine-tuning.
+Results. Table 4 shows that CARE-LoRA at r = 16
+achieves a higher overall average of 46.89, compared to
+46.79 for LoRA. Subject fidelity improves on both metrics,
+with DINO rising from 43.18 to 43.40 and CLIP-I from 69.18
+to 69.29, while CLIP-T remains essentially unchanged at
+28.00. At the same time, peak memory drops from 9882 to
+8630 MiB, a reduction of approximately 13%. These results
+confirm that the memory benefit of CARE-LoRA extends
+to the diffusion-transformer architecture without sacrificing
+personalization quality.
+4.5
+Memory Analysis
+Peak memory. Across all four benchmarks (Tables 1, 2, 3,
+and 4), CARE-LoRA consistently reduces peak memory rel-
+ative to standard LoRA. In the T5 experiments, CARE-LoRA
+at the same rank reduces the total peak memory by roughly
+20% relative to LoRA on both GLUE and SuperGLUE. In
+the larger Mistral-7B-v0.3 and SD3-Medium experiments,
+CARE-LoRA uses rank r = 16 and still requires less peak
+memory than standard LoRA at r = 8. Since model weights,
+LoRA parameters, and optimizer states are fixed across
+
+
+8
+TABLE 5
+Activation Memory (MiB) of LoRA Layers Under Different Batch Sizes When Fine-Tuning T5-Base on MNLI. Memory Ratio Is Computed as the
+Activation Memory of CARE-LoRA Divided by That of LoRA. Smaller Values Indicate Lower Activation Memory Cost.
+Batch Size
+8
+16
+32
+64
+128
+LoRA (r = 8)
+528.77
+1057.55
+2115.09
+4230.19
+8460.38
+CARE-LoRA (r = 16)
+24.61
+36.84
+61.31
+110.25
+208.13
+Memory Ratio
+4.65%
+3.48%
+2.90%
+2.61%
+2.46%
+TABLE 6
+Per-Step Training Time (Seconds) on Fine-Tuning Mistral-7B-v0.3, Averaged Over Three Seeds on Different Training Tasks. Time Ratio Is
+Computed as Each Method’s Average Per-Step Time Divided by That of LoRA.
+Method
+Math
+Code
+Instruct
+Avg. Time
+Time Ratio
+LoRA (r = 8)
+2.26
+4.66
+11.32
+6.08
+1.00×
+DoRA (r = 8)
+7.49
+15.29
+38.91
+20.56
+3.39×
+LoRAct (r = 8)
+3.25
+6.42
+15.48
+8.38
+1.38×
+LoRA-FA (r = 8)
+2.24
+4.32
+10.83
+5.80
+0.95×
+CARE-LoRA (r = 16)
+2.34
+4.74
+11.59
+6.22
+1.02×
+TABLE 7
+Comparison With Gradient Checkpointing Under a Similar Memory
+Budget When Fine-Tuning Mistral-7B-v0.3 on the Math Task. Per-Step
+Training Time (Seconds) and Peak CUDA Memory (MiB) Are Averaged
+Over Three Seeds.
+Method
+Time / Step
+Peak Mem
+LoRA + GC (r = 8)
+2.46
+25992.36
+CARE-LoRA (r = 16)
+2.34
+25272.29
+methods and occupy a substantial share of total memory,
+the actual reduction on the activation budget is considerably
+larger in proportion.
+Activation memory of LoRA layers. Table 5 further
+isolates the savings on the LoRA layers, reporting their ac-
+tivation memory when fine-tuning T5-Base on MNLI under
+varying batch sizes. CARE-LoRA reduces this memory to
+only 2.5% to 4.7% of LoRA’s. The ratio decreases as batch
+size grows, because the compressed activation Z ∈RN×r
+scales with N while the rank-r reconstruction matrix M
+remains fixed, so the per-sample overhead of CARE-LoRA
+diminishes relative to the full activation X ∈RN×m re-
+tained by LoRA at larger batch sizes.
+4.6
+Time Analysis
+Per-step training time. Table 6 compares the average per-
+step training time on Mistral-7B-v0.3, normalized by LoRA.
+We omit PiSSA, whose per-step computation matches LoRA
+once initialized. For CARE-LoRA, we report the costlier
+r = 16 configuration as a conservative case. DoRA combines
+per-step weight renormalization with backward-pass re-
+computation in its memory-saving implementation, making
+it 3.39× slower than LoRA despite its competitive accuracy.
+LoRAct performs an online low-rank decomposition of the
+cached activation, raising the per-step time to 1.38× that
+of LoRA. LoRA-FA is the fastest but least accurate baseline.
+CARE-LoRA at r = 16 requires only 1.02× the per-step time
+of LoRA at r = 8, nearly matching it. Combined with the
+accuracy and memory results above, these findings show
+that CARE-LoRA is the only method that is simultaneously
+memory-efficient, fast, and accurate, whereas each baseline
+sacrifices at least one of these three axes.
+Comparison with gradient checkpointing. Gradient
+checkpointing (GC) [4] is a standard approach to activation-
+memory reduction, trading compute for memory by recom-
+puting activations during the backward pass. To enable a
+direct comparison, we apply GC to the first 25% of Mistral-
+7B-v0.3’s decoder blocks, i.e., 8 of 32, during LoRA fine-
+tuning on the Math task, so that its memory budget roughly
+matches that of CARE-LoRA at r = 16. Since GC does
+not alter the optimization, LoRA+GC retains the accuracy
+of LoRA, so we focus on memory and time. As shown in
+Table 7, under a comparable memory budget, CARE-LoRA
+at r = 16 outperforms LoRA+GC in both per-step time (2.34
+vs. 2.46 s) and peak memory (25272 vs. 25992 MiB). The
+advantage is structural: GC saves memory by recomputing
+entire blocks, whereas CARE-LoRA exploits the inherent
+low-rank structure of LoRA, substantially reducing compute
+overhead at the same memory level.
+5
+CONCLUSION
+In this paper, we propose CARE-LoRA, a data-aware frame-
+work that replaces the full activation retained by standard
+LoRA with a compressed activation and a lightweight re-
+construction matrix, keeping both LoRA matrices trainable
+at a memory cost close to LoRA-FA. Building on this recon-
+struction, we proved that the projection-down subspace is
+not frozen: under non-degenerate activations and backward
+signals, it can evolve during training, unlike the fixed sub-
+space that LoRA-FA imposes. Extensive experiments across
+diverse tasks show that CARE-LoRA closes most of the
+accuracy gap LoRA-FA leaves relative to standard LoRA,
+and that reinvesting the saved memory into a higher rank
+lets it surpass standard LoRA and representative variants
+with only a negligible increase in training time, achieving a
+favorable balance of memory efficiency, speed, and accuracy.
+
+
+9
+REFERENCES
+[1]
+E. J. Hu et al., “LoRA: Low-rank adaptation of large language
+models,” in International Conference on Learning Representations,
+2022.
+[2]
+Y. Wang et al., “HyC-LoRA: Memory efficient LoRA fine-tuning
+with hybrid activation compression,” in Proceedings of Machine
+Learning and Systems, vol. 7, 2025.
+[3]
+J.-X. Shi, W.-D. Wei, J.-F. Qi, X. Chen, T. Wei, and Y.-F. Li, “Memory-
+efficient fine-tuning via low-rank activation compression,” arXiv
+preprint arXiv:2509.23472, 2025.
+[4]
+T. Chen, B. Xu, C. Zhang, and C. Guestrin, “Training deep nets
+with sublinear memory cost,” arXiv preprint arXiv:1604.06174,
+2016.
+[5]
+L. Zhang, L. Zhang, S. Shi, X. Chu, and B. Li, “LoRA-FA: Memory-
+efficient low-rank adaptation for large language models fine-
+tuning,” arXiv preprint arXiv:2308.03303, 2023.
+[6]
+A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, and S. R. Bowman,
+“GLUE: A multi-task benchmark and analysis platform for nat-
+ural language understanding,” in Proceedings of the 2018 EMNLP
+Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks
+for NLP.
+Brussels, Belgium: Association for Computational Lin-
+guistics, 2018, pp. 353–355.
+[7]
+A. Wang et al., “SuperGLUE: A stickier benchmark for general-
+purpose language understanding systems,” in Advances in Neural
+Information Processing Systems, vol. 32, 2019.
+[8]
+S.-Y. Liu et al., “DoRA: Weight-decomposed low-rank adaptation,”
+in International Conference on Machine Learning, ser. Proceedings of
+Machine Learning Research, vol. 235.
+PMLR, 2024, pp. 32 100–
+32 121.
+[9]
+F. Meng, Z. Wang, and M. Zhang, “PiSSA: Principal singular
+values and singular vectors adaptation of large language models,”
+in Advances in Neural Information Processing Systems, vol. 37, 2024,
+pp. 121 038–121 072.
+[10] A. Q. Jiang et al., “Mistral 7B,” arXiv preprint arXiv:2310.06825,
+2023.
+[11] Q. Zhang et al., “AdaLoRA: Adaptive budget allocation for
+parameter-efficient fine-tuning,” in International Conference on
+Learning Representations, 2023.
+[12] D. J. Kopiczko, T. Blankevoort, and Y. M. Asano, “VeRA: Vector-
+based random matrix adaptation,” in International Conference on
+Learning Representations, 2024.
+[13] K. Bałazy, M. Banaei, K. Aberer, and J. Tabor, “LoRA-XS: Low-
+rank adaptation with extremely small number of parameters,”
+in European Conference on Artificial Intelligence, ser. Frontiers in
+Artificial Intelligence and Applications, vol. 413.
+IOS Press, 2025,
+pp. 3194–3201.
+[14] S. Wang, L. Yu, and J. Li, “LoRA-GA: Low-rank adaptation with
+gradient approximation,” in Advances in Neural Information Process-
+ing Systems, vol. 37, 2024, pp. 54 905–54 931.
+[15] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer,
+“QLoRA: Efficient finetuning of quantized LLMs,” in Advances
+in Neural Information Processing Systems, vol. 36, 2023, pp. 10 088–
+10 115.
+[16] V. A. Korthikanti et al., “Reducing activation recomputation in
+large transformer models,” in Proceedings of Machine Learning and
+Systems, vol. 5, 2023, pp. 341–353.
+[17] J. Zhao, Z. Zhang, B. Chen, Z. Wang, A. Anandkumar, and Y. Tian,
+“GaLore: Memory-efficient LLM training by gradient low-rank
+projection,” in International Conference on Machine Learning, ser.
+Proceedings of Machine Learning Research, vol. 235. PMLR, 2024,
+pp. 61 121–61 143.
+[18] J. Chen et al., “ActNN: Reducing training memory footprint via 2-
+bit activation compressed training,” in International Conference on
+Machine Learning, ser. Proceedings of Machine Learning Research,
+vol. 139.
+PMLR, 2021, pp. 1803–1813.
+[19] Y. Shamshoum, N. Hodos, Y. Sieradzki, and A. Schuster, “Com-
+pAct: Compressed activations for memory-efficient LLM train-
+ing,” in Proceedings of the 2025 Conference of the Nations of the Amer-
+icas Chapter of the Association for Computational Linguistics: Human
+Language Technologies, Volume 1: Long Papers.
+Albuquerque, NM,
+USA: Association for Computational Linguistics, 2025, pp. 1511–
+1524.
+[20] A. N. Tikhonov, “On the regularization of ill-posed problems,”
+Doklady Akademii Nauk SSSR, vol. 153, no. 1, pp. 49–52, 1963.
+[21] C. Raffel et al., “Exploring the limits of transfer learning with
+a unified text-to-text transformer,” Journal of Machine Learning
+Research, vol. 21, no. 140, pp. 1–67, 2020.
+[22] P. Esser et al., “Scaling rectified flow transformers for high-
+resolution image synthesis,” in International Conference on Machine
+Learning, ser. Proceedings of Machine Learning Research, vol. 235.
+PMLR, 2024, pp. 12 606–12 633.
+[23] N. Ruiz, Y. Li, V. Jampani, Y. Pritch, M. Rubinstein, and K. Aber-
+man, “DreamBooth: Fine tuning text-to-image diffusion models
+for subject-driven generation,” in Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition, 2023, pp.
+22 500–22 510.
+[24] I. Loshchilov and F. Hutter, “Decoupled weight decay regulariza-
+tion,” in International Conference on Learning Representations, 2019.
+[25] S. Mangrulkar et al., “PEFT: State-of-the-art parameter-efficient
+fine-tuning methods,” GitHub repository, 2022, [Online]. Avail-
+able: https://github.com/huggingface/peft. Accessed: Jul. 7,
+2026.
+[26] L. Yu et al., “MetaMath: Bootstrap your own mathematical ques-
+tions for large language models,” in International Conference on
+Learning Representations, 2024.
+[27] K. Cobbe et al., “Training verifiers to solve math word problems,”
+arXiv preprint arXiv:2110.14168, 2021.
+[28] W. U. Ahmad et al., “OpenCodeInstruct: A large-scale instruction
+tuning dataset for code LLMs,” arXiv preprint arXiv:2504.04030,
+2025.
+[29] M. Chen et al., “Evaluating large language models trained on
+code,” arXiv preprint arXiv:2107.03374, 2021.
+[30] L. Ben Allal et al., “SmolLM2: When smol goes big—data-centric
+training of a fully open small language model,” in Conference on
+Language Modeling, 2025.
+[31] J. Zhou et al., “Instruction-following evaluation for large language
+models,” arXiv preprint arXiv:2311.07911, 2023.
+[32] M. Caron et al., “Emerging properties in self-supervised vision
+transformers,” in Proceedings of the IEEE/CVF International Confer-
+ence on Computer Vision, 2021, pp. 9650–9660.
+[33] A. Radford et al., “Learning transferable visual models from nat-
+ural language supervision,” in International Conference on Machine
+Learning, ser. Proceedings of Machine Learning Research, vol. 139.
+PMLR, 2021, pp. 8748–8763.
+[34] R. Vershynin, High-Dimensional Probability: An Introduction with
+Applications in Data Science, ser. Cambridge Series in Statistical
+and Probabilistic Mathematics.
+Cambridge, U.K.: Cambridge
+University Press, 2018.
+
+
+10
+APPENDIX A
+PROOFS FOR SUBSPACE ADAPTATION
+This appendix gives the detailed derivations for the sub-
+space adaptation analysis in Section III-C. We first recall,
+with explicit intermediate steps, how the reconstructed gra-
+dient of A yields a condition for the projection-down sub-
+space to change. We then give complete proofs of two claims
+that Section III-C states without proof, namely that the data-
+dependent part is nonzero except on a measure-zero set
+of initializations, and that the matrix Z⊤U governing the
+gradient-dependent part is generically nonsingular.
+A.1
+Gradient Form and the Movement Condition
+Recall that
+Z = XA,
+U = GB⊤,
+ΣX = X⊤X.
+CARE-LoRA stores the regularized reconstruction matrix
+M = (Z⊤Z + λIr)−1Z⊤X.
+(A1)
+The reconstructed gradient for A is
+e∇AL = M ⊤Z⊤U.
+(A2)
+Taking the transpose of M gives
+M ⊤= X⊤Z(Z⊤Z + λIr)−1.
+(A3)
+Therefore,
+e∇AL = X⊤Z(Z⊤Z + λIr)−1Z⊤U
+= X⊤XA(A⊤X⊤XA + λIr)−1A⊤X⊤U
+= ΣXA(A⊤ΣXA + λIr)−1A⊤X⊤U.
+(A4)
+Defining
+Kλ = (A⊤ΣXA + λIr)−1A⊤X⊤U
+(A5)
+yields
+e∇AL = ΣXAKλ.
+(A6)
+Because λ
+>
+0 and A⊤ΣXA is positive semidefinite,
+A⊤ΣXA + λIr is positive definite and therefore invertible.
+Thus, the regularized form is always well-defined.
+We now use this form to determine when a gradient step
+moves A outside its current column space. Let
+S = Col(A),
+P ⊥
+S = Im −PS.
+Since every column of A lies in S, we have
+P ⊥
+S A = 0.
+(A7)
+For a gradient step
+A+ = A −ηΣXAKλ,
+(A8)
+left-multiplying by P ⊥
+S gives
+P ⊥
+S A+ = P ⊥
+S A −ηP ⊥
+S ΣXAKλ
+= −ηP ⊥
+S ΣXAKλ.
+(A9)
+Therefore, if
+P ⊥
+S ΣXAKλ̸ = 0,
+(A10)
+then P ⊥
+S A+̸ = 0. Hence at least one column of A+ has a
+nonzero component in S⊥, which implies
+Col(A+) ⊈S = Col(A).
+(A11)
+If A+ has full column rank, then Col(A+) is again an
+r-dimensional subspace, and the learned projection-down
+subspace has changed. As stated in Section III-C, this condi-
+tion separates into a data-dependent part, P ⊥
+S ΣXA̸ = 0, and
+a gradient-dependent part concerning whether Kλ cancels
+it. The next two subsections prove that each part holds
+except on a measure-zero set of degenerate cases.
+A.2
+Invariance Analysis of the Data-Dependent Part
+Section III-C states that the data-dependent condition
+P ⊥
+S ΣXA̸ = 0 fails exactly when Col(A) is an invariant sub-
+space of ΣX, but does not prove this equivalence. We prove
+it here, and then justify why such an invariant subspace is
+nongeneric.
+We show that
+P ⊥
+S ΣXA = 0
+(A12)
+is equivalent to S = Col(A) being invariant under ΣX.
+First, if P ⊥
+S ΣXA = 0, then every column of ΣXA lies in
+S, so
+Col(ΣXA) ⊆S.
+(A13)
+For any vector s ∈S, there exists v ∈Rr such that s = Av.
+Then
+ΣXs = ΣXAv ∈Col(ΣXA) ⊆S.
+(A14)
+Thus ΣXS ⊆S, i.e., S is an invariant subspace of ΣX.
+Conversely, if ΣXS ⊆S, then each column of A belongs
+to S, and therefore each column of ΣXA also belongs to S.
+Hence
+P ⊥
+S ΣXA = 0.
+(A15)
+This proves
+P ⊥
+S ΣXA = 0
+⇐⇒
+ΣXS ⊆S.
+(A16)
+It remains to argue that a randomly initialized Col(A) is
+essentially never an invariant subspace of ΣX. For a fixed
+non-scalar symmetric matrix ΣX, a continuously sampled
+r-dimensional subspace is not an invariant subspace with
+probability one. Indeed, the invariant subspaces of a sym-
+metric matrix are constrained by its eigenspace decompo-
+sition. Every invariant subspace decomposes as a direct
+sum of subspaces drawn from the individual eigenspaces
+of ΣX, so an invariant r-dimensional subspace must align
+with this eigenstructure rather than sit in a generic position.
+Unless ΣX is proportional to the identity, this alignment
+requirement confines the invariant r-dimensional subspaces
+to a measure-zero subset of the Grassmannian of all r-
+dimensional subspaces, so a continuously distributed initial-
+ization of Col(A) avoids them almost surely. The isotropic
+case ΣX = cIm is the degenerate exception, since every
+subspace is invariant.
+
+
+11
+A.3
+Genericity of the Gradient-Dependent Part
+We now turn to the gradient-dependent part. Let
+D = P ⊥
+S ΣXA.
+(A17)
+Even when D̸ = 0, the outside-subspace component of the
+CARE-LoRA gradient is
+DKλ.
+Thus the outside component vanishes if and only if every
+column of Kλ lies in the null space of D
+DKλ = 0
+⇐⇒
+Col(Kλ) ⊆Null(D).
+(A18)
+This is a backward-signal degeneracy. Since
+Kλ = (A⊤ΣXA + λIr)−1A⊤X⊤U
+= (A⊤ΣXA + λIr)−1Z⊤U,
+(A19)
+and the first factor is invertible for λ > 0, this degeneracy is
+governed entirely by the rank of Z⊤U. Because an invertible
+factor preserves rank, Kλ is singular if and only if Z⊤U is.
+For example, if U = GB⊤= 0, then Z⊤U = 0, so Kλ = 0
+and no update to A is produced. This happens at the first
+optimization step under the common LoRA initialization
+B = 0.
+Section III-C asserts that, away from such special cases,
+Z⊤U is generically nonsingular, without proof. We prove
+this claim below.
+Lemma 1 (Generic nonsingularity of Z⊤U). Let N ≥r and
+let Z, U ∈RN×r. Suppose that the joint distribution of (Z, U)
+is absolutely continuous with respect to the Lebesgue measure on
+RN×r × RN×r. Then
+Pr
+
+rank(Z⊤U) < r
+
+= 0.
+(A20)
+In particular, since rank(Z) = r and rank(U) = r also hold
+with probability one, we have
+Pr
+
+rank(Z⊤U) < r
+ rank(Z) = rank(U) = r
+
+= 0. (A21)
+Proof. The condition rank(Z⊤U) < r is equivalent to
+det(Z⊤U) = 0.
+(A22)
+The function
+p(Z, U) = det(Z⊤U)
+(A23)
+is a polynomial in the entries of Z and U. This polynomial
+is not identically zero. For example, taking
+Z =
+Ir
+0
+
+,
+U =
+Ir
+0
+
+(A24)
+gives Z⊤U = Ir and hence p(Z, U) = 1. Therefore, the zero
+set {(Z, U) : p(Z, U) = 0} is a proper algebraic variety and
+has Lebesgue measure zero. Since (Z, U) has an absolutely
+continuous joint distribution, the probability of this event is
+zero.
+The same argument also implies that rank(Z) = r and
+rank(U) = r hold with probability one, because the van-
+ishing of all r × r minors is again a measure-zero algebraic
+condition. This proves the conditional statement.
+Together with Section A.2, this shows that, under the
+assumptions stated above, the set of initializations and back-
+ward signals for which P ⊥
+S ΣXAKλ = 0 has measure zero.
+Hence, the projection-down subspace generically evolves
+under CARE-LoRA.
+APPENDIX B
+DETAILED MEMORY ANALYSIS
+This appendix gives the detailed derivation for the memory
+analysis of the main paper. We analyze one adapted linear
+layer
+Y = X(W + AB),
+X ∈RN×m,
+A ∈Rm×r,
+B ∈Rr×n.
+The count below only includes tensors specific to the LoRA
+branch. The frozen backbone path XW and other model
+activations are shared by the compared methods.
+B.1
+Activation Memory
+Standard LoRA keeps A and B trainable. To compute
+∇AL = X⊤GB⊤,
+(B1)
+the full activation X ∈RN×m must be available in the
+backward pass. Following the dominant-term accounting
+used in the main text, the LoRA-side activation count is
+Mact
+LoRA = Nm.
+(B2)
+LoRA-FA freezes A and only updates B. Since it does
+not need ∇AL, it only saves
+Z = XA ∈RN×r,
+(B3)
+and therefore
+Mact
+LoRA-FA = Nr.
+(B4)
+CARE-LoRA saves Z and the batch-dependent recon-
+struction matrix M ∈Rr×m, giving
+Mact
+CARE = Nr + rm.
+(B5)
+It is smaller than the LoRA-side activation count whenever
+Nr + rm < Nm
+⇐⇒
+r <
+Nm
+N + m.
+(B6)
+For example, when N = 8192 and m = 768, the right-
+hand side is approximately 702.2, which is far larger than
+common LoRA ranks such as 8 or 16, so this condition is
+easily satisfied in typical fine-tuning settings.
+B.2
+Layer-Wise Numerical Examples
+For N = 8192, the activation counts for a single adapted
+layer are as follows.
+If LoRA is applied to all attention and feed-forward
+linear layers of a T5-Base-style encoder-decoder model, the
+same calculation can be aggregated over layers. With 12
+encoder blocks and 12 decoder blocks, an encoder block
+contains four attention projections and two feed-forward
+projections, while a decoder block contains self-attention,
+cross-attention, and two feed-forward projections. Using
+dmodel = 768 and dff = 3072, the sum of input dimensions
+over these adapted linear layers is
+X
+ℓ
+mℓ= 12(5 · 768 + 3072) + 12(9 · 768 + 3072)
+= 202,752,
+and the number of adapted linear layers is
+Ladapt = 12 · 6 + 12 · 10 = 192.
+
+
+12
+TABLE 8
+LoRA-Side Activation Storage for One Adapted Linear Layer. Counts Are Reported in Number of Scalar Values.
+Input dim. m
+Rank r
+LoRA Nm
+CARE r(N + m)
+CARE / LoRA
+768
+8
+6.29M
+71.7K
+1.14%
+768
+16
+6.29M
+143.4K
+2.28%
+3072
+8
+25.17M
+90.1K
+0.36%
+3072
+16
+25.17M
+180.2K
+0.72%
+For N = 8192, standard LoRA stores
+N
+X
+ℓ
+mℓ= 1660.9M
+LoRA-side activation values, independent of r under this
+dominant-term count. For r = 8, CARE-LoRA stores
+r
+ 
+NLadapt +
+X
+ℓ
+mℓ
+!
+= 14.20M
+values, about 0.86% of the standard LoRA count. Assuming
+two bytes per value in BF16 or FP16, this corresponds
+to roughly 3.09GiB versus 27.1MiB for these adapter-side
+activation buffers. For r = 16, the corresponding CARE-
+LoRA count is 28.41M values, or about 1.71% of standard
+LoRA.
+APPENDIX C
+DETAILED COMPUTATION ANALYSIS
+This appendix gives the detailed derivation for the compu-
+tation analysis of the main paper, using the same adapted
+linear layer as in Appendix B, with input activation X ∈
+RN×m, projection-down matrix A ∈Rm×r, and projection-
+up matrix B ∈Rr×n. As in Appendix B, the count below
+only includes matrix multiplications specific to the LoRA
+branch, excluding the shared frozen backbone path.
+C.1
+Computation Cost
+We count matrix multiplication costs up to constant factors,
+i.e., using multiply-accumulate order rather than distin-
+guishing a factor of two in FLOPs. The LoRA branch consists
+of the following operations.
+Standard LoRA. In the forward pass, standard LoRA
+computes
+Z = XA,
+∆Y = ZB,
+with costs Nmr and Nrn, respectively.
+In the backward pass, let G = ∂L/∂Y . Standard LoRA
+computes
+U = GB⊤∈RN×r,
+(C1)
+with cost Nrn, then
+∇AL = X⊤U
+(C2)
+with cost Nmr, and
+∇BL = Z⊤G
+(C3)
+with cost Nrn. The LoRA-side input-gradient contribution
+UA⊤
+(C4)
+has cost Nmr. Therefore,
+TLoRA = Nmr
+| {z }
+XA
++ Nrn
+|{z}
+ZB
++ Nrn
+|{z}
+GB⊤
++ Nmr
+| {z }
+X⊤U
++ Nrn
+|{z}
+Z⊤G
++ Nmr
+| {z }
+UA⊤
+,
+(C5)
+which gives
+TLoRA = 3Nmr + 3Nrn.
+(C6)
+CARE-LoRA. CARE-LoRA shares the same XA, ZB,
+GB⊤, Z⊤G, and UA⊤computations. The difference is how
+the A-gradient is obtained.
+In the forward pass, CARE-LoRA forms
+H = Z⊤Z + λIr,
+C = Z⊤X,
+and solves
+M = solve(H, C).
+(C7)
+The cost of forming H is Nr2. The cost of forming C is Nmr.
+This Nmr term replaces the Nmr term used by standard
+LoRA to compute X⊤U in the backward pass. Therefore,
+it is not an additional large-matrix term relative to standard
+LoRA. Since H is an r×r symmetric positive definite matrix
+for λ > 0, it can be factorized by Cholesky decomposition
+and solved against m right-hand sides. This contributes
+O(r3 + mr2).
+(C8)
+In the backward pass, CARE-LoRA computes
+T = Z⊤U
+(C9)
+with cost Nr2, and then
+e∇AL = M ⊤T
+(C10)
+with cost mr2. Therefore,
+TCARE = 3Nmr + 3Nrn + 2Nr2 + 2mr2 + r3.
+(C11)
+The ratio between CARE-LoRA and standard LoRA is
+TCARE
+TLoRA
+= 3Nmr + 3Nrn + 2Nr2 + 2mr2 + r3
+3Nmr + 3Nrn
+= 1 + 2Nr2 + 2mr2 + r3
+3Nr(m + n)
+= 1 + r(2N + 2m + r)
+3N(m + n)
+.
+(C12)
+Thus the extra arithmetic scales with r relative to the
+large feature dimensions. For common settings with r ≪
+min(m, n, N), the additional algebraic cost is small.
+
+
+13
+C.2
+Numerical Cost Ratios
+For a hidden-to-hidden layer with N = 8192, m = n = 768,
+and r = 8,
+TLoRA = 3 · 8192 · 768 · 8 + 3 · 8192 · 8 · 768 = 301.99M,
+and the reconstruction overhead is
+2 · 8192 · 82 + 2 · 768 · 82 + 83 = 1.147M.
+Therefore,
+TCARE
+TLoRA
+≈1.0038.
+For r = 16, the ratio becomes approximately 1.0076.
+For a feed-forward down-projection input with m =
+3072, n = 768, and r = 8, the same formula gives
+TCARE
+TLoRA
+≈1.0019.
+For r = 16, the ratio is approximately 1.0038. These ratios
+should be understood as algebraic operation counts. Actual
+wall-clock time also depends on kernel fusion, memory
+access patterns, and the efficiency of the small Cholesky
+solve.
+APPENDIX D
+DIRECTIONAL FIDELITY OF THE RECONSTRUCTED
+GRADIENT
+Global
+Cosine
+Similarity.
+CARE-LoRA
+updates
+the
+projection-down matrix with the reconstructed gradient
+e∇AL =
+b
+X⊤GB⊤in place of the exact gradient ∇AL =
+X⊤GB⊤. We quantify the fidelity of this approximation via
+the global cosine similarity between the exact and recon-
+structed A-gradients across all L adapted layers:
+Cglobal =
+⟨gall, egall⟩
+∥gall∥2 ∥egall∥2
+,
+(D1)
+where gall =
+ vec(∇A1L)⊤, . . . , vec(∇ALL)⊤⊤and egall is
+defined analogously. By construction Cglobal ∈[−1, 1], with
+Cglobal = 1 indicating perfect directional alignment between
+the two gradients. In practice, gall need not be explicitly
+constructed because the inner product and squared norms
+can be computed and accumulated layer by layer. We focus
+on direction rather than magnitude because differences in
+magnitude can be absorbed by the learning rate and further
+attenuated by AdamW’s per-coordinate rescaling.
+Setting. We measure Cglobal along a standard CARE-
+LoRA fine-tuning run of Mistral-7B-v0.3 on the Math task
+with r = 16 and seed 0. The trajectory is driven entirely by
+the reconstructed gradient, and at diagnostic checkpoints
+we temporarily retain X to compute the exact ∇AL for
+measurement only. These checkpoints are placed evenly at
+5%, 10%, . . . , 100% of the optimizer steps. The 0% point is
+excluded because the default initialization B = 0 forces both
+gradients to vanish and leaves the cosine undefined.
+Results. Figure 2 plots Cglobal along the training tra-
+jectory. Cglobal stays consistently above 0.6 from the first
+valid checkpoint to the last, with no visible degradation
+across training. The reconstructed A-gradient therefore re-
+tains strong directional agreement with the exact ∇AL
+0
+20
+40
+60
+80
+100
+Training Progress (%)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Global Cosine Similarity
+Perfect alignment (cos = 1)
+Observed lower bound  (cos = 0.6)
+Fig. 2. Global cosine similarity between the exact and reconstructed A-
+gradients of CARE-LoRA along the training trajectory on the Math task.
+The dashed line at 1.0 marks perfect alignment.
+throughout fine-tuning, justifying its use as the surrogate
+update direction in CARE-LoRA.
+Geometric interpretation. The observed cosine must
+be read against the geometry of the ambient space. The
+concatenated A-gradient vector in Eq. (D1) lives in Rd
+with d = r P
+ℓmℓ, where mℓis the input width of the
+ℓ-th adapted layer. For Mistral-7B-v0.3 with r = 16 and
+L = 224 adapted linear layers, P
+ℓmℓ= 1,245,184, giving
+d ≈1.99 × 107. In a space of this dimension, two directions
+chosen without relation to each other are almost exactly
+orthogonal, as the following lemma makes precise.
+Lemma 2 (Near-orthogonality in high dimension [34]). Let
+u, v be independent and uniformly distributed on the unit sphere
+Sd−1 ⊂Rd. Then E⟨u, v⟩= 0, Var⟨u, v⟩= 1/d, and for every
+ε ∈(0, 1),
+Pr
+ |⟨u, v⟩| ≥ε
+ ≤2 exp
+
+−dε2
+2
+
+.
+(D2)
+Instantiated here, Lemma 2 implies that, under the
+random-direction null model, an uninformative reconstruc-
+tion would produce a cosine of typical magnitude 1/
+√
+d ≈
+2.2 × 10−4, and that the probability of reaching even 0.6
+by chance is at most 2 exp(−3.6 × 106), effectively zero.
+This provides supporting evidence that the reconstructed
+gradient retains meaningful directional alignment with the
+exact A-gradient. We further note that 0.6 is an empirical
+lower bound across our diagnostic checkpoints rather than a
+typical value, so the observed directional alignment over the
+bulk of training is generally stronger than this conservative
+reading suggests.
+APPENDIX E
+DETAILED EXPERIMENTAL CONFIGURATIONS
+This appendix reports the key hyperparameters, evaluation
+protocols, and hardware used for the three experimental
+settings in Section IV, covering T5-Base fine-tuning on GLUE
+and SuperGLUE, Mistral-7B-v0.3 fine-tuning on mathemat-
+ical reasoning, code generation, and instruction following,
+and SD3-Medium fine-tuning on DreamBooth personaliza-
+tion.
+
+
+14
+TABLE 9
+Hyperparameter Configuration for Fine-Tuning T5-Base on the GLUE
+Datasets.
+Hyperparameter
+Value
+Learning Rate
+5 × 10−4
+Batch Size
+32
+Epochs (MNLI, QNLI)
+1
+Epochs (others)
+10
+Max Sequence Length
+256
+LoRA Rank r
+8
+LoRA Alpha α
+16
+Target Modules
+All linear layers
+LR Scheduler
+Cosine
+Warmup Ratio
+0.03
+Seed
+0, 21, 42
+Evaluation Metric (CoLA)
+Matthews Corr.
+Evaluation Metric (MRPC)
+F1
+Evaluation Metric (others)
+Accuracy
+TABLE 10
+Hyperparameter Configuration for Fine-Tuning T5-Base on the
+SuperGLUE Datasets.
+Hyperparameter
+Value
+Learning Rate
+5 × 10−4
+Batch Size
+32
+Epochs (BoolQ)
+20
+Epochs (CB, COPA)
+50
+Epochs (RTE, WiC)
+10
+Max Sequence Length
+256
+LoRA Rank r
+8
+LoRA Alpha α
+16
+Target Modules
+All linear layers
+LR Scheduler
+Cosine
+Warmup Ratio
+0.03
+Seed
+0, 21, 42
+Evaluation Metric (CB)
+F1
+Evaluation Metric (others)
+Accuracy
+Unless otherwise noted, all methods across the three
+settings use the standard LoRA initialization, with A drawn
+from a Kaiming uniform distribution and B set to zero, the
+default and most widely used initialization for LoRA-based
+fine-tuning. The exception is PiSSA, which instead uses the
+SVD-based initialization already described in Section IV-C.
+For CARE-LoRA, we use a fixed diagonal offset λ =
+10−6 in all experiments when solving (Z⊤Z + λIr)M =
+Z⊤X. This value is used for numerical stability and is not
+tuned across tasks.
+E.1
+Experiments on Natural Language Understanding
+Table 9 and Table 10 list the hyperparameters used for fine-
+tuning T5-Base on GLUE and SuperGLUE, corresponding
+to the same-rank results in Section IV-B. All compared
+methods use rank r = 8 with α = 16.
+The number of training epochs varies by task, as shown
+in Table 9 and Table 10. We evaluate on the validation set
+after every epoch and report the best-epoch result for each
+task.
+TABLE 11
+Hyperparameter Configuration for Fine-Tuning Mistral-7B-v0.3 on
+Mathematical Reasoning, Code Generation, and Instruction Following.
+Hyperparameter
+Value
+Learning Rate (Math, Instruct)
+5 × 10−5
+Learning Rate (Code)
+1 × 10−4
+Batch Size
+32
+Micro-Batch Size (Math)
+4
+Micro-Batch Size (Code)
+2
+Micro-Batch Size (Instruct)
+1
+Epochs
+1
+Max Sequence Length (Math)
+512
+Max Sequence Length (Code)
+1024
+Max Sequence Length (Instruct)
+2048
+LoRA Rank r
+8 (main), 16 (CARE-LoRA)
+LoRA Alpha α
+16 (main), 32 (CARE-LoRA)
+Target Modules
+All linear layers
+LR Scheduler
+Cosine
+Warmup Ratio
+0.03
+Seed
+0, 21, 42
+Evaluation Metric (Math)
+Accuracy
+Evaluation Metric (Code)
+Pass@1
+Evaluation Metric (Instruct)
+Prompt/Instruction-Strict
+TABLE 12
+Training and Generation Configuration for Fine-Tuning SD3-Medium on
+DreamBooth Personalization.
+Hyperparameter
+Value
+Resolution
+512 × 512
+Batch Size
+4
+Training Steps
+500 per subject
+Learning Rate
+2 × 10−4
+LR Scheduler
+Constant
+Warmup Steps
+0
+LoRA Rank r
+8 (LoRA), 16 (CARE-LoRA)
+LoRA Alpha α
+16 (LoRA), 32 (CARE-LoRA)
+Target Modules
+SD3 attention projections
+Seed
+0, 21, 42
+Inference Steps
+28
+Guidance Scale
+7.0
+Images per Prompt
+4
+Generation Seed
+42
+Evaluation Metrics
+DINO, CLIP-I, CLIP-T
+All experiments in this subsection are conducted on a
+single NVIDIA GeForce RTX 2080 Ti 11GB.
+E.2
+Experiments on Large Language Models
+Table 11 lists the hyperparameters used for fine-tuning
+Mistral-7B-v0.3 on mathematical reasoning, code genera-
+tion, and instruction following, corresponding to the results
+in Section IV-C. The main comparison uses rank r = 8 with
+α = 16 for all methods, and CARE-LoRA is additionally
+evaluated at r = 16 with α = 32 to study whether the
+saved activation memory can be reinvested into stronger
+performance, keeping α/r = 2 fixed.
+All experiments in this subsection are conducted on a
+single NVIDIA GeForce RTX 5090 32GB.
+
+
+15
+E.3
+Experiments on Diffusion Models
+Table 12 lists the training and generation configuration used
+for fine-tuning SD3-Medium on DreamBooth personaliza-
+tion, corresponding to the results in Section IV-D. Each of
+the ten subjects is trained independently under this config-
+uration for both standard LoRA and CARE-LoRA.
+All experiments in this subsection are conducted on a
+single NVIDIA GeForce RTX 4090 24GB.
+APPENDIX F
+BROADER IMPACTS AND LIMITATIONS
+Broader Impacts. CARE-LoRA reduces the activation mem-
+ory required for LoRA fine-tuning while keeping both LoRA
+matrices trainable, lowering the hardware cost of adapting
+large pretrained models to new tasks. This can make fine-
+tuning large language and diffusion models more accessible
+to research groups and practitioners with limited compu-
+tational resources. As with other efficiency improvements
+for model fine-tuning, easier access to adaptation could
+also lower the barrier for misuse, and we encourage use
+of CARE-LoRA consistent with the license and usage terms
+of the underlying pretrained models.
+Limitations. While CARE-LoRA is effective across the
+settings studied in this paper, several directions remain
+open. (i) Although the experiments in this paper cover T5-
+Base, Mistral-7B-v0.3, and SD3-Medium, evaluating larger
+backbones and additional modalities remains to be ex-
+plored. (ii) The subspace-movement guarantee proved in
+this paper holds generically. This is a common form of
+guarantee in this line of analysis, though it does not cover
+atypical worst-case configurations. (iii) The reconstruction is
+developed for linear layers adapted by LoRA, and extending
+a similar idea to other adapter families or to activations
+retained by nonlinear operators is a direction we leave for
+future work.

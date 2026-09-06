@@ -1,0 +1,1475 @@
+Value-Aware Stochastic KV Cache Eviction for
+Reasoning Models
+Ting-Yun Chang⋆σ
+Harvey Yiyun Fu⋆χ
+Deqing Fu⋆σ
+Chenghao Yangχ
+Jesse Thomasonσ
+Robin Jiaσ
+σUniversity of Southern California
+χUniversity of Chicago
+{tingyun,deqingfu,jessetho,robinjia}@usc.edu
+{harveyfu,chenghao}@uchicago.edu
+Abstract
+Reasoning models improve accuracy through extended chains of thought, but
+their long outputs create a memory and compute bottleneck. KV cache eviction
+methods reduce this cost by evicting unimportant key-value pairs from the cache,
+yet they often yield worse accuracy than selection-based sparse attention alter-
+natives, which keep the full KV cache. We identify key factors crucial to KV
+cache eviction accuracy. First, a small fraction of value states have abnormally
+large magnitudes, and evicting them causes catastrophic failure where models
+enter repetitive reasoning loops. Second, introducing stochasticity during evic-
+tion improves accuracy by increasing cache diversity. Based on these findings,
+we propose Value-aware Stochastic KV Cache Eviction (VASE), a training-free
+recipe that protects large-magnitude value states and promotes diverse eviction
+decisions. Across six reasoning tasks, Qwen3 models using VASE with 4× KV
+cache compression yield higher average accuracies than SOTA selection method at
+the same sparsity, while outperforming the strongest eviction method by more than
+4%. Overall, VASE bridges the gap between efficiency and accuracy, supporting
+FlashAttention2 and enabling a static memory footprint for reasoning models.
+1
+Introduction
+Reasoning models (OpenAI, 2024; Qwen, 2024; Guo et al., 2025a) leverage test-time compute (Snell
+et al., 2025) to improve accuracy by generating extended chains of thought before producing a final
+answer. While this approach yields high accuracy on complex tasks, it introduces an efficiency
+bottleneck at test time because the reasoning models tend to generate unnecessary long outputs. For
+example, Chen et al. (2025) show that models may overthink a simple arithmetic question, using
+more than 900 tokens to answer “2 + 3 = ?”. As a consequence, an auto-regressive large language
+model that stores the key-value representations of every past token incurs substantial memory and
+computational overhead as the sequence length grows.
+Sparse attention (Zhao et al., 2019; Beltagy et al., 2020; Zaheer et al., 2020; Kitaev et al., 2020)
+addresses this bottleneck by attending to only a subset of previous tokens; such approaches fall into
+two broad categories. KV cache selection methods (Ribar et al., 2024; Tang et al., 2024; Yang et al.,
+2025b; Gao et al., 2026) keep the full KV cache in memory but activate only a sparse subset of KV
+pairs at each decode step. These methods reduce compute and memory movement, but their memory
+footprints scale linearly with sequence length. In contrast, KV cache eviction methods (Zhang et al.,
+2023; Ge et al., 2024; Devoto et al., 2024; Oren et al., 2024) permanently discard low-importance
+KV pairs once the cache reaches a predefined budget. While eviction methods (Li et al., 2024; Cai
+et al., 2025) suffer larger accuracy degradation on reasoning tasks compared to their selection-based
+counterparts, they can yield a static memory footprint and better throughput.
+⋆Equal contribution.
+arXiv:2606.03928v1  [cs.LG]  2 Jun 2026
+
+
+KV Cache Size 
+# Tokens
+Buﬀer
+Max KV
+Attention scoring
+Value scoring
+=
++
+R-KV
+CurDKV
+R-KV
+CurDKV
+VASE-AttnV
+VASE-DKV
+VASE (ours)
+Value score
+Diversity
++ Weighted sampling
+[
+[
+[
+[
+Figure 1: Top: VASE is a KV Cache eviction method that combines stochastic sampling with value-
+state magnitude scoring to retain diverse and important KV pairs under a fixed KV cache budget.
+Bottom: By integrating both stochasticity and value awareness, VASE outperforms baseline methods
+that use either signal alone, improving average pass@1 accuracy across various reasoning tasks.
+In this paper, we reveal two key findings to improve KV cache eviction methods on reasoning models.
+First, the magnitudes of value states show strongly skewed distributions, with a small fraction of
+tokens having abnormally large vector magnitudes (see Figure 2). Those large-magnitude value states
+are crucial for maintaining task accuracies: evicting them causes the models to enter repetitive loops,
+where they endlessly re-examine the context or generate nonsensical outputs without reaching a final
+answer (see Figure 9 for the examples). Second, we find that introducing stochasticity during KV
+cache eviction effectively improves reasoning task accuracies. We attribute this to improved diversity
+of the retained KV pairs, which together yield a more representative coverage of the full context. Our
+case study on GSM8K demonstrates that incorporating value scoring boosts Qwen3-4B’s accuracy
+by as much as 16.2%, while introducing stochasticity yields an additional 4.7% improvement.
+Building on these findings, we propose Value-aware Stochastic KV Cache Eviction (VASE), a
+training-free KV cache eviction recipe that prioritizes large-magnitude value states and introduces
+stochasticity during eviction. We target the decoding step of reasoning models, by applying VASE to
+Qwen3 models (Yang et al., 2025a) and evaluating on six tasks spanning math, code generation, and
+science question answering. On average, VASE outperforms the previously SOTA eviction method
+R-KV (Cai et al., 2025) by 4.4% on Qwen3-4B and 4.9% on Qwen3-14B. When combined with
+CurDKV (Sengupta et al., 2025), stochastic sampling further boosts its average accuracy by 7.7%
+and 9.2% on the two models, respectively. VASE even slightly surpasses the average accuracy of
+SeerAttention-R (Gao et al., 2026), a strong selection method whose KV cache memory grows linearly
+with the sequence length, on both models while using static memory. In addition, we benchmark
+the actual throughput and peak memory of different methods, showing that VASE achieves higher
+throughput and a lower memory footprint than the R-KV eviction baseline across token budgets. Our
+results match closely with the theoretical memory compression ratio.
+Furthermore, our insights generalize to other efficiency methods like KV cache quantization; we
+show that large-magnitude value states also lead to disproportionately large reconstruction errors
+under per-token quantization (Liu et al., 2024b). Together, we demonstrate that value-state magnitude
+and stochasticity are fundamental axes of KV cache management, with our VASE recipe bridging the
+efficiency-accuracy gap left by prior sparse attention methods.1
+1Our code is available at https://github.com/terarachang/VaSE.
+2
+
+
+2
+Problem Setup
+We formalize the decode-phase KV cache eviction setting by drawing the distinction between
+selection-based and eviction-based methods, and introduce several representative eviction baselines.
+Selection-based method. Selection-based sparse attention methods retain the full KV cache but
+activate only a sparse subset of KV pairs at each decoding step. A representative example is
+SeerAttention-R (Gao et al., 2026), which uses a trained attention gate to predict attention sparsity
+patterns and selectively activates different KV cache blocks during inference, thereby reducing compu-
+tational complexity and memory movement. Compared to eviction-based methods, SeerAttention-R
+retains all KV pairs and the memory footprint scales linearly as O(T) with sequence length T.
+Eviction-based method. KV cache eviction methods permanently discard low-importance key-
+value pairs once the cache size reaches a predefined budget, reducing memory cost at the risk of
+irrecoverable information loss. We specifically focus on eviction methods for the decoding step
+of autoregressive reasoning models, as these models can generate over 10,000 tokens for a math
+question that has fewer than 200 prompt tokens (see Table 4 for statistics).
+Formally, let N be the total KV cache budget, and d be the dimension of keys and values. As the
+KV cache budget fills up at the token index t, we have N KV pairs (ki, vi) for i = 1, . . . , N, where
+ki ∈Rd, vi ∈Rd. Given the current query qt ∈Rd, the attention head computes its output as a
+weighted sum over the N cached values,
+ot =
+X
+i≤N
+α(t)
+i
+vi,
+α(t)
+i
+=
+exp
+
+q⊤
+t ki/
+√
+d
+
+P
+j≤N exp
+
+q⊤
+t kj/
+√
+d
+,
+(1)
+where α(t)
+i
+is the attention weight assigned to token i, obtained by applying softmax to the scaled dot
+products between the current query and all cached keys (Vaswani et al., 2017).
+Periodic eviction with budget K and buffer B. We adopt the periodic-eviction framework proposed
+by Cai et al. (2025) and Song et al. (2025), which targets decode-phase compression. The framework
+consists of a persistent budget of K tokens and a buffer of size B ≪K holding the most recent
+tokens, capping the total cache size at N = K + B tokens. Since each decoding step adds one KV
+pair to the cache, the buffer fills every B steps and triggers an eviction step: the eviction operator
+chooses B pairs to discard, clears the buffer, and restores the cache to size K (See the upper-left
+panel in Figure 1). Concretely, the most recent B KV pairs in the buffer are protected from eviction.
+A scoring function then assigns a scalar importance score to each of the remaining K candidates,
+and the B candidates with the lowest importance scores will be discarded. Below, we describe the
+scoring functions of three prior eviction methods, SnapKV (Li et al., 2024), R-KV (Cai et al., 2025),
+and CurDKV(Sengupta et al., 2025). Following common practice, KV pairs are scored independently
+for each attention head and layer. To simplify notation, we omit layer and head indices hereafter.
+SnapKV. Li et al. (2024) rank candidate pairs by their average attention score over a window of
+recent queries, where we set the window size to be the same as the buffer size B.2
+¯αi := 1
+B
+t
+X
+τ=t−B+1
+α(τ)
+i
+,
+(2)
+where i is the KV pair index, t is the eviction timestep, and α(τ)
+i
+is the attention score defined in Eq. 1.
+SnapKV uses keys for the attention computation, but does not consider values in the scoring function.
+R-KV. Cai et al. (2025) specifically target redundant tokens in reasoning models. They augment the
+SnapKV score ¯αi with a redundancy penalty ri to promote diversity among retained KV pairs:
+sRKV
+i
+:= λ · ¯αi −(1 −λ) · ri,
+where
+ri = Softmax
+
+1
+K
+X
+j̸=i
+CosSim(ki, kj)
+
+,
+(3)
+where λ ∈[0, 1] is a hyperparameter. A high ri indicates that token i has a high cosine similarity to
+many cached tokens; subtracting it discourages choosing redundant pairs.
+2Following Li et al. (2024), we apply average pooling to ¯αi to smooth the attention scores. Following the decode-phase
+SnapKV variant introduced by Cai et al. (2025), we cache the most recent queries and compute non-causal attention scores.
+3
+
+
+0
+5
+10
+15
+20
+25
+Value-State Range
+Layer 13
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Layer 22
+Full
+Evict Random Evict Large V
+0
+20
+40
+60
+80
+100
+Accuracy (%)
+88.0
+53.2
+14.3
+GSM8k
+Figure 2: Left: Range distribution of the value states. The violin plots show the presence of extreme
+magnitude outliers at different layers. Right: Evicting the large magnitude outliers causes accuracy
+to collapse to 14.3%, greatly underperforming a random eviction baseline at the same token budget,
+suggesting that these large-magnitude value states are crucial to model accuracy.
+CurDKV. Sengupta et al. (2025) observe the limitations of scoring KV pairs with attention alone,
+which ignores value states. They compute leverage scores for keys and values respectively via
+approximate CUR matrix decomposition and combine them into a single importance score. Originally
+designed for the prefill stage, we extend CurDKV for the decode phase with the periodic eviction
+framework. Specifically, CurDKV draws a Gaussian projection G ∈Rd×r at the start of generation,
+with each entry Gab
+iid∼N(0, 1/r), and rank candidates by the product of key and value scores:
+sCUR
+i
+:= ℓ(K)
+i
+(G) · ℓ(V )
+i
+(G),
+where
+ℓ(K)
+i
+(G) := ∥G⊤ki∥2
+2,
+ℓ(V )
+i
+(G) := ∥G⊤vi∥2
+2. (4)
+CurDKV considers value states during scoring, but it does not promote diversity among KV pairs.
+3
+Methodology
+We hypothesize that incorporating value states and diversity into KV cache scoring is essential for
+preserving model accuracy under eviction. Inspired by the scoring function of CurDKV, which favors
+value vectors with larger magnitudes, and by the finding of Sun et al. (2024) that massive activations
+in LLMs are indispensable, we first study the effect of large-magnitude value states on eviction
+accuracy. Based on the analysis, we propose a framework that prioritizes those large-magnitude value
+states within the scoring function and introduces stochasticity to promote diversity.
+3.1
+Significance of Value States with Large Magnitudes
+We first analyze the distribution of value-state magnitudes, where we extract the full KV cache from
+Qwen3-4B while generating responses to GSM8K examples (Cobbe et al., 2021). We define the
+magnitude3 of a cached value vector v ∈Rd as:
+Range(v) := max
+j∈[d] vj −min
+j∈[d] vj
+(5)
+where vj is the j-th entry of v, and Range(v) is chosen over L2(v) for its connection to quantization
+(see §4.3). Figure 2 shows that the distribution of Range(v) has large outliers over layers (see
+Appendix A for more layers). We hypothesize that these large-Range outliers are critical to the
+model accuracy. Because attention output is computed as a weighted summation of values (Eq. 1),
+those values with larger magnitudes have a disproportionate influence on the output.
+To validate this hypothesis, we purposefully evict the B largest KV pairs ranked by Range(vi).
+This reduces GSM8K accuracy to just 14.3%, under-performing random eviction by 38.9% at the
+same 512-token budget (Figure 2; Right). Further inspection of the model outputs reveals that the
+model tends to enter endless loops of self-reflection and never reaches a conclusion; it also tends to
+generate non-grammatical sentences (see Figure 9). Prior work (Guo et al., 2024, 2025b) observes
+that low-magnitude values co-occur with attention sinks (Xiao et al., 2024), which are crucial to
+3We experiment with three variants, Range, L2 norm, and variance, to capture the magnitude and variety of value vectors
+in Appendix A. We find that these variants are positively correlated and lead to comparable accuracies.
+4
+
+
+Method
+Family
+Key score
+Value score
+Diversity
+SeerAttention-R (Gao et al., 2026)
+Select
+Attn Gate
+–
+–
+SnapKV (Li et al., 2024)
+Evict
+¯αi
+–
+–
+R-KV (Cai et al., 2025)
+Evict
+λ · ¯αi −(1 −λ) · ri
+–
+redundancy ri
+CurDKV (Sengupta et al., 2025)
+Evict
+ℓ(K)
+i
+= ∥(KG)i∥2
+2
+ℓ(V )
+i
+= ∥(V G)i∥2
+2
+–
+VASE-ATTNV(ours)
+Evict
+¯αi
+Range(vi)
+sample ¯αi
+VASE-DKV(ours)
+Evict
+ℓ(K)
+i,t
+= ∥(KGt)i∥2
+2
+ℓ(V )
+i,t
+= ∥(V Gt)i∥2
+2
+sample Gt
+Table 1: Design space of sparse attention methods. Among eviction methods, prior work covers at
+most two of the three axes (key-based scoring, value-based scoring, diversity); VASE is the first to
+combine all three, instantiated as VASE-AttnV and VASE-DKV.
+eviction methods. In this paper, we demonstrate that large-magnitude values are equally important
+and should be up-weighted within the scoring function (§4.1).
+3.2
+VASE: Value-Aware Stochastic Eviction
+We propose VASE (Value-aware Stochastic Eviction), a training-free eviction recipe designed around
+two principles: upweighting large-magnitude value states in the scoring function, and introducing
+stochasticity to promote diversity in the retained cache. We propose two VASE variants that apply
+our recipe to SnapKV and CurDKV, respectively.
+VASE-ATTNV. VASE-ATTNV reserves part of the token budget for large-magnitude value states
+and applies stochastic sampling on top of SnapKV. Recall that K is the persistent budget and B is
+the buffer size (§ 2). We first rank each KV pair by Range(vi) (Eq. 5), where i ∈[K] indexes the
+non-buffer tokens. Given a value reservation budget Nv < K, we select the Nv candidates with the
+largest Range(vi) and unconditionally retain them as the reserved set RV . We denote the set of
+tokens in the buffer as RB, forming the full reserved set R = RV ∪RB. The remaining K −|R|
+slots are then filled by sampling from the SnapKV attention distribution, with weights proportional to
+¯αi (Eq. 2). This preserves SnapKV’s core idea of favoring high-attention tokens, while replacing its
+hard topk selection with a soft, probabilistic one.
+Stochastic sampling offers a key advantage over topk in terms of token retention flexibility. Let π(t)
+i
+denote the probability of token i being retained at step t. After T eviction steps, the probability that
+token i is kept in the KV cache can be factorized as QT
+t=1 π(t)
+i . Under topk, any token below the
+cutoff is evicted with certainty (π(t)
+i
+= 0). In contrast, under sampling, every factor is strictly positive,
+π(t)
+i
+≥1 −(1 −¯α(t)
+i /Zt)K−|R| > 0, where Zt = P
+j∈Ct ¯α(t)
+j
+and Ct = [K] \ R(t)
+V is the candidate
+set for sampling; therefore, each token has a nonzero probability of being retained across all T steps.
+VASE-DKV. VASE-DKV inherits value-state awareness directly from CurDKV’s product score
+(Eq. 4), where the value score ℓ(V )
+i
+(G) upweights large-magnitude values. On top of this, we
+introduce stochasticity through the Gaussian matrix G at each eviction step t to promote diversity
+among the retained KV pairs. Specifically, at step t we resample a random projection Gt ∈Rd×r
+independently of all past projections, and compute the leverage scores following Eq. 4. This improves
+upon CurDKV, which uses a fixed G across all steps: tokens with certain representations are then
+consistently assigned low scores and deterministically evicted. Resampling G avoids this failure
+mode by applying an independent scoring criterion at each eviction step such that no token would be
+permanently disadvantaged by a single projection.
+4
+Experiments
+4.1
+Isolating the Effects of Value-Awareness and Stochasticity
+We perform a case study on GSM8K to isolate the individual contributions of value-awareness and
+stochasticity to the accuracy of Qwen3-4B.
+5
+
+
+SnapKV
++Sampling
++V16
++V32
++V64
++V256
++Sampling +V256
+CurDKV
++Sampling
+50
+60
+70
+80
+90
+Accuracy (%)
+64.3
+70.9
+73.3
+76.0
+79.0
+80.5
+85.2
+78.6
+87.6
+Baseline
++ Value scoring
++ Sampling
++ Value scoring + Sampling
+Figure 3: Accuracy of Qwen3-4B on GSM8K with a KV cache budget of K=512 (∼4× compression).
++V16 indicates reserving 16 slots in the budget K for value scoring. By combining stochastic sampling
+with value scoring, our methods
+achieve accuracy close to the full model (88.4%).
+Value Awareness. We experiment with different reservation budgets Nv to evaluate the efficacy of
+our value-scoring function Range(v) (Eq. 5). To isolate the effect of our value scoring, we implement
+VASE-ATTNVwithout sampling. Specifically, we fill the remaining budget with KV pairs ranked
+highest by SnapKV’s scoring function ¯αi (Eq. 2). Figure 3 shows that when increasing the number of
+Nv from 16 to 256 (green bars), the accuracies on GSM8K increase consistently from 73.3%(+9.0%)
+to 80.5%(+16.2%), showing the importance of keeping large-range values from eviction.
+Stochasticity. We introduce stochasticity into SnapKV and CurDKV to promote diversity in KV
+pair retention. For SnapKV (leftmost in Figure 3), replacing its deterministic topk selection with
+¯αi-weighted sampling improves model accuracy from 64.3% to 70.9%. Similarly, for CurDKV
+(rightmost), resampling Gaussian matrix Gt at each eviction step t throughout generation improves
+accuracy from 78.6% to 87.6%. The teal bars
+show that value scoring and stochasticity are
+complementary, with the combination of both strategies achieving the highest accuracies.
+4.2
+Main Results
+Setup. We evaluate VASE on Qwen3-4B and Qwen3-14B (Yang et al., 2025a) across six reasoning
+tasks: AIME25, AIME26 (Art of Problem Solving), HMMT25 (Feb and Nov splits combined; HMMT
+2025), GPQA-Diamond (Rein et al., 2024), MATH (Hendrycks et al., 2021), and LiveCodeBench-v6
+(Jain et al., 2025).4 All eviction methods operate under the periodic-eviction framework (§ 2) with
+a shared recency buffer of B = 64 and a persistent budget K. For each task, we first measure the
+average number of tokens Navg under the uncompressed full model and then set the eviction budget
+K to approximately Navg/4, where K ∈{1024, 2048, 4096}. This yields a nominal 4× compression
+ratio over the uncompressed baseline. SeerAttention-R is configured at the matching 25% activation
+ratio so that all sparse methods operate at the same effective attention sparsity. We use the models’
+default top-p configurations for all generations. We report pass@1 results, which are averaged over
+16 runs for datasets under 100 examples, and 8 runs for larger datasets. We select the hyperparameters
+on GSM8K for each method and apply them to other tasks without further tuning (see Appendix B).
+VASE-ATTNV achieves the best average accuracy. Table 2 shows that both VASE variants
+outperform every prior eviction baseline on the per-model average and reach parity with the selection
+method SeerAttention-R. On Qwen3-4B, VASE-ATTNV achieves an average accuracy of 59.09%,
+edging out SeerAttention-R (58.81%) and surpassing the strongest eviction baseline R-KV (54.69%)
+by 4.4%; VASE-DKV reaches 57.48%, improving over CurDKV (49.78%) by 7.7%. The same
+pattern holds on Qwen3-14B: VASE-ATTNV (65.81%) matches SeerAttention-R (65.37%) and
+outperforms R-KV (60.90%) by 4.9%; VASE-DKV (64.94%) improves over the deterministic
+CurDKV baseline (55.70%) by 9.2%. Overall, VASE-ATTNV achieves the best average accuracy
+among all methods. While SnapKV and R-KV baselines do not consider value states in their
+deterministic scoring, the results of VASE-ATTNV show the effectiveness of combining value
+awareness with stochasticity in the eviction scoring function. The substantial improvements of
+VASE-DKV over CurDKV further highlight the importance of stochasticity. Since both variants
+4We use the same evaluation scripts as SeerAttention-R: https://github.com/microsoft/SeerAttention
+6
+
+
+Model
+Method
+AIME25
+AIME26
+HMMT25
+GPQA-D
+MATH
+Avg.
+Qwen3-4B
+Full
+66.41
+62.71
+45.94
+56.19
+93.93
+65.04
+SeerAttention-R
+58.59
+60.42
+40.42
+49.94
+84.67
+58.81
+SnapKV
+47.92
+53.33
+35.31
+36.87
+72.30
+49.15
+R-KV
+49.58
+54.58
+36.98
+49.05
+83.28
+54.69
+CurDKV
+48.75
+54.58
+33.23
+37.94
+74.42
+49.78
+VASE-DKV
+57.29
+61.88
+39.58
+43.94
+84.72
+57.48
+VASE-ATTNV
+59.17
+62.08
+44.38
+47.98
+81.82
+59.09
+Qwen3-14B
+Full
+70.21
+76.04
+54.79
+65.25
+95.22
+72.30
+SeerAttention-R
+64.79
+65.62
+48.65
+61.68
+86.12
+65.37
+R-KV
+54.58
+60.21
+44.58
+59.09
+86.05
+60.90
+CurDKV
+53.75
+61.25
+39.58
+48.48
+75.42
+55.70
+VASE-DKV
+63.33
+68.75
+49.38
+56.76
+86.47
+64.94
+VASE-ATTNV
+63.96
+72.29
+50.00
+57.39
+85.42
+65.81
+Table 2: Reasoning-task accuracy (%) of sparse attention methods on Qwen3-4B and Qwen3-14B
+with ∼25% of full KV activated (4× compression for eviction methods). Bold marks the best
+eviction method of each task. Our eviction methods VASE achieve comparable average accuracy to
+SeerAttention-R, the SOTA selection method.
+of VASE belong to the eviction family, we demonstrate that the VASE recipe can recover accuracy
+without paying the memory cost of selection methods.
+Code generation. Figure 5 (Left) reports pass@1 of Qwen3-4B on LiveCodeBench-v6-Medium under
+a 2048-token budget (∼20% of full KV size). R-KV (62.6%), VASE-DKV (61.9%), and VASE-
+ATTNV (63.5%) achieve comparable performance, while CurDKV only yields 34.6%. Surprisingly,
+SeerAttention-R (45.3%) underperforms eviction methods, with the exception of CurDKV. This is
+likely because the learning-based attention gate of SeerAttention-R struggles to generalize under
+domain shifts, while the training-free eviction methods are less affected.
+Token Budgets. Figure 4 reports pass@1 accuracy of Qwen3-14B on AIME26 and HMMT25 as the
+KV cache budget increases from 2048 to 6144 tokens. At the tightest budget of 2048 tokens, which
+corresponds to roughly 7.5× compression of the full cache on AIME26 and 8.7× on HMMT25,
+both VASE variants show clear improvement over R-KV and CurDKV baselines. As the budget
+increases, the performance gap diminishes with the accuracy of all methods recovering. Nevertheless,
+VASE methods (teal lines) consistently outperform the baselines. We observe this pattern in both
+datasets: the accuracy gains from value awareness and stochastic eviction are largest under aggressive
+compression and diminish gracefully when the cache capacity is abundant (see Table 6 in the appendix
+for results on GPQA-Diamond).
+4.3
+Large-Range Values Correlate with KV Cache Quantization Error
+Our findings regarding large-Range values have a deep connection with per-token KV cache quantiza-
+tion (Liu et al., 2024b; Su and Yuan, 2025), an alternative way to compress the KV cache. Formally, in
+asymmetric b-bit linear quantization, the range of the input value state v, [min v, max v], is mapped to
+the full range of the quantized integer space, [0, 2b −1]. The b-bit integer quantization-dequantization
+process can be expressed as:
+Q(v) =
+v −zv
+sv
+
+,
+v′ = Q(v) · sv + zv,
+(6)
+where zv = min v is the zero point, sv = (max v −min v)/(2b −1) = Range(v)/(2b −1)
+is the scaling factor, ⌊·⌉is the rounding operation, and v′ is the reconstructed vector of v after
+dequantization. The scaling factor sv represents the step size of quantization: if Range(v) is small,
+sv is small, leading to fine-grained quantization, and the reconstructed value v′ is close to the original
+value v; on the other hand, if Range(v) is large, a large sv results in a large and coarse step size,
+causing v′ to deviate significantly from v, which is known as the outlier issue (Dettmers et al., 2022)
+in LLM quantization.
+7
+
+
+2048
+4096
+6144
+KV Cache Budget
+40
+50
+60
+70
+76.0
+80
+Accuracy (%)
+7.5x
+3.7x
+2.5x
+Tokens
+Compress
+AIME26
+CurDKV
+R-KV
+VaSE-DKV
+VaSE-AttnV
+Full (15.3k tokens)
+2048
+4096
+6144
+KV Cache Budget
+25
+30
+35
+40
+45
+50
+55
+8.7x
+4.4x
+2.9x
+HMMT25
+CurDKV
+R-KV
+VaSE-DKV
+VaSE-AttnV
+Full (17.8k tokens)
+Figure 4: Pass@1 accuracy of Qwen3-14B under varying KV cache budgets. The full-cache model
+uses an average of 15.3k and 17.8k tokens on AIME26 and HMMT25, respectively. Each x-axis label
+reports the number of budget tokens (e.g., 2048) and its corresponding KV cache compression ratio
+to the full model (e.g., 7.5×).
+R-KV
+CurDKV
+VASE-DKV
+VASE-AttnV
+SeerAttention-R
+20
+30
+40
+50
+60
+70
+80
+Pass@1
+62.6
+34.6
+61.9
+63.5
+45.3
+LiveCodeBench
+Eviction
+Eviction (Ours)
+Selection
+Full KV
+L0
+L4
+L8
+L13
+L17
+L22
+L26
+L31
+Layer
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Correlation
+Corr(Range, Quantization Error)
+b2g32 (Avg. 0.83)
+b2g64 (Avg. 0.87)
+b4g32 (Avg. 0.89)
+b4g64 (Avg. 0.92)
+Figure 5: Left: Pass@1 results of Qwen3-4B on LiveCodeBench under a 2048-token budget (∼20%
+of full KV). R-KV and our VASE methods achieve the strongest performance. Right: Range(v)
+and per-token value cache quantization errors are highly correlated under different quantization
+configurations, where b2g32 means 2-bit precision with a group size of 32.
+We validate the relationship between Range(v) and per-token quantization error on the value cache
+empirically, using the HQQ quantizer (Badri and Shaji, 2023) with different bit-widths and quantiza-
+tion group sizes. Quantization error is measured via the mean-squared reconstruction error between
+v and v′ (Frantar et al., 2023). We extract the full value cache from Qwen3-4B during the generation
+of GSM8K examples, quantize them, and compute the per-token mean-squared error. Figure 5
+(Right) demonstrates that Range(v) and the reconstruction error are highly correlated across layers
+under different quantization configurations, suggesting that large-Range value states lead to large
+information loss under per-token KV cache quantization.
+5
+Benchmark Throughput and Memory
+In this section, we benchmark the actual decode-phase throughput and peak memory of different
+methods on the Qwen3-14B model using a single A100-80G GPU. We sweep over KV cache budgets
+{2048, 4096, 6144} and total output tokens {16384, 32768}. All methods are benchmarked with
+FlashAttention2 kernels (Dao, 2024), without PagedAttention (Kwon et al., 2023). Our benchmark
+script builds on that of Song et al. (2025); we set the batch size to 16 and the input prompt length to
+256 tokens across all experiments.
+Figure 6 (Left & Middle) shows that all eviction methods achieve substantially higher throughput
+than the Full baseline, with a consistent ordering of VASE-DKV> VASE-ATTNV> R-KV> Full
+across all settings. For example, at 16K output tokens and a KV cache budget of 2048, VASE-DKV
+is 3.1× faster than Full (411 vs. 133 tokens per second). Our VASE-DKV is the fastest eviction
+method because it does not compute attention scores during eviction, and VASE-ATTNV outperforms
+8
+
+
+2048
+4096
+6144
+KV Cache Budget
+150
+200
+250
+300
+350
+400
+Throughput (tokens/s)
+16K
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full
+2048
+4096
+6144
+KV Cache Budget
+150
+200
+250
+300
+350
+400
+32K
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full (OOM)
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full
+20
+30
+40
+50
+60
+70
+Memory (GB)
+42.4
+39.6
+38.9
+68.7
+16K / 4096 Budget
+14B Model Weights
+Figure 6: Left & Middle: Decode throughput (↑) of the Qwen3-14B model on a single A100-80G
+GPU under different KV cache budgets {2048, 4096, 6144} and total output tokens {16K, 32K}.
+All eviction methods run well above the original Full method (dashed line; OOM at 32K), with
+VASE-DKV achieving the fastest throughput. Right: Peak GPU memory (↓) at the 16K output tokens
+and 4096 budget; the 14B model weights (hatched) account for nearly 30GB of memory. All eviction
+methods have a much lower memory footprint than Full, with VASE-DKV using the least memory.
+R-KV because it avoids the additional redundancy-score computation used to promote diversity. For
+all eviction methods, the throughput decreases with increase of the token budget. On the other hand,
+the ordering of memory footprint (Figure 6, Right, ↓) is reversed: VASE-DKV< VASE-ATTNV<
+R-KV< Full. Figure 11 in the appendix shows consistent ranking under different token budgets.
+Excluding the memory of the 14B model weights (the hatched bars), our VASE methods achieve
+roughly 4× theoretical KV cache compression (16K/4K) over the Full baseline.
+6
+Related Work
+KV Cache Compression Methods. Prior work reduces the cost of the KV cache through different
+approaches: reducing the number of tokens via sparse attention (Liu et al., 2023; Jiang et al., 2024;
+Singhania et al., 2024; Chari and Van Durme, 2025), reducing the precision via quantization (Hooper
+et al., 2024; Liu et al., 2024b; Kim et al., 2025; Zandieh et al., 2026), and reducing the hidden
+dimension via low-rank decomposition (Saxena et al., 2024; Liu et al., 2024a; Chang et al., 2025). In
+this paper, we focus on sparse attention methods. Our findings on the importance of large-magnitude
+values also carry profound implications for per-token KV cache quantization (Liu et al., 2024b).
+Decoding Phase Compression. Inference proceeds in two phases. In the prefill phase, the model
+processes the T-token input prompt and computes T key–value pairs in parallel. In the decode phase,
+the model generates one token at a time and appends the corresponding KV pairs to the cache. Unlike
+the prefill phase, the decode phase is memory-bound, and the growing cache intensifies the memory
+bottleneck. For reasoning models, the KV pairs from the decode phase dominate the cost due to the
+long thinking traces. Therefore, several recent works (Cai et al., 2025; Song et al., 2025; Gao et al.,
+2026; Guo et al., 2026) have targeted KV cache compression during the decoding phase of reasoning
+models. Our paper also focuses on the decoding phase compression of reasoning models. Unlike
+Song et al. (2025), we do not distinguish between prompt tokens and generated tokens at the eviction
+step; therefore, prompt tokens may also be evicted in our experiments.
+Leveraging Value-State Magnitude for KV Cache Scoring. Typically, sparse attention involves
+scoring key-value pairs by their importance. Because the output of attention is a weighted combination
+of values, Guo et al. (2024); Devoto et al. (2025) score KV pairs by weighting attention scores with
+the norm of their corresponding values. In this paper, we deeply investigate the importance of large-
+magnitude values. Rather than multiplying attention and value scores, we propose an alternative,
+VASE-ATTNV, which reserves dedicated slots in the token budget to ensure that large-magnitude
+values are always preserved in the cache.
+7
+Discussion and Conclusion
+Implications for KV cache quantization. We show that large-Range value states are not only critical
+for maintaining KV cache eviction accuracy but also a major source of error under quantization.
+Therefore, a promising future direction is to investigate a mixed-precision approach (Liu et al.,
+2024b) to maintain the precision of large-Range value states. For example, they can be placed in a
+high-precision reserved cache, while the remaining KV cache is quantized to a lower bit-width. Once
+9
+
+
+the high-precision budget is used up, the earliest value state in this reserved cache can be quantized
+and “evicted” into the low-precision cache.
+Large-magnitude value states are crucial for reasoning progression. Our observation in Figure 9
+suggests that large-magnitude value states play a special role in maintaining reasoning progression.
+After these values are evicted, generations often degenerate into repetitive loops, where the model
+repeatedly restates intermediate reasoning without making progress. One hypothesis is that these
+values help transition between latent reasoning steps, preventing the model from collapsing into
+self-reinforcing paths. Therefore, their removal traps the model in repetitive loops. One potential
+future direction is to analyze what information large-magnitude value states carry and how they
+influence long-form reasoning.
+Conclusion. We present VASE, a training-free KV cache eviction framework designed to address the
+memory bottleneck of reasoning models. We identify two critical factors for maintaining accuracy
+during KV cache compression: protecting large-magnitude value states from eviction, and introducing
+stochasticity to improve KV cache diversity. Taking both factors into consideration, VASE provides
+a simple and effective recipe for improving existing eviction methods. More broadly, our findings
+highlight the importance of value states in long-form reasoning and suggest new directions for
+designing memory-efficient inference methods.
+Acknowledgment
+This work was supported in part by a gift from the Capital One Center for Responsible AI and
+Decision Making in Finance (CREDIF), and by the National Science Foundation under Grant No.
+IIS-2403436. Any opinions, findings, and conclusions or recommendations expressed in this material
+are those of the author(s) and do not necessarily reflect the views of the National Science Foundation.
+10
+
+
+References
+Art of Problem Solving. AIME problems and solutions. https://artofproblemsolving.com/
+wiki/index.php/AIME_Problems_and_Solutions. 6
+Hicham Badri and Appu Shaji. Half-quadratic quantization of large machine learning models,
+November 2023. URL https://dropbox.github.io/hqq_blog/. 8
+Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+arXiv preprint arXiv:2004.05150, 2020. 1
+Zefan Cai, Wen Xiao, Hanshi Sun, Cheng Luo, Yikai Zhang, Ke Wan, Yucheng Li, Yeyang Zhou,
+Li-Wen Chang, Jiuxiang Gu, Zhen Dong, Anima Anandkumar, Abedelkadir Asi, and Junjie Hu.
+R-KV: Redundancy-aware KV cache compression for reasoning models. In The Thirty-ninth
+Annual Conference on Neural Information Processing Systems, 2025. 1, 2, 3, 5, 9
+Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-Fang Hu, Pei-Shuo Wang,
+Ning-Chi Huang, Luis Ceze, Mohamed S. Abdelfattah, and Kai-Chiang Wu. Palu: KV-cache
+compression with low-rank projection. In The Thirteenth International Conference on Learning
+Representations, 2025. URL https://openreview.net/forum?id=LWMS4pk2vK. 9
+Vivek Chari and Benjamin Van Durme. Compactor: Calibrated query-agnostic kv cache compression
+with approximate leverage scores. arXiv preprint arXiv:2507.08143, 2025. 9
+Xingyu Chen, Jiahao Xu, Tian Liang, Zhiwei He, Jianhui Pang, Dian Yu, Linfeng Song, Qiuzhi
+Liu, Mengfei Zhou, Zhuosheng Zhang, Rui Wang, Zhaopeng Tu, Haitao Mi, and Dong Yu. Do
+NOT think that much for 2+3=? on the overthinking of long reasoning models. In Forty-second
+International Conference on Machine Learning, 2025. URL https://openreview.net/forum
+?id=MSbU3L7V00. 1
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+Schulman. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168,
+2021. 4
+Tri Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning. In
+International Conference on Learning Representations (ICLR), 2024. 8
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. GPT3.int8(): 8-bit matrix
+multiplication for transformers at scale. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave,
+and Kyunghyun Cho, editors, Advances in Neural Information Processing Systems, 2022. URL
+https://openreview.net/forum?id=dXiGWqBoxaD. 7, 16
+Alessio Devoto, Yu Zhao, Simone Scardapane, and Pasquale Minervini. A simple and effective
+l_2 norm-based strategy for KV cache compression. In Proceedings of the 2024 Conference on
+Empirical Methods in Natural Language Processing, pages 18476–18499, Miami, Florida, USA,
+November 2024. Association for Computational Linguistics. doi: 10.18653/v1/2024.emnlp-main.
+1027. URL https://aclanthology.org/2024.emnlp-main.1027/. 1
+Alessio Devoto, Maximilian Jeblick, and Simon Jégou. Expected attention: Kv cache compression
+by estimating attention from future queries distribution. arXiv preprint arXiv:2510.00636, 2025. 9
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. OPTQ: Accurate quantization
+for generative pre-trained transformers. In The Eleventh International Conference on Learning
+Representations, 2023. URL https://openreview.net/forum?id=tcbBPnfwxS. 8
+Yizhao Gao, Shuming Guo, Shijie Cao, Yuqing Xia, Yu Cheng, Lei Wang, Lingxiao Ma, Yutao Sun,
+Tianzhu Ye, Li Dong, Hayden Kwok-Hay So, Yu Hua, Ting Cao, Fan Yang, and Mao Yang. Sparse
+attention adaptation for long reasoning. In The Fourteenth International Conference on Learning
+Representations, 2026. URL https://openreview.net/forum?id=c5BOcHM6J8. 1, 2, 3, 5, 9
+Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells
+you what to discard: Adaptive KV cache compression for LLMs. In The Twelfth International
+Conference on Learning Representations, 2024. URL https://openreview.net/forum?id=
+uNrFpDPMyo. 1
+11
+
+
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu
+Zhang, Shirong Ma, Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via
+reinforcement learning. arXiv preprint arXiv:2501.12948, 2025a. 1
+Tianyu Guo, Druv Pai, Yu Bai, Jiantao Jiao, Michael I. Jordan, and Song Mei. Active-dormant
+attention heads: Mechanistically demystifying extreme-token phenomena in LLMs. In The
+Second Conference on Parsimony and Learning (Recent Spotlight Track), 2025b. URL https:
+//openreview.net/forum?id=Zx6WUbE9J7. 4
+Zhenyuan Guo, Tong Chen, Wenlong Meng, Chen Gong, Xin Yu, Chengkun Wei, and Wenzhi Chen.
+Dynamic thinking-token selection for efficient reasoning in large reasoning models. arXiv preprint
+arXiv:2601.18383, 2026. 9
+Zhiyu Guo, Hidetaka Kamigaito, and Taro Watanabe. Attention score is not all you need for token
+importance indicator in KV cache reduction: Value also matters. In Proceedings of the 2024
+Conference on Empirical Methods in Natural Language Processing, pages 21158–21166, Miami,
+Florida, USA, November 2024. Association for Computational Linguistics. doi: 10.18653/v1/20
+24.emnlp-main.1178. URL https://aclanthology.org/2024.emnlp-main.1178/. 4, 9, 18
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song,
+and Jacob Steinhardt. Measuring mathematical problem solving with the MATH dataset. In
+Thirty-fifth Conference on Neural Information Processing Systems Datasets and Benchmarks Track
+(Round 2), 2021. URL https://openreview.net/forum?id=7Bywt2mQsCe. 6
+HMMT. HMMT 2025, 2025. URL https://www.hmmt.org/. Accessed: 2025. 6
+Coleman Richard Charles Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney,
+Sophia Shao, Kurt Keutzer, and Amir Gholami. KVQuant: Towards 10 million context length
+LLM inference with KV cache quantization. In The Thirty-eighth Annual Conference on Neural
+Information Processing Systems, 2024. URL https://openreview.net/forum?id=0LXote
+w9Du. 9
+Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida Wang, Armando
+Solar-Lezama, Koushik Sen, and Ion Stoica. Livecodebench: Holistic and contamination free
+evaluation of large language models for code. In The Thirteenth International Conference on
+Learning Representations, 2025. URL https://openreview.net/forum?id=chfJJYC3iL. 6
+Huiqiang Jiang, YUCHENG LI, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+Han, Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. MInference 1.0:
+Accelerating pre-filling for long-context LLMs via dynamic sparse attention. In The Thirty-eighth
+Annual Conference on Neural Information Processing Systems, 2024. 9
+Junhyuck Kim, Ethan Ewer, Taehong Moon, Jongho Park, and Dimitris Papailiopoulos. Not all bits
+are equal: Scale-dependent memory optimization strategies for reasoning models. arXiv preprint
+arXiv:2510.10964, 2025. 9
+Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In
+International Conference on Learning Representations, 2020. URL https://openreview.net
+/forum?id=rkgNKkHtvB. 1
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+serving with pagedattention.
+In Proceedings of the 29th Symposium on Operating Systems
+Principles, SOSP ’23, page 611–626, New York, NY, USA, 2023. Association for Computing
+Machinery. ISBN 9798400702297. doi: 10.1145/3600006.3613165. URL https://doi.org/
+10.1145/3600006.3613165. 8
+Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle
+Cai, Patrick Lewis, and Deming Chen. SnapKV: LLM knows what you are looking for before
+generation. In The Thirty-eighth Annual Conference on Neural Information Processing Systems,
+2024. 1, 3, 5
+12
+
+
+Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi Dengr, Chong
+Ruan, Damai Dai, Daya Guo, et al. Deepseek-v2: A strong, economical, and efficient mixture-of-
+experts language model. arXiv preprint arXiv:2405.04434, 2024a. 9
+Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+Kyrillidis, and Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance
+hypothesis for LLM KV cache compression at test time. In Thirty-seventh Conference on Neural
+Information Processing Systems, 2023. URL https://openreview.net/forum?id=JZfg6w
+Gi6g. 9
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen,
+and Xia Hu. Kivi: A tuning-free asymmetric 2bit quantization for kv cache. In International
+Conference on Machine Learning, pages 32332–32344. PMLR, 2024b. 2, 7, 9
+OpenAI. Learning to reason with LLMs. https://openai.com/index/learning-to-reaso
+n-with-llms, 2024. 1
+Matanel Oren, Michael Hassid, Nir Yarden, Yossi Adi, and Roy Schwartz.
+Transformers are
+multi-state RNNs. In Proceedings of the 2024 Conference on Empirical Methods in Natural
+Language Processing, pages 18724–18741, Miami, Florida, USA, November 2024. Association
+for Computational Linguistics. doi: 10.18653/v1/2024.emnlp-main.1043. URL https:
+//aclanthology.org/2024.emnlp-main.1043/. 1
+Qwen. QwQ: Reflect deeply on the boundaries of the unknown. https://qwenlm.github.io/b
+log/qwq-32b-preview/, November 2024. 1
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien Dirani,
+Julian Michael, and Samuel R. Bowman. GPQA: A graduate-level google-proof q&a benchmark.
+In First Conference on Language Modeling, 2024. URL https://openreview.net/forum?i
+d=Ti67584b98. 6
+Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, and Douglas
+Orr.
+SparQ attention: Bandwidth-efficient LLM inference.
+In Ruslan Salakhutdinov, Zico
+Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix Berkenkamp,
+editors, Proceedings of the 41st International Conference on Machine Learning, volume 235 of
+Proceedings of Machine Learning Research, pages 42558–42583. PMLR, 21–27 Jul 2024. URL
+https://proceedings.mlr.press/v235/ribar24a.html. 1
+Utkarsh Saxena, Gobinda Saha, Sakshi Choudhary, and Kaushik Roy. Eigen attention: Attention
+in low-rank space for kv cache compression. In Findings of the Association for Computational
+Linguistics: EMNLP 2024, pages 15332–15344, 2024. 9
+Ayan Sengupta, Siddhant Chaudhary, and Tanmoy Chakraborty. Value-guided KV compression for
+LLMs via approximated CUR decomposition. In The Thirty-ninth Annual Conference on Neural
+Information Processing Systems, 2025. 2, 3, 4, 5
+Prajwal Singhania, Siddharth Singh, Shwai He, Soheil Feizi, and Abhinav Bhatele. Loki: Low-rank
+keys for efficient sparse attention. In The Thirty-eighth Annual Conference on Neural Information
+Processing Systems, 2024. URL https://openreview.net/forum?id=raABeiV71j. 9
+Charlie Victor Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling LLM test-time compute
+optimally can be more effective than scaling parameters for reasoning. In The Thirteenth Interna-
+tional Conference on Learning Representations, 2025. URL https://openreview.net/forum
+?id=4FWAwZtd2n. 1
+Jiwon Song, Dongwon Jo, Yulhwa Kim, and Jae-Joon Kim. Reasoning path compression: Compress-
+ing generation trajectories for efficient LLM reasoning. In The Thirty-ninth Annual Conference on
+Neural Information Processing Systems, 2025. 3, 8, 9
+Zunhai Su and Kehong Yuan. KVSink: Understanding and enhancing the preservation of attention
+sinks in KV cache quantization for LLMs. In Second Conference on Language Modeling, 2025.
+URL https://openreview.net/forum?id=gIqb6zWZoO. 7, 18
+13
+
+
+Mingjie Sun, Xinlei Chen, J Zico Kolter, and Zhuang Liu. Massive activations in large language
+models. In First Conference on Language Modeling, 2024. URL https://openreview.net/f
+orum?id=F7aAhfitX6. 4
+Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. Quest: Query-
+aware sparsity for efficient long-context llm inference. In Proceedings of the 41st International
+Conference on Machine Learning, 2024. 1
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing
+systems, 30, 2017. 3
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+language models with attention sinks. In The Twelfth International Conference on Learning
+Representations, 2024. 4
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang
+Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388,
+2025a. 2, 6
+Lijie Yang, Zhihao Zhang, Zhuofu Chen, Zikun Li, and Zhihao Jia. Tidaldecode: Fast and accurate
+LLM decoding with position persistent sparse attention. In The Thirteenth International Conference
+on Learning Representations, 2025b. URL https://openreview.net/forum?id=EkfLaCJ7
+bk. 1
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+longer sequences. Advances in neural information processing systems, 33:17283–17297, 2020. 1
+Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni.
+Turboquant: Online vector
+quantization with near-optimal distortion rate. In The Fourteenth International Conference on
+Learning Representations, 2026. URL https://openreview.net/forum?id=tO3ASKZlok. 9
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient
+generative inference of large language models. Advances in Neural Information Processing
+Systems, 36:34661–34710, 2023. 1
+Guangxiang Zhao, Junyang Lin, Zhiyuan Zhang, Xuancheng Ren, Qi Su, and Xu Sun. Explicit sparse
+transformer: Concentrated attention through explicit selection. arXiv preprint arXiv:1912.11637,
+2019. 1
+14
+
+
+Appendix
+A
+Variants for Capturing Value-State Magnitude and Variety . . . . . . . . . . . . . .
+15
+B
+Token Statistics and Hyperparameters
+. . . . . . . . . . . . . . . . . . . . . . . .
+16
+C
+Statistical Significance
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+D
+Additional Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+E
+Limitations
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+F
+Compute Resources . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+G
+Licenses . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+H
+Broader Impacts . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+A
+Variants for Capturing Value-State Magnitude and Variety
+Figure 7: Layer-wise violin plots of L2(vi) := ∥vi∥2, where the value vectors vi are from the full
+KV cache of Qwen3-4B during GSM8K generation. The distribution shows outliers that have large
+L2 norm.
+Figure 8: Layer-wise violin plots of Range(vi), where the values vi are from the full KV cache of
+Qwen3-4B during GSM8K generation. The distribution shows outliers that have large Range.
+In this section, we explore different ways to compute the magnitude and variety of a value state
+v ∈Rd in KV cache: (1) L2(v) =
+qPd
+j=1(vj)2, (2) Range(v) := maxj∈[d] vj −minj∈[d] vj,
+and (3) Var(v) = 1
+d
+Pd
+j=1(vj −µ)2, where µ = 1
+d
+Pd
+j=1 vj.
+First, we extract the value vectors v from the full KV cache during the generation of Qwen3-4B on
+GSM8K. Figures 7 and 8 present the layer-wise distributions of L2(v) and Range(v), respectively.
+15
+
+
+The violin plots show prominent outliers that have large L2(v) and Range(v) in different layers.
+We also compute the Pearson correlation between L2(v) and Range(v) and found that the two are
+highly correlated (> 0.8) over layers.
+Next, we study whether preventing these outlier value states from eviction can maintain the accuracy
+under KV cache compression. We apply the framework introduced in Section 3 that pre-allocates
+dedicated value slots in the token budget. To decide which entries to keep in the slots, we experiment
+with the three value-scoring variants: keeping values with the largest L2(v), Range(v), or Var(v),
+respectively.5 For the remaining budget, we apply stochastic sampling on top of the attention
+scores in SnapKV as described in Section 3. In Table 3, we compare the value-scoring variants on
+GSM8K and AIME25. The three variants demonstrate comparable accuracy gains over the SnapKV
+(attention-only) baseline.
+Method
+GSM8K
+AIME25
+SnapKV
+64.25
+45.80
++ L2(v)
+84.55
+59.17
++ Range(v)
+84.45
+59.19
++ Var(v)
+84.00
+57.71
+Table 3: Impact of value-state scoring variants on KV cache eviction accuracy. We report the results
+on Qwen3-4B at 4× compression. The three variants , which capture different aspects of value-state
+magnitude and variety, achieve comparable performance gains over the SnapKV baseline.
+We choose Range(v) as the value scoring function for our main approach due to its connection with
+quantization; specifically, Range(v) captures the extreme values max v and min v in the vector,
+which is associated with the outlier challenge in LLM quantization (Dettmers et al., 2022). We show
+the importance of large-Range value states in Section 3.1, where evicting them causes the model to
+enter a nonsensical reasoning loop:
+B
+Token Statistics and Hyperparameters
+Prompt Tokens
+Gen Tokens
+AIME25
+198
+17,790
+AIME26
+148
+16,642
+HMMT25
+127
+18,189
+MATH
+94
+5,281
+LiveCodeBench-v6-medium
+557
+11,088
+Table 4: The average token counts of prompt (prefill) and generation (decode) of reasoning tasks.
+The Gen Tokens column represents the average number of tokens generated by the full Qwen3-4B
+model. The decode phase yields a significantly higher number of tokens than the prefill phase.
+Table 4 lists the average token counts of the prefill and decode phase of Qwen3-4B, respectively,
+showing that reasoning models may generate over 10,000 tokens at decode steps for a math question
+that has fewer than 200 prefill tokens. This intensifies the memory-bound constraints of the decode
+phase, motivating our approach to bound KV cache memory usage to a fixed cost.
+Based on the statistics of Table 4, we set the token budget K = 4096 for AIME25, AIME26, and
+HMMT25, K = 1024 for MATH, and K = 2048 for GPQA-Diamond, which roughly translates to a
+4× KV cache compression. For LiveCodeBench, we set K = 2048, which is ∼5× compression.
+All the eviction methods are training-free but have hyperparameters. We choose the best hyperpa-
+rameters for each method on GSM8K and then apply them to our main experiments (Section 4.2)
+without further tuning. For R-KV, we experiment with different redundancy hyperparameters,
+λ = {0.1, 0.5, 0.9}, and set λ = 0.5. We set the Gaussian matrix rank r = 20 for CurDKV and
+VASE-DKV, and the value reservation budget Nv = K/4 for VASE-ATTNV.
+5Here, Range is the same as VASE-ATTNV in the main content.
+16
+
+
+[Example 1] Okay, let's see. Carla is trying to download a 200 GB file… First, 
+let me figure out what 40% of the file is.... But wait, does the restart happen at 
+the 80 GB mark, ... Wait, so does that mean she has to start over?… so she has 
+to download the entire 200 GB again? Or does she have to restart... Wait, the 
+total file is 200 GB? Wait, no. Wait, the problem says that the download is a 
+200 GB file? Wait, no, the problem says that the file is 200 GB? Wait, no. 
+Wait, the problem says... Wait, no. Let me check again…
+[Example 2] Okay, let's see. Janet has these ducks that lay 16 eggs every day. 
+… 9 times 2 is 18. Yeah, that seems right. But let me make sure I didn't 
+misinterpret the question. It says she bakes muffins "with four." Does that 
+mean four eggs per muffin or four muffins using four eggs? … Maybe it's 
+four eggs? … Alternatively, maybe "with four" refers to four muffins? But 
+that would be a bit unclear… Alternatively, maybe she uses four eggs per 
+muffin? … Alternatively, maybe "with four" is a typo or mistranslation… 
+Alternatively, maybe the problem is that she uses four eggs per day for 
+muffins. So, 3 for breakfast, 4 for muffins, total 7, and 16 - 7 = 9. 
+Alternatively, maybe the "with four" is per day. So, she uses four eggs for 
+muffins each day. So, 3 + 4 = 7... Wait, no. Let me check again…
+Figure 9: Examples of model outputs on GSM8K when evicting large-Range value states. In the
+first example, the model starts with reasonable thinking traces but falls into a repetitive loop, never
+reaching the correct answer. In the second example, the model generates the correct answer once
+(18), but then gets stuck in an endless loop of self-reflection and fails to reach a conclusion.
+C
+Statistical Significance
+Method
+AIME25
+AIME26
+HMMT25
+GPQA-D
+MATH
+R-KV
+54.6 ± 7.4
+60.2 ± 7.4
+44.6 ± 5.7
+59.1 ± 3.0
+86.1 ± 1.3
+CurDKV
+53.8 ± 7.6
+61.3 ± 7.3
+39.6 ± 5.3
+48.5 ± 3.1
+75.4 ± 1.7
+VASE-DKV
+63.3 ± 7.5
+68.8 ± 6.9
+49.4 ± 5.4
+56.8 ± 3.0
+86.5 ± 1.3
+VASE-ATTNV
+64.0 ± 7.3
+72.3 ± 6.5
+50.0 ± 5.6
+57.4 ± 3.0
+85.4 ± 1.4
+Table 5: Reasoning-task accuracy (%) with standard errors for KV cache eviction methods on Qwen3-
+14B under ∼4× cache compression.
+Table 5 shows the average accuracy ± standard errors for KV cache eviction methods on Qwen3-
+14B under ∼4× cache compression. For each problem indexed s ∈{1, . . . , S}, we sample R
+independent generations and compute the per-problem pass@1 accuracy:
+ps = 1
+R
+R
+X
+r=1
+1[sample r of problem s is correct],
+(7)
+where R = 16 for datasets with fewer than 100 examples and R = 8 otherwise. The overall pass@1
+accuracy and its standard error SE are then:
+¯p = 1
+S
+S
+X
+s=1
+ps,
+SD =
+v
+u
+u
+t
+1
+S −1
+S
+X
+s=1
+(ps −¯p)2,
+SE = SD
+√
+S
+.
+(8)
+The variability captured by the standard errors reflects both the stochasticity of the model’s sampling
+procedure and, for VASE methods, the randomness introduced by stochastic eviction. On tasks
+with larger standard errors (e.g., AIME25, AIME26), the small number of test problems (30 each)
+is the primary cause. While individual confidence intervals overlap due to small test sets, VASE
+outperforms all baselines across every task–model combination.
+17
+
+
+D
+Additional Results
+Recall that in Figure 3, we demonstrate that reserving Nv slots for large-range values greatly improves
+GSM8K accuracy. To verify the importance of these specific value states, we conduct an ablation
+study where we instead reserve Nv slots for randomly sampled KV pairs. Experimenting with
+Nv = {16, 32, 64} yield accuracies of 65.6%, 63.4%, and 65.3%, respectively. These results are
+comparable to SnapKV (64.3%) but substantially underperform the green bars in Figure 3, confirming
+that replacing large-range values with random KV pairs is ineffective.
+Table 6 shows the Qwen3-14B results of GPQA-Diamond under different token budgets. While
+R-KV outperforms our VASE methods at 2048 token budget, the accuracy gap closes at 4096 tokens
+(∼2× compression). In this setting, both R-KV and our methods nearly recover the performance of
+the full model.
+Token Budget
+2048
+4096
+Full
+Compression
+4×
+2×
+1×
+R-KV
+59.09
+63.32
+65.25
+CurDKV
+48.48
+60.54
+VASE-DKV
+56.76
+63.38
+VASE-ATTNV
+57.39
+63.07
+Table 6: GPQA-D accuracy for eviction methods on Qwen3-14B under different token budgets.
+In Figure 10, we extract the full value cache during the generation of Qwen3-4B on GSM8K examples
+and plot the distributions of Range(v) over different chunks of consecutive tokens. We put the first
+four sink tokens (Su and Yuan, 2025) into an individual chunk, which shows distinct distributions
+compared to the other chunks. Except for the first layer (Layer 0), the sink tokens have a lower median
+Range(v), which corresponds to the value-state drain phenomena (Guo et al., 2024). Excluding the
+sink tokens, the distributions of Range(v) are consistent as the sequence length increases.
+Figure 10: Range(v) over token position chunks, where each chunk consists of the value states
+of consecutive tokens. Boxplots illustrate the dynamic range (y-axis) of value states at specific
+layers. Token positions (x-axis) are bucketed to show how the range distribution evolves through
+the sequence. The first chunk contains sink tokens at position (0, 4). Excluding the sink tokens, the
+distribution of Range(v) does not drift as the context window grows.
+In Figure 11, we show the peak memory footprint of different methods across three KV-cache budgets
+{2048, 4096, 6144} at 16K output tokens. Overall, VASE-DKV< VASE-ATTNV< R-KV< Full,
+showing that our VASE methods are more memory-efficient than the R-KV baseline. At 32K output
+tokens, the memory footprints of different eviction methods remain the same under the same token
+budgets; however, the Full method can no longer fit a single GPU with 80GB memory.
+18
+
+
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full
+20
+30
+40
+50
+60
+70
+Memory (GB)
+34.3
+34.3
+33.9
+68.7
+16K / 2048 Budget
+14B Model Weights
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full
+20
+30
+40
+50
+60
+70
+42.4
+39.6
+38.9
+68.7
+16K / 4096 Budget
+14B Model Weights
+R-KV
+VaSE-AttnV
+VaSE-DKV
+Full
+20
+30
+40
+50
+60
+70
+52.6
+45.4
+43.9
+68.7
+16K / 6144 Budget
+14B Model Weights
+Figure 11: Peak GPU memory of Qwen3-14B at 16K output length across three KV-cache budgets
+{2048, 4096, 6144}. VASE-DKV is the most memory-efficient method at every budget.
+E
+Limitations
+Our evaluation focuses on reasoning models and the decode phase of generation, where eviction
+methods offer the greatest benefit. As a result, we do not evaluate on prefill-phase compression
+benchmarks. However, because our method is built on fundamental observations of value-state
+distributions and stochastic diversity, we believe the core methodology can be extended to the prefill
+phase for long-prompt compression.
+We only implement our methods on Qwen3 models because our selection-based baseline
+SeerAttention-R only releases checkpoints for Qwen models. Nevertheless, since our value-scoring
+function relies on simple min and max statistics of the value cache, our method is model-agnostic
+and can be easily extended to other LLM architectures.
+Lastly, while our findings link value-state magnitude to quantization errors, we focus on sparse atten-
+tion, and quantization method development is beyond the scope of this paper. Future research could
+explore an integrated framework that combines KV cache eviction with outlier-aware quantization to
+push the limits of compression ratio.
+F
+Compute Resources
+Our experiments were conducted on NVIDIA A100 and H100 GPUs. Every experiment can be run
+on a single GPU with 80GB memory. Without PagedAttention and continuous batching, each task
+takes 10-72 GPU hours, depending on the dataset size and the average number of generated tokens.
+G
+Licenses
+As shown in Table 7, we include licenses for any artifacts used in this work. Copyright © MAA
+indicates that AIME problems are copyrighted by the Mathematical Association of America and are
+used here for evaluation purposes only.
+H
+Broader Impacts
+This work proposes a training-free KV cache eviction method that reduces the memory footprint
+of reasoning models during inference. The primary positive impact is enabling more efficient
+deployment of large language models, reducing hardware requirements and energy consumption.
+This can broaden access to reasoning-capable models for resource-constrained practitioners and
+organizations.
+As a general-purpose inference optimization, VASE does not introduce new model capabilities or
+alter model outputs beyond the approximation inherent in cache compression. It therefore does not
+directly raise new ethical concerns beyond those already associated with the underlying language
+models. We do not foresee specific negative societal impacts arising from this work.
+19
+
+
+Asset
+License
+Source
+Models
+Qwen3-4B
+Apache 2.0
+huggingface.co/Qwen/Qwen3-4B
+Qwen3-14B
+Apache 2.0
+huggingface.co/Qwen/Qwen3-14B
+Datasets & Benchmarks
+GSM8K
+MIT
+github.com/openai/grade-school-math
+MATH
+MIT
+github.com/hendrycks/math
+GPQA-Diamond
+CC-BY-4.0
+huggingface.co/datasets/Idavidrein/gpqa
+LiveCodeBench-v6
+MIT (code) / CC (data)
+github.com/LiveCodeBench/LiveCodeBench
+AIME 2025 / 2026
+Copyright © MAA
+artofproblemsolving.com/wiki
+HMMT 2025
+CC-BY-NC-SA 4.0
+huggingface.co/datasets/MathArena/hmmt_feb_2025
+huggingface.co/datasets/MathArena/hmmt_nov_2025
+Code & Baselines
+SnapKV
+CC-BY-4.0
+openreview.net/forum?id=poE54GOq2l
+R-KV
+CC-BY-4.0
+openreview.net/forum?id=2jwAjomEDB
+CurDKV
+CC-BY-4.0
+openreview.net/forum?id=klmc4fwPLd
+SeerAttention-R
+CC-BY-4.0
+openreview.net/forum?id=c5BOcHM6J8
+HQQ
+Apache 2.0
+github.com/dropbox/hqq
+Table 7: Assets and their licenses.
+20

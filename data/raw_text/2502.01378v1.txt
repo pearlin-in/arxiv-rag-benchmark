@@ -1,0 +1,1537 @@
+CE-LoRA: Computation-Efficient LoRA
+Fine-Tuning for Language Models
+Guanduo Chen∗†
+Fudan University
+gdchen22@m.fudan.edu.cn
+Yutong He†
+Peking University
+yutonghe@pku.edu.cn
+Yipeng Hu
+Peking University
+yipenghu@pku.edu.cn
+Kun Yuan‡
+Peking University
+kunyuan@pku.edu.cn
+Binhang Yuan‡
+HKUST
+biyuan@ust.hk
+Abstract
+Large Language Models (LLMs) demonstrate exceptional performance across
+various tasks but demand substantial computational resources even for fine-tuning
+computation. Although Low-Rank Adaptation (LoRA) significantly alleviates
+memory consumption during fine-tuning, its impact on computational cost re-
+duction is limited. This paper identifies the computation of activation gradients
+as the primary bottleneck in LoRA’s backward propagation and introduces the
+Computation-Efficient LoRA (CE-LoRA) algorithm, which enhances computa-
+tional efficiency while preserving memory efficiency. CE-LoRA leverages two key
+techniques: Approximated Matrix Multiplication, which replaces dense multipli-
+cations of large and complete matrices with sparse multiplications involving only
+critical rows and columns, and the Double-LoRA technique, which reduces error
+propagation in activation gradients. Theoretically, CE-LoRA converges at the same
+rate as LoRA, O(1/
+√
+T), where T is the number of iterations. Empirical evalua-
+tions confirm that CE-LoRA significantly reduces computational costs compared
+to LoRA without notable performance degradation.
+1
+Introduction
+Large Language Models (LLMs) have garnered significant attention in recent years for their excep-
+tional performance across a wide range of practical tasks, including machine translation, common-
+sense reasoning, and planning, among others [1]. The versatility of these models has also driven a
+growing demand for fine-tuning them on specific tasks or domains to unlock their full potential [2, 3].
+However, fine-tuning these models remains a highly resource-intensive process, demanding substan-
+tial computational power and large amounts of GPU memory. As model parameters and training
+tokens scale up, the increasing training costs have made it difficult for most organizations to keep
+pace with advancements in LLM research due to resource constraints.
+To tackle these challenges, recent advancements such as Low-Rank Adaptation (LoRA) [4] have
+demonstrated promising results in reducing memory consumption during LLM fine-tuning, enabling
+the fine-tuning of models with more parameters or larger batch sizes within constrained resources.
+While LoRA significantly alleviates memory requirements, its reduction of computational costs
+remains limited — although the low-rank adapters can save part of the computation costs by reducing
+the matrix sizes, the size of original weight matrices used to calculate activation gradients remains
+unchanged, which contributes to half of the total computation cost in the backpropagation of the
+original model. The formulation of this computation is illustrated in Section 2. Limited by this
+computational bottleneck, LoRA can reduce computation by at most half during the backpropagation
+process. This limitation raises the following open question:
+∗Work done when the author was working as a research assistant under the supervision of Binhang Yuan.
+† Both authors contributed equally to this research.
+† Coressponding author.
+arXiv:2502.01378v1  [cs.LG]  3 Feb 2025
+
+
+Standard Matrix 
+Multiplication
+Approximated Matrix 
+Multiplication (AMM)
+FLOPs
+FLOPs
+𝑻ൌ𝑷⋅𝑸
+𝑻ൎ𝒞௣ሺ𝑷⋅𝑸ሻ
+𝒚ൌ𝑾𝒙
+𝑾𝟎
+𝑨
+𝑩
+𝒙
+𝑮𝑩ൌ𝑮𝒚ሺ𝑨𝒙ሻୃ
+FLOPs
+𝑮𝑨ൌ𝑩ୃ𝑮𝒚𝒙ୃ
+𝑮𝒙ൌ𝑾଴ୃ𝑮𝒚൅𝑨ୃሺ𝑩ୃ𝑮𝒚ሻ
+FLOPs
+𝒚ൌ𝑾𝒙
+𝒙
+𝑾𝒔
+𝑨𝟎
+𝑩𝟎
+𝑨
+𝑩
+𝑮𝑩ൌ𝑮𝒚ሺ𝑨𝒙ሻୃ
+FLOPs
+𝑮𝑨ൌ𝑩ୃ𝑮𝒚𝒙ୃ
+𝑮௫ൎ𝒞௣ሺ𝑾௦ୃ⋅𝑮𝒚ሻ൅𝑨଴ୃሺ𝑩଴ୃ𝑮𝒚ሻ൅𝑨ୃሺ𝑩ୃ𝑮𝒚ሻ
+FLOPs
+FLOPs
+FLOPs
+Standard LoRA
+Back Propagation
+CeLoRA
+Back Propagation
+Figure 1: An illustration of the Approximated Matrix Multiplication (AMM) technique (left) and the CE-LoRA
+framework (right).
+Compared with vanilla LoRA, can we develop a more computation-efficient fine-
+tune algorithm by the same memory budget without sacrificing the statistical
+efficiency (i.e., convergence)?
+To answer this question, we first conduct a computational analysis of LoRA’s backward propagation
+procedure and identify the primary computational bottleneck as the calculation of the activation
+gradients. This step accounts for the majority of the backward computation load, especially when
+LoRA employs a relatively small rank r.
+Based on this analysis, we propose the Approximated Matrix Multiplication (AMM) technique to
+reduce the computation of activation gradients. In order to reduce the computation of a dense matrix
+multiplication T = PQ, where P ∈Rm×n and Q ∈Rn×k, AMM directly reduces the size of the
+matrices by discarding unimportant rows or columns, obtaining P[:, I] and Q[I, :], as illustrated in
+Figure 1 (left). Compared to the original multiplication procedure, AMM reduces the computational
+complexity to |I|/n times by instead multiplying P[:, I] with Q[I, :], trading computational accuracy
+for computational efficiency. To identify the important rows or columns, we compute the importance
+scores αi = ∥P[:, i]Q[i, :]∥F every τ iterations and select the top ones in the following τ times of
+AMM operation.
+Unfortunately, the computational error in the activations’ gradients can further propagate to pre-
+vious layers. Under such a long-lasting effect of inaccurate activation gradients, the accumulated
+computational error can lead to poor gradient estimations, which severely harms the optimization pro-
+cedure and degrades the final model performance. To resolve this issue, we develop a double-LoRA
+technique that significantly reduces the relative error induced to the activation gradients by AMM.
+Specifically, double-LoRA splits the frozen dense weight matrix into two parts, where the first part
+applies AMM to save computation, the second part is a frozen LoRA adapter which is computation-
+efficient without using AMM. In order to reduce the AMM-induced error, we expect the first part to
+include as little information as possible. Consequently, we initially conduct SVD of the parameter
+matrix and identify the first part according to the smallest singular values and corresponding vectors.
+Combining the above techniques, we propose Computation-Efficient LoRA (CE-LoRA), which is
+more computation-efficient and equally memory-efficient compared with LoRA.
+We evaluate the proposed CE-LoRA algorithm both theoretically and empirically. In theory, we
+prove that CE-LoRA with momentum SGD converges at a rate of O(1/
+√
+T), the same order of
+LoRA’s convergence rate. Empirically, we validate that CE-LoRA can converge at a comparable
+precision as standard LoRA, with slightly reduced memory consumption and a 3.39× acceleration
+in computation. To our knowledge, CE-LoRA is the first algorithm that accelerates LoRA without
+sacrificing memory-efficiency or leading to notable performance degradation.
+The main contributions of this paper are as follows:
+• We propose a novel algorithm CE-LoRA, which is more computation-efficient and equally memory-
+efficient compared with standard LoRA.
+• We theoretically prove that CE-LoRA converges at a rate of O(1/
+√
+T), which is the same order of
+standard LoRA’s convergence rate.
+2
+
+
+• We experimentally validate that CE-LoRA has a 3.39× acceleration compared with LoRA without
+sacrificing memory-efficiency or leading to notable training performance degradation.
+2
+Preliminaries
+2.1
+LoRA Algorithm
+In order to fine-tune language models memory-efficiently, LoRA applies a low-rank adapter to
+each linear layer in the model. Specifically, let y = Wx represent a linear layer with y ∈Rm×b,
+W ∈Rm×n and x ∈Rn×b, where m, n represent the output and input dimension, respectively, and
+b represents the batch-size. The LoRA adapter is given by W = W0 + BA with W0 ∈Rm×n fixed
+as the pre-trained weights, B ∈Rm×r and A ∈Rr×n trainable.
+y = Wx,
+(Original)
+y = (W0 + BA)x.
+(LoRA)
+When r ≪min{m, n}, the number of trainable parameters in LoRA, (m + n)r, is much fewer
+than that in full fine-tuning, i.e., mn, which significantly reduces the memory consumption of the
+optimizer states.
+2.2
+Computational Bottleneck
+While applying LoRA can significantly reduce the memory cost for fine-tuning large language models,
+the computational cost for computing the gradient via back propagation is not sufficiently reduced.
+Specifically, let Gθ denote the stochastic gradient of θ calculated by back propagation, for linear
+layer y = Wx we compute:
+GW = Gy · x⊤,
+(1)
+Gx = W⊤· Gy,
+(2)
+Both (1) and (2) require 2bmn FLOPs of computation. Accordingly, in LoRA we compute:
+GB = Gy · z⊤,
+(3)
+Gz = B⊤· Gy,
+(4)
+GA = Gz · x⊤,
+(5)
+Gx,1 = A⊤· Gz,
+(6)
+Gx,2 = W⊤
+0 · Gy,
+(7)
+Gx = Gx,1 + Gx,2,
+(8)
+where z = Ax ∈Rr×b represents LoRA’s additional activation.
+(3)(4)(5)(6)(7)(8) require
+2brm, 2brm, 2brn, 2brn, 2bmn, and bn FLOPs of computation, respectively, resulting in
+4br(m + n) + 2bmn + bn FLOPs in total. When r ≪min{m, n}, the computational cost in
+LoRA’s back propagation is roughly 2bmn, half of the computation in the original approach (1)(2).
+The computational bottleneck lies in the dense matrix multiplication step in (7), which alone requires
+2bmn FLOPs of computation.
+3
+CE-LoRA: Computation-Efficient LoRA
+3.1
+Approximated Matrix Multiplication (AMM)
+Consider matrix multiplication T = PQ, where T ∈Rm×k, P ∈Rm×n and Q ∈Rn×k. Let
+p1, p2, · · · , pn denote the column vectors of matrix P, and q1, q2, · · · , qn denote the column
+vectors of matrix Q⊤. We can rewrite the matrix multiplication into:
+T =
+n
+X
+i=1
+piq⊤
+i .
+3
+
+
+0
+100
+200
+300
+400
+Step
+0.08
+0.10
+0.12
+0.14
+0.16
+Loss
+Commonsense
+0
+200
+400
+600
+800
+Step
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Arithmetic
+420
+430
+440
+450
+0.12
+0.13
+0.14
+840
+860
+880
+900
+0.36
+0.38
+0.40
+0.42
+LoRA
+No-Sample-Q
+No-Sample-K
+No-Sample-V
+No-Sample-O
+No-Sample-Up
+No-Sample-Gate
+No-Sample-Down
+Figure 2: Layer-wise Sensitivity Analysis of LLaMA3.2-1B.
+To estimate the product T computation-efficiently, we may assume the matrices P and Q enjoy some
+kinds of structured sparsity, such that a few (piq⊤
+i )′s contribute to most of the result Pn
+i=1 piq⊤
+i ,
+in which case we could estimate T by computing the most important parts only. Specifically, we
+identify s most important indices 1 ≤i1 < · · · < is ≤n, and the AMM estimate of T is given by:
+ˆT =
+s
+X
+j=1
+pijq⊤
+ij = ˆP ˆQ,
+where ˆP and ˆQ⊤collect column vectors {pij}s
+j=1 and {qij}s
+j=1, respectively.
+The efficiency of AMM is concerned with the number of selected indices s, or the structured sparsity
+p := s/n ∈(0, 1]. Replacing the dense matrix multiplication T = PQ by AMM estimate ˆT = ˆP ˆQ,
+the computational complexity is reduced from 2mnk to 2msk = p · (2mnk). Hereafter, we use
+Cp(P · Q) to denote the AMM estimate of matrix multiplication P · Q with structured sparsity p.
+An important question is how to select the indices I = {i1, i2, · · · , is} properly. A previous research
+[5] has studied a random sampling strategy, which does not work well in our experiments. Based on
+the above intuition, we define the importance score αi of index i by the Frobenius norm ∥piq⊤
+i ∥F and
+attempt to select the indices with highest scores. However, as calculating {αi}k
+i=1 requires the same
+amount of computation as that of conducting the original matrix multiplication, we cannot determine
+I based on the calculation results of {αi}k
+i=1 in every iteration. We use historical information
+to mitigate this issue. Specifically, the matrices P, Q we multiply by AMM should be variables
+that live along the whole optimization process, and Pt, Qt are multiplied at every iteration t. The
+corresponding It is only re-selected according to the top-s importance scores every τ iterations and
+is reused in intermediate ones.
+To reduce the computational bottleneck in LoRA’s backward propagation, we apply AMM to step (7)
+and get:
+Gx,2 = Cp(W⊤
+0 · Gy).
+(9)
+3.2
+Double-LoRA Mechanism
+Although computation-efficient, AMM will induce errors to gx, the gradient with respect to the
+activations. These errors propagate backward through the network, potentially compounding as they
+traverse previous layers. If the magnitude of these errors is not properly controlled, the accuracy of the
+parameter gradients can be significantly degraded. To mitigate this issue, we propose a double-LoRA
+mechanism to alleviate the error induced by the AMM operation in each layer. Intuitively, we wish
+the objective matrix multiplication result we estimate by AMM has as little contribution to the
+activation gradient as possible. This drives us to further separate the frozen matrix W0 into two
+parts: a low-rank part inheriting computational efficiency without AMM, and a residual part with a
+relatively small magnitude.
+Specifically, we initially compute the SVD of W0, yielding
+W0 = UΣV⊤
+Next, We collect the principal low-rank component B0 = U[: r]Σ1/2, A0 = Σ1/2(V[: r])⊤, and
+the residual Ws = W0 −B0A0. By separating W0 to Ws + B0A0, we split the matrix to two
+4
+
+
+Algorithm 1 CE-LoRA
+Input: Frozen layer weight Wℓ∈Rmℓ×nℓ, sparsity level pℓ, double-LoRA rank r0,ℓ, indices recomputing
+period τ, Top-K indices Iℓ= empty, optimizer ρ.
+Initialize Double-LoRA
+1:
+for Layer ℓ= 1, 2, · · · , L do
+2:
+Conducting SVD on frozen weight matrix
+W0,ℓ= UℓΣℓV⊤
+ℓ;
+3:
+A0,ℓ, B0,ℓ←√ΣℓV⊤
+ℓ[:r0,], Uℓ[,:r0]
+√Σℓ;
+▷Stored in layer’s buffer.
+4:
+end for
+5: for CE-LoRA Training Step t = 0, 1, · · · , T −1 do
+6:
+for Layer ℓ= 1, 2, · · · , L do
+▷Forward
+7:
+zℓ←Aℓxℓ;
+8:
+yℓ←W0,ℓxℓ+ Bℓzℓ;
+9:
+end for
+10:
+for Layer ℓ= L, L −1, · · · , 1 do
+▷Backward
+11:
+Ws,ℓ←W0,ℓ−B0,ℓA0,ℓ;
+12:
+if τ | t or Iℓis empty then
+13:
+αi,ℓ←
+W⊤
+s,ℓ[:,i]Gyℓ[i,:]
+
+F , ∀i ∈{1, . . . , mℓ}
+14:
+Select {i1,ℓ, · · · , iKℓ,ℓ} with largest αi,ℓ’s;
+15:
+Iℓ= {i1,ℓ, · · · , iKℓ,ℓ};
+▷Here Kℓ= ⌈mℓpℓ⌉
+16:
+end if
+17:
+GBℓ←Gyℓz⊤
+ℓ;
+18:
+Gzℓ←B⊤
+ℓGyℓ;
+19:
+GAℓ←Gzℓx⊤
+ℓ;
+20:
+Gxℓ←W⊤
+s,ℓ[,I]Gyℓ[I,] + A⊤
+0,ℓ(B⊤
+0,ℓGyℓ) + A⊤
+ℓGzℓ;
+21:
+end for
+22: Use optimizer ρ to update {Aℓ, Bℓ}L
+ℓ=1 according to {GAℓ, GBℓ}L
+ℓ=1;
+23: end for
+parts. The first part Ws is believed to have better structured sparsity and is more compatible to AMM.
+The second low-rank part B0A0 is computation-efficient just like the trainable LoRA adapter BA.
+Combining AMM with double-LoRA, (9) is further replaced by
+Gx,2 = Cp(W⊤
+s · Gy) + A⊤
+0 (B⊤
+0 Gy).
+(10)
+3.3
+Layer-wise Adaptive Sparsity
+It is natural to apply more aggressive sparsity to layers that are relatively robust to computational
+errors, while using more conservative sparsity for those that are more sensitive. Inspired by [6–12],
+we adopt a layer-wise adaptive sparsity strategy for CE-LoRA.
+To determine which layers are more sensitive to varying sparsity levels, we conduct experiments on
+two small fine-tuning datasets: the Commonsense 14K dataset and the Math 7K dataset [13]. In these
+experiments, we fix LoRA’s rank to 32, and set both CE-LoRA’s trainable LoRA rank and its frozen
+Double-LoRA rank to 28. For each CE-LoRA configuration, we vary the sparsity level of one layer
+type, while setting the sparsity of all remaining layer types to p = 0.3. As shown in Figure 2, the
+Gate layers are essential for preventing error propagation. In addition, the Q and K layers have a
+strong impact on arithmetic and commonsense reasoning tasks, respectively. Based on these findings,
+we disable sparsity for the Q, K, and Gate layers. For the remaining MHA layers, we use p = 0.55,
+and for the last two layers in the FFN, we set p = 0.65 throughout our experiments.
+3.4
+Algorithm
+Overall, CE-LoRA integrates AMM, double-LoRA, and layer-wise adaptivity, as outlined in Algo-
+rithm 1. During model initialization, we replace all frozen linear layers with CE-LoRA and apply
+the double-LoRA technique to the weight matrix W0, resulting in low-rank components A0 and B0
+(lines 2–3). For each training step t, the forward pass of a CE-LoRA linear layer behaves the same as
+5
+
+
+the original frozen linear layer (lines 8). In the backward pass, CE-LoRA first computes the residual
+weight matrix by subtracting the low-rank components from the original weight matrix (line 11).
+Next, if the current step t is a multiple of τ or if the indices are empty (e.g., at the start of training),
+the top-K indices are updated (lines 12–15). Finally, CE-LoRA uses AMM to compute activation
+gradient Gxℓ(line 20).
+3.5
+Complexity Analysis
+To better illustrate the computational efficiency of CE-LoRA, we theoretically compare the computa-
+tional and memory complexity of CE-LoRA with LoRA and standard AdamW fine-tuning. Consider
+linear layer y = Wx with W ∈Rm×n, trained with LoRA rank r, double-LoRA rank r0, structured
+sparsity p and batch size b using BF16 precision. As illustrated in Table 1, CE-LoRA can achieve
+a memory usage similar to LoRA by applying slightly smaller r0 and r, while significantly reduce
+the backward computation by applying a relatively small p when b ≫1 and r ≪min{m, n}. When
+combined with low-precision training, the influence of double-LoRA can be further reduced, as the
+frozen low-rank parameters do not require high-precision weight copies or gradient accumulators.
+4
+Convergence Analysis
+We first present the assumptions under which we prove CE-LoRA’s convergence properties.
+Assumption 4.1 (Lower Boundedness). The loss function f : Rd →R satisfies infx∈Rd f(x) >
+−∞.
+Assumption 4.2 (L-Smoothness). The loss function f is L-smooth, i.e., it holds for any x, y ∈Rd
+that
+∥∇f(x) −∇f(y)∥2 ≤L∥x −y∥2.
+Assumption 4.3 (Stochastic Gradient). We assume the stochastic gradient oracle satisfies
+E[∇F(xt; ξt)] = ∇f(xt);
+(11)
+E[∥∇F(xt; ξt) −∇f(xt)∥2] ≤σ2,
+(12)
+for some σ > 0.
+Assumptions 4.1-4.3 are standard assumptions commonly used in stochastic optimization.
+Assumption 4.4 (Gradient Error). Let gt and ˆgt denote the original stochastic gradient ∇F(xt, ξt)
+and its estimation by CE-LoRA, it holds that
+∥ˆgt −gt∥2 ≤(1 −δ)∥gt∥2,
+(13)
+and
+∥Eξt∼D[ˆgt] −∇f(xt)∥2 ≤(1 −δ)∥∇f(xt)∥2,
+(14)
+for some δ ∈(0, 1].
+Assumption 4.4 illustrates the property of stochastic gradients in CE-LoRA. Though not standard,
+this assumption can be empirically justified by our experimental results.
+Table 1: Computation and memory analysis for a single linear layer.
+Method
+Standard AdamW
+LoRA
+CE-LoRA
+Memory Usage
+10mn + 2bm
+2mn + 10r(m + n)
+2mn + 2r0(m + n)
++2b(m + r)
++10r(m + n) + 2b(m + r)
+Forward Computation
+2bmn
+2bmn + 2br(m + n)
+2bmn + 2br(m + n)
+Backward Computation
+4bmn
+2bmn + 4br(m + n)
+(2pb + 1)mn
++2(r0 + br0 + 2br)(m + n)
+6
+
+
+Empirical Justification of Assumption 4.4. To justify (13), we conduct experiments on language
+model fine-tuning tasks on google/gemma-2b [14] model using CoLA [15], RTE and MRPC [16]
+datasets, three tasks in the GLUE benchmark [17]. In these experiments, we use AdamW with a
+learning rate of 1e-5 to train for 1 epoch per task and calculate the relative error ∥ˆgt −gt∥2/∥gt∥2
+every 10 steps, as illustrated in Figure 3, where all relative errors are below 0.9. To justify (14), we
+conduct experiments on the same model and datasets, where we alternatively calculate one iteration
+of full gradient AdamW and one epoch of random gradient AdamW, each with a learning rate of
+1e-5 for a total of 80 cycles. We apply a rank of 64 for both LoRA and double-LoRA in CE-LoRA,
+and apply a structured sparsity of pFFN = 0.9 and pMHA = 0.4. We calculate the relative error
+∥Eξt∼D[ˆgt] −∇f(xt)∥2/∥∇f(xt)∥2 for every full-gradient step, as illustrated in Figure 4, where
+all relative errors are below 0.9.
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+Relative Error
+0
+2
+4
+6
+Density
+MRPC
+ePDF
+0.55
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+Relative Error
+0
+5
+10
+15
+20
+RTE
+ePDF
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+Relative Error
+0
+2
+4
+6
+8
+CoLA
+ePDF
+Figure 3: Empirical validation of (13) on MRPC (left), RTE (middle) and CoLA (right).
+0.5
+0.6
+0.7
+0.8
+Relative Error
+0
+5
+10
+15
+20
+Density
+MRPC
+ePDF
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+Relative Error
+0
+5
+10
+15
+20
+RTE
+ePDF
+0.5
+0.6
+0.7
+0.8
+0.9
+Relative Error
+0
+2
+4
+6
+8
+10
+CoLA
+ePDF
+Figure 4: Empirical validation of (14) on MRPC (left), RTE (middle) and CoLA (right).
+We now propose the convergence results of CE-LoRA using the momentum SGD optimizer with the
+following update:
+mt = (1 −β1)mt−1 + β1ˆgt,
+xt+1 = xt −ηmt,
+Theorem 4.5. Under Assumptions 4.1 - 4.4, if β1 ∈
+
+0,
+δ
+24−12δ
+
+and η ≤min
+
+L
+2 , β1
+L ·
+q
+δ
+8
+
+,
+CE-LoRA with momentum SGD converges as
+1
+T + 1
+T
+X
+t=0
+E[∥∇f(xt)∥2
+2] ≤4[f(x0) −infx f(x)]
+δη(T + 1)
++ 4∥m0 −∇f(x0)∥2
+2]
+δβ1(T + 1)
++ 12β1σ2
+δ
+.
+Corollary 4.6. Under Assumptions 4.1-4.4, if we choose β1 =
+
+24
+δ + σ
+q
+δ1/2(T +1)
+L∆
+−1
+, η =
+
+2L + 23/2L
+δ1/2β1
+−1
+, CE-LoRA with momentum SGD converges as
+1
+T + 1
+T
+X
+t=0
+E[∥∇f(xt)∥2
+2] = O
+ 
+L∆
+δ5/2(T + 1) +
+s
+L∆σ2
+δ5/2(T + 1)
+!
+,
+where ∆:= f(x0) −infx f(x) + (δ/L) · ∥m0 −∇f(x0)∥2
+2.
+Detailed proofs are deferred to Appendix A.
+7
+
+
+5
+Experiments
+In this section, we present a comprehensive set of experiments to evaluate the convergence perfor-
+mance and computational efficiency of CE-LoRA, and compare it against the baseline method.
+5.1
+Experimental Setup
+Datasets. We follow the benchmark design outlined in [13] and evaluate CE-LoRA on two popular
+reasoning benchmarks:
+• Commonsense Reasoning: This dataset includes eight tasks: BoolQ [18], PIQA [19], SocialQA
+[20], HellaSwag [21], WinoGrande [22], ARC-challenge [23], ARC-easy [23], and OpenbookQA
+[24]. In our experiments, we fine-tune all models using the Commonsense 170K dataset [13],
+which is constructed by combining the training sets from these eight tasks.
+• Arithmetic Reasoning: This benchmark consists of seven subsets: MultiArith [25], GSM8K [26],
+AddSub [27], AQuA [28], SingleEq [29], SVAMP [30] and MAWPS [31]. We fine-tune the models
+on the Math 10k dataset [13], which includes training data from GSM8K, MAWPS, and AQuA,
+augmented by language models with chain-of-thought reasoning steps.
+Fine-tuned models and hyper-parameters. We fine-tune LLaMA-2-7B, LLaMA-2-13B [32], and
+LLaMA-3.1-8B [33] using both CE-LoRA and LoRA. The adapter is applied to all linear layers
+in each transformer block, including Q, K, V, O, Up, Gate, and Down. Unless specified otherwise,
+all CE-LoRA experiments replace the frozen V, O, Up, and Down layers with CE-LoRA layers. The
+sparsity levels are set as follows: pV = pO = 0.55 and pUp = pDown = 0.65. For consistency, the
+same set of hyperparameters is applied across both methods for each model size. All experiments are
+conducted using the BF16 format to optimize memory usage.
+5.2
+Statistical Efficiency of CE-LoRA
+In this set of experiments, we evaluate the convergence performance of CE-LoRA using two critical
+metrics: the accuracy achieved on each benchmark and the trajectory of the fine-tuning loss across
+training iterations. By monitoring these metrics, we aim to gain insights into how quickly and
+effectively CE-LoRA converges compared to LoRA.
+Accuracy. We trained both CE-LoRA and LoRA under low-rank (LoRA rank of 16, CE-LoRA
+rank of 14) and high-rank (LoRA rank of 64, CE-LoRA rank of 56) configurations across two
+reasoning datasets for one epoch. Table 2 and Table 3 summarize the results for the commonsense
+and arithmetic reasoning benchmarks. The experimental outcomes demonstrate that, across all LoRA
+rank settings in both benchmarks, CE-LoRA achieves fine-tuning accuracy that is nearly identical
+to that of LoRA, with an average difference in results of 1.58%. These findings suggest that our
+approach has a negligible impact on the original LoRA fine-tuning accuracy. The slight differences in
+accuracy between CE-LoRA and LoRA on the test sets can primarily be attributed to the scaling of
+CE-LoRA’s rank, which was adjusted to ensure a fair experimental comparison.
+Table 2: Comparison among eight commonsense reasoning tasks for the LLaMA2-7B/13B,
+LLaMA3.1-8B models
+Model
+Method
+Rank
+BoolQ
+PIQA
+SIQA
+HellaSwag
+Wino
+ARC-e
+ARC-c
+OBQA
+Avg. ↑
+LLaMA2-7B
+LoRA
+16
+71.99
+84.49
+81.73
+94.45
+85.95
+87.63
+73.21
+83.80
+82.91
+CE-LoRA
+14
+70.24
+82.59
+79.27
+93.17
+82.72
+85.56
+70.65
+79.80
+80.50
+LoRA
+64
+72.26
+84.88
+82.70
+94.97
+86.42
+88.55
+74.74
+86.40
+83.87
+CE-LoRA
+56
+71.68
+85.20
+82.09
+94.61
+83.98
+87.29
+73.29
+84.20
+82.79
+LLaMA2-13B
+LoRA
+16
+75.32
+88.03
+83.21
+81.14
+92.34
+88.20
+96.08
+88.71
+86.63
+CE-LoRA
+14
+73.21
+86.62
+82.14
+94.65
+86.27
+90.15
+77.22
+84.80
+84.38
+LoRA
+64
+75.72
+88.85
+84.39
+96.34
+88.71
+92.42
+81.83
+89.60
+87.23
+CE-LoRA
+56
+74.01
+86.51
+83.11
+92.74
+87.92
+91.37
+79.61
+85.40
+85.08
+LLaMA3-8B
+LoRA
+16
+75.84
+90.86
+83.52
+96.93
+89.90
+94.07
+84.47
+88.8
+88.05
+CE-LoRA
+14
+72.08
+89.72
+82.65
+96.24
+88.32
+93.35
+83.36
+87.60
+86.66
+LoRA
+64
+75.63
+90.21
+83.32
+96.38
+88.95
+93.39
+84.04
+89.20
+87.64
+CE-LoRA
+56
+73.36
+89.66
+82.40
+95.76
+86.42
+93.14
+82.68
+87.60
+86.38
+8
+
+
+0
+500
+1000
+1500
+2000
+2500
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+Loss
+Llama2-7B
+LoRA Loss
+Celora Loss
+0
+500
+1000
+1500
+2000
+2500
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Llama2-13B
+LoRA Loss
+Celora Loss
+0
+500
+1000
+1500
+2000
+2500
+0.05
+0.10
+0.15
+0.20
+0.25
+Rank 16
+Llama3-8B
+LoRA Loss
+Celora Loss
+0
+500
+1000
+1500
+2000
+2500
+Step
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+Loss
+LoRA Loss
+Celora Loss
+0
+500
+1000
+1500
+2000
+2500
+Step
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+LoRA Loss
+Celora Loss
+0
+500
+1000
+1500
+2000
+2500
+Step
+0.05
+0.10
+0.15
+0.20
+0.25
+Rank 64
+LoRA Loss
+Celora Loss
+Figure 5: Loss curve of commonsense reasoning fine-tune task. Each row in the figure corresponds to
+a different trainable parameter setting, while each column represents base models: LLaMA2-7B/13B
+and LLaMA3.1-8B.
+Loss curve. Figure 5 illustrates the loss curves of both CE-LoRA and LoRA under different
+rank settings across the three models on the commonsense reasoning fine-tuning task. In each
+setting, CE-LoRA’s loss curves nearly overlap with those of its LoRA counterparts, indicating
+similar convergence behaviors. These results highlight the effectiveness of our method, empirically
+demonstrating that CE-LoRA can achieve nearly the same convergence capability as the original
+LoRA while potentially offering computational savings. The overlapping loss curves suggest that
+CE-LoRA does not introduce additional convergence challenges and maintains training stability
+comparable to LoRA.
+5.3
+Computation Efficiency
+In these experiments, we measure CE-LoRA’s training efficiency by comparing the average training
+step latency of a single-layer CE-LoRA with a single-layer LoRA. All experiments are conducted
+on a single NVIDIA-HGX-H20-(96GB) GPU to maintain consistent hardware conditions. For a fair
+comparison, both CE-LoRA and LoRA employ the same trainable rank of 64. We run experiments
+on three different model weight sizes—(8192, 8192), (4096, 4096), and (2048, 2048)—using a fixed
+batch size of 16 and a sequence length of 8192. To measure average training step latency, each
+configuration is tested over 100 runs.The first 10 iterations of each run are considered warmup and
+are excluded from latency measurements to mitigate initialization overhead.
+Figure 6 compares the results of LoRA and CE-LoRA with various sparsity levels and shows that
+CE-LoRA achieves a consistent reduction in overall training time, with a maximum of 36.3% speedup.
+As illustrated, CE-LoRA ’s forward pass latency closely matches that of LoRA’s due to the unchanged
+forward logic of the frozen layer. However, in the backward pass, CE-LoRA outperforms LoRA by
+up to 3.39× with some aggressive sampling rate. The observed improvements in wall-clock speed are
+primarily attributed to two key factors: (i) CE-LoRA effectively reduces the theoretical floating-point
+operations required during backpropagation for frozen layers. (ii) We developed specialized CUDA
+kernels tailored for low-rank computations inherent in CE-LoRA’s backpropagation process, which
+optimize memory access patterns, resulting in enhanced computational efficiency and reduced latency.
+Table 3: Performance comparison of LoRA and CE-LoRA on seven arithmetic reasoning tasks.
+Model
+Method
+Rank
+MultiArith
+GSM8K
+AddSub
+AQuA
+SingleEq
+SVAMP
+MAWPS
+Avg. ↑
+LLaMA3-8B
+LoRA
+16
+94.50
+64.59
+90.89
+47.24
+92.13
+76.30
+88.66
+79.19
+CE-LoRA
+14
+94.00
+62.09
+91.14
+44.88
+93.50
+75.00
+90.76
+78.77
+LoRA
+64
+96.33
+65.50
+90.63
+49.61
+92.91
+81.2
+89.50
+80.81
+CE-LoRA
+56
+96.17
+62.02
+88.86
+47.64
+93.31
+77.10
+89.08
+79.17
+9
+
+
+2
+1
+2
+2
+2
+3
+2
+4
+0
+50
+100
+150
+200
+250
+300
+Time (ms)
+Weight Size 8192 × 8192
+2
+1
+2
+2
+2
+3
+2
+4
+0
+20
+40
+60
+80
+Weight Size 4096 × 4096
+2
+1
+2
+2
+2
+3
+2
+4
+0
+5
+10
+15
+20
+25
+30
+Weight Size 2048 × 2048
+Sample Ratio
+LoRA FW
+LoRA BW
+CE-LoRA FW
+CE-LoRA BW
+Figure 6: Comparison of training latency for CE-LoRA and LoRA at various sparsity levels (i.e.,
+1
+2, 1
+4, 1
+8,
+1
+16) across three model shapes: (8192, 8192), (4096, 4096), and (2048, 2048). CE-LoRA
+provides significant speedups in the backward pass, leading to a maximum of 36.3% overall reduction
+in end-to-end training time compared to LoRA.
+6
+Related Works
+Large Language Models. Since the transformer structure was proposed in the famous work [34] in
+2017, it has shown great potential in various tasks, including reasoning, planning, machine translation,
+etc., and has become a popular choice in modern LLM designs, e.g., GPT [35–37], OPT [38], LLaMA
+[39–41], BLOOM [42], BERT [43], Falcon [44], etc. In general, the basic structure of a transformer
+block consists of a multi-head attention (MHA) module followed by a feed-forward network (FFN),
+combined with normalization and residual connections. Linear layers take up most of the trainable
+parameters in transformers and account for the expensive training and inference costs.
+Memory-Efficient Training Algorithms. As the scale of LLM parameters grows, the memory
+consumption to train these models has become a bottleneck problem. Recent studies have proposed a
+series of works in order to reduce training-time memory consumption, enabling LLM researchers to
+effectively pre-train / fine-tune larger LLMs within constrained computational resources. [45, 46]
+fine-tune LLMs parameter-efficiently by adding trainable adapter layers, LoRA [4] reparameterizes
+linear layers in transformers with low-rank adapters, ReLoRA [47] extends to pre-training tasks by
+accumulating LoRA updates, S2FT [48] applies sparse structures, SLTrain [49] combines low-rank
+and sparse structures. Besides the above parameter-efficient approaches, another line of works reduce
+the memory consumption for optimizer states by optimizing in periodically updated subspaces,
+including LISA [50], GaLore [51], GoLore [52] and FLORA [53]. In addition, BackRazor [54] and
+PreBackRazor [55] improve memory-efficiency by compressing the activation memory. Further-
+more, quantization methods [56, 57] that are orthogonal to the above approaches have shown nice
+compatibilities in memory cost reduction.
+Computation-Efficient Training Algorithms. Though not specially designed for computational
+efficiency, a lot of memory-efficient training algorithms, particularly those belong to parameter-
+efficient fine-tuning (PEFT), can also reduce computational costs to some extent. On the other hand,
+the training throughput can also be improved by utilizing a larger batch size thanks to the reduced
+memory consumption [58]. However, the computational savings of these approaches are limited by
+precisely retaining the complete backward propagation process. Recently, [59] proposes DropBP, an
+approach orthogonal to PEFT that saves computation by strategically skip connections in backward
+propagation. Since some layers are dropped during backward propagation, corresponding parameters
+do not have gradients for update. To the best of our knowledge, this paper provides the first approach
+to accelerate LoRA by employing structured sparsity to reduce the computational bottleneck in
+backward propagation without sacrificing memory-efficiency or model performance.
+7
+Conclusion
+We propose CE-LoRA that saves computational FLOPs by approximated matrix multiplication and
+controls the compression error by a novel double LoRA technique and layer-wise compression ratios.
+While enjoying a 3.39 times of acceleration compared to LoRA, CE-LoRA theoretically converges at
+a rate of O(1/
+√
+T) and shows comparable performance in our experiments.
+10
+
+
+References
+[1] Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von
+Arx, Michael S Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al. On the
+opportunities and risks of foundation models. arXiv preprint arXiv:2108.07258, 2021.
+[2] Shengyu Zhang, Linfeng Dong, Xiaoya Li, Sen Zhang, Xiaofei Sun, Shuhe Wang, Jiwei Li,
+Runyi Hu, Tianwei Zhang, Fei Wu, et al. Instruction tuning for large language models: A survey.
+arXiv preprint arXiv:2308.10792, 2023.
+[3] Zeyu Han, Chao Gao, Jinyang Liu, Jeff Zhang, and Sai Qian Zhang. Parameter-efficient
+fine-tuning for large models: A comprehensive survey. arXiv preprint arXiv:2403.14608, 2024.
+[4] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+Lu Wang, and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv
+preprint arXiv:2106.09685, 2021.
+[5] Petros Drineas, Ravi Kannan, and Michael W Mahoney. Fast monte carlo algorithms for
+matrices i: Approximating matrix multiplication. SIAM Journal on Computing, 36(1):132–157,
+2006.
+[6] Gansen Hu, Zhaoguo Wang, Jinglin Wei, Wei Huang, and Haibo Chen. Accelerating large
+language models through partially linear feed-forward network. arXiv e-prints, pages arXiv–
+2501, 2025.
+[7] Chi Ma, Mincong Huang, Ying Zhang, Chao Wang, Yujie Wang, Lei Yu, Chuan Liu, and Wei
+Lin. First activations matter: Training-free methods for dynamic activation in large language
+models. arXiv preprint arXiv:2408.11393, 2024.
+[8] Ajay Jaiswal, Lu Yin, Zhenyu Zhang, Shiwei Liu, Jiawei Zhao, Yuandong Tian, and Zhangyang
+Wang. From galore to welore: How low-rank weights non-uniformly emerge from low-rank
+gradients. arXiv preprint arXiv:2407.11239, 2024.
+[9] Binrui Zeng, Bin Ji, Xiaodong Liu, Jie Yu, Shasha Li, Jun Ma, Xiaopeng Li, Shangwen
+Wang, and Xinran Hong. Lsaq: Layer-specific adaptive quantization for large language model
+deployment. arXiv preprint arXiv:2412.18135, 2024.
+[10] Vladimir Malinovskii, Andrei Panferov, Ivan Ilin, Han Guo, Peter Richtárik, and Dan Alistarh.
+Pushing the limits of large language model quantization via the linearity theorem. arXiv preprint
+arXiv:2411.17525, 2024.
+[11] Zhenyu Zhang, Ajay Jaiswal, Lu Yin, Shiwei Liu, Jiawei Zhao, Yuandong Tian, and Zhangyang
+Wang. Q-galore: Quantized galore with int4 projection and layer-adaptive low-rank gradients.
+arXiv preprint arXiv:2407.08296, 2024.
+[12] James Liu, Pragaash Ponnusamy, Tianle Cai, Han Guo, Yoon Kim, and Ben Athiwaratkun.
+Training-free activation sparsity in large language models. arXiv preprint arXiv:2408.14690,
+2024.
+[13] Zhiqiang Hu, Yihuai Lan, Lei Wang, Wanyu Xu, Ee-Peng Lim, Roy Ka-Wei Lee, Lidong Bing,
+and Soujanya Poria. Llm-adapters: An adapter family for parameter-efficient fine-tuning of
+large language models. arXiv preprint arXiv:2304.01933, 2023.
+[14] google/gemma-2b.
+[15] Alex Warstadt, Amanpreet Singh, and Samuel R. Bowman. Neural network acceptability
+judgments. Transactions of the Association for Computational Linguistics, 7:625–641, 2019.
+[16] William B. Dolan and Chris Brockett. Automatically constructing a corpus of sentential
+paraphrases. In Proceedings of the Third International Workshop on Paraphrasing (IWP2005),
+2005.
+[17] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R. Bowman.
+Glue: A multi-task benchmark and analysis platform for natural language understanding, 2019.
+11
+
+
+[18] Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, and
+Kristina Toutanova. BoolQ: Exploring the surprising difficulty of natural yes/no questions. In
+Jill Burstein, Christy Doran, and Thamar Solorio, editors, Proceedings of the 2019 Conference
+of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies, Volume 1 (Long and Short Papers), pages 2924–2936, Minneapolis,
+Minnesota, June 2019. Association for Computational Linguistics.
+[19] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. Piqa: Reasoning about phys-
+ical commonsense in natural language. In Proceedings of the AAAI conference on artificial
+intelligence, volume 34, pages 7432–7439, 2020.
+[20] Maarten Sap, Hannah Rashkin, Derek Chen, Ronan LeBras, and Yejin Choi. Socialiqa: Com-
+monsense reasoning about social interactions. arXiv preprint arXiv:1904.09728, 2019.
+[21] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a
+machine really finish your sentence? arXiv preprint arXiv:1905.07830, 2019.
+[22] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An
+adversarial winograd schema challenge at scale. Communications of the ACM, 64(9):99–106,
+2021.
+[23] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+and Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning
+challenge. arXiv preprint arXiv:1803.05457, 2018.
+[24] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct
+electricity? a new dataset for open book question answering. arXiv preprint arXiv:1809.02789,
+2018.
+[25] Subhro Roy and Dan Roth.
+Solving general arithmetic word problems.
+arXiv preprint
+arXiv:1608.01413, 2016.
+[26] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to
+solve math word problems. arXiv preprint arXiv:2110.14168, 2021.
+[27] Mohammad Javad Hosseini, Hannaneh Hajishirzi, Oren Etzioni, and Nate Kushman. Learning to
+solve arithmetic word problems with verb categorization. In Proceedings of the 2014 Conference
+on Empirical Methods in Natural Language Processing (EMNLP), pages 523–533, 2014.
+[28] Wang Ling, Dani Yogatama, Chris Dyer, and Phil Blunsom. Program induction by rationale
+generation: Learning to solve and explain algebraic word problems. In Regina Barzilay
+and Min-Yen Kan, editors, Proceedings of the 55th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pages 158–167, Vancouver, Canada, July
+2017. Association for Computational Linguistics.
+[29] Rik Koncel-Kedziorski, Hannaneh Hajishirzi, Ashish Sabharwal, Oren Etzioni, and Siena Du-
+mas Ang. Parsing algebraic word problems into equations. Transactions of the Association for
+Computational Linguistics, 3:585–597, 2015.
+[30] Arkil Patel, Satwik Bhattamishra, and Navin Goyal. Are NLP models really able to solve
+simple math word problems? In Kristina Toutanova, Anna Rumshisky, Luke Zettlemoyer,
+Dilek Hakkani-Tur, Iz Beltagy, Steven Bethard, Ryan Cotterell, Tanmoy Chakraborty, and
+Yichao Zhou, editors, Proceedings of the 2021 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, pages 2080–2094,
+Online, June 2021. Association for Computational Linguistics.
+[31] Rik Koncel-Kedziorski, Subhro Roy, Aida Amini, Nate Kushman, and Hannaneh Hajishirzi.
+MAWPS: A math word problem repository. In Kevin Knight, Ani Nenkova, and Owen Rambow,
+editors, Proceedings of the 2016 Conference of the North American Chapter of the Association
+for Computational Linguistics: Human Language Technologies, pages 1152–1157, San Diego,
+California, June 2016. Association for Computational Linguistics.
+12
+
+
+[32] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas
+Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes,
+Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony
+Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian
+Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov,
+Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta,
+Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiao-
+qing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng
+Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien
+Rodriguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation
+and fine-tuned chat models, 2023.
+[33] AI@Meta. Llama 3 model card. 2024.
+[34] A Vaswani. Attention is all you need. Advances in Neural Information Processing Systems,
+2017.
+[35] Alec Radford. Improving language understanding by generative pre-training. 2018.
+[36] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al.
+Language models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+[37] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[38] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen,
+Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained
+transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+[39] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timo-
+thée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open
+and efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+[40] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open
+foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+[41] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle,
+Aiesha Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd
+of models. arXiv preprint arXiv:2407.21783, 2024.
+[42] Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ili´c, Daniel Hesslow,
+Roman Castagné, Alexandra Sasha Luccioni, François Yvon, Matthias Gallé, et al. Bloom: A
+176b-parameter open-access multilingual language model. 2023.
+[43] Jacob Devlin. Bert: Pre-training of deep bidirectional transformers for language understanding.
+arXiv preprint arXiv:1810.04805, 2018.
+[44] Guilherme Penedo, Quentin Malartic, Daniel Hesslow, Ruxandra Cojocaru, Alessandro Cappelli,
+Hamza Alobeidli, Baptiste Pannier, Ebtesam Almazrouei, and Julien Launay. The refinedweb
+dataset for falcon llm: outperforming curated corpora with web data, and web data only. arXiv
+preprint arXiv:2306.01116, 2023.
+[45] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe,
+Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning
+for nlp. In International conference on machine learning, pages 2790–2799. PMLR, 2019.
+[46] Jonas Pfeiffer, Andreas Rücklé, Clifton Poth, Aishwarya Kamath, Ivan Vuli´c, Sebastian Ruder,
+Kyunghyun Cho, and Iryna Gurevych. Adapterhub: A framework for adapting transformers.
+arXiv preprint arXiv:2007.07779, 2020.
+13
+
+
+[47] Vladislav Lialin, Sherin Muckatira, Namrata Shivagunde, and Anna Rumshisky. Relora: High-
+rank training through low-rank updates. In The Twelfth International Conference on Learning
+Representations, 2023.
+[48] Xinyu Yang, Jixuan Leng, Geyang Guo, Jiawei Zhao, Ryumei Nakada, Linjun Zhang, Huaxiu
+Yao, and Beidi Chen. S$^{2}$FT: Efficient, scalable and generalizable LLM fine-tuning by
+structured sparsity. In The Thirty-eighth Annual Conference on Neural Information Processing
+Systems, 2024.
+[49] Andi Han, Jiaxiang Li, Wei Huang, Mingyi Hong, Akiko Takeda, Pratik Jawanpuria, and
+Bamdev Mishra. Sltrain: a sparse plus low-rank approach for parameter and memory efficient
+pretraining. arXiv preprint arXiv:2406.02214, 2024.
+[50] Rui Pan, Xiang Liu, Shizhe Diao, Renjie Pi, Jipeng Zhang, Chi Han, and Tong Zhang. Lisa:
+Layerwise importance sampling for memory-efficient large language model fine-tuning. arXiv
+preprint arXiv:2403.17919, 2024.
+[51] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+Tian. Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint
+arXiv:2403.03507, 2024.
+[52] Yutong He, Pengrui Li, Yipeng Hu, Chuyan Chen, and Kun Yuan. Subspace optimization for
+large language models with convergence guarantees. arXiv preprint arXiv:2410.11289, 2024.
+[53] Yongchang Hao, Yanshuai Cao, and Lili Mou. Flora: Low-rank adapters are secretly gradient
+compressors. arXiv preprint arXiv:2402.03293, 2024.
+[54] Ziyu Jiang, Xuxi Chen, Xueqin Huang, Xianzhi Du, Denny Zhou, and Zhangyang Wang. Back
+razor: Memory-efficient transfer learning by self-sparsified backpropagation. Advances in
+neural information processing systems, 35:29248–29261, 2022.
+[55] Zhiyuan Yu, Li Shen, Liang Ding, Xinmei Tian, Yixin Chen, and Dacheng Tao. Sheared back-
+propagation for fine-tuning foundation models. In Proceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition, pages 5883–5892, 2024.
+[56] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia,
+Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, et al. Mixed precision
+training. arXiv preprint arXiv:1710.03740, 2017.
+[57] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient
+finetuning of quantized llms. Advances in Neural Information Processing Systems, 36, 2024.
+[58] Hanqing Zhu, Zhenyu Zhang, Wenyan Cong, Xi Liu, Sem Park, Vikas Chandra, Bo Long,
+David Z Pan, Zhangyang Wang, and Jinwon Lee. Apollo: Sgd-like memory, adamw-level
+performance. arXiv preprint arXiv:2412.05270, 2024.
+[59] Sunghyeon Woo, Baeseong Park, Byeongwook Kim, Minjung Jo, Sejung Kwon, Dongsuk Jeon,
+and Dongsoo Lee. Dropbp: Accelerating fine-tuning of large language models by dropping
+backward propagation. arXiv preprint arXiv:2402.17812, 2024.
+14
+
+
+A
+Missing Proofs
+In this section, we provide detailed proofs for Theorem 4.5. We first prove the following lemma.
+Lemma A.1. Under Assumptions 4.1-4.4, if β1 ∈(0, 1), it holds that
+T
+X
+t=0
+E[∥mt −∇f(xt)∥2
+2] ≤2∥m0 −∇f(x0)∥2
+2
+β1
++ 4L2
+δβ2
+1
+T
+X
+t=1
+∥xt −xt−1∥2
+2
++
+
+1 −δ
+2
+
+(1 + 6β1)
+T
+X
+t=1
+E[∥∇f(xt)∥2
+2] + 6Tβ1σ2.
+(15)
+Proof. According to the update of momentum, we have
+mt −∇f(xt) =(1 −β1)(mt−1 −∇f(xt)) + β1(ˆgt −∇f(xt)).
+Taking expectation we have
+E[∥mt −∇f(xt)∥2
+2] =E[∥(1 −β1)(mt−1 −∇f(xt)) + β1(E[ˆgt] −∇f(xt))∥2
+2]
++ β2
+1E[∥ˆgt −E[ˆgt]∥2
+2].
+(16)
+For the first term, applying Jensen’s inequality yields
+E[∥(1 −β1)(mt−1 −∇f(xt) + β1(E[ˆgt] −∇f(xt))∥2
+2]
+≤(1 −β1)E[∥mt−1 −∇f(xt−1) −∇f(xt) + ∇f(xt−1)∥2
+2] + β1E[∥E[ˆgt] −∇f(xt)∥2
+2].
+(17)
+By Young’s inequality, we have
+E[∥mt−1 −∇f(xt−1) −∇f(xt) + ∇f(xt−1)∥2
+2] ≤
+
+1 + δβ1
+2
+
+E[∥mt−1 −∇f(xt−1)∥2
+2]
++
+
+1 +
+2
+δβ1
+
+E[∥∇f(xt) −∇f(xt−1)∥2
+2].
+(18)
+For the second term, applying Cauchy’s inequality yields
+E[∥ˆgt −E[ˆgt]∥2
+2] ≤3E∥ˆgt −gt∥2
+2 + 3E[∥gt −∇f(xt)∥2
+2] + 3E[∥∇f(xt) −E[ˆgt]∥2
+2]
+≤6(1 −δ)E[∥∇f(xt)∥2
+2] + 3(2 −δ)σ2,
+(19)
+where the last inequality uses Assumption 4.3 and 4.4. Applying (17)(18)(19) to (16) and using
+Assumption 4.2 and 4.4, we obtain
+E[∥mt −∇f(xt)∥2
+2] ≤
+
+1 −β1
+
+1 −δ
+2
+
+E[∥mt−1 −∇f(xt−1)∥2
+2] + 2L2
+δβ1
+E[∥xt −xt−1∥2
+2]
++ (β1 + 6β2
+1)(1 −δ)E[∥∇f(xt)∥2
+2] + 3(2 −δ)β2
+1σ2.
+(20)
+Summing (20) for t = 1, 2, · · · , T yields (15).
+Now we are ready to prove Theorem 4.5. We first restate the theorem below in Theorem A.2.
+Theorem A.2.
+Under Assumptions 4.1-4.4,
+if β1
+∈
+(0, δ/(24 −12δ)) and η
+≤
+min{1/2L,
+p
+(δβ2
+1)/(8L2)}, CeLoRA with momentum SGD converges as
+1
+T + 1
+T
+X
+t=0
+E[∥∇f(xt)∥2
+2] ≤4[f(x0) −infx f(x)]
+δη(T + 1)
++ 4∥m0 −∇f(x0)∥2
+2]
+δβ1(T + 1)
++ 12β1σ2
+δ
+.
+(21)
+Proof. By Assumption 4.2, we have
+f(xt+1) −f(xt) ≤⟨∇f(xt), xt+1 −xt⟩+ L
+2 ∥xt+1 −xt∥2
+2
+=
+mt
+2 , xt+1 −xt
+
++
+
+∇f(xt) −mt
+2 , xt+1 −xt
+
++ L
+2 ∥xt+1 −xt∥2
+2
+= −
+ 1
+2η −L
+2
+
+∥xt+1 −xt∥2
+2 + η
+2∥∇f(xt) −mt∥2
+2 −η
+2∥∇f(xt)∥2
+2.
+(22)
+15
+
+
+Taking expectation and summing (22) for t = 0, 1, · · · , T yields
+inf
+x f(x) −f(x0) ≤η
+2
+T
+X
+t=0
+E[∥∇f(xt) −mt∥2
+2] −
+ 1
+2η −L
+2
+
+T
+X
+t=0
+E[∥xt+1 −xt∥2
+2]
+−η
+2
+T
+X
+t=0
+E[∥∇f(xt)∥2
+2].
+(23)
+Applying Lemma A.1 to (23) and noting that β1 ∈(0, δ/(24 −12δ)) implies (1 −δ/2)(1 + 6β1) ≤
+1 −δ/4, we obtain
+1
+T + 1
+T
+X
+t=0
+E[∥∇f(xt)∥2
+2] ≤4[f(x0) −infx f(x)]
+δη(T + 1)
++ 4∥m0 −∇f(x0)∥2
+2
+δβ1(T + 1)
++ 12β1σ2
+δ
+−4
+δη
+ 1
+2η −L
+2 −2ηL2
+δβ2
+1
+
+T
+X
+t=0
+∥xt+1 −xt∥2
+2.
+(24)
+Since η ≤min{1/2L,
+p
+(δβ2
+1)/(8L2)} implies 1/(4η) ≥L/2 and 1/(4η) ≥(2ηL2)/(δβ2
+1), (21)
+is a direct result of (24).
+16

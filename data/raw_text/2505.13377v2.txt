@@ -1,0 +1,4098 @@
+Published as a conference paper at ICLR 2026
+SCORE DISTILLATION BEYOND ACCELERATION: GEN-
+ERATIVE MODELING FROM CORRUPTED DATA
+Yasi Zhang∗,1, Tianyu Chen∗,2,3,‡, Zhendong Wang3, Ying Nian Wu1,
+Mingyuan Zhou†,2,3, Oscar Leong†,1
+∗Equal contribution
+†Equal advising
+1University of California, Los Angeles
+2University of Texas at Austin
+3Microsoft AI Superintelligence
+‡ Work done during an internship in Microsoft
+Correspondonce to yasminzhang@ucla.edu, tianyuchen@utexas.edu
+ABSTRACT
+Learning generative models directly from corrupted observations is a long-standing
+challenge across natural and scientific domains. We introduce Restoration Score
+Distillation (RSD), a unified framework for learning high-fidelity, one-step genera-
+tive models using only degraded data of the form y = A(x) + σε, x ∼pX, ε ∼
+N(0, Im), where the mapping A may be the identity or a non-invertible corruption
+operator (e.g., blur, masking, subsampling, Fourier acquisition). RSD first pretrains
+a corruption-aware diffusion teacher on the observed measurements, then distills
+it into an efficient one-step generator whose samples are statistically closer to the
+clean distribution pX. The framework subsumes identity corruption (denoising
+task) as a special case of our general formulation.
+Empirically, RSD consistently reduces Fréchet Inception Distance (FID) rela-
+tive to corruption-aware diffusion teachers across noisy generation (CIFAR-10,
+FFHQ, CELEBA-HQ, AFHQ-V2), image restoration (Gaussian deblurring, ran-
+dom inpainting, super-resolution, and mixtures with additive noise), and multi-coil
+MRI—without access to any clean images. The distilled generator inherits one-
+step sampling efficiency, yielding up to 30× speedups over multi-step diffusion
+while surpassing the teachers after substantially fewer training iterations. These
+results establish score distillation as a practical tool for generative modeling from
+corrupted data, not merely for acceleration. We provide theoretical support for the
+use of distillation in enhancing generation quality in the Appendix. The code is
+available at https://github.com/TianyuCodings/RSD.
+1
+INTRODUCTION
+Learning from corrupted data is central to many scientific and engineering domains where clean
+observations are scarce or costly, including astronomy Roddier (1988); Lin et al. (2024), medical
+imaging Reed et al. (2021); Jalal et al. (2021), and seismology Nolet (2008); Rawlinson et al.
+(2014). For instance, fully sampled MRI acquisitions are time-consuming and uncomfortable for
+patients Knoll et al. (2020); Zbontar et al. (2018), motivating methods that recover the structure of
+the underlying clean distribution from corrupted measurements alone.
+Problem Statement.
+We study generative modeling from corrupted observations. Let x ∈Rd be
+drawn from an unknown clean distribution pX. We observe only
+y = A(x) + σϵ,
+ϵ ∼N(0, Im),
+(1)
+where A : Rd →Rm is a (known) non-invertible corruption operator and σ is the noise level. The
+operator may be identity (i.e., denoising), a deterministic linear map (blur, downsampling), a random
+mask (inpainting), or a Fourier-domain undersampling pattern (MRI). Our goal is to learn a generator
+whose samples follow pX using only a dataset of N corrupted datapoints {y(i)}N
+i=1 of the form Eq 1.
+Background and limitations.
+Diffusion models Sohl-Dickstein et al. (2015); Ho et al. (2020),
+also known as score-based generative models Song and Ermon (2019); Song et al. (2021b), achieve
+1
+arXiv:2505.13377v2  [cs.LG]  17 Mar 2026
+
+
+Published as a conference paper at ICLR 2026
+Phase 1: Flexible corruption-aware 
+      diﬀusion pretraining
+Problem Statement
+Corrupted Data
+Clean Distribution
+Phase 2: One-step generator distillation
+Our Method: Restoration Score Distillation
+Masked
+RSD
+FID: 4.44
+(a) Random Inpainting
+(b) Gaussian Deblurring
+(c) Super-Resolution
+RSD
+FID: 12.99
+RSD
+FID: 32.71
+Blurred
+Downsampled
+How to learn from corrupted data?
+?
+teacher diﬀusion
+Corruption 
+Pipeline
+A
+Noise
+Corruption
+teacher diﬀusion
+fake diﬀusion
+one-step
+generator
+FID: 275.04
+FID: 72.83
+FID: 23.94
+Figure 1: Overview of Restoration Score Distillation (RSD) and some qualitative results across
+diverse operators: Gaussian deblurring, random inpainting, and super-resolution. Additional examples
+appear in Appendix A and K.
+state-of-the-art results in high-dimensional image synthesis Dhariwal and Nichol (2021); Ho et al.
+(2022); Ramesh et al. (2022); Rombach et al. (2022); Peebles and Xie (2023); Zheng et al. (2024);
+Zhang et al. (2025); Chang et al. (2025); Chen et al. (2025). When only measurements are available,
+corruption-aware training adapts diffusion objectives to the forward operator: Ambient Diffusion
+for masking Daras et al. (2023b), Ambient Tweedie for additive noise Daras et al. (2025), and
+Fourier-space variants for MRI Aali et al. (2025). These methods, however, inherit the sampling cost
+of multi-step reverse processes. EM-Diffusion Bai et al. (2024) offers broader operator coverage but
+requires a few clean images, is computationally expensive, and can struggle under severe corruption.
+Distillation beyond acceleration.
+Score distillation transfers a pretrained diffusion teacher into
+a one-step generator while largely preserving fidelity (Poole et al., 2022; Wang et al., 2024b; Luo
+et al., 2024; Yin et al., 2024b; Zhou et al., 2024; Xie et al., 2024; Xu et al., 2025; Yin et al.,
+2024a). Recent reports indicate that distilled generators can even outperform their diffusion teach-
+ers (Zhou et al., 2024), though gains under clean-data training are typically modest. In contrast, under
+corrupted-data–only training, we observe substantially larger improvements over the teacher (Sec. 4),
+underscoring distillation’s particular advantage in challenging regimes.
+Restoration Score Distillation (RSD).
+We introduce RSD, a unified framework for learning high-
+fidelity one-step generators directly and only from corrupted observations, with denoising (A=I) as a
+special case. RSD proceeds in two stages: (i) corruption-aware diffusion pretraining, where a teacher
+is trained on measurements using an objective matched to the forward operator A (Sec. 3.1); and (ii)
+score distillation, which transfers the teacher into a single-step generator while explicitly respecting
+the measurement operator during training (Sec. 3.2). Concretely, we synthesize measurements by
+applying the same corruption pipeline to generator outputs and then align the induced generator
+scores with the teacher’s scores under a divergence (e.g., Fisher or KL). The distillation phase,
+which includes a corruption-respecting procedure, consistently improves generation quality upon the
+diffusion teacher across both denoising and more general operators (Fig. 1).
+Contributions.
+Our work makes three primary contributions. Unified framework for diverse
+corruptions: We propose RSD, a unified approach that learns generators directly from diverse
+corrupted measurements y = A(x)+σϵ. This formulation encompasses denoising (A = I) as well as
+more general operators, including blur, downsampling, random masking, and Fourier undersampling,
+under both noisy and noiseless regimes, and achieves state-of-the-art performance across these settings.
+Modular training: Our training pipeline is organized into two phases. Phase I accommodates a
+variety of corruption-aware techniques, such as standard diffusion, diffusion for denoising, random
+inpainting, and masked Fourier-space (F.S.) transformations. Phase II distills the teacher model into
+2
+
+
+Published as a conference paper at ICLR 2026
+Table 1: Summary of corruption-aware diffusion objectives used for pretraining. Our framework can
+be seamlessly integrated with existing advanced corruption-aware diffusion objectives.
+Suitable Scenario
+Algorithm
+Operator
+Domain
+Pretrain Objective
+Notation
+Noiseless Corruption
+Alg(2)
+A(x)
+Image
+LSD = E
+
+λ(t)∥fϕ(y + σtε, t) −y∥2
+2
+
+y: corrupted data
+Noisy Corruption
+Alg(3)
+A(x) + σϵ
+Image
+LN = E
+h
+∥˜σ2
+t −σ2
+˜σ2
+t
+fϕ(yt, t) + σ2
+˜σ2
+t yt −y∥2
+2
+i
+σ: data noise level, ˜σt = max{σt, σ}
+Random Inpainting
+Alg(5)
+Mx
+Image
+LRI = E
+
+∥M(fϕ( ˜
+M, ˜
+Myt, t) −y)∥2
+2
+
+˜
+M: further corrupted mask M
+Masked F.S.
+Alg(6)
+MFx
+Fourier
+LFS = E
+
+∥Afϕ( ˜
+M, ˜yt, t) −y∥2
+2
+
+˜yt: further corrupted yt, A defined in Appx.H.4
+a one-step generator while retaining the corruption pipeline used during training. This modularity
+makes it straightforward to plug in new forward operators or training objectives. We also provide
+theoretical analysis that explains why the distillation phase can enhance generation quality. Extensive
+experiments: We conduct comprehensive evaluations on natural-image benchmarks (CIFAR-10,
+CelebA-HQ, FFHQ, AFHQ-v2), restoration tasks (denoising with σ ∈{0.1, 0.2, 0.4}, Gaussian
+deblurring, random inpainting with p ∈{0.6, 0.8, 0.9}, and 2× super-resolution), and multi-coil
+MRI with acceleration factors R ∈{4, 6, 8}. Across all settings, RSD consistently improves FID
+over corruption-aware diffusion teachers while offering substantial speedups via one-step generation
+(Sec. 4). Additional ablations (Sec. 4.5) on unknown corruption types and different data size further
+underscore the robustness of our framework. Moreover, we demonstrate that the learned clean-image
+prior (the generator) can be directly leveraged for downstream conditional inverse problems, achieving
+good performance (Sec. 4.7).
+2
+BACKGROUND
+2.1
+DIFFUSION MODELS
+Diffusion models Sohl-Dickstein et al. (2015); Ho et al. (2020), also known as score-based generative
+models Song and Ermon (2019); Song et al. (2021b), consist of a forward process that gradually
+perturbs data with noise and a reverse process that denoises this signal to recover the data distribution
+pX(x). Specifically, the forward process defines a family of conditional distributions over noise levels
+t ∈(0, 1], given by qt(xt | x) = N(αtx, σ2
+t I), with marginals qt(xt). We adopt a variance-exploding
+(VE) process Song and Ermon (2019) by setting αt = 1, yielding the simple form xt = x + σtε,
+where ε ∼N(0, Id). To model the reverse denoising process, one typically trains a time-dependent
+denoising autoencoder (DAE) fϕ(·, t) : Rd × [0, 1] →Rd Vincent (2011), parameterized by a neural
+network, to approximate the posterior mean E[x | xt]. This is achieved by minimizing the following
+standard diffusion loss:
+LSD(ϕ; {x(i)}N
+i=1) := Ex,σt,ε
+
+λ(t)∥fϕ(xt, t) −x∥2
+2
+
+(2)
+where xt = x + σtε and {x(i)}N
+i=1 denotes the dataset. One can also apply the loss to the corrupted
+data {y(i)}N
+i=1 to directly learn the distribution pY (y). For clarity, we omit the diffusion training
+schedule λ(t), p(σt) and the noise term ε ∼N(0, Im); full details are deferred to Appendix H.1,
+Alg 2. The corresponding objectives are summarized in Table 1, with additional discussion below.
+2.2
+DIFFUSION MODELS FOR CORRUPTIONS
+Recent advances have extended diffusion models to address diverse forms of data corruption. We
+present several variants of the diffusion loss tailored to different corruption settings, including
+objectives for noisy data, random inpainting in the image domain and Fourier domain.
+Diffusion for Noisy Corruptions.
+Daras et al. (2025) generalizes score matching to noisy observa-
+tions y = x + σε, ε ∼N(0, I). Here, σ > 0 is a known noise level in the measurements. One can
+incorporate the known corruption by minimizing the following diffusion for noisy corruptions
+LN(ϕ; {y(i)}N
+i=1) = Ey,˜σt,ϵ
+"
+λ(t)
+
+˜σ2
+t −σ2
+˜σ2
+t
+fϕ(yt, t) + σ2
+˜σ2
+t
+yt −y
+
+2
+2
+#
+,
+(3)
+where ˜σt = max{σt, σ}, yt = y + ˜σt, and p(σt) and λ(t) arise from the diffusion training schedule.
+This formula models the distribution of the xt := x + σtε where σt ≥σ. Full details are deferred to
+Appendix H.2, the training algorithm in Algorithm 3 and the sampling algorithm in Algorithm 4.
+3
+
+
+Published as a conference paper at ICLR 2026
+Diffusion for Image-Space Random Masked Corruptions.
+Daras et al. (2023b) learn pX(x)
+from randomly inpainted measurements by incorporating mask into the diffusion objective. Given
+observations y = Mx for a binary mask M, the teacher is trained with a random-inpainting loss
+LRI(ϕ; {y(i)}N
+i=1) = E(y,M), ˜
+M, σt, ε
+h M
+
+fϕ( ˜
+M, ˜
+Myt, t) −y
+ 2
+2
+i
+,
+(4)
+where yt = y + σtε is from diffusion schedule, ε ∼N(0, I), and ˜
+M is a secondary mask that
+further erases pixels based on M. Details of the diffusion schedule λ(t), p(σt), and the full training
+procedure are provided in Appendix H.3, Algorithm 5.
+Diffusion for Fourier-Space Random Masked Corruptions.
+(Aali et al., 2025) extends diffusion
+models to handle frequency-domain measurements with random masking, which are used in scientific
+imaging (e.g., MRI). Specifically, observations take the form y = MFx, where F denotes the Fourier
+transform operator and M is a sampling mask. Formal definitions of the measurement process and
+the corresponding training algorithm are provided in Appendix H.4 and Algorithm 6.
+These specialized frameworks enable generative modeling from realistic scenarios such as noisy,
+missing data, or frequency-domain degradation. All objective functions are summarized in Table 1.
+2.3
+SCORE DISTILLATION FOR GENERATIVE MODELING
+Score distillation compresses multi-step diffusion models into efficient one-step generators. Originally
+proposed for text-to-3D generation Poole et al. (2022); Wang et al. (2024b) and later extended to
+image synthesis Luo et al. (2024); Yin et al. (2024b); Zhou et al. (2024); Xie et al. (2024), it transfers
+knowledge from a pretrained diffusion teacher fϕ to a generator Gθ : Rd →Rd. To bridge the two, a
+fake diffusion model fψ approximates the distribution induced by Gθ(·) across diffusion noise levels.
+Training encourages consistency between fψ and fϕ over time:
+Ldistill(θ) = Eσt, z∼N (0,Id)Exθ=Gθ(z)
+
+∥fϕ(xt, t) −fψ(xt, t)∥2
+2
+
+,
+(5)
+where xt = xθ + σtϵ and the loss corresponds to Fisher divergence, following SiD Zhou et al.
+(2024). This divergence of true and fake distribution can be replaced by KL divergence; ablation
+results are reported in Section 4.5 and Appendix D.5. Intuitively, the fixed teacher fϕ represents
+the true data distribution, while fψ captures the generator’s induced distribution. Updating Gθ to
+minimize Ldistill(θ) aligns generator samples with the true data. Notably, distilled generators can
+even outperform their teachers: for instance, Zhou et al. (2024) reports that on FFHQ the teacher
+achieves an FID of 2.39, whereas its distilled generator attains 1.55. In our setting, we find that such
+improvements are further amplified when distillation is performed under corrupted-data training.
+Details of the distillation training schedules are deferred to Appendix I.
+3
+RESTORATION SCORE DISTILLATION
+Problem Statement.
+Suppose we are given a finite corrupted dataset of size N, denoted by
+{y(i)}N
+i=1. Each corrupted observation is generated as y(i) = A(x(i)) + σε(i), where σ is a known
+noise level (with extensions available for the unknown-σ setting, see Section 4.5), and ε(i) i.i.d.
+∼
+N(0, Im). Crucially, the clean data {x(i)}N
+i=1 is never accessible. In certain scenarios, such as
+random inpainting, the corruption operator A may vary across samples, drawn from a common
+distribution. In this case, each corrupted observation takes the form y(i) = A(i)(x(i)) + σε(i).
+RSD is a two-phase framework for learning generative models solely from corrupted observations.
+It decouples the process into: (1) a flexible corruption-aware diffusion pretraining stage, and (2)
+a distillation stage that compresses the pretrained model into a single-step generator and further
+improves generation quality. The overall procedure is summarized in Algorithm 1. We summarize
+different types of pretrained diffusion models in Table 1, and then describe how they can be seamlessly
+integrated into RSD to further enhance performance. Notably, even when a suitable corruption-aware
+pretrained model is unavailable, employing a standard diffusion model (Tab 1) to learn the corrupted
+data distribution still yields substantial improvements after distillation (Tab 4).
+4
+
+
+Published as a conference paper at ICLR 2026
+3.1
+PHASE I: FLEXIBLE CORRUPTION-AWARE PRETRAINING
+The first phase trains a teacher diffusion model fϕ(·, t) directly on corrupted observations y =
+A(x)+σϵ, where A is a potentially non-invertible corruption operator. A straightforward approach is
+to train on corrupted data y using the standard diffusion loss (Eq. 2). In practice, we find that this naive
+strategy already yields strong performance. To further improve performance across diverse corruption
+operators, we incorporate existing corruption-aware diffusion training methods, as summarized in
+Table 1. Our choice of pretraining objectives for different corruption scenarios is as follows: 1)
+Standard Diffusion is effective under noiseless corruptions, directly modeling the distribution of
+y = A(x). 2) Noisy Corruption Daras et al. (2025) targets additive noise settings, learning the
+distribution of A(x) from noisy observations y = A(x) + σϵ, with denoising as a special case when
+A = I. 3) Random Inpainting Daras et al. (2023b) addresses learning from partial observations
+Mx, where M is a random inpainting mask, and learns the distribution of x. 4) Masked F.S Aali et al.
+(2025) extends inpainting to Fourier-domain corruptions, well-suited for frequency-based degradation
+such as accelerated MRI, learning from masked Fourier observations MFx.
+3.2
+PHASE II: ONE-STEP GENERATOR DISTILLATION
+After pretraining, we distill the teacher diffusion model fϕ(·, t) into a one-step generator Gθ that
+maps latent noise z ∼N(0, Id) directly to clean samples. To facilitate this distillation, we introduce
+an auxiliary fake diffusion model fψ(·, t), initialized from fϕ and trained on corrupted output of
+Gθ(z), which is also initialized from fϕ. Note that this is common practice in the distillation literature
+to facilitate and stabilize training. In this case, Gθ, fϕ, fψ share the same network structure; see
+Appendix I for further discussion. By encouraging fψ to match the teacher’s time-dependent dynamics
+(e.g., score fields parameterized by fϕ), we align the behavior of Gθ with the data distribution learned
+by fϕ, thereby narrowing the gap between the generated and clean data distributions.
+We adopt the SiD Zhou et al. (2024) framework for distillation and optimize the distillation loss
+Ldistill(θ) (Eq. 5). An ablation of loss choices is provided in Sec. 4.5. Beyond standard score
+distillation, we further corrupt the generated samples xg = Gθ(z) into ˜y using the same corruption
+pipeline as the training data (Algorithm 1, Line 6). These corrupted samples are then used to train a
+fake diffusion model fψ(·, t). In Algorithm 1, Lines 2 and 7 allow any of the pretraining objectives
+summarized in Table 1 (or new objectives tailored to specific corruptions), but the same objective
+must be used for both lines; mixing objectives destabilizes training and can lead to divergence. To
+complement the empirical results in Section 4, Appendix F offers a theoretical analysis establishing
+conditions under which distillation yields improved sample quality.
+Algorithm 1 Restoration Score Distillation (RSD)
+1: procedure RESTORATION SCORE DISTILLATION({y(i)}N
+i=1)
+2:
+fϕ ←DIFFUSIONTRAINING({y(i)}N
+i=1, Obj)
+▷Diffusion training with Obj ∈Tab. 1
+3:
+Initialize fψ ←fϕ, Gθ ←fϕ
+4:
+for j = 1, . . . , K do
+5:
+xg ←Gθ(z),
+z ∼N(0, Id)
+▷Generate fake clean images
+6:
+˜y = A
+ stopgrad(xg)
+
++ σ ε, ε ∼N(0, Id)
+▷Corrupt xg same way as observation
+7:
+# If corruption contains noise, choose an Obj for fϕ, fψ that is denoising-aware
+8:
+fψ ←DIFFUSIONTRAINING({˜y(i)}N
+i=1, Obj)
+▷Same Obj as above
+9:
+# Do NOT inject additional noise during distillation when updating θ
+10:
+yθ ←A(Gθ(z)),
+z ∼N(0, Id)
+11:
+Update θ by distillation loss Ldistill(θ) with generated xθ = yθ
+▷Eq. 5
+12:
+end for
+13: end procedure
+4
+EXPERIMENTS
+We conduct comprehensive experiments to evaluate the effectiveness, flexibility, and generality of
+our framework, RSD, across both natural and scientific imaging domains. We first demonstrate
+its performance through a 2D toy task and qualitative visualizations, providing intuition into the
+5
+
+
+Published as a conference paper at ICLR 2026
+(a) Noisy dataset σ = 0.05
+(b) Teacher-Full
+(c) Teacher-Truncated
+(d) RSD (ours one-step)
+Figure 2: A toy example of learning from a noisy dataset with σ = 0.05.
+underlying mechanism. Then we consider four challenging image restoration tasks—denoising,
+Gaussian deblurring, random inpainting, and super-resolution—on CIFAR-10 (32 × 32), FFHQ
+(64 × 64), and CelebA-HQ (64 × 64) Liu et al. (2015); Karras et al. (2017), under both noiseless
+(σ = 0.0) and noisy (σ = 0.2) regimes. We further show that RSD can be distilled directly
+from pretrained teacher models trained with corruption-aware objectives, including diffusion for
+denoising Daras et al. (2025), diffusion for random inpainting Daras et al. (2023a), and diffusion for
+Fourier-space inpainting Aali et al. (2025), highlighting the framework’s modularity and flexibility.
+Sec. 4.2 benchmarks denoising across multiple datasets and noise levels. Sec. 4.3 evaluates general
+corruption operators in both noiseless and noisy settings, including a sweep over random-inpainting
+missing rates p ∈{0.6, 0.8, 0.9}.
+To assess real-world applicability, we evaluate RSD on multi-coil Magnetic Resonance Imaging
+(MRI) using the FastMRI dataset Zbontar et al. (2018); Knoll et al. (2020), a setting where fully
+sampled ground truth is often unavailable. Across tasks and corruption regimes, RSD consistently
+surpasses teacher diffusion models in generative quality as measured by FID Heusel et al. (2017)
+without access to clean data (Sec. 4.4).
+Finally, RSD exhibits strong distillation–data efficiency (Sec. 4.6)—it quickly surpasses the
+teacher—and offers substantial inference-time gains from its one-step design (up to 30×; see Sec. 4.6).
+Our ablations (Sec. 4.5) show that the framework accommodates unknown noise levels σ and is robust
+with respect to the training-data size; we also examine alternative distillation losses in an ablation
+study. Separately, Sec. 4.7 demonstrates that the trained generator achieves superior performance on
+downstream conditional inverse problems, indicating broad applicability.
+4.1
+A 2D TOY EXAMPLE
+In Fig. 2, the observation is a noisy spiral dataset with σ = 0.05. The core issue with teacher
+diffusion models trained on noisy datasets, i.e., (b) Teacher-Full and (c) Teacher-Truncated (Daras
+et al. (2024), Algorithm 4), is that they force the approximating distribution to spread its probability
+mass across all regions, making the learned density overly diffuse. In contrast, (d) RSD excels at
+denoising the original dataset, producing a narrow, concentrated, and sharp approximation. This
+effect occurs without providing the clean data itself during training.
+4.2
+DENOISING AS A SPECIAL CASE OF RESTORATION SCORE DISTILLATION
+Table 3: RSD vs. teachers on CIFAR-10/FFHQ/AFHQ-v2.
+RSD (distilled) consistently surpasses teacher diffusion (Full,
+Truncated) across datasets and noise levels. (FID).
+Methods
+CIFAR-10
+FFHQ
+AFHQ-v2
+Data noise
+σ=0.1
+σ=0.2
+σ=0.4
+σ=0.2
+σ=0.2
+Observation
+73.74
+127.22
+205.52
+110.83
+51.51
+Teacher-Full
+25.55
+60.73
+124.28
+41.52
+17.93
+Teacher-Truncated
+7.55
+12.21
+22.12
+14.67
+9.82
+RSD (Distilled)
+3.98
+4.77
+21.63
+6.29
+5.42
+We begin with the denoising special
+case y = x + σϵ where the for-
+ward operator A = I. We compare
+RSD against three groups of base-
+lines (Table 2). (1) Teacher diffu-
+sion models. A teacher trained with
+the noisy corruption loss in Eq. 3
+serves as a strong generative baseline.
+We adopt the two sampling sched-
+ules of Daras et al. (2024)—Teacher-
+Full and Teacher-Truncated (Algo-
+rithm 4)—and additionally evaluate
+the Teacher-consistency variant Daras et al. (2025). There may exist better sampling schedules
+for denoising; however, to the best of our knowledge, the schedules we adopt achieve strongest
+6
+
+
+Published as a conference paper at ICLR 2026
+Table 2: Denoising results on CIFAR-10 and CelebA-HQ at σ = 0.2. Rows with σ=0.0 are
+clean-data upper bounds. Few-shot methods use 50 clean images. Baseline numbers are from the
+original papers or Bai et al. (2024); Lu et al. (2025). The distilled student (RSD, one-step) improves
+over teacher models (Full/Truncated/Consistency) and surpasses all few-shot baselines.
+Methods
+CIFAR-10 (32×32)
+CelebA-HQ (64×64)
+σ
+Type
+FID
+σ
+Type
+FID
+DDPM Ho et al. (2020)
+0.0
+Full-Shot
+4.04
+0.0
+Full-Shot
+3.26
+DDIM Song et al. (2021a)
+0.0
+Full-Shot
+4.16
+0.0
+Full-Shot
+6.53
+EDM Karras et al. (2022)
+0.0
+Full-Shot
+1.97
+–
+–
+–
+SURE-Score Aali et al. (2023)
+0.2
+Few-Shot
+132.61
+–
+–
+–
+Ambient Diffusion Daras et al. (2023a)
+0.2
+Few-Shot
+114.13
+–
+–
+–
+EM-Diffusion Bai et al. (2024)
+0.2
+Few-Shot
+86.47
+–
+–
+–
+TweedieDiff Daras et al. (2024)
+0.2
+Few-Shot
+65.21
+0.2
+Few-Shot
+58.52
+SFBD Lu et al. (2025)
+0.2
+Few-Shot
+13.53
+0.2
+Few-Shot
+6.49
+TweedieDiff Daras et al. (2024)
+0.2
+Zero-Shot
+167.23
+0.2
+Zero-Shot
+246.95
+Teacher-Full Daras et al. (2025)
+0.2
+Zero-Shot
+60.73
+0.2
+Zero-Shot
+61.14
+Teacher-Truncated Daras et al. (2025)
+0.2
+Zero-Shot
+12.21
+0.2
+Zero-Shot
+13.90
+Teacher-Consistency Daras et al. (2025)
+0.2
+Zero-Shot
+11.93
+0.2
+Zero-Shot
+12.97
+RSD (Ours, One-Step)
+0.2
+Zero-Shot
+4.77
+0.2
+Zero-Shot
+6.48
+Table 4: CelebA-HQ restoration under noiseless/noisy settings. Baselines are taken from original
+papers when available, otherwise reproduced. EM-Diffusion uses 50 clean images for initialization,
+while RSD uses none. Best results are highlighted.
+Methods
+σ
+Gaussian Deblurring
+Random Inpainting (p = 0.9)
+Super-Resolution (×2)
+Observation
+0.0
+72.83
+396.14
+23.94
+Teacher Diffusion
+94.40
+25.53
+23.28
+EM-Diffusion (Few-Shot)
+56.69
+104.68
+58.99
+RSD (Ours, One-Step)
+31.90
+16.86
+12.99
+Observation
+0.2
+264.37
+419.92
+200.04
+Teacher Diffusion
+99.19
+319.34
+23.92
+EM-Diffusion (Few-Shot)
+51.33
+165.60
+57.31
+RSD (Ours, One-Step)
+76.98
+79.48
+22.00
+performance reported in prior work. (2) Few-shot methods. EM-Diffusion Bai et al. (2024) alter-
+nates DPS-based reconstructions (E-step) with model refinement (M-step), while SFBD Lu et al.
+(2025) casts the problem as density deconvolution; both use 50 clean images for initialization. (3)
+Clean-data diffusion (upper bound). DDPM Ho et al. (2020), DDIM Song et al. (2021a), and
+EDM Karras et al. (2022) are trained on clean data (σ=0) and serve as upper bounds for any method
+trained purely on corrupted observations. Across CIFAR-10 and CelebA-HQ at σ=0.2, RSD (one-
+step) outperforms all zero-shot and few-shot baselines and improves over its teachers (Table. 2).
+For FFHQ and AFHQ-v2 where prior few-shot results are not reported, RSD also surpasses teacher
+models (Table 3). Finally, we sweep noise levels σ ∈{0.1, 0.2, 0.4} on CIFAR-10 and observe
+consistent gains over teachers. Quality examples are provided in Appendix A and K.
+4.3
+GENERAL CORRUPTIONS MIXED WITH NOISE
+We now move beyond denoising to the general measurement model y = A(x) + σϵ, where A may be
+non-invertible. Using CelebA-HQ as a running example, we study both noiseless (σ = 0.0) and noisy
+(σ = 0.2) regimes and instantiate A as (i) Gaussian deblurring, (ii) random inpainting, and (iii) 2×
+super-resolution. Aggregate results across tasks and noise levels are reported in Table 4. For random
+inpainting, we further sweep the missing rate p ∈{0.6, 0.8, 0.9}; see Table 5. Across settings,
+RSD—trained without clean images—consistently improves over its teacher diffusion models and is
+competitive with, or exceeds, few-shot methods that rely on clean initialization. Qualitative examples
+are provided in Appendix A and K.
+4.4
+BEYOND NATURAL IMAGES: MULTI-COIL MAGNETIC RESONANCE IMAGING (MRI)
+7
+
+
+Published as a conference paper at ICLR 2026
+Table 5: CelebA-HQ random inpainting vs.
+missing rate p. Teacher diffusion is trained
+as in Daras et al. (2023b).
+Method
+p = 0.6
+p = 0.8
+p = 0.9
+Observation
+275.04
+383.82
+396.14
+Teacher Diffusion
+6.08
+11.19
+25.53
+RSD
+4.44
+7.10
+16.86
+Table 6: FID across acceleration levels R in
+multi-coil MRI. Teacher diffusion is trained as
+in Aali et al. (2024).
+Method
+R = 2
+R = 4
+R = 6
+R = 8
+L1-EDM
+18.55
+27.64
+51.43
+102.98
+Teacher Diffusion
+30.34
+32.31
+31.50
+48.15
+RSD
+12.95
+10.71
+14.64
+22.51
+L1-EDM
+F.S. Ambient Diﬀusion
+RSD (ours)
+Mask
+Ground Truth
+Observation
+R = 2
+R = 4
+R = 6
+R = 8
+Figure 3: Multi-coil MRI: qualitative reconstructions from RSD across acceleration levels R. See
+Tab. 6 for corresponding FID trends.
+Table 7: Comparison of RSD with teacher diffusion and
+baselines on CIFAR-10. Metrics for DDPM and Rectified
+Flow are from [34].
+Method
+σ
+FID↓
+IS↑
+Prec.↑
+Rec.↑
+KID↓
+Teacher
+0.2
+12.21
+8.31
+0.59
+0.41
+.0059
+RSD
+0.4
+21.63
+7.93
+0.53
+0.38
+.0127
+RSD
+0.2
+4.77
+9.16
+0.65
+0.56
+.0025
+RSD
+0.1
+3.98
+9.34
+0.64
+0.57
+.0015
+DDPM
+0.0
+3.21
+9.46
+N/A
+0.57
+N/A
+RF (ODE)
+0.0
+2.58
+9.60
+N/A
+0.57
+N/A
+We next apply RSD to a practical
+medical-imaging setting where fully
+sampled data are often unavailable
+due to time and cost constraints Knoll
+et al. (2020); Zbontar et al. (2018);
+Tibrewala et al. (2023); Desai et al.
+(2022). This case study demonstrates:
+(i) the flexibility of RSD to integrate
+with advanced corruption-aware diffu-
+sion techniques, (ii) robustness across
+acceleration factors R, and (iii) an ex-
+tension from real- to complex-valued signals, x ∈Cd. Table 6 reports FID versus acceleration
+R ∈{2, 4, 6, 8} comparing RSD, a teacher trained via Fourier-Space Ambient Diffusion Aali et al.
+(2025), and a baseline L1-EDM that trains EDM Karras et al. (2022) on L1–Wavelet reconstruc-
+tions Lustig et al. (2007). Across all acceleration levels, RSD improves over the teacher; notably, it
+also outperforms L1-EDM at low acceleration (R=2), suggesting that distillation-based regularization
+is more effective than handcrafted L1 priors in the wavelet domain. Qualitative examples are shown
+in Fig. 3, with full algorithmic details in Appendix H.4 and I.
+4.5
+ABLATIONS: DATA SCALE, DISTILLATION LOSS CHOICE, AND MORE
+Table 8: Data-size ablation on CelebA-HQ.
+Data Size
+Teacher-Full
+Teacher-Trunc.
+RSD
+10%
+62.25
+14.36
+10.53
+50%
+56.09
+17.19
+9.76
+100%
+61.14
+13.90
+6.48
+Data scale.
+We next vary the training set size
+on CelebA-HQ to test data efficiency. RSD
+maintains strong performance even with 10%
+of the data and improves as more data become
+available, outperforming both Teacher-Full and
+Teacher-Truncated across settings. The results
+are shown in Table 8.
+8
+
+
+Published as a conference paper at ICLR 2026
+Comprehensive data quality metrics.
+While FID is the primary metric for assessing data quality
+in image generation, we incorporate additional metrics for a more holistic evaluation, as detailed
+in Table 7. The results demonstrate that our distilled RSD generator achieves both superior density
+modeling (low FID) and robust mode coverage (high Recall), even when compared to generative
+models trained on clean datasets.
+Choice of distillation loss.
+We compare several popular distillation losses used to compress
+diffusion teachers into one-step generators, including SDS Poole et al. (2022), DMD Yin et al.
+(2024b), and SiD Zhou et al. (2024). Unless otherwise noted, we use the default hyperparameters
+from the original papers (and public repos) without task-specific tuning. Under these settings, SiD
+consistently yields the strongest FID across our datasets, while SDS and DMD underperform. We
+report the full per-dataset and per-σ breakdown in Table 18 (Appendix D.5). We emphasize that we
+did not perform a hyperparameter sweep; consequently, better-tuned configurations of SDS or DMD
+may close the gap to SiD. Empirically, we find SiD’s default hyperparameters at different setting is a
+stable choice in our RSD pipeline.
+More ablations can be found in the Sec. D of the Appendix.
+4.6
+SAMPLING AND TRAINING EFFICIENCY FOR DISTILLATION
+Figure 4:
+Efficiency of RSD
+(CIFAR-10, σ = 0.2).
+After distillation, RSD attains markedly higher inference throughput
+than its diffusion teacher. On CIFAR-10 at σ = 0.2, producing
+50,000 samples drops from 10 minutes (teacher) to 20 seconds
+(generator), a ∼30× reduction in wall-clock time. Training is like-
+wise efficient: the Phase II distillation stage surpasses the teacher’s
+FID in roughly 4 hours, compared to 48 hours for Phase I teacher
+pretraining. Thus, once the teacher is available, running RSD adds
+only a minor computational budget yet yields substantial quality
+and speed gains. Figure 4 summarizes both sampling and training
+efficiency. All wall-clock times were measured on 8× RTX A6000
+(32 GB). Additional quantitative statistics and efficiency examples
+are provided in Appendix C and Table 12.
+4.7
+AFTER DISTILLATION: SOLVING CONDITIONAL INVERSE PROBLEMS
+Table 9: Conditional inverse problem results of
+denoising on CIFAR10 at σ = 0.2. Results for the
+baselines are taken from [5]. We follow [5] and
+sample 250 test images and compute the average
+PSNR and LPIPS.
+Method
+Type
+PSNR↑
+LPIPS↓
+Observations
+18.05
+0.047
+DPS w/ clean prior [12]
+Full-Shot
+25.91
+0.010
+SURE-Score [1]
+Few-Shot
+22.42
+0.138
+AmbientDiffusion [15]
+Few-Shot
+21.37
+0.033
+EM-Diffusion [5]
+Few-Shot
+23.16
+0.022
+Noise2Self [6]
+Zero-Shot
+21.32
+0.227
+RSD (ours)
+Zero-Shot
+24.11
+0.025
+Because our framework yields a high-quality
+clean image generator—which naturally serves
+as a prior in conditional inverse solvers Chung
+et al. (2022); Zhang et al. (2024); Zhu et al.
+(2024); Zhang and Leong (2025); Hertrich et al.
+(2025)—a direct extension is to evaluate its util-
+ity on downstream inverse problems. We report
+a denoising task performance in Table 9, where
+RSD substantially outperforms prior methods
+and achieves performance comparable to few-
+shot approaches such as EM-Diffusion. In our
+implementation, we solve minz
+A(Gθ(z)) −
+y
+2
+2 for 1000 steps using Adam Kingma (2014)
+with a learning rate of 0.05. Exploring alter-
+native strategies for inverse problems with one-
+step generators is an exciting direction. Additional results are provided in Appendix D.3.
+4.8
+MODEL SELECTION CRITERION UNDER CORRUPTION: PROXIMAL FID
+Prior baselines Daras et al. (2023a); Bai et al. (2024) report FID scores yet do not specify how
+to perform model selection under corruption during training. To address this gap, we introduce
+Proximal FID, a model-selection metric tailored to corrupted-data regimes. Concretely, we generate
+50k clean samples {x(i)}50k
+i=1 from the current generator, corrupt them to match the training noise
+9
+
+
+Published as a conference paper at ICLR 2026
+and operator—yielding
+
+A
+ x(i)
++ σ ϵ(i)	50k
+i=1, and compute FID against the corrupted training set
+{y(i)}n
+i=1. As shown on CIFAR-10 in Fig. 5 and Tab. 10, Proximal FID tracks the true FID closely
+throughout distillation and attains near-optimal true FID across datasets. More results can be found
+in the Appendix. Taken together, these results support Proximal FID as a practical and reliable proxy
+for model selection when clean data are unavailable.
+Figure 5: CIFAR-10 (denoising, σ = 0.2):
+Proximal FID closely tracks true FID and se-
+lects a near-optimal checkpoint.
+Table 10: Model selection by Proximal FID.
+Best true FID obtained by selecting checkpoints
+via Proximal FID vs. selecting via true FID (ora-
+cle). The red (+·) indicates the gap to the best
+achievable true FID during training.
+Dataset
+Proximal FID (selected)
+Best true FID (oracle)
+CIFAR-10
+5.21 (+0.45)
+4.76
+FFHQ
+6.12 (+0.04)
+6.08
+CelebA-HQ
+6.90 (+0.54)
+6.36
+AFHQ-v2
+5.45 (+0.06)
+5.39
+4.9
+WHY SCORE DISTILLATION BEYOND ACCELERATION?
+Score distillation is traditionally viewed as a means of accelerating sampling by compressing a
+multi-step diffusion process into a single forward pass. However, our paper aims to reveal a more
+fundamental conceptual shift: In corrupted or low-quality data regimes, score distillation serves as a
+principled mechanism for improving the sample quality of teacher diffusion models.
+Intuitive Understanding:
+Diffusion models are trained using the ELBO objective for maximum
+likelihood, which minimizes the forward KL divergence, a mode-covering objective. As a result,
+teacher diffusions are incentivized to place probability mass on all plausible locations suggested by
+noisy data, even if these regions do not correspond to the true clean distribution.
+In contrast, the reverse distillation objective (Eq. 5) takes its expectation over the student generator’s
+distribution, which naturally induces mode-seeking behavior: the generator does not need to cover
+all regions where the teacher assigns non-zero mass. Instead, it is encouraged to place probability
+only where it will actually sample from. Importantly, we stress that encouraging mode seeking does
+not imply mode collapse. This is also evidenced by the FID and Recall in Tab. 7, qualitative results
+in Fig. 2, and extensive qualitative examples in Appendix K. This change in objective allows the
+one-step generator to concentrate its probability mass on the high-density, well-supported regions
+implied by the teacher’s score field, while discarding diffuse or low-density regions that the teacher
+includes.
+Theoretical Support:
+Detailed analysis is provided in the appendix. Sec. F.1 first focuses on a
+linear Gaussian setting, providing a direct quantitative analysis and error bounds (Eq. 9). These
+findings are extended to general linear corruption in Sec. F.2. Sec. F.3 derives performance bounds
+for the distilled generator under a more general setting. We posit that a deeper theoretical analysis of
+the surprising effects of score distillation under corruption is a promising research direction.
+5
+CONCLUSION
+In this work, we introduced Restoration Score Distillation (RSD) to learn clean data distribution
+from a broad class of corruption types. Our empirical results on natural images and scientific MRI
+datasets show consistent improvements over existing baselines. Moreover, beyond standard diffusion
+objectives, the RSD framework is compatible with several corruption-aware training techniques,
+enabling flexible integration with recent advances in diffusion modeling. Together, our contributions
+highlight the potential of score distillation as a powerful mechanism for robust generative learning in
+real-world settings where clean data are scarce or unavailable. A detailed discussion of limitations is
+provided in Appendix E.
+10
+
+
+Published as a conference paper at ICLR 2026
+ETHICS STATEMENT
+This work develops methods for training generative models from corrupted data without requiring
+access to clean ground truth. The primary applications we target are scientific and medical imaging
+domains where clean acquisitions are expensive or infeasible. Our framework does not involve human
+subjects, personal data, or harmful content, and thus poses minimal ethical risks. Nevertheless, as
+with all generative models, there is potential for misuse in creating synthetic content; to mitigate this,
+we emphasize the intended use of our approach in scientific and restoration contexts.
+REPRODUCIBILITY STATEMENT
+We provide complete algorithmic and training details in the Appendix. To ensure reproducibility, we
+will release all code and model checkpoints upon acceptance of this manuscript.
+ACKNOWLEDGMENTS
+Ying Nian Wu was supported in part by NSF DMS-2415226, DARPA W912CG25CA007, and
+research gifts from Amazon and Qualcomm. Tianyu Chen and Mingyuan Zhou acknowledge the
+support of NSF-IIS 2212418 and NIH-R37 CA271186. We gratefully acknowledge Microsoft for
+providing the computing resources used in this project.
+REFERENCES
+A. Aali, M. Arvinte, S. Kumar, and J. I. Tamir. Solving inverse problems with score-based generative
+priors learned from noisy data. In 2023 57th Asilomar Conference on Signals, Systems, and
+Computers, pages 837–843. IEEE, 2023.
+A. Aali, G. Daras, B. Levac, S. Kumar, A. G. Dimakis, and J. I. Tamir. Ambient diffusion posterior
+sampling: Solving inverse problems with diffusion models trained on corrupted data. arXiv preprint
+arXiv:2403.08728, 2024.
+A. Aali, G. Daras, B. Levac, S. Kumar, A. Dimakis, and J. Tamir.
+Ambient diffusion poste-
+rior sampling: Solving inverse problems with diffusion models trained on corrupted data. In
+The Thirteenth International Conference on Learning Representations, 2025. URL https:
+//openreview.net/forum?id=qeXcMutEZY.
+K. Akiyama, A. Alberdi, W. Alef, K. Asada, R. Azulay, A.-K. Baczko, D. Ball, M. Balokovi´c,
+J. Barrett, D. Bintley, et al. First m87 event horizon telescope results. iv. imaging the central
+supermassive black hole. The Astrophysical Journal Letters, 875(1):L4, 2019.
+W. Bai, Y. Wang, W. Chen, and H. Sun. An expectation-maximization algorithm for training
+clean diffusion models from corrupted observations. In The Thirty-eighth Annual Conference on
+Neural Information Processing Systems, 2024. URL https://openreview.net/forum?
+id=jURBh4V9N4.
+J. Batson and L. Royer. Noise2self: Blind denoising by self-supervision. In International conference
+on machine learning, pages 524–533. PMLR, 2019.
+Y. Chang, Y. Zhang, Z. Fang, Y. N. Wu, Y. Bisk, and F. Gao. Skews in the phenomenon space hinder
+generalization in text-to-image generation. In A. Leonardis, E. Ricci, S. Roth, O. Russakovsky,
+T. Sattler, and G. Varol, editors, Computer Vision – ECCV 2024, pages 422–439, Cham, 2025.
+Springer Nature Switzerland. ISBN 978-3-031-73021-4.
+M. Chen, K. Huang, T. Zhao, and M. Wang. Score approximation, estimation and distribution
+recovery of diffusion models on low-dimensional data. In International Conference on Machine
+Learning, pages 4672–4712. PMLR, 2023.
+S. Chen, V. Kontonis, and K. Shah. Learning general gaussian mixtures with efficient score matching.
+arXiv preprint arXiv:2404.18893, 2024a.
+11
+
+
+Published as a conference paper at ICLR 2026
+T. Chen, Z. Wang, and M. Zhou. Enhancing and accelerating diffusion-based inverse problem solving
+through measurements optimization. arXiv preprint arXiv:2412.03941, 2024b.
+T. Chen, Y. Zhang, Z. Zhang, P. Yu, S. Wang, Z. Wang, K. Lin, X. Wang, Z. Yang, L. Li, et al.
+Edival-agent: An object-centric framework for automated, fine-grained evaluation of multi-turn
+editing. arXiv preprint arXiv:2509.13399, 2025.
+H. Chung, J. Kim, M. T. Mccann, M. L. Klasky, and J. C. Ye. Diffusion posterior sampling for
+general noisy inverse problems. arXiv preprint arXiv:2209.14687, 2022.
+H. Cui, F. Krzakala, E. Vanden-Eijnden, and L. Zdeborová. Analysis of learning a flow-based
+generative model from limited sample complexity. arXiv preprint arXiv:2310.03575, 2023.
+K. Dabov, A. Foi, V. Katkovnik, and K. Egiazarian. Image denoising by sparse 3-d transform-domain
+collaborative filtering. IEEE Transactions on image processing, 16(8):2080–2095, 2007.
+G. Daras, K. Shah, Y. Dagan, A. Gollakota, A. Dimakis, and A. Klivans. Ambient diffusion: Learning
+clean distributions from corrupted data. Advances in Neural Information Processing Systems, 36:
+288–313, 2023a.
+G. Daras, K. Shah, Y. Dagan, A. Gollakota, A. Dimakis, and A. Klivans. Ambient diffusion: Learning
+clean distributions from corrupted data. Advances in Neural Information Processing Systems, 36:
+288–313, 2023b.
+G. Daras, A. Dimakis, and C. C. Daskalakis. Consistent diffusion meets tweedie: Training exact
+ambient diffusion models with noisy data. In Forty-first International Conference on Machine
+Learning, 2024. URL https://openreview.net/forum?id=PlVjIGaFdH.
+G. Daras, Y. Cherapanamjeri, and C. C. Daskalakis. How much is a noisy image worth? data
+scaling laws for ambient diffusion. In The Thirteenth International Conference on Learning
+Representations, 2025. URL https://openreview.net/forum?id=qZwtPEw2qN.
+A. D. Desai, A. M. Schmidt, E. B. Rubin, C. M. Sandino, M. S. Black, V. Mazzoli, K. J. Stevens,
+R. Boutin, C. Ré, G. E. Gold, et al. Skm-tea: A dataset for accelerated mri reconstruction with
+dense image labels for quantitative clinical evaluation. arXiv preprint arXiv:2203.06823, 2022.
+P. Dhariwal and A. Nichol. Diffusion models beat GANs on image synthesis. Advances in neural
+information processing systems, 34:8780–8794, 2021.
+D. L. Donoho and I. M. Johnstone. Ideal spatial adaptation by wavelet shrinkage. biometrika, 81(3):
+425–455, 1994.
+S. Foucart and H. Rauhut. An invitation to compressive sensing. In A mathematical introduction to
+compressive sensing, pages 1–39. Springer, 2013.
+J. Hertrich, H. S. Wong, A. Denker, S. Ducotterd, Z. Fang, M. Haltmeier, Ž. Kereta, E. Kobler,
+O. Leong, M. S. Salehi, et al. Learning regularization functionals for inverse problems: A
+comparative study. arXiv preprint arXiv:2510.01755, 2025.
+M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter. GANs trained by a two
+time-scale update rule converge to a local nash equilibrium. Advances in neural information
+processing systems, 30, 2017.
+N. J. Higham. Accuracy and stability of numerical algorithms. SIAM, 2002.
+J. Ho, A. Jain, and P. Abbeel. Denoising diffusion probabilistic models. Advances in neural
+information processing systems, 33:6840–6851, 2020.
+J. Ho, C. Saharia, W. Chan, D. J. Fleet, M. Norouzi, and T. Salimans. Cascaded diffusion models for
+high fidelity image generation. Journal of Machine Learning Research, 23(47):1–33, 2022.
+A. Jalal, M. Arvinte, G. Daras, E. Price, A. G. Dimakis, and J. Tamir. Robust compressed sensing mri
+with deep generative priors. Advances in Neural Information Processing Systems, 34:14938–14954,
+2021.
+12
+
+
+Published as a conference paper at ICLR 2026
+T. Karras, T. Aila, S. Laine, and J. Lehtinen. Progressive growing of GANs for improved quality,
+stability, and variation. arXiv preprint arXiv:1710.10196, 2017.
+T. Karras, M. Aittala, T. Aila, and S. Laine. Elucidating the design space of diffusion-based generative
+models. Advances in neural information processing systems, 35:26565–26577, 2022.
+D. P. Kingma. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980, 2014.
+F. Knoll, J. Zbontar, A. Sriram, M. J. Muckley, M. Bruno, A. Defazio, M. Parente, K. J. Geras,
+J. Katsnelson, H. Chandarana, et al. fastmri: A publicly available raw k-space and dicom dataset of
+knee images for accelerated mr image reconstruction using machine learning. Radiology: Artificial
+Intelligence, 2(1):e190007, 2020.
+Y. Y. Lin, A. F. Gao, and K. L. Bouman. Imaging an evolving black hole by leveraging shared
+structure. In ICASSP 2024-2024 IEEE International Conference on Acoustics, Speech and Signal
+Processing (ICASSP), pages 2475–2479. IEEE, 2024.
+X. Liu, C. Gong, and Q. Liu. Flow straight and fast: Learning to generate and transfer data with
+rectified flow. arXiv preprint arXiv:2209.03003, 2022.
+Z. Liu, P. Luo, X. Wang, and X. Tang. Deep learning face attributes in the wild. In Proceedings of
+the IEEE international conference on computer vision, pages 3730–3738, 2015.
+H. Lu, Q. Wu, and Y. Yu. Stochastic forward-backward deconvolution: Training diffusion models
+with finite noisy datasets. arXiv preprint arXiv:2502.05446, 2025.
+W. Luo, T. Hu, S. Zhang, J. Sun, Z. Li, and Z. Zhang. Diff-Instruct: A universal approach for
+transferring knowledge from pre-trained diffusion models. Advances in Neural Information
+Processing Systems, 36:76525–76546, 2023.
+W. Luo, T. Hu, S. Zhang, J. Sun, Z. Li, and Z. Zhang. Diff-instruct: A universal approach for
+transferring knowledge from pre-trained diffusion models. Advances in Neural Information
+Processing Systems, 36, 2024.
+M. Lustig, D. Donoho, and J. M. Pauly. Sparse mri: The application of compressed sensing for rapid
+mr imaging. Magnetic Resonance in Medicine: An Official Journal of the International Society for
+Magnetic Resonance in Medicine, 58(6):1182–1195, 2007.
+L. Mirsky. A trace inequality of john von neumann. Monatshefte für mathematik, 79(4):303–306,
+1975.
+G. Nolet. A breviary of seismic tomography. A breviary of seismic tomography, 2008.
+W. Peebles and S. Xie. Scalable diffusion models with transformers. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision, pages 4195–4205, 2023.
+B. Poole, A. Jain, J. T. Barron, and B. Mildenhall. Dreamfusion: Text-to-3d using 2d diffusion. arXiv
+preprint arXiv:2209.14988, 2022.
+A. Ramesh, P. Dhariwal, A. Nichol, C. Chu, and M. Chen. Hierarchical text-conditional image
+generation with clip latents. arXiv preprint arXiv:2204.06125, 1(2):3, 2022.
+N. Rawlinson, A. Fichtner, M. Sambridge, and M. K. Young. Seismic tomography and the assessment
+of uncertainty. Advances in geophysics, 55:1–76, 2014.
+A. W. Reed, H. Kim, R. Anirudh, K. A. Mohan, K. Champley, J. Kang, and S. Jayasuriya. Dynamic
+ct reconstruction from limited views with implicit neural representations and parametric motion
+fields. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages
+2258–2268, 2021.
+F. Roddier. Interferometric imaging in optical astronomy. Physics Reports, 170(2):97–166, 1988.
+R. Rombach, A. Blattmann, D. Lorenz, P. Esser, and B. Ommer. High-resolution image synthesis
+with latent diffusion models. In Proceedings of the IEEE/CVF conference on computer vision and
+pattern recognition, pages 10684–10695, 2022.
+13
+
+
+Published as a conference paper at ICLR 2026
+O. Ronneberger, P. Fischer, and T. Brox. U-net: Convolutional networks for biomedical image
+segmentation. In Medical image computing and computer-assisted intervention–MICCAI 2015:
+18th international conference, Munich, Germany, October 5-9, 2015, proceedings, part III 18,
+pages 234–241. Springer, 2015.
+J. Sohl-Dickstein, E. Weiss, N. Maheswaranathan, and S. Ganguli. Deep unsupervised learning
+using nonequilibrium thermodynamics. In International conference on machine learning, pages
+2256–2265. PMLR, 2015.
+J. Song, C. Meng, and S. Ermon. Denoising diffusion implicit models. In International Confer-
+ence on Learning Representations, 2021a. URL https://openreview.net/forum?id=
+St1giarCHLP.
+Y. Song and S. Ermon. Generative modeling by estimating gradients of the data distribution. Advances
+in neural information processing systems, 32, 2019.
+Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, and B. Poole. Score-based generative
+modeling through stochastic differential equations. In International Conference on Learning
+Representations, 2021b. URL https://openreview.net/forum?id=PxTIG12RRHS.
+R. Tibrewala, T. Dutt, A. Tong, L. Ginocchio, M. B. Keerthivasan, S. H. Baete, S. Chopra, Y. W. Lui,
+D. K. Sodickson, H. Chandarana, et al. Fastmri prostate: A publicly available, biparametric mri
+dataset to advance machine learning for prostate cancer imaging. arXiv preprint arXiv:2304.09254,
+2023.
+P. Vincent. A connection between score matching and denoising autoencoders. Neural computation,
+23(7):1661–1674, 2011.
+B. Wang and J. J. Vastola. The unreasonable effectiveness of gaussian score approximation for
+diffusion models and its applications. arXiv preprint arXiv:2412.09726, 2024.
+P. Wang, H. Zhang, Z. Zhang, S. Chen, Y. Ma, and Q. Qu. Diffusion models learn low-dimensional
+distributions via subspace clustering. arXiv preprint arXiv:2409.02426, 2024a.
+Z. Wang, C. Lu, Y. Wang, F. Bao, C. Li, H. Su, and J. Zhu. Prolificdreamer: High-fidelity and
+diverse text-to-3d generation with variational score distillation. Advances in Neural Information
+Processing Systems, 36, 2024b.
+S. Xie, Z. Xiao, D. P. Kingma, T. Hou, Y. N. Wu, K. P. Murphy, T. Salimans, B. Poole, and
+R. Gao. EM distillation for one-step diffusion models. In The Thirty-eighth Annual Conference on
+Neural Information Processing Systems, 2024. URL https://openreview.net/forum?
+id=rafVvthuxD.
+Y. Xu, W. Nie, and A. Vahdat. One-step diffusion models with f-divergence distribution matching.
+arXiv preprint arXiv:2502.15681, 2025.
+T. Yin, M. Gharbi, T. Park, R. Zhang, E. Shechtman, F. Durand, and B. Freeman. Improved distribution
+matching distillation for fast image synthesis. Advances in neural information processing systems,
+37:47455–47487, 2024a.
+T. Yin, M. Gharbi, R. Zhang, E. Shechtman, F. Durand, W. T. Freeman, and T. Park. One-step
+diffusion with distribution matching distillation. In Proceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition, pages 6613–6623, 2024b.
+J. Zbontar, F. Knoll, A. Sriram, T. Murrell, Z. Huang, M. J. Muckley, A. Defazio, R. Stern, P. Johnson,
+M. Bruno, et al. fastmri: An open dataset and benchmarks for accelerated mri. arXiv preprint
+arXiv:1811.08839, 2018.
+K. Zhang, W. Zuo, Y. Chen, D. Meng, and L. Zhang. Beyond a gaussian denoiser: Residual learning
+of deep cnn for image denoising. IEEE transactions on image processing, 26(7):3142–3155, 2017.
+K. Zhang, W. Zuo, and L. Zhang. Ffdnet: Toward a fast and flexible solution for cnn-based image
+denoising. IEEE Transactions on Image Processing, 27(9):4608–4622, 2018.
+14
+
+
+Published as a conference paper at ICLR 2026
+Y. Zhang and O. Leong. Learning difference-of-convex regularizers for inverse problems: A flexible
+framework with theoretical guarantees. arXiv preprint arXiv:2502.00240, 2025.
+Y. Zhang, P. Yu, Y. Zhu, Y. Chang, F. Gao, Y. N. Wu, and O. Leong. Flow priors for linear inverse
+problems via iterative corrupted trajectory matching. In The Thirty-eighth Annual Conference on
+Neural Information Processing Systems, 2024. URL https://openreview.net/forum?
+id=1H2e7USI09.
+Y. Zhang, P. Yu, and Y. N. Wu. Object-conditioned energy-based attention map alignment in text-
+to-image diffusion models. In A. Leonardis, E. Ricci, S. Roth, O. Russakovsky, T. Sattler, and
+G. Varol, editors, Computer Vision – ECCV 2024, pages 55–71, Cham, 2025. Springer Nature
+Switzerland. ISBN 978-3-031-72946-1.
+H. Zheng, Z. Wang, J. Yuan, G. Ning, P. He, Q. You, H. Yang, and M. Zhou. Learning stackable and
+skippable LEGO bricks for efficient, reconfigurable, and variable-resolution diffusion modeling.
+In The Twelfth International Conference on Learning Representations, 2024. URL https:
+//openreview.net/forum?id=qmXedvwrT1.
+H. Zheng, W. Chu, B. Zhang, Z. Wu, A. Wang, B. T. Feng, C. Zou, Y. Sun, N. Kovachki, Z. E. Ross,
+et al. Inversebench: Benchmarking plug-and-play diffusion priors for inverse problems in physical
+sciences. arXiv preprint arXiv:2503.11043, 2025.
+M. Zhou, H. Zheng, Z. Wang, M. Yin, and H. Huang. Score identity distillation: Exponentially fast
+distillation of pretrained diffusion models for one-step generation. In Forty-first International
+Conference on Machine Learning, 2024.
+Y. Zhu, Z. Dou, H. Zheng, Y. Zhang, Y. N. Wu, and R. Gao. Think twice before you act: Improving
+inverse problem solving with mcmc. arXiv preprint arXiv:2409.08551, 2024.
+15
+
+
+Published as a conference paper at ICLR 2026
+A Qualitative Snapshots of Generated Results
+16
+B
+Proximal FID
+18
+C Training and Inference Efficiency
+18
+D Additional Experiments
+19
+D.1
+More Metrics . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+D.2
+Unknown σ. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+D.3
+More Conditional Inverse Problem Results . . . . . . . . . . . . . . . . . . . . . .
+21
+D.4
+Random Noise Ablation
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+21
+D.5
+Choice of Distillation Loss . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+21
+E
+Discussions and Limitations
+22
+F
+Theoretical Results and Proofs
+23
+F.1
+Quantitative analysis in a linear setting . . . . . . . . . . . . . . . . . . . . . . . .
+23
+F.2
+Extensions of the theory in Section F.1 . . . . . . . . . . . . . . . . . . . . . . . .
+28
+F.3
+General guarantees for distillation
+. . . . . . . . . . . . . . . . . . . . . . . . . .
+35
+G Visualization for Overestimated Data Noise Level
+39
+H Phase I: Variants of Pretraining Details
+39
+H.1
+Standard Diffusion
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+39
+H.2
+Diffusion for Denoising . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+40
+H.3
+Diffusion for Random Inpainting Task . . . . . . . . . . . . . . . . . . . . . . . .
+41
+H.4
+Diffusion Training for Fourier Space Inpainting . . . . . . . . . . . . . . . . . . .
+41
+I
+Phase II: Distillation
+42
+J
+Implementation Details
+42
+K Additional Qualitative Results
+44
+A
+QUALITATIVE SNAPSHOTS OF GENERATED RESULTS
+In this section, we present visual examples highlighting the quality of outputs produced by our model
+across various tasks and corruption settings. A full version of qualitative examples are in Appendix
+K.
+16
+
+
+Published as a conference paper at ICLR 2026
+Training Dataset 
+Training Dataset
+Ours (one-step generation)
+FID: 110.83
+FID: 6.29
+FID: 51.51
+FID: 5.42
+Ours (one-step generation)
+Figure 6: Qualitative results for the Denoising task. Each pair shows the corrupted input and the
+generation output from our RSD at σ = 0.2. The left two panels are from FFHQ, while the right two
+are from AFHQ-v2.
+(a) Dataset (σ = 0)
+(b) RSD (ours)
+(c) Dataset (σ = 0.2)
+(d) RSD (ours)
+Figure 7: Qualitative results for the Gaussian blur task. Each pair shows the corrupted input and the
+generation output from our RSD.
+(a) Dataset (σ = 0)
+(b) RSD (ours)
+(c) Dataset (σ = 0.2)
+(d) RSD (ours)
+Figure 8: Qualitative results for the Super Resolution task. Each pair shows the corrupted input and
+the generation output from our RSD.
+(a) Dataset (σ = 0)
+(b) RSD (ours)
+(c) Dataset (σ = 0.2)
+(d) RSD (ours)
+Figure 9: Qualitative results for the Random Inpainting task with missing probability (p = 0.9).
+Each pair shows the corrupted input and the generation output from our RSD.
+17
+
+
+Published as a conference paper at ICLR 2026
+(a) Dataset (p = 0.6)
+(b) RSD (ours)
+(c) Dataset (p = 0.8)
+(d) RSD (ours)
+Figure 10: Qualitative results for the Random Inpainting task with different missing probability
+(p = 0.6, p = 0.8). Each pair shows the corrupted input and the generation output from our RSD.
+B
+PROXIMAL FID
+When only corrupted data are available, model selection must proceed without clean references. In
+standard image generation, FID is the de facto criterion, but in our setting computing FID against
+clean ground-truth images is infeasible.
+Prior baselines—Ambient Diffusion Daras et al. (2023a) and EM-Diffusion Bai et al. (2024)—report
+FID scores yet do not specify how to perform model selection under corruption during training. To
+address this gap, we introduce Proximal FID, a model-selection metric tailored to corrupted-data
+regimes. Concretely, we generate 50k clean samples {x(i)}50k
+i=1 from the current generator, corrupt
+them to match the training noise and operator—yielding
+
+A
+
+x(i)
++ σ ϵ(i)	50k
+i=1,
+and compute FID against the corrupted training set {y(i)}n
+i=1. As shown on CIFAR-10 in Fig. 5,
+Proximal FID tracks the true FID closely throughout distillation. Quantitatively, Table 10 shows that
+the model chosen by Proximal FID attains near-optimal true FID across datasets (e.g., 6.12 vs. best
+6.08 on FFHQ) for denoising task, and Table 11 for general corruption task. We further visualize
+the dynamics on FFHQ, CelebA-HQ, and AFHQ-v2 in Fig. 11, and extend the analysis to multiple
+corruption operators in Fig. 12. Taken together, these results support Proximal FID as a practical and
+reliable proxy for model selection when clean data are unavailable.
+(a) FFHQ (σ = 0.2)
+(b) CelebA-HQ (σ = 0.2)
+(c) AFHQ-v2 (σ = 0.2)
+Figure 11: Across datasets: True FID vs. Proximal FID during distillation on FFHQ, CelebA-HQ,
+and AFHQ-v2 (denoising, σ = 0.2). In all cases, Proximal FID reliably identifies checkpoints with
+near-optimal true FID.
+C
+TRAINING AND INFERENCE EFFICIENCY
+We use the denoising setting with σ = 0.2 as a running example to quantify efficiency. Our approach
+improves not only accuracy but also end-to-end efficiency in both training and inference. All
+experiments were conducted on a Linux system with 8×NVIDIA RTX A6000 GPUs unless otherwise
+stated.
+Training.
+The additional distillation phase introduces only a minor overhead: the FID of the
+one-step generator rapidly decreases and surpasses the Teacher (Teacher-Truncated) within 4 hours.
+18
+
+
+Published as a conference paper at ICLR 2026
+(a) Gaussian deblurring (σ = 0.0)
+(b) Random inpainting
+(c) Super-resolution (×2, σ = 0.0)
+Figure 12: Across corruption operators: True FID vs. Proximal FID during training for Gaussian
+deblurring, random inpainting, and super-resolution. Proximal FID consistently tracks the true FID
+and supports reliable model selection across operators.
+Table 11: Comparison between the best true FID and the FID of the model selected by proximal FID
+for the general corruption task.
+Noise (σ)
+Task
+Best FID
+FID Selected by Proximal FID
+σ = 0.0
+Gaussian Deblurring
+31.90
+35.68
+Random Inpainting (p = 0.9)
+16.79
+20.59
+Super Resolution (×2)
+12.99
+14.66
+σ = 0.2
+Gaussian Deblurring
+76.98
+88.29
+Random Inpainting (p = 0.9)
+79.48
+83.98
+Super Resolution (×2)
+22.00
+27.42
+Table 12: Training and inference efficiency of our method. During training, the additional
+distillation phase introduces only a minor overhead, as FID decreases rapidly and surpasses the
+teacher diffusion model, Teacher-Truncated, within just 4 hours. For inference, our one-step generator
+enables the generation of 50k images in only 20 seconds, achieving a 30× speedup.
+Datasets
+Pretraining Time
+Distillation Time to Achieve the Same FID as
+Time to Generate 50k Images
+Teacher-Full
+Teacher-Truncated
+Best
+Diffusion
+RSD
+CIFAR-10
+~2 days
+7 minutes
+~3 hours
+~3 days
+10 minutes
+20 seconds
+FFHQ
+56 minutes
+~3 hours
+~9 hours
+15 minutes
+30 seconds
+CelebA-HQ
+34 minutes
+~2 hours
+~13 hours
+AFHQ-v2
+80 minutes
+~3 hours
+~13 hours
+Representative wall-clock times across datasets are summarized in Table 12. During distillation, we
+employ early stopping when the validation FID begins to diverge.
+Inference.
+Our one-step generator produces 50k images in ∼20 s on 4×NVIDIA RTX A6000
+GPUs with batch size 1024, compared to ∼10 min for the diffusion teacher—yielding a 30× speedup.
+Inference wall-clock measurements are reported in the rightmost columns of Table 12.
+D
+ADDITIONAL EXPERIMENTS
+D.1
+MORE METRICS
+The detailed results show that our distilled RSD generator achieves both strong density modeling
+(low FID) and robust mode coverage (high Recall).
+19
+
+
+Published as a conference paper at ICLR 2026
+Table 13: Comparison of RSD with teacher diffusion and baselines on CIFAR-10. *Metrics for
+DDPM and Rectified Flow (ODE) are copied from the Rectified Flow Liu et al. (2022) paper’s
+Table 1.
+Method
+σ
+FID (↓)
+IS (↑)
+Precision (↑)
+Recall (↑)
+KID (↓)
+Teacher
+0.2
+12.21
+8.312
+0.595
+0.416
+0.00593
+RSD
+0.4
+21.63
+7.934
+0.536
+0.384
+0.01270
+RSD
+0.2
+4.77
+9.165
+0.650
+0.564
+0.00252
+RSD
+0.1
+3.98
+9.346
+0.643
+0.578
+0.00157
+DDPM
+0.0
+3.21
+9.46
+N/A
+0.57
+N/A
+Rectified Flow (ODE)
+0.0
+2.58
+9.60
+N/A
+0.57
+N/A
+Figure 13: Mismatched Corruption Levels during Distillation. Our method remains robust even
+when the assumed corruption level is mismatched during distillation.
+D.2
+UNKNOWN σ.
+When σ is unavailable at training time, we adopt a simple strategy: (1) estimate per-image noise level
+using the off-the-shelf estimator implemented via skimage.restoration.estimate_sigma
+Donoho and Johnstone (1994); (2) for reliability, select the maximum estimated ˆσ over a small
+calibration set. Concretely, we sample 100 noisy CIFAR-10 images, compute ˆσ per image across 100
+independent trials, and use the trial-wise maximum as the working ˆσ. As shown in Table 14, this
+deliberately slightly overestimates the noise, a regime where RSD remains stable (see experiments in
+Table 15) and, in line with blind denoising results Zhang et al. (2018; 2017); Dabov et al. (2007),
+helps avoid under-regularization.
+Table 14: Unknown noise:
+true σ vs. ˆσ on CIFAR-10.
+σ
+ˆσ
+95% CI
+0.05
+0.07
+[0.073, 0.074]
+0.10
+0.12
+[0.119, 0.121]
+0.20
+0.22
+[0.215, 0.216]
+0.30
+0.31
+[0.311, 0.313]
+Table 15: Misspecification study on CIFAR-10. RSD is robust
+to slight overestimation when the true σ = 0.2.
+Teacher-Full
+Teacher-Trunc.
+RSD
+ˆσ = 0.15 (under)
+80.60
+49.78
+103.55
+ˆσ = 0.20 (true)
+60.73
+12.21
+4.77
+ˆσ = 0.25 (over)
+42.99
+88.11
+16.07
+Effect of misspecified σ.
+To isolate the impact of noise misspecification, we fix the ground-truth
+level at σ = 0.2 on CIFAR-10 and evaluate three settings: (i) underestimation, ˆσ = 0.15; (ii)
+correct, ˆσ = 0.20; and (iii) overestimation, ˆσ = 0.25. The same ˆσ is used consistently in both
+Phase I pretraining (noisy corruption objective) and Phase II distillation. As shown in Table 15 and
+Fig. 13, RSD attains its best accuracy under correct specification and remains competitive under
+mild overestimation, whereas underestimation is substantially more harmful—echoing observations
+in blind denoising Dabov et al. (2007); Zhang et al. (2018; 2017). Thus, when σ is unknown,
+slight overestimation is a robust practical choice, consistent with the strategy shown in Table 14. A
+20
+
+
+Published as a conference paper at ICLR 2026
+Table 16: ×2 super-resolution on CelebA-HQ (100 images). We compare a pseudo-inverse baseline
+(A†y), EM-Diffusion (few-shot) with DPS, Teacher Diffusion with DPS, and our RSD prior with
+latent optimization (Eq. 6). Higher PSNR/SSIM and lower LPIPS/FID are better.
+Method
+PSNR ↑
+SSIM ↑
+LPIPS ↓
+Prior FID ↓
+A†y
+24.065
+0.816
+0.125
+23.94
+EM-Diffusion (few-shot, DPS)
+25.678
+0.839
+0.056
+58.99
+Teacher Diffusion (DPS)
+23.810
+0.778
+0.056
+23.28
+RSD (ours, latent opt.)
+27.803
+0.909
+0.047
+12.99
+complementary 2D toy example in Appendix G corroborates this conclusion. We further include
+an ablation where the noise level is drawn from a distribution, i.e., σ ∼p(σ). Our method remains
+robust under this setting as well; see Appendix D.4 for details.
+D.3
+MORE CONDITIONAL INVERSE PROBLEM RESULTS
+Our primary goal is to learn a strong generative prior solely from corrupted data. Once such a prior
+is obtained via RSD, it is agnostic to the forward operator, enabling conditional generation under
+arbitrary measurement models. A natural approach with our one-step generator is to solve
+min
+z
+A(Gθ(z)) −y
+2
+2,
+(6)
+which enforces data consistency through the measurement process.
+Setup.
+Beyond the denoising task discussed in Section 4.5, we consider an additional conditional
+inverse problem. Specifically, we use the generator trained on the ×2 super-resolution task and
+evaluate it in a conditional inverse setting where A corresponds to a ×2 down-sampling operator. We
+conduct experiments on 100 CelebA-HQ images and compare RSD against EM-Diffusion (few-shot)
+and the Teacher Diffusion prior. For a fair comparison, RSD optimizes Eq. 6 for 1000 steps using
+Adam with a learning rate of 0.1, while both EM-Diffusion and Teacher Diffusion adopt DPS Chung
+et al. (2022), a classical solver for diffusion priors, with 1000 diffusion sampling steps. LPIPS is
+computed using AlexNet.
+Results.
+Table 16 reports PSNR, SSIM, LPIPS, and the prior’s FID. RSD attains the best perfor-
+mance across all metrics (e.g., PSNR = 27.803, LPIPS = 0.047), and its learned prior achieves a
+strong FID of 12.99, highlighting the benefit of high-quality priors for conditional generation.
+D.4
+RANDOM NOISE ABLATION
+We conducted an additional experiment in a more challenging setting where each sample is corrupted
+with a different noise level. Specifically, we adopt the corruption model:
+y = x + σϵ,
+σ ∼p(σ)
+where p(σ) = Uniform[0.15, 0.25]. This naturally introduces variability across samples both in terms
+of noise level and corruption behavior.
+To accommodate this setup, we made a minimal modification to Algorithm 1—replacing Lines 6 from
+the fixed-noise setting (˜y = xg + σϵ) to the sample-dependent corruption (˜y = xg + σϵ, , σ ∼p(σ)).
+With this simple change, RSD can be applied directly to heterogeneous corruption settings.
+We tested this on the CIFAR-10 dataset, and the results are reported below in Table 17.
+D.5
+CHOICE OF DISTILLATION LOSS
+In our experiments (Sec. 4), the distillation phase adopts the SiD loss (Eq. 5) by default. Other
+distillation objectives are also applicable—e.g., KL-based variants such as SDS Poole et al. (2022),
+21
+
+
+Published as a conference paper at ICLR 2026
+Table 17: Comparison of FID scores. Lower is better.
+Method
+FID
+Teacher-Full
+50.29
+Teacher-Truncated (σ = 0.25)
+16.21
+Teacher-Truncated (σ = 0.15)
+11.80
+RSD (ours)
+5.67
+Table 18: Ablation of distillation losses on CIFAR-10 denoising (σ ∈{0.1, 0.2, 0.4}; FID)
+Method
+σ = 0.1
+σ = 0.2
+σ = 0.4
+SDS
+> 200
+> 200
+> 200
+DMD
+12.52 ±0.04
+7.48 ±0.06
+30.09 ±0.23
+SiD
+3.98 ±0.04
+4.77 ±0.03
+21.63 ±0.03
+DMD Yin et al. (2024b) (also referred to as Diff-Instruct Luo et al. (2023) or VSD Wang et al.
+(2024b)), and SiD Zhou et al. (2024). For completeness, we report their generator-level results below
+and defer implementation details (e.g., time-scheduling and hyperparameters) to the original papers.
+We ablate this design choice on the CIFAR-10 denoising task; results are summarized in Table 18.
+Notes.
+All distillation variants use the default hyperparameters from their official repositories; we
+did not tune hyperparameters. The relatively weaker performance of D-SDS and D-DMD in Table 18
+may therefore reflect suboptimal default settings for the corrupted-data regime rather than intrinsic
+limitations of the losses. Empirically, SiD is robust under defaults and already yields strong results,
+hence our choice to use SiD for all main experiments (Sec. 4). Importantly, the distillation stage in
+our framework is modular and can be replaced by more advanced objectives; future work may close
+the gap—or even surpass SiD—via principled hyperparameter tuning and improved losses.
+E
+DISCUSSIONS AND LIMITATIONS
+Solving inverse problems.
+We demonstrate how to use the distilled generator as a learned prior
+for inverse problems in Section 4.7 and Appendix D.3. Concretely, given measurements y =
+A(x) + noise, we recover a plausible x by optimizing over the latent z so that the synthesized sample
+matches the observations, e.g.,
+min
+z
+A(Gθ(z)) −y
+2
+2
+(optionally with regularization or priors on z).
+A broader treatment—including principled conditioning, data-consistency guidance, and plug-and-
+play/score-based solvers—is a promising direction Chung et al. (2022); Zhang et al. (2024); Zhu et al.
+(2024); Zhang and Leong (2025); Chen et al. (2024b), with applications in scientific and engineering
+domains where reconstructing clean signals from measurements is critical.
+Applications in scientific discovery.
+Our approach is particularly well-suited for scientific discov-
+ery, where clean observational data are often scarce or fundamentally unobtainable. Extending our
+method to datasets across diverse scientific domains is a promising avenue for future research. For
+instance, ground-truth black hole images are inherently unobservable, yet large collections of cor-
+rupted telescope measurements are available, as demonstrated by the Event Horizon Telescope (EHT)
+observations Akiyama et al. (2019). EHT relies on Very Long Baseline Interferometry (VLBI), where
+the measurement process is modeled as a 2D Fourier transform of the sky brightness distribution.
+Specifically, the forward model can be expressed as
+V (u, v) =
+ZZ
+I(x, y)e−2πi(ux+vy)dxdy,
+as in Eq. 2 of Akiyama et al. (2019), or in practice as
+V t
+(a,b) = gt
+agt
+be−i(ϕt
+a−ϕt
+b)It
+(a,b)(z) + ηt
+(a,b),
+as described in Eq. 16 of Zheng et al. (2025).
+22
+
+
+Published as a conference paper at ICLR 2026
+Unknown corruption operator.
+We first note that in many scientific applications such as backhole
+imaging and multi-coil MRI, the corruption operator is known. In settings where the true corruption
+operator is unknown, off-the-shelf estimators can provide usable approximations of the corruption
+process, as illustrated in Section 4.5. Crucially, our method does not require an explicit closed-form
+specification of the operator: it only assumes access to its forward propagation (i.e., the ability
+to apply the corruption). This black-box requirement confers a key advantage—our approach can
+recover salient properties of the underlying data distribution without explicit knowledge of how the
+corruption is parameterized.
+F
+THEORETICAL RESULTS AND PROOFS
+We provide theoretical insights to support our empirical results. In Section F.1, we first focus on
+a simpler, linear Gaussian setting where we explicitly analyze the optimization landscape of score
+distillation given noisy samples, yielding quantitative error bounds and characterizations of global
+minimizers. Then, we offer several extensions of this theory in Section F.2, including handling
+linear corruption and multiple noise levels. Finally, in Section F.3, we provide a more general
+analysis asking when can the distilled student achieve a strictly smaller Fisher divergence to the clean
+distribution than the teacher. This regime will operate under distributional assumptions on the data
+and corruption along with capacity and optimization assumptions on the teacher and generator.
+F.1
+QUANTITATIVE ANALYSIS IN A LINEAR SETTING
+To begin, we first analyze the performance of score distillation in a stylized setting where the
+underlying data distribution is Gaussian. In particular, we will assume that our data follows a
+low-rank linear model for our analysis.
+Assumption 1 (Linear Low-Rank Data Distribution). Suppose our underlying data distribution is
+given by a low-rank linear model x = Ez ∼pX and z ∼N(0, Ir), where E ∈Rd×r with r < d
+and with orthonormal columns (i.e., ET E = Ir).
+Assumption 1 is equivalent to pX := N(0, EET ). For a fixed corruption noise level σ > 0, consider
+the setting we only have access to the noisy distribution y = x+σϵ, where x ∼pX and ϵ ∼N(0, Id).
+In other words, pY,σ := N(0, EET + σ2Id). In our setting we assume that we have perfectly learned
+the noisy score:
+Assumption 2 (Perfect Score Estimation). Suppose we can estimate the score function of corrupted
+data y perfectly:
+∇log pY,σ(x) = −
+ EET + σ2Id
+−1x.
+Our goal is to distill this distribution into a distribution pGθ := (Gθ)♯(N(0, Id)) given by the push-
+forward of N(0, Id) by a generative network Gθ : Rd →Rd. To model a U-Net Ronneberger et al.
+(2015) style architecture with bottleneck structure, we assume Gθ satisfies the following low-rank
+linear structure detailed in Assumption 3.
+Assumption 3 (Low-Rank Linear Generator). Assume the generator is a low-rank linear mapping,
+where Gθ is parameterized by θ = (U, V ) where U, V ∈Rd×r with r < d and has the form:
+Gθ(z) := UV T z.
+Note that Gθ induces a degenerate low-rank Gaussian distribution pGθ := N(0, UV T V U T ). Con-
+sider a bounded noise schedule (σt) ⊆[σmin, σmax] for some 0 < σmin < σmax < ∞and
+perturbed data points xt = x + σtϵ where ϵ ∼N(0, Id) and x ∼pGθ. Then xt ∼pσt
+Gθ :=
+N(0, UV T V U T + σ2
+t Id). To distill the noisy distribution, we minimize the score-based loss (or
+Fisher divergence) as in Zhou et al. (2024):
+L(θ) := Et∼Unif(0,1)Ext∼pσt
+Gθ
+hsσ,σt(xt) −∇log pσt
+Gθ(xt)
+2
+2
+i
+.
+(7)
+Here, sσ,σt(x) := −(EET + (σ2 + σ2
+t )Id)−1x. Note this objective is similar to Eq. 5, but with the
+real score in place of the fake score. This is also considered the idealized distillation loss (see Eq.
+23
+
+
+Published as a conference paper at ICLR 2026
+(8) in Zhou et al. (2024)). In Theorem 1, we show that minimizing Eq. 7 over a certain family of
+non-degenerate parameters finds a distilled distribution with smaller Wasserstein-2 distance to the
+underlying clean distribution.
+Theorem 1. Fix σ > 0. Under Assumptions 1, 2, and 3, consider the family of parameters θ = (U, V )
+such that
+θ ∈Θ := {(U, V ) : U T U = Ir, V T V ≻0}.
+For any bounded noise schedule (σt) ⊆[σmin, σmax], the global minimizers of L (7) over Θ, denoted
+by θ∗
+σ := (U ∗, V ∗
+σ ), satisfy the following:
+U ∗= EQ for some orthogonal matrix Q and (V ∗
+σ )T V ∗
+σ = (1 + σ2)Ir.
+(8)
+For any such θ∗
+σ, the induced generator distribution pGθ∗σ = N(0, (1 + σ2)EET ) satisfies
+W 2
+2 (pGθ∗σ , pX) = W 2
+2 (pY,σ, pX) −(d −r)σ2 < W 2
+2 (pY,σ, pX).
+(9)
+Discussion.
+This result shows that global minimizers of the distillation loss over a family of
+“non-degenerate” parameters induces a distribution close to the ground truth. Moreover, we can
+precisely quantify the distance to the underlying distribution due to the fact that all distributions
+are now Gaussians and the Wasserstein-2 distance has a closed form. We further explore what the
+unconstrained minimizers are in Theorem 3 for the rank-one case.
+Regarding our assumptions, we note that making either Gaussian or potentially more complex
+Gaussian mixture model assumptions is common in the generative modeling literature Chen et al.
+(2023); Cui et al. (2023); Wang and Vastola (2024). We further note that this result focuses on
+the setting where the underlying generator has low-rank structure. While it is common to make
+simplifying assumptions on the network architecture to understand score-based models Chen et al.
+(2023; 2024a), there is also recent work Wang et al. (2024a) that has shown when trained on data of
+low intrinsic dimensionality, score-based models can exhibit low-rank structures. Empirically, we
+find that neural-network-based distilled models can find such low-dimensional structures through
+noisy data. An interesting future direction of this work is to understand the influence of neural-
+network-based parameterizations of the score function along with analyzing the fake score setting.
+Before we dive into the proof, we provide the following lemmas.
+Lemma 1. [Generalized Woodbury Matrix Identity Higham (2002)]
+Given an invertible square matrix A ∈Rn×n, along with matrices U ∈Rn×k and V ∈Rk×n, define
+the perturbed matrix: B = A + UV . If (Ik + V A−1U) is invertible, then the inverse of B is given
+by:
+B−1 = A−1 −A−1U(Ik + V A−1U)−1V A−1.
+Lemma 2. The Wasserstein-2 distance between two mean-zero Gaussians N(0, Σ1) and N(0, Σ2)
+whose covariance matrices commute, i.e., Σ1Σ2 = Σ2Σ1, is given by
+W 2
+2 (N(0, Σ1), N(0, Σ2)) =
+d
+X
+i=1
+λi(Σ1) + λi(Σ2) −2
+p
+λi(Σ1)λi(Σ2).
+Lemma 3 (Mirsky (1975)). Suppose A and B are d × d complex matrices with singular values
+σ1(A) ⩾σ2(A) ⩾· · · ⩾σd(A) ⩾0 and σ1(B) ⩾σ2(B) ⩾· · · ⩾σd(B) ⩾0, respectively. Then
+|tr(AB)| ⩽
+d
+X
+i=1
+σi(A)σi(B).
+Lemma 4. Let E ∈Rd×r with r < d have orthonormal columns and Σ ∈Rr×r be symmetric
+positive definite. Then
+argmax
+U T U=Ir
+tr(EET UΣU T ) = {EQ : Q orthogonal}.
+Proof of Lemma 4. Observe that by the von Neumann trace inequality (Lemma 3), we have that for
+any feasible U,
+tr(EET UΣU T ) = tr(U T EET UΣ) ⩽
+r
+X
+i=1
+λi(U T EET U)λi(Σ) ⩽
+r
+X
+i=1
+λi(Σ)
+24
+
+
+Published as a conference paper at ICLR 2026
+where the last line we used the fact that λi(U T EET U) ⩽1 for each i ∈[r]. Hence, to maximize
+U 7→tr(EET UΣU T ) over {U : U T U = Ir}, we want U ∗to satisfy tr(EET U ∗Σ(U ∗)T ) =
+Pr
+i=1 λi(Σ).
+We claim that this occurs if and only if U ∗= EQ for some orthogonal Q. If U ∗= EQ, then
+(U ∗)T EET U ∗= QT ET EET EQ = I so
+tr(EET U ∗Σ(U ∗)T ) = tr((U ∗)T EET U ∗Σ) = tr(Σ) =
+r
+X
+i=1
+λi(Σ).
+For the other direction, suppose U ∗maximizes the objective. Then
+tr((U ∗)T EET U ∗Σ) = tr(Σ) ⇐⇒tr
+ ((U ∗)T EET U ∗−Ir)Σ
+
+= 0.
+Set Q := ET U ∗. Note that the eigenvalues of QT Q are bounded by 1 so QT Q −Ir is negative
+semi-definite while Σ is positive definite. But if tr((QT Q −Ir)Σ) = 0, by positive definiteness of Σ,
+we must have QT Q −Ir = 0, i.e., QT Q = Ir. This means Q is orthogonal. Since Q is orthogonal
+and Q = ET U ∗=⇒U ∗= EQ, as desired.
+Lemma 5. Fix σ > 0 and consider a noise schedule σt > 0 for t ∈(0, 1) such that (σt) ⊆
+[σmin, σmax] for some 0 < σmin < σmax < ∞. Define the function fσ : (0, ∞) →R by
+fσ(u) := Et∼Unif(0,1)
+
+u
+(σ2 + σ2
+t + 1)2 −
+u
+σ2
+t (u + σ2
+t )
+
+.
+Then fσ is strictly convex and has a unique minimizer at u∗= σ2 + 1 which is the unique solution to
+the equation
+Et∼Unif(0,1)
+
+1
+(σ2 + σ2
+t + 1)2
+
+= Et∼Unif(0,1)
+
+1
+(u∗+ σ2
+t )2
+
+.
+Proof of Lemma 5. First, note that the conditions on σt ensure that all of the following expectations
+are finite. By direct calculation, we have the derivatives of fσ are
+f ′
+σ(u) = Et
+
+1
+(σ2 + σ2
+t + 1)2
+
+−Et
+
+1
+(σ2
+t + u)2
+
+and f ′′
+σ (u) = Et
+
+2
+(σ2
+t + u)3
+
+.
+Hence f ′′
+σ (u) > 0 for all u > 0 so fσ is strictly convex. To find its minimizer u∗, setting the derivative
+equal to 0 yields u∗must satisfy
+Et
+
+1
+(σ2 + σ2
+t + 1)2
+
+= Et
+
+1
+(σ2
+t + u∗)2
+
+.
+Note that the point u∗= 1 + σ2 clearly satisfies the critical point equation. Uniqueness follows due
+to strict convexity.
+F.1.1
+PROOF OF THEOREM 1
+We break down the proof of Theorem 1 into three key steps. First, we show that minimizing the
+objective (Eq. 7) is equivalent to minimizing a simpler objective. Then, we show that we can derive
+exact analytical expressions for the global minimizers of this simpler objective, which are then
+global minimizers of the original score-based loss. Finally, we will directly compute the Wasserstein
+distance between our learned distilled distribution to the clean distribution and compare this to the
+noisy distribution.
+Reduction of objective function:
+For σt > 0, define pσt
+Gθ := N(0, UV T V U T + σ2
+t Id) and
+sσ,σt(x) := −(EET + (σ2 + σ2
+t )Id)−1x. For the proof, we will assume our parameters θ =
+(U, V ) ∈Θ so that U T U = Ir and V T V ≻0. We consider minimizing the loss
+L(θ) := Et∼Unif(0,1)Ext∼pσt
+Gθ
+hsσ,σt(xt) −∇log pσt
+Gθ(xt)
+2
+2
+i
+.
+25
+
+
+Published as a conference paper at ICLR 2026
+For t ∈(0, 1), consider the inner expectation of the loss
+˜Lt(θ) := Ext∼pσt
+Gθ
+hsσ,σt(xt) −∇log pσt
+Gθ(xt)
+2
+2
+i
+.
+For notational convenience, set Σσ,t := EET + (σ2 + σ2
+t )Id and Σθ,t := UV T V U T + σ2
+t Id. Then
+sσ,σt(x) := −Σ−1
+σ,tx and ∇log pσt
+Gθ(x) := −Σ−1
+θ,tx. First, recall that for xt ∼pσt
+Gθ and any matrix Σ,
+Ex∼pσt
+Gθ [∥Σxt∥2
+2] = ∥ΣΣ1/2
+θ,t ∥2
+F . Using this, we can compute the loss as follows:
+˜Lt(θ) = Ext∼pσt
+Gθ
+h
+∥(Σ−1
+σ,t −Σ−1
+θ,t)xt∥2
+2
+i
+= ∥(Σ−1
+σ,t −Σ−1
+θ,t)Σ1/2
+θ,t ∥2
+F
+= tr
+
+Σ1/2
+θ,t (Σ−1
+σ,t −Σ−1
+θ,t)(Σ−1
+σ,t −Σ−1
+θ,t)Σ1/2
+θ,t
+
+= tr
+
+Σθ,t(Σ−1
+σ,t −Σ−1
+θ,t)(Σ−1
+σ,t −Σ−1
+θ,t)
+
+= tr
+
+(Σθ,tΣ−1
+σ,t −Id)(Σ−1
+σ,t −Σ−1
+θ,t)
+
+= tr
+
+Σθ,tΣ−2
+σ,t −Σθ,tΣ−1
+σ,tΣ−1
+θ,t −Σ−1
+σ,t + Σ−1
+θ,t
+
+= tr
+ Σθ,tΣ−2
+σ,t
+
+−tr
+
+Σθ,tΣ−1
+σ,tΣ−1
+θ,t
+
+−tr
+ Σ−1
+σ,t
+
++ tr
+
+Σ−1
+θ,t
+
+= tr
+ Σ−2
+σ,tΣθ,t
+
+−2tr
+ Σ−1
+σ,t
+
++ tr
+
+Σ−1
+θ,t
+
+=: Cσ,t + tr
+ Σ−2
+σ,tΣθ,t
+
++ tr
+
+Σ−1
+θ,t
+
+.
+Using Lemma 2, it is straightforward to see that
+Σ−1
+σ,t =
+1
+σ2 + σ2
+t
+Id −
+1
+(σ2 + σ2
+t )2(σ2 + σ2
+t + 1)EET and
+Σ−1
+θ,t = σ−2
+t
+Id −σ−4
+t
+U
+ (V T V )−1 + σ−2
+t
+Ir
+−1 U T
+Hence the third term in ˜Lt is given by
+tr(Σ−1
+θ,t) = tr
+
+σ−2
+t
+Id −σ−4
+t
+U
+ (V T V )−1 + σ−2
+t
+Ir
+−1 U T 
+=: Cσt−σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1
+where we used the cyclic property of the trace and U T U = Ir in the last equality. For the second
+term, let β2
+t := σ2 + σ2
+t and γσ,t :=
+1
+β2
+t (β2
+t +1). Then we have by direct computation,
+tr
+ Σ−2
+σ,tΣθ,t
+
+= tr
+  β−2
+t
+Id −γσ,tEET   β−2
+t
+Id −γσ,tEET 
+(UV T V U T + σ2
+t Id)
+
+= tr
+  β−4
+t
+Id −2β−2
+t
+γσ,tEET + γ2
+σ,tEET 
+(UV T V U T + σ2
+t Id)
+
+= tr
+ β−4
+t
+UV T V U T −σ2
+t β−4
+t
+Id +
+ γ2
+σ,t −2β−2
+t
+γσ,t
+
+EET UV T V U T 
+−tr
+ 2β−2
+t
+σ2
+t EET + γ2
+σ,tσ2
+t Id
+
+=: ˜Cσ,t + β−4
+t
+tr(UV T V U T ) +
+ γ2
+σ,t −2β−2
+t
+γσ,t
+
+· tr(EET UV T V U T )
+= ˜Cσ,t + β−4
+t
+tr(V T V ) +
+ γ2
+σ,t −2β−2
+t
+γσ,t
+
+· tr(EET UV T V U T )
+where we used the cyclic property of trace and orthogonality of U in the final line. Combining the
+above displays, we get that there exists a constant Cσ,σt := Cσ,t + Cσt + ˜Cσ,t such that
+˜Lt(θ) = Cσ,σt +
+
+1
+β4
+t (β2
+t + 1)2 −
+2
+β4
+t (β2
+t + 1)
+
+· tr(EET UV T V U T )
++ β−4
+t
+tr(V T V ) −σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1
+=: Cσ,σt + Bt(U, V ) + Rt(V )
+26
+
+
+Published as a conference paper at ICLR 2026
+where we have defined the quantities
+Bt(U, V ) :=
+
+1
+β4
+t (β2
+t + 1)2 −
+2
+β4
+t (β2
+t + 1)
+
+· tr(EET UV T V U T ) and
+Rt(V ) := β−4
+t
+tr(V T V ) −σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1
+.
+Recalling the definition of L(·), we have that
+L(θ) = Et∼Unif(0,1)
+h
+˜Lt(θ)
+i
+= Et∼Unif(0,1) [Cσ,σt + Bt(U, V ) + Rt(U, V )] .
+Hence we have the equivalence
+argmin
+θ∈Θ
+L(θ) = argmin
+θ∈Θ
+Et∼Unif(0,1) [Bt(U, V )] + Et∼Unif(0,1)[Rt(V )].
+Form of minimizers:
+We use the shorthand notation Et[·] := Et∼Unif(0,1)[·]. First, note that we
+can first minimize Et[Bt(U, V )] over feasible U. But note that
+Et[Bt(U, V )] = Et
+
+1
+β4
+t (β2
+t + 1)2 −
+2
+β4
+t (β2
+t + 1)
+
+|
+{z
+}
+<0
+tr(EET UV T V U T )
+since for any t,
+1
+(β2
+t +1)2 <
+2
+(β2
+t +1). Hence minimizing Et[Bt(U, V )] is equivalent to maximizing
+tr(EET UV T V U T ). Taking Σ = V T V in Lemma 4, we have that the minimizer of Et[Bt(U, V )] is
+given by
+U ∗= EQ for some orthogonal Q.
+Moreover, the proof of Lemma 4 shows that tr(EET U ∗V T V (U ∗)T ) = tr(V T V ). This gives
+Et[Bt(U ∗, V )] = Et
+
+1
+β4
+t (β2
+t + 1)2 −
+2
+β4
+t (β2
+t + 1)
+
+tr(V T V ).
+In summary, we now must minimize the following with respect to invertible V :
+Et[Bt(U ∗, V )] + Et[Rt(V )] = Et
+
+1
+β4
+t (β2
+t + 1)2 −
+2
+β4
+t (β2
+t + 1) + 1
+β4
+t
+
+tr(V T V )
+−Et
+h
+σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1i
+= Et
+ 
+1
+β4
+t
+
+1
+β2
+t + 1 −1
+2!
+tr(V T V ) −Et
+h
+σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1i
+= Et
+ 
+1
+β4
+t
+
+β2
+t
+β2
+t + 1
+2!
+tr(V T V ) −−Et
+h
+σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1i
+= Et
+
+1
+(β2
+t + 1)2
+
+tr(V T V ) −Et
+h
+σ−4
+t
+tr
+ (V T V )−1 + σ−2
+t
+Ir
+−1i
+where in the second equality, we completed the square.
+We now claim that Et[Bt(U ∗, V )] + Et[Rt(V )] solely depends on the eigenvalues of V T V . In
+particular, for invertible V , note that V T V ≻0 so it admits the decomposition V T V = QΛQT
+where QT Q = QQT = Ir and Λ is a diagonal matrix with positive entries Λii = λi(V T V ) > 0.
+Hence tr(V T V ) = tr(QΛQT ) = tr(QT QΛ) = tr(Λ) = Pr
+i=1 λi(V T V ). Likewise, we have using
+27
+
+
+Published as a conference paper at ICLR 2026
+the orthogonality of Q that for any ε > 0,
+tr
+ (V T V )−1 + ε−2Ir
+−1
+= tr
+ (QΛQT )−1 + ε−2Ir
+−1
+= tr
+ QΛ−1QT + ε−2QQT −1
+= tr
+ Q
+ Λ−1 + ε−2Ir
+
+QT −1
+= tr
+
+Q
+ Λ−1 + ε−2Ir
+−1 QT 
+= tr
+ Λ−1 + ε−2Ir
+−1
+=
+r
+X
+i=1
+1
+λi(V T V )−1 + ε−2
+=
+r
+X
+i=1
+λi(V T V ) · ε2
+λi(V T V ) + ε2 .
+In sum, the final objective is a particular function of the eigenvalues of V T V :
+Et[Bt(U ∗, V )] + Et[Rt(V )] =
+r
+X
+i=1
+Et
+ λi(V T V )
+(β2
+t + 1)2 −
+λi(V T V )
+σ2
+t (λi(V T V ) + σ2
+t )
+
+=
+r
+X
+i=1
+Et
+
+λi(V T V )
+(σ2 + σ2
+t + 1)2 −
+λi(V T V )
+σ2
+t (λi(V T V ) + σ2
+t )
+
+=:
+r
+X
+i=1
+fσ(λi(V T V )).
+In Lemma 5, we show that the function u 7→fσ(u) is strictly convex on (0, ∞) with a unique
+minimizer at 1 + σ2. Thus V 7→B(U ∗, V ) + R(V ) for invertible V is minimized when the gram
+matrix of V ∗
+σ has equal eigenvalues λi((V ∗
+σ )T V ∗
+σ ) = 1+σ2 for all i ∈[r]. Since all of its eigenvalues
+are the same, by the Spectral Theorem, we must have that (V ∗
+σ )T V ∗
+σ = (1 + σ2)Ir.
+Wasserstein bound:
+We now show the Wasserstein error bound. Note that θ∗
+σ = (U ∗, V ∗
+σ ) induces
+the distribution pGθ∗σ defined by
+x = Gθ∗σ(z), z ∼N(0, Id) ⇐⇒x ∼pGθ∗σ := N(0, EQ(V ∗
+σ )T V ∗
+σ QT ET ) = N(0, (1+σ2)EET ).
+Then by Lemma 2, we have
+W 2
+2 (pY,σ, pX) = r
+
+1 + σ2 + 1 −2
+p
+1 + σ2
+
++ (d −r)σ2,
+W 2
+2 (pGθ∗σ , pX) = r
+
+1 + σ2 + 1 −2
+p
+1 + σ2
+
+.
+This gives
+W 2
+2 (pGθ∗σ , pX) = W 2
+2 (pY,σ, pX) −(d −r)σ2 < W 2
+2 (pY,σ, pX).
+F.2
+EXTENSIONS OF THE THEORY IN SECTION F.1
+We now discuss three extensions of Theorem 1: 1) we allow for additional corruption in y, 2)
+characterize the full optimization landscape in the rank-one case, and 3) analyze the global minimizers
+when we may have varying noise levels in the training data.
+F.2.1
+ADDITIONAL MEASUREMENT CORRUPTION
+We will now consider the case when the data is not simply noisy, but also exhibits more general
+corruption. For a fixed corruption noise level σ > 0, consider the setting we only have access to
+the noisy distribution y = A(x) + σϵ, where ϵ ∼N(0, Im) and A(x) = Ax with A ∈Rm×d is a
+linear corruption operator. By our assumption on pX (see Assumption 1) and the noise, pY,σ :=
+N(0, AEET AT + σ2Im). In order to get rid of error in estimating score, we assume that we have
+perfectly learned the noisy score:
+28
+
+
+Published as a conference paper at ICLR 2026
+Assumption 4 (Perfect Score Estimation with A). Suppose A ∈Rm×d with rank(A) = m and we
+can estimate the score function of corrupted data y perfectly:
+sA,σ2(x) := ∇log pY,σ2(x) = −
+ AEET AT + σ2Im
+−1x.
+Our goal is to match the corrupted noise distribution’s score with the score of pGθ under Assumption
+3 corrupted by A over a series of noise schedules (σt), which is given by
+˜pσt
+Gθ(y) = N(0, AUV T V U T AT + σ2
+t Im).
+To distill the noisy distribution, we minimize the score-based loss (or Fisher divergence) as in Zhou
+et al. (2024):
+L(θ) := Et∼Unif[0,1]Eyt∼˜pσt
+Gθ
+h
+∥sA,σ2+σ2
+t (yt) −∇log ˜pσt
+Gθ(yt)∥2
+2
+i
+.
+(10)
+We show that we can characterize the global minimizers of this loss, which correspond to a noise-
+dependent scaling of the true eigenspace of pX plus perturbations in the kernel of A. If we penalize
+the norm of our solution, we can nearly recover the true data distribution in Wasserstein-2 distance
+up to the noise in our measurements. We consider the rank-r = 1 case for simplicity.
+Theorem 2. Fix σ > 0 and consider e ∈Rd with unit norm and Ae̸ = 0. Under Assumptions 1, 4,
+and 3 and any bounded noise schedule (σt) ⊆[σmin, σmax], the set of global minimizers of the loss
+10 under the parameterization u 7→θ(u) = (u, u/∥u∥) is given by
+Θ∗:=
+(
+±
+s
+1 +
+σ2
+∥Ae∥2 · e
+)
++ ker(A).
+If e ∈Im(AT ), we have that θ∗= θ∗(u∗) with the minimum norm solution u∗∈argminu∈Θ∗∥u∥
+satisfies
+W 2
+2 (pX, pGθ∗) =
+ s
+1 +
+σ2
+∥Ae∥2 −1
+!2
+.
+Discussion.
+Theorem 2 aims to provide a quantitative bound of the Wasserstein distance between
+the distribution learned via distillation and the target clean distribution. To do this, we characterize
+the global minimizers of the loss, which correspond to scalings of the true principal component
+e plus perturbations in the kernel of A. The scaling depends on an effective signal-to-noise ratio
+SNR := ∥Ae∥2/σ2 Note that terms involving perturbations in the kernel of A are expected since
+the corruption compresses the data, leaving many plausible images that could give rise to the same
+measurements (a fundamental part of the ill-posedness in inverse problems). Furthermore, we
+show that if we penalize the norm of our parameter, the Wasserstein distance simplifies into a more
+interpretable quantity. A more general bound for all elements in the set of global minimizers is shown
+at the end of the proof. The intuition for the Theorem is that if we encourage finding a “simple” model
+(i.e., one with low-norm), the Wasserstein distance decreases and is effectively inversely proportional
+to the SNR. The distance between our learned distilled distribution and the true distribution goes to
+zero whenever 1) the noise goes to zero or 2) the signal strength increases. This result recovers the
+rank-1 version of Theorem 2 when A = I, showing that the learned distilled distribution’s Wasserstein
+distance to the true distribution is less than the noisy distribution’s Wasserstein distance to the true
+distribution subtracted by a factor of (d −1)σ2, showing a clear improvement in distribution learning.
+Finally, we note that the condition e ∈Im(AT ) we use is akin to assumptions in the compressed
+sensing literature on stable recovery via the construction of dual certificates Foucart and Rauhut
+(2013).
+To prove the Theorem, we first show that the objective under the parameterization θ = (u, u/∥u∥)
+simplifies into a form that we directly analyze.
+Lemma 6. Consider the setting of Theorem 2. For t ∈[0, 1], let at := σ2
+t , ct := at + σ2, and
+ηt :=
+2ct+∥Ae∥2
+c2
+t (ct+∥Ae∥2)2 . Then the objective L(θ) with θ = (u, u/∥u∥) satisfies the following: there
+exists a constant C independent of u ∈Rd such that
+L(θ) = C + L(u)
+29
+
+
+Published as a conference paper at ICLR 2026
+where
+L(u) := Et∼Unif[0,1]
+ 1
+c2
+t
+∥Au∥2 −ηt(eT AT Au)2 −
+∥Au∥2
+at(at + ∥Au∥2)
+
+.
+Proof of Lemma 6. Consider the loss function L(θ) under the parameterization θ = (u, u/∥u∥) for
+u̸ = 0:
+L(θ) := Et∼Unif[0,1]Eyt∼˜pσt
+Gθ
+"
+
+Σ−1
+t,e,A −Σt,θ,A
+−1
+yt
+
+2
+2
+#
+]
+where
+Σt,e,A := AeeT AT + ctIm and Σt,θ,A := AuuT AT + atIm.
+Using a similar reduction in the proof of Theorem 1, we get that the above loss equals
+L(θ) = Et∼Unif[0,1] [Cσ,t] + Et∼Unif[0,1]
+h
+tr
+
+Σ−2
+t,e,AΣt,θ,A
+i
++ Et∼Unif[0,1]
+h
+tr
+
+Σ−1
+t,θ,A
+i
+where Cσ,t is a constant that depends only on time and σ and not on θ. Note that using the Woodbury
+matrix identity in Lemma 1, we get
+Σ−2
+t,e,A = (AeeT AT + ctIm)−2 = c−2
+t Im −
+2ct + ∥Ae∥2
+c2
+t(ct + ∥Ae∥2)2 AeeT AT
+which implies
+Σ−2
+t,e,AΣt,θ,A =
+
+c−2
+t Im −
+2ct + ∥Ae∥2
+c2
+t(ct + ∥Ae∥2)2 AeeT AT
+
+AuuT AT
++ c−2
+t atIm −at
+2ct + ∥Ae∥2
+c2
+t(ct + ∥Ae∥2)2 AeeT AT
+= c−2
+t AuuT AT −ηtAeeT AT AuuT AT + c−2
+t atIm −atηtAeeT AT .
+Also, we have that
+Σ−1
+t,θ,A = (AuuT AT + atIm)−1 = a−1
+t Im −
+AuuT AT
+at(at + ∥Au∥2).
+Thus computing the trace, taking an expectation, and collecting terms that only involve u, we see that
+there exists a constant C depending on (σt), σ, A, and e (independent of u) such that
+L(θ) = C + Et[c−2
+t ]tr(AuuT AT ) −Et[ηt]tr(AeeT AT AuuT AT ) −Et
+ tr(AuuT AT )
+at(at + ∥Au∥2)
+
+= C + Et[c−2
+t ]∥Au∥2 −Et[ηt](eT AT Au)2 −Et
+
+∥Au∥2
+at(at + ∥Au∥2)
+
+=: C + L(u).
+Proof of Theorem 2. Note that Lemma 6 shows that we have the simpler formula
+L(θ) = C + L(u)
+where
+L(u) := Et
+ 1
+c2
+t
+∥Au∥2 −ηt(eT AT Au)2 −
+∥Au∥2
+at(at + ∥Au∥2)
+
+For notational simplicity, let G = AT A, g(u) = uT Gu, h(u) = eT Gu, ϕt(g) = g/(at(at + g)),
+and ηt := (2ct + ∥Ae∥2)/(c2
+t(ct + ∥Ae∥2)2). Then our objective results in
+L(u) := Et[c−2
+t ]g(u) −Et[ηt]h(u)2 −Et[ϕt(g(u))] =: ˜cg(u) −˜ηh(u)2 −Et[ϕt(g(u))].
+30
+
+
+Published as a conference paper at ICLR 2026
+We claim that any global minimizer of L is of the form u∗= ±λ∗e + q for some constant λ∗to be
+defined and q ∈ker(A). First, note that we can lower bound L(u) by another function Ψ(g(u)) as
+follows: since G is PSD, note that we have the generalized Cauchy Schwarz inequality:
+h(u)2 = (eT Gu)2 ⩽(eT Ge)(uT Gu) = g(e)g(u).
+Moreover, this holds with equality if and only if Au and Ae are collinear, i.e., Au = λAe or
+equivalently u = λe + v for v ∈ker(A). Then we get the lower bound
+L(u) = ˜cg(u) −˜ηh(u)2 −Et[ϕt(g(u))] ⩾(˜c −˜η∥Ae∥2)g(u) −Et[ϕt(g(u))] =: Ψ(g(u))
+where we have defined the new function Ψ(g) := (˜c −˜η∥Ae∥2)g −Et[ϕt(g)] for g ⩾0. Since
+g(u) ⩾0 for every u, we have that
+L(u) ⩾min
+g⩾0 Ψ(g).
+We first analyze the minimizers of Ψ and then construct u∗such that L(u∗) = Ψ(g∗). First let
+∆= (˜c −˜η∥Ae∥2) which is given by
+∆= Et
+
+c−2
+t
+−ηt∥Ae∥2
+= Et
+ 1
+c2
+t
+−(2ct + ∥Ae∥2)∥Ae∥2
+c2
+t(ct + ∥Ae∥2)2
+
+.
+We claim that ∆> 0. Indeed, note that for any g > 0,
+g(2ct + g)
+(ct + g)2 =
+g(2ct + g)g
+c2
+t + (2ct + g)g = g(2ct + g) + c2
+t −c2
+t
+c2
+t + (2ct + g)g
+= 1 −
+c2
+t
+(ct + g)2 .
+Applying this to ∆with g = ∥Ae∥2 yields
+∆= Et
+ 1
+c2
+t
+−(2ct + ∥Ae∥2)∥Ae∥2
+c2
+t(ct + ∥Ae∥2)2
+
+= Et
+ 1
+c2
+t
+
+1 −(2ct + ∥Ae∥2)∥Ae∥2
+(ct + ∥Ae∥2)2
+
+= Et
+ 1
+c2
+t
+
+1 −1 +
+c2
+t
+(ct + ∥Ae∥2)2
+
+= Et
+
+1
+(ct + ∥Ae∥2)2
+
+> 0
+as desired. This gives
+Ψ(g) = ∆g −Et[ϕt(g)].
+Observe that
+Ψ′(g) = ∆−∂
+∂g
+Z 1
+0
+g
+a2
+t + atg dt = ∆−
+Z 1
+0
+a2
+t
+(a2
+t + atg)2 dt = ∆−Et
+
+1
+(at + g)2
+
+and
+Ψ′′(g) = −∂/∂gEt[(at + g)−2] = 2Et[(at + g)−3] > 0 ∀g.
+Hence the function Ψ is strictly convex. Moreover, a sign analysis reveals that
+Ψ′(0) = ∆−Et[1/a2
+t] = Et
+
+1
+(ct + ∥Ae∥2)2 −1
+a2
+t
+
+= Et
+
+1
+(σ2 + at + ∥Ae∥2)2 −1
+a2
+t
+
+< 0
+while for g > σ2 + ∥Ae∥2, we have
+Ψ′(g) = Et
+
+1
+(σ2 + at + ∥Ae∥2)2 −
+1
+(at + g)2
+
+> 0
+so there must exist a unique root g∗such that Ψ′(g∗) = 0. In fact, g∗= σ2 + ∥Ae∥2 achieves
+Ψ′(g∗) = 0. Finally, we have that
+L(u) ⩾min
+g⩾0 Ψ(g) = Ψ(g∗) = ∆(σ2 + ∥Ae∥2) −Et[ϕt(σ2 + ∥Ae∥2)].
+31
+
+
+Published as a conference paper at ICLR 2026
+We claim that u∗= ±
+p
+g∗/∥Ae∥2e achieves L(u∗) = Ψ(g∗).
+Indeed, note that g(u∗) =
+(u∗)T Gu∗= g∗/∥Ae∥2eT Ge = g∗/∥Ae∥2 · ∥Ae∥2 = g∗and
+h(u∗)2 = (eT Gu∗)2 =
+g∗
+∥Ae∥2 (eT Ge) = g∗∥Ae∥2.
+Hence
+L(u∗) = ˜cg(u∗) −˜ηh(u∗) −Et[ϕt(g(u∗))]
+= ˜cg∗−˜ηg∗∥Ae∥2 −Et[ϕt(g∗)]
+= (˜c −˜η∥Ae∥2)g∗−Et[ϕt(g∗)]
+= ∆g∗−Et[ϕt(g∗)]
+= Ψ(g∗).
+The only other cases include h∗= u∗+ v for v ∈ker(A) since these are precisely the equality cases
+of the generalized Cauchy-Schwarz inequality. Note that for such h∗,
+g(h∗) = (h∗)T Gh∗= (u∗+ v)T G(u∗+ v) = g(u∗) + 2vT Gu∗+ vT Gv = g∗
+and h(u∗+ v) = eT G(u∗+ v) = h(u∗). These cases are also global minimizers, which gives us the
+total set of globally optimal solutions:
+Θ∗:=
+(
+±
+s
+σ2 + ∥Ae∥2
+∥Ae∥2
+e
+)
++ ker(A).
+Finally, we consider the Wasserstein distance bound. Note that for any u̸ = 0, we have that
+W 2
+2 (N(0, eeT ), N(0, uuT )) = tr
+
+eeT + uuT −2
+
+(uuT )1/2eeT (uuT )1/21/2
+= 1 + ∥u∥2 −2tr
+"uuT
+∥u∥eeT uuT
+∥u∥
+1/2#
+= 1 + ∥u∥2 −2tr
+"(eT u)2
+∥u∥2 uuT
+1/2#
+= 1 + ∥u∥2 −2tr
+|eT u|
+∥u∥2 uuT
+
+= 1 + ∥u∥2 −2|eT u|.
+In our case, note that u∗= q ± λ∗e where q ∈ker(A) and λ∗=
+p
+1 + σ2/∥Ae∥2 > 1. Since
+e ∈Im(AT ), eT q = 0. Hence |eT u∗| = λ∗and ∥u∗∥2 = ∥q∥2 + λ2
+∗where we used ∥e∥= 1 in both
+equalities. Using the previous result and these properties of u∗, we see that for any u∗∈Θ∗,
+W 2
+2 (N(0, eeT ), N(0, u∗uT
+∗)) = 1 + ∥q∥2 + λ2
+∗−2λ∗= ∥q∥2 + (λ∗−1)2.
+The minimum norm element of Θ∗is precisely given by either λ∗e or −λ∗e. This is because e and q
+are orthogonal for any q ∈ker(A), so for any u∗∈Θ∗, ∥u∗∥2 = λ2
+∗∥e∥2 + ∥q∥2 ⩾λ2
+∗= ∥λ∗e∥2.
+Taking q = 0 minimizes the norm of u∗∈Θ∗.
+F.2.2
+STRICT SADDLE PROPERTY
+A natural question is whether the objective landscape is well-behaved for first-order optimization
+algorithms. We now analyze the rank-one case and show that the objective landscape has a strict
+saddle property, namely that all critical points are either global minimizers or strict saddles, i.e.,
+points for which the gradient is zero, but the Hessian exhibits a negative eigenvalue, hence a descent
+direction.
+Theorem 3. Consider the setting of Theorem 1 with r = 1 and E = e ∈Rd with unit norm. Then the
+objective L under the parameterization θ(u) = (u, u/∥u∥) satisfies the following: the set of critical
+points for u̸ = 0 is precisely given by
+Ω:= {
+p
+1 + σ2e, −
+p
+1 + σ2e} ∪Ω⊥where Ω⊥:=
+
+u ∈Rd : ⟨u, e⟩= 0, ∥u∥= σ
+	
+.
+32
+
+
+Published as a conference paper at ICLR 2026
+Each point in {
+√
+1 + σ2e, −
+√
+1 + σ2e} is a global minimizer. Moreover, each point in Ω⊥is a strict
+saddle, meaning that for any u ∈Ω⊥, the Hessian ∇2L(u) is a strictly negative eigenvalue. Hence
+all local minima are global minima.
+Proof of Theorem 3. By Lemma 6, we have the simpler formula
+L(θ) = C + L(u)
+where
+L(u) := Et
+ 1
+c2
+t
+∥u∥2 −ηt(eT u)2 −
+∥u∥2
+at(at + ∥u∥2)
+
+We will use the notation al = σ2
+l , cl = al + σ2, and ηl = (2cl + ∥e∥2)/(c2
+l (cl + ∥e∥2)2) for
+l ∼Unif[0, 1]. Furthermore, let ˜c := El[c−2
+l
+], ˜η := El[ηl] and ϕl(g) :=
+g
+al(al+g)2 for g > 0. Further
+setting g(u) = uT u, and h(u) = eT u our objective can be written as
+L(u) := ˜cuT u −˜η(eT u)2 −El[ϕl(uT u)].
+An elementary calculation shows that ϕ′
+l(g) =
+1
+(at+g)2 and ϕ′′
+l (g) = −2(at + g)−3 for g > 0.
+Note that
+∇L(u) = 2
+ (˜c −Et[ϕ′
+t(∥u∥2)])u −˜ηeT ue
+
+= 0
+if and only if
+(˜c −Et[ϕ′
+t(∥u∥2)])u = ˜ηeT ue.
+Note that u ∈{±
+√
+1 + σ2e} satisfies this condition. On the other hand, consider a decomposition
+u = βe + s where s ⊥e. Set F(r) = ˜c −Et[ϕ′
+t(r)]. Then u = βe + s is a critical point if and only if
+β(F(β2 + ∥s∥2) −˜η)e + F(β2 + ∥s∥2)s = 0.
+Suppose β = 0. Then this above equation requires F(∥s∥2)s = 0. If s̸ = 0, then we need ∥s∥= σ
+since F(σ2) = 0. If β̸ = 0, then we require F(β2 + ∥s∥2) = ˜η > 0 so s = 0 which means
+F(β2) = ˜η. This indeed satisfied by β2 = 1 + σ2, i.e., β = ±
+√
+1 + σ2. Hence the critical points are
+n
+±
+p
+1 + σ2e
+o [
+{u : u ⊥e, ∥u∥= σ} .
+Note that the Hessian is
+∇2L(u) = 4F ′(∥u∥2)uuT + 2F(∥u∥2)Id −2˜ηeeT .
+Note that for critical points u such that u ⊥e and ∥u∥= σ, we have
+∇2L(u)e = 4F ′(∥u∥2)uuT e + 2F(∥u∥2)e −2˜ηe = 2(F(σ2) −˜η) = −2˜ηe
+so e is an eigenvector of ∇2L(u) with eigenvalue −2˜η < 0, which is strictly negative. Hence e is a
+descent direction of the objective L(u) so u is a strict saddle point. If u = ±
+√
+1 + σ2e, then
+∇2L(u) = 4(1+σ2)F ′(1+σ2)eeT +2F(1+σ2)Id−2˜ηeeT =
+ 4(1 + σ2)F ′(1 + σ2) −2˜η
+
+eeT +2˜ηId.
+Note that for directions orthogonal to e, v ⊥e,
+∇2L(u)v = 2˜ηv with 2˜η > 0.
+Along e, we have
+∇2L(u)e = (2˜η + 4(1 + σ2)F ′(1 + σ2) −2˜η)e = 4(1 + σ2)F ′(1 + σ2)e
+where 4(1 + σ2)F ′(1 + σ2) > 0 so ∇2L(u) is in fact positive definite at u = ±
+√
+1 + σ2e. Hence
+such points are global minimizers while other points are strict saddles.
+33
+
+
+Published as a conference paper at ICLR 2026
+F.2.3
+MULTIPLE NOISE SCALES
+It is possible to extend Theorem 1 to the setting in which one has access to a dataset of varying
+noise levels σ ∼p(σ) (as in the experiments discussed in Appendix D.4). An illustrative example
+is the case when we have noisy images y = x + σz where σ comes from a finite set of noise levels
+{σ1, . . . , σK}. This can be modeled as σ ∼p(σ) = PK
+k=1 πkδσk where πk ⩾0, PK
+k=1 πk = 1 and
+σk > 0 for each k ∈[K]. We will minimize the following objective that also considers noise at
+different scales:
+˜L(θ) := Eσ∼p(σ)L(θ) := Eσ∼p(σ),t∼Unif(0,1)Ext∼pσt
+Gθ
+hsσ,σt(xt) −∇log pσt
+Gθ(xt)
+2
+2
+i
+We prove that, when the noise levels follow a general distribution σ ∼p(σ), we can also characterize
+minimizers to the above loss. In particular, the scaling of the covariance now depends on the p(σ)
+and (σt). We will show through an example for a finite set of noise levels how the distilled generator
+can outperform any of the noisy teachers.
+Theorem 4. Consider the same setting as Theorem 1. Then for any distribution p(σ) supported on
+(0, ∞), there is exists a unique λ∗> 0 that depends on (σt) and p(σ) such that the global minimizers
+of ˜L over Θ, denoted by θ∗
+σ := (U ∗, V ∗
+σ ), satisfy the following:
+U ∗= EQ for some orthogonal matrix Q and (V ∗
+σ )T V ∗
+σ = λ∗Ir.
+(11)
+In particular, λ∗is the unique solution to the equation
+Ep(σ),t
+
+(σ2 + σ2
+t + 1)−2
+= Et
+
+(λ∗+ σ2
+t )−2
+.
+Hence the learned distilled distribution is given by pGθ∗σ = N(0, λ∗EET ).
+Proof. The proof of Theorem turns out to be very similar to the proof of Theorem 1, with a particular
+modification of Lemma 5 needed to find the precise form of the minimizer. In particular, one can
+show using similar arguments that the optimal U is given by U ∗= EQ for orthogonal Q. To find the
+form of V , one needs to minimize the following function over feasible V , which only depends on the
+eigenvalues of V T V :
+r
+X
+i=1
+F(λi(V T V )) :=
+r
+X
+i=1
+Ep(σ),t
+
+λi(V T V )
+(σ2 + σ2
+t + 1)2 −
+λi(V T V )
+σ2
+t (λi(V T V ) + σ2
+t )
+
+where F(u) := Ep(σ)[fσ(u)] and fσ is the function defined in Lemma 5. We claim that F is strictly
+convex and has a unique minimizer λ∗. Note that for any u > 0, its derivatives are
+F ′(u) = Ep(σ),t
+
+1
+(σ2 + σ2
+t + 1)2
+
+−Et
+
+1
+(σ2
+t + u)2
+
+and
+F ′′(u) = Ep(σ),t
+
+2
+(σ2
+t + u)3
+
+> 0.
+Moreover, note that u 7→ψ(u) := Ep(σ),t
+
+(σ2
+t + u)−2
+is strictly decreasing with limu→∞ψ(u) =
+0 and limu→0+ ψ(u) = Et[σ−4
+t
+] > Ep(σ),t
+
+(σ2 + σ2
+t + 1)−2
+. Note the last strict inequality follows
+by strict monotonicity of ψ. Hence there must exist a unique λ∗∈(0, ∞) that minimizes F satisfying
+F ′(λ∗) = 0, i.e., Ep(σ),t
+
+(σ2 + σ2
+t + 1)−2
+= Et
+
+(λ∗+ σ2
+t )−2
+. Thus the above function for
+invertible V T V is minimized when the gram matrix of V ∗
+σ has equal eigenvalues λi((V ∗
+σ )T V ∗
+σ ) = λ∗
+for all i ∈[r]. Since all of its eigenvalues are the same, by the Spectral Theorem, we must have that
+(V ∗
+σ )T V ∗
+σ = λ∗Ir.
+Example with a finite number of noise levels:
+Consider the case when p(σ) = PK
+k=1 πkδσk for
+σk > 0 with πk ⩾0 and PK
+k=1 πk = 1. Then λ∗is the unique solution to
+K
+X
+k=1
+πkEt
+
+(σ2
+k + σ2
+t + 1)−2
+= Et
+
+(λ∗+ σ2
+t )−2
+.
+34
+
+
+Published as a conference paper at ICLR 2026
+Since the right-hand side is strictly decreasing with respect to λ∗, one can show that we always have
+1 + σ2
+min ⩽λ∗⩽1 + σ2
+max, σmin := min
+k σk, σmax := max
+k
+σk.
+The precise value of λ∗interestingly depends now on the noise schedule (σt). In particular, when the
+noise schedule σt has much smaller values, the right-hand side increases, requiring λ∗to decrease to
+satisfy the equation. Likewise, when σt focuses on larger noise levels, the right-hand side goes down,
+requiring a larger λ∗for the equation to be satisfied.
+One can also give a mathematical condition on when the distilled distribution is closer in Wasserstein
+distance to each of the noisy distributions to the ground-truth. In particular, consider the low-rank
+regime r ≪d. Then if λ∗satisfies
+λ∗< min
+k∈[K]
+
+1 +
+sq
+1 + σ2
+k −1
+2
++ d −r
+r
+σ2
+k
+
+
+2
+≈1 + d
+r σ2
+min
+then
+W 2
+2 (pGθ∗σ , pX) < min
+k∈[K] W 2
+2 (pY,σk, pX),
+i.e., the distilled generator is closer to the ground-truth distribution than every noisy teacher. Note that
+if the difference between σmax and σmin is not too large and the data is low-rank enough d ≫r, then
+this can be satisfied. For example, if the largest noise level is less than a multiple of the smallest noise
+level σmax <
+p
+d/r · σmin, then this would ensure λ∗⩽1 + σ2
+max < 1 + d
+r σ2
+min. As an example,
+suppose d/r = 10. Then as long as σmax < 3σmin, the above condition would be satisfied.
+F.3
+GENERAL GUARANTEES FOR DISTILLATION
+Following up on our linear analysis, we aim to derive more general guarantees showing that, under
+capacity and optimization assumptions on the teacher and generator, we can give bounds on the
+distilled generator’s performance. This will be for more general corruptions and then we will state
+a result more tailored to denoising after where we can give conditions on when the distilled model
+improves upon the noisy distribution.
+To state our results, we set the notation. Let F(p||q) := Ep[∥∇log p(x) −∇log q(x)∥2
+2] denote the
+Fisher divergence between p and q. For a density p, we let dp = p(x)dx = pdx. Let χ2(p||q) =
+R
+(p/q −1)2dq denote the chi-square divergence between p and q. For notational simplicity, we let ≲
+denote an inequality up to absolute constants so that a ≲b if there exists an absolute constant C > 0
+such that a ⩽Cb. We let y = Ax + σϵ with σ > 0 and define pY := T [pX] := A♯pX ∗N(0, σ2Im).
+We will use the notation
+xt = x + σtϵ, yt = y + σtϵ′
+with marginals pX,t, pY,t. For the generator Gθ with clean law pθ and parameters θ ∈Θ, its
+measurement law is pθ,Y := T [pθ] with noise-convolved marginals pθ,Y,t. We consider distilling by
+minimizing
+Ldistill(θ) := Et,˜yt∼pθ,Y,t∥fϕ(˜yt, t) −fψ(˜yt, t)∥2
+2
+where fϕ is the teacher and fψ is the fake diffusion model. For each t, let sY,t and sθ,Y,t denote
+the scores of pY,t and pθ,Y,t, respectively. Throughout, we will assume sufficient regularity of the
+densities so that all scores ∇log p and gradients ∇p are well-defined, including those induced by pθ
+for θ ∈Θ. Moreover, put
+δϕ(y, t) := fϕ(y, t) −sY,t(y)
+δψ(˜y, t) := fψ(˜y, t) −sθ,Y,t(˜y)
+ε2
+ϕ,2 := sup
+t EpY,t∥δϕ(yt, t)∥2
+2, ε2
+ϕ,4 := sup
+t
+ EpY,t∥δϕ(yt, t)∥4
+2
+1/2 .
+We will assume we have optimized our parameter θ to a point ˆθ. Define the local fake-diffusion error
+at ˆθ:
+ε2
+ψ(ˆθ) := sup
+t Epˆ
+θ,Y,t∥δψ(˜yt, t)∥2
+2.
+Finally, let ∆(ˆθ) denote the local density ratio
+∆(ˆθ) := sup
+t sup
+y wt(y), wt(y) := pˆθ,Y,t(y)/pY,t(y).
+35
+
+
+Published as a conference paper at ICLR 2026
+We will make the following assumptions on the data and learned parameters:
+Assumption 5 (Data distribution). Suppose that the corrupted data distribution pY,t satisfies a
+uniform Poincaré-like inequality in the sense that there exists a λ0 > 0 such that
+χ2(p||pY,t) ⩽λ−1
+0
+Z
+∥∇(p/pY,t)∥2dpY,t, ∀t, p ∈{pθ,Y,t}θ∈Θ.
+Assumption 6 (Capacity and local near-optimality). There exists a θ∗such that pθ∗,Y = pY and ˆθ
+satisfies the following for some εopt ⩾0:
+Ldistill(ˆθ) ⩽Ldistill(θ∗) + εopt.
+Moreover, the fake diffusion network parameters ψ satisfies Et,pY,t∥fϕ(yt, t) −fψ(yt, t)∥2
+2 ⩽
+Et,pY,t∥fϕ(yt, t) −sY,t∥2
+2. We note that this can be relaxed to an upper bound up to a constant.
+We will aim to prove the following:
+Theorem 5. Under Assumptions 5 and 6, we have that the following holds:
+1. (general bound) the learned distilled distribution in measurement space satisfies
+EtF(pˆθ,Y,t||pY,t) ≲
+
+ε2
+ϕ,4
+s
+∆(ˆθ)
+λ0
++
+s
+ε4
+ϕ,4
+∆(ˆθ)
+λ0
++ ε2
+ϕ,2 + ε2
+ψ(ˆθ) + εopt
+
+
+2
+;
+2. (measurement injectivity) if the measurement operator T : p 7→A♯p ∗N(0, σ2Im) satisfies
+EtF(pˆθ,t||pX,t) ⩽ˆκ · EtF(pˆθ,Y,t||pY,t) for some ˆκ > 0, then we have that the learned
+distilled distribution in image space satisfies
+EtF(pˆθ,t||pX,t) ≲ˆκ
+
+ε2
+ϕ,4
+s
+∆(ˆθ)
+λ0
++
+s
+4ε4
+ϕ,4
+∆(ˆθ)
+λ0
++ ε2
+ϕ,2 + ε2
+ψ(ˆθ) + εopt
+
+
+2
+;
+Discussion.
+This result guarantees a bound on the Fisher divergence between the distilled genera-
+tor’s measurement distribution and the true measurement distribution. The key idea is that minimizing
+the distillation loss encourages the generator to learn an image distribution whose induced measure-
+ments are close the true measurements. Lemma 8 more explicitly connects the distillation loss to the
+reverse Fisher divergence between the measurement distributions. The second key component is the
+second bound, which shows that if the corruption operator satisfies an injectivity property over the
+data, then we can transfer this bound to the distilled distribution in image space. Hence distillation
+has the potential to succeed when 1) the distilled generator learns to create images such that, when
+corrupted further, look like the measurements and 2) the corruption operator is stable or injective
+over our distributions. We show in the following Corollary that in the instructive case of denoising,
+the corruption operator is stable and we can give a condition on when distillation can improve over
+the noisy distribution.
+Corollary 1 (Improvement in denoising). Under the setting of Theorem 5, when A = I, we have
+that the measurement injectivity condition holds for some ˆκ > 0 that depends on the noise schedule
+and for εϕ,2, εϕ,4, εψ(ˆθ), εopt sufficiently small, we have that the distilled distribution improves upon
+the noisy distribution
+EtF(pˆθ,t||pX,t) < EtF(pY,t||pX,t).
+To prove these results, we require a number of technical lemmas. The first is a change of measure
+result that will be useful in transferring expectations.
+Lemma 7. For fixed t, let eϕ(y, t) := ∥δϕ(y, t)∥2
+2. Then we have that
+Epθ,Y,teϕ(y, t) ⩽ε2
+ϕ,2 + ε2
+ϕ,4
+q
+χ2(pθ,Y,t||pY,t).
+36
+
+
+Published as a conference paper at ICLR 2026
+Proof of Lemma 7. Suppose we set q = pY,t, p = pθ,Y,t, and w = dp/dq. Recall that for a density
+q, the induced L2(q) norm is given by ∥f∥2
+L2(q) =
+R
+f 2dq. Then we have via an application of
+Cauchy-Schwarz that
+|Epeϕ(y, t) −Eqeϕ(y, t)| =
+
+Z
+(w(y) −1)eϕ(y, t)dq
+
+⩽∥w −1∥L2(q)∥eϕ∥L2(q)
+=
+p
+χ2(p||q) ·
+ Eqe2
+ϕ(y, t)
+1/2 .
+The result follows by using the definitions of εϕ,2 and εϕ,4.
+The next Lemma is crucial, in that it shows how the distillation loss from SiD Zhou et al. (2024)
+encourages the generator Gθ to produce images whose measurements match the distribution of the
+true measurements.
+Lemma 8. For ˆθ, define Γ(ˆθ) := Et
+h
+ε2
+ϕ,4
+q
+χ2(pˆθ,Y,t||pY,t)
+i
+. Then we have that the distillation
+loss satisfies
+1
+2EtF(pˆθ,Y,t||pY,t) −2ε2
+ψ(ˆθ) −2ε2
+ϕ,2 −2Γ(ˆθ) ⩽Ldistill(ˆθ)
+Proof of Lemma 8. We first consider the decomposition
+fϕ −fψ = (sY,t −sˆθ,Y,t) + δϕ −δψ.
+Using ∥x + y −w∥2
+2 ⩽3(∥x∥2
+2 + ∥y∥2
+2 + ∥w∥2
+2) for x = sY,t −sˆθ,Y,t, y = δϕ and w = δψ and
+taking expectations, we have that for fixed t,
+Epˆ
+θ,Y,t∥fϕ(˜yt, t) −fψ(˜yt, t)∥2
+2 ⩽3Epˆ
+θ,Y,t∥sY,t(˜yt, t) −sˆθ,Y,t(˜yt, t)∥2
+2 + 3Epˆ
+θ,Y,teϕ(˜yt, t) + 3Epˆ
+θ,Y,t∥δψ(˜yt, t)∥2
+2
+⩽3Epˆ
+θ,Y,t∥sY,t(˜yt, t) −sˆθ,Y,t(˜yt, t)∥2
+2 + 3
+
+ε2
+ϕ,2 + ε2
+ϕ,4
+q
+χ2(pˆθ,Y,t||pY,t)
+
++ 3ε2
+ψ(ˆθ)
+where the last line follows by Lemma 7 and the definition of ε2
+ψ(ˆθ). Taking an expectation over t
+yields
+Ldistill(ˆθ) ⩽3EtF(pˆθ,Y,t||pY,t) + 3ε2
+ϕ,2 + 3Γ(ˆθ) + 3ε2
+ψ(ˆθ).
+The lower bound holds by using the bound ∥x + y −w∥2
+2 ⩾1
+2∥x∥2
+2 −2(∥y∥2
+2 + ∥w∥2
+2), applying the
+same bounds, and taking expectations. Note that this bound holds because for any z,
+∥x + z∥2
+2 = ∥x∥2
+2 + 2⟨x, z⟩+ ∥z∥2
+2.
+Recall Young’s inequality: |⟨x, z⟩| ⩽α2
+2 ∥x∥2
+2 +
+1
+2α2 ∥z∥2
+2 for α > 0. Hence we have the lower bound
+∥x + z∥2
+2 ⩾∥x∥2
+2 −α2∥x∥2
+2 −α−2∥z∥2
+2 + ∥z∥2
+2.
+Choosing α2 = 1/2, setting z = y −w, and using ∥y −w∥2
+2 ⩽2(∥y∥2
+2 + ∥w∥2
+2) yields the desired
+inequality.
+An additional ingredient we need is control over the χ2 distance and relating it to the Fisher divergence.
+For that, we need the following Lemma.
+Lemma 9. Under Assumption 5, we have that
+Γ(ˆθ) ⩽ε2
+ϕ,4
+s
+∆(ˆθ)
+λ0
+·
+
+EtF(pˆθ,Y,t||pY,t)
+1/2
+.
+Proof of Lemma 9. We first fix t and set q = pY,t, p = pˆθ,Y,t and w = p/q. Then Assumption 5
+yields
+χ2(p||q) ⩽λ−1
+0
+Z
+∥∇w∥2
+2dq = λ−1
+0
+Z
+w∥∇w∥2
+2
+w
+dq ⩽∆(ˆθ)
+λ0
+Z ∥∇w∥2
+2
+w
+dq = ∆(ˆθ)
+λ0
+F(p||q)
+37
+
+
+Published as a conference paper at ICLR 2026
+where the first line follows by assumption, the second inequality follows by definition of ∆(ˆθ) and
+the last equality follows by definition of the Fisher divergence. Ineed, for the last equality, note that if
+w = p/q, then ∇w = ∇(p/q) = p
+q (∇log p −∇log q) = w(sp −sq) where sp and sq are the scores
+of p and q, respectively. This ensures that
+Z ∥∇w∥2
+2
+w
+dq =
+Z
+w∥sp −sq∥2dq =
+Z
+∥sp −sq∥2pdx = F(p||q).
+Taking square roots and applying an expectation over t along with Jensen’s inequality for the concave
+map v 7→√v yields the desired bound.
+Armed with these technical results, we now prove Theorem 5.
+Proof of Theorem 5. First, recall that by Lemma 8, we have the lower bound
+Ldistill(ˆθ) ⩾1
+2EtF(pˆθ,Y,t||pY,t) −2ε2
+ψ(ˆθ) −2ε2
+ϕ,2 −2Γ(ˆθ).
+(12)
+Moreover, by definition of θ∗, we have that
+Ldistill(θ∗) = Et,pθ∗,Y,t∥fϕ −fψ∥2
+2 = Et,pY,t∥fϕ −fψ∥2
+2 ⩽Et,pY,t∥fϕ −sY,t∥2
+2 ⩽ε2
+ϕ,2
+where we used pθ∗,Y = pY in the second equality and the assumption on ψ in the second-to-last
+inequality. Then note that by Assumption 6, we have that
+Ldistill(ˆθ) ⩽Ldistill(θ∗) + εopt ⩽ε2
+ϕ,2 + εopt.
+(13)
+Combining 12 and 13 along with Lemma 9 yields the quadratic inequality 1
+2X ⩽A + B
+√
+X where
+we have set X := EtF(pˆθ,Y,t||pY,t), A := 3ε2
+ϕ,2 + εopt + 2ε2
+ψ(ˆθ) and B := 2ε2
+ϕ,4
+q
+∆(ˆθ)
+λ0 . Solving
+this inequality, we have that X ⩽
+ B +
+√
+B2 + 2A
+2 . Substituting the values of X, A, and B yields
+the desired result.
+Finally, we show the denoising Corollary.
+Proof of Corollary 1. The Corollary is a consequence of the fact that when A = I, we have that
+pY,t = T [pX] ∗N(0, σ2
+t I) = pX ∗N(0, σ2I) ∗N(0, σ2
+t I) = pX ∗N(0, (σ2 + σ2
+t )I). Hence if we
+define the time-shift map τ(t) by σ2
+τ(t) = σ2
+t + σ2, we have that for any θ and t, F(pθ,Y,t||pY,t) =
+F(pθ,τ(t)||pX,τ(t)). Denote the distribution of t ∼ρ where ρ has support in τ([tmin, tmax]) and set
+ˆκ :=
+sup
+t∈[tmin,tmax]
+ρ(τ(t))τ ′(t)
+ρ(t)
+∈(0, ∞).
+Then we have that
+EtF(pˆθ,t||pX,t) ⩽ˆκ · EtF(pˆθ,τ(t)||pX,τ(t)) = ˆκ · EtF(pˆθ,Y,t||pY,t).
+Define ∆σ := EtF(pY,t||pX,t). Then using the measurement injectivity bound in Theorem 5, there
+exists a universal constant C such that if
+ˆκ ·
+
+ε2
+ϕ,4
+s
+∆(ˆθ)
+λ0
++
+s
+ε4
+ϕ,4
+∆(ˆθ)
+λ0
++ ε2
+ϕ,2 + ε2
+ψ(ˆθ) + εopt
+
+
+2
+⩽∆σ/C
+then we have
+EtF(pˆθ,t||pX,t) < EtF(pY,t||pX,t).
+38
+
+
+Published as a conference paper at ICLR 2026
+Connection to mode-seeking.
+The previous theory connects to mode-seeking behavior in the
+following way. In particular, under the setting of our theory, obtaining a small Fisher divergence
+encourages small reverse KL-divergence. To see this, recall that the KL-divergence and χ2-divergence
+satisfy DKL(p||q) ⩽χ2(p||q) when p ≪q (which follows by the inequality log t ⩽t −1 for t > 0).
+Following the proof of Lemma 9, this shows that we have the inequality
+DKL(pθ,Y,t||pY,t) ⩽χ2(pθ,Y,t||pY,t) ⩽∆
+λ0
+F(pθ,Y,t||pY,t)
+where ∆= ∆(θ) is the density ratio of pθ,Y,t and pY,t and λ0 is the constant in Assumption 5. Hence
+if one can minimize the Fisher divergence and the ratio ∆, this will also encourage smaller reverse
+KL-divergence (mode-seeking behavior). A further theoretical investigation of this connection is an
+important direction for future work.
+G
+VISUALIZATION FOR OVERESTIMATED DATA NOISE LEVEL
+In Section 4.5, we discussed handling an unknown data-noise level σ and showed that slight overes-
+timation preserves strong performance, consistent with blind inverse-problem solvers Zhang et al.
+(2017; 2018). Here, we provide an intuitive 2D toy example demonstrating that modest overestimation
+yields clean generations, whereas underestimation produces noticeably noisier samples.
+We construct a noisy training set with ground-truth σ = 0.05. During both pretraining and distillation,
+we vary the assumed noise ˆσ to represent underestimation (ˆσ < σ), accurate estimation (ˆσ = σ),
+and overestimation (ˆσ > σ). As shown in Fig. 14, a slight overestimation increases effective
+regularization, helping generated samples better adhere to the data manifold.
+(a) ˆσ = 0 (underestimation)
+(b) ˆσ = 0.05 (accurate)
+(c) ˆσ = 0.10 (overestimation)
+Figure 14: Effect of noise-level misspecification in a 2D toy example. We train with a noisy dataset
+at σ = 0.05 and vary the assumed noise ˆσ during pretraining and distillation. Underestimation
+(ˆσ < σ) yields noisy generations; accurate estimation recovers the target structure; and slight
+overestimation (ˆσ > σ) acts as additional regularization, improving adherence to the data manifold.
+See also Section 4.5 for ablations.
+H
+PHASE I: VARIANTS OF PRETRAINING DETAILS
+In Section 3.1, we introduced four variants of diffusion model pretraining methods. Here, we provide
+the training details for each of these variants.
+H.1
+STANDARD DIFFUSION
+Standard Diffusion aims to learn the distribution of y(i) = A(x(i)) + σε directly. To do this, we train
+the diffusion model on the corrupted dataset {y(i)}N
+i=1. The training objective is given by:
+LSD = Eσt,y,ε
+h
+λ(t) ∥fϕ(y + σtε, t) −y∥2
+2
+i
+,
+(14)
+where λ(t) is a time-dependent weighting function and σt is sampled from a predefined noise
+schedule. We are using the EDM schedule for λ(t) and σt same as in Karras et al. (2022).
+39
+
+
+Published as a conference paper at ICLR 2026
+The detailed training procedure is summarized in Algorithm 2.
+Algorithm 2 Standard Diffusion Training
+1: procedure STANDARD-DIFFUSION({y(i)}N
+i=1, σ, p(σt), K)
+2:
+for k = 1 to K do
+3:
+Sample a batch y ∼{y(i)}N
+i=1
+4:
+Sample noise level σt ∼p(σt)
+5:
+Sample noise ε ∼N(0, Id)
+6:
+Construct noisy input: yt = y + σt · ε
+7:
+Update parameters ϕ via gradient descent on LSD (Eq. 14)
+8:
+end for
+9:
+return Trained diffusion model fϕ
+10: end procedure
+H.2
+DIFFUSION FOR DENOISING
+Diffusion for denoising aims to learn the distribution of A(x(i)) from noisy observations y(i) =
+A(x(i)) + σε, where σ is a known (constant) noise level. The objective is to mitigate the impact of
+additive noise during training. Related denoising strategies have been explored in Daras et al. (2025).
+The Tweedie adjustment is compatible with more advanced diffusion training techniques (Ap-
+pendix H.3 and Appendix H.4), tailored for random inpainting and Fourier-space inpainting, respec-
+tively.
+Training loss.
+We use the following objective:
+LD = E σt, y, ε
+"
+σ2
+t −σ2
+σ2
+t
+fϕ(yt, t) + σ2
+σ2
+t
+yt −y
+
+2
+2
+#
+,
+(15)
+where σt is sampled from the diffusion noise schedule and clipped so that σt ≥σ, and yt :=
+y +
+p
+σ2
+t −σ2 ε.
+This formulation induces differences in both training and inference. Full details are given in Algo-
+rithm 3 and Algorithm 4. For sampling, we denote by Teacher-Full the standard EDM sampling
+from σmax down to 0, and by Teacher-Truncated the EDM sampling truncated at the data noise
+level σ. See Algorithm 4 for details.
+Algorithm 3 Diffusion for Denoising (Training)
+1: procedure DIFFUSION-FOR-DENOISING-TRAINING({y(i)}N
+i=1, σ, p(σt), K)
+2:
+for k = 1 to K do
+3:
+Sample a minibatch y ∼{y(i)}N
+i=1, σt ∼p(σt), ε ∼N(0, Id)
+4:
+σt ←max{σ, σt}
+▷Clip noise level
+5:
+yt ←y +
+p
+σ2
+t −σ2 ε
+6:
+Update fϕ by descending ∇ϕ LD in Eq. 15
+7:
+end for
+8:
+return trained diffusion model fϕ
+9: end procedure
+40
+
+
+Published as a conference paper at ICLR 2026
+Algorithm 4 Diffusion for Denoising (Sampling)
+1: procedure DIFFUSION-FOR-DENOISING-SAMPLING(fϕ, σ, {σt}T
+t=0)
+2:
+Sample xT ∼N(0, σ2
+T Id)
+3:
+for t = T, T −1, . . . , 1 do
+4:
+ˆx0 ←fϕ(xt, t)
+5:
+if truncation enabled ∧σt−1 < σ then
+6:
+return ˆx0
+▷Teacher-Truncated
+7:
+end if
+8:
+xt−1 ←xt −σt−σt−1
+σt
+ xt −ˆx0
+
+▷EDM-style update
+9:
+end for
+10:
+return ˆx0
+▷Teacher-Full
+11: end procedure
+H.3
+DIFFUSION FOR RANDOM INPAINTING TASK
+Daras et al. Daras et al. (2023a) introduced a diffusion training objective specifically designed for the
+random inpainting task. The goal is to learn the underlying clean data distribution pX from partial
+observations of the form y(i) = Mx(i), where M is a binary inpainting mask applied to the image.
+To introduce further stochasticity, a secondary corruption mask ˜
+M is applied during training.
+The training loss for random inpainting is given by:
+LRI = Eσt,y,ε
+M
+
+fϕ( ˜
+M, ˜
+Myt, t) −y
+
+2
+2
+
+,
+(16)
+where yt = y + σtε, and fϕ is conditioned on both the corrupted observation and the masking
+pattern. All training schedules and hyperparameters follow the same configuration as in the original
+paper Daras et al. (2023b).
+The full training procedure is outlined in Algorithm 5.
+Algorithm 5 Diffusion Training for Random Inpainting
+1: procedure DIFFUSION-INPAINTING-TRAINING({y(i)}N
+i=1, M, p(σt), K)
+2:
+for k = 1 to K do
+3:
+Sample batch y ∼{y(i)}N
+i=1
+4:
+Sample noise level σt ∼p(σt)
+5:
+Sample noise ε ∼N(0, Id)
+6:
+Sample a further corruption mask ˜
+M conditioned on M
+7:
+Compute yt ←y + σt · ε
+8:
+Update fϕ using gradient descent on LRI in Eq. 16
+9:
+end for
+10:
+return Trained diffusion model fϕ
+11: end procedure
+H.4
+DIFFUSION TRAINING FOR FOURIER SPACE INPAINTING
+Aali et al. (2025) introduced a diffusion training objective specifically designed for the multi-coil
+MRI on Fourier Space. The goal is to learn the underlying clean data distribution pX from
+y = (
+Nc
+X
+i=1
+SH
+i F−1MFSi)
+|
+{z
+}
+A
+x,
+41
+
+
+Published as a conference paper at ICLR 2026
+where Si denotes the coil sensitivity profile of the i-th coil, F is the Fourier transform, and M is the
+masking operator in Fourier space. The further corrupted observation would be
+˜y = (
+Nc
+X
+i=1
+SH
+i F−1 ˜
+MFSi)
+|
+{z
+}
+˜
+A
+x.
+The training loss for multi-coil MRI is given by:
+LFS = Eσt,y,ε
+A(fϕ(˜yt, ˜
+M, t) −y)
+
+2
+2
+
+,
+(17)
+where yt = y + σtε, and fϕ is conditioned on both the corrupted observation and the masking pattern.
+The full training procedure is outlined in Algorithm 6. All training schedules and hyperparameters
+follow the same configuration as in the original paper Aali et al. (2025).
+Algorithm 6 Diffusion Training for Fourier Space Inpainting
+1: procedure DIFFUSION-FSINPAINTING-TRAINING({y(i)}N
+i=1, M, p(σt), K, S)
+2:
+for k = 1 to K do
+3:
+Sample batch y ∼{y(i)}N
+i=1
+4:
+Sample noise level σt ∼p(σt)
+5:
+Sample noise ε ∼N(0, Id)
+6:
+Sample a further corruption mask ˜
+M conditioned on M
+7:
+Compute yt ←y + σt · ε
+8:
+Update fϕ using gradient descent on LRI in Eq. 17
+9:
+end for
+10:
+return Trained diffusion model fϕ
+11: end procedure
+I
+PHASE II: DISTILLATION
+In Section 2.3, we introduced the SiD generator loss (Eq. 5). The SiD objective admits additional
+design choices, as discussed in the original paper Zhou et al. (2024). For completeness, we present
+the exact generator-loss formulation used in our implementation and defer details such as time-step
+scheduling and hyperparameter settings to the cited work.
+SiD generator loss.
+Let xg = Gθ(z) and xt = xg + σtε with z, ε ∼N(0, Id). The loss is
+LSiD(wg) = E z, t, ε
+h
+(1 −α) λ(t)
+fψ(xt, t) −fϕ(xt, t)
+2
+2
++ λ(t)
+ fϕ(xt, t) −fψ(xt, t)
+⊤ fψ(xt, t) −xg
+i
+,
+(18)
+where fϕ is the teacher (pretrained diffusion model), fψ is the fake diffusion model, λ(t) is a
+time-dependent weight, and α balances the two terms. Unless otherwise noted, we use α = 1.2,
+following Zhou et al. (2024), which reports strong performance across tasks.
+Note that, following common practice, we initialize both the auxiliary diffusion model fψ and the
+generator Gθ from the teacher diffusion model fϕ Zhou et al. (2024); Yin et al. (2024a;b), which
+is crucial for facilitating and stabilizing training. Importantly, all three networks share the same
+architecture and capacity. Nonetheless, the generator has been shown to outperform the teacher Zhou
+et al. (2024), as it avoids the accumulation error inherent in multi-step sampling.
+J
+IMPLEMENTATION DETAILS
+Hardware and measurement.
+Unless otherwise noted, all pretraining and distillation runs use
+8×NVIDIA A6000 GPUs. Inference wall-clock time is measured on 4× NVIDIA A6000 GPUs with
+a batch size of 1024. Images are normalized to [−1, 1] prior to adding Gaussian noise.
+42
+
+
+Published as a conference paper at ICLR 2026
+Teacher pretraining: denoising task.
+For the denoising task, we follow the EDM setup Karras
+et al. (2022). On CIFAR-10, we train for 200 M image iterations to match the EDM computational
+budget; on FFHQ, CelebA-HQ, and AFHQ-v2 we train for 100 M iterations (half of EDM’s budget).
+We adopt EDM hyperparameters verbatim Karras et al. (2022). All images are corrupted with additive
+Gaussian noise at the prescribed level.
+Distillation: denoising task.
+For the distillation phase, we train the one-step generator on CIFAR-
+10 for 100 M image iterations and on FFHQ, CelebA-HQ, and AFHQ-v2 for 15 M iterations; this
+budget suffices to reach competitive FID. Unless stated otherwise, hyperparameters mirror those of
+SiD Zhou et al. (2024). For CelebA-HQ, we use the same configuration as FFHQ/AFHQ-v2 except
+for a dropout rate of 0.15.
+Teacher-consistency.
+For experiments in Tab 2 involving Teacher-Consistency Daras et al. (2024),
+we use 8 reverse steps and 32 Monte Carlo samples to approximate expectations. The consistency-loss
+weight is selected from {0.1, 1.0, 10.0} as a fixed coefficient to maximize performance.
+General corruption tasks: pretraining.
+We again follow the EDM training protocol Karras
+et al. (2022) and pretrain for 100 M image iterations: (i) For Gaussian deblurring and super-
+resolution with σ = 0, we use the Standard Diffusion objective (Eq. 14). (ii) For the same tasks with
+σ = 0.2, we adopt the Diffusion for denoising loss (Eq. 15). (iii) For random inpainting with σ = 0,
+we use the publicly available Diffusion for random inpainting checkpoint at https://github.
+com/giannisdaras/ambient-diffusion/tree/main. (iv) For random inpainting with
+σ = 0.2, we train with the Diffusion for denoising loss (Eq. 15); we avoid the dedicated inpainting
+loss (Eq. 16) in this noisy regime due to instability, consistent with Daras et al. (2023b). (v) For
+Fourier-space random inpainting on MRI, we initialize from the checkpoint at https://github.
+com/utcsilab/ambient-diffusion-mri.git. Unless noted, pretrained diffusion models
+use EDM hyperparameters Karras et al. (2022).
+General corruption tasks: distillation.
+During distillation we train the one-step generator for
+50–100 M image iterations, with early stopping if the validation FID begins to diverge.
+Reproducibility.
+Upon acceptance, we will release code and checkpoints to facilitate reproduction
+and further research.
+43
+
+
+Published as a conference paper at ICLR 2026
+Figure 15: CIFAR-10 32x32 noisy dataset with σ = 0.1 (FID: 73.74).
+K
+ADDITIONAL QUALITATIVE RESULTS
+In this section, we present additional qualitative results. A quick view is in Appendix A.
+44
+
+
+Published as a conference paper at ICLR 2026
+Figure 16: Unconditional CIFAR-10 32x32 random images generated with RSD training with noisy
+dataset with σ = 0.1 (FID: 3.98).
+45
+
+
+Published as a conference paper at ICLR 2026
+Figure 17: CIFAR-10 32x32 noisy dataset with σ = 0.2 (FID: 127.22).
+46
+
+
+Published as a conference paper at ICLR 2026
+Figure 18: Unconditional CIFAR-10 32x32 random images generated with RSD training with noisy
+dataset with σ = 0.2 (FID: 4.77).
+47
+
+
+Published as a conference paper at ICLR 2026
+Figure 19: CIFAR-10 32x32 noisy dataset with σ = 0.4 (FID: 205.52).
+48
+
+
+Published as a conference paper at ICLR 2026
+Figure 20: Unconditional CIFAR-10 32x32 random images generated with RSD training with noisy
+dataset with σ = 0.4 (FID: 21.63).
+49
+
+
+Published as a conference paper at ICLR 2026
+Figure 21: Unconditional FFHQ 64x64 random images generated with RSD training on noisy dataset
+with σ = 0.2 (FID: 6.29).
+50
+
+
+Published as a conference paper at ICLR 2026
+Figure 22: Unconditional CelebA-HQ 64x64 random images generated with RSD training on noisy
+dataset with σ = 0.2 (FID: 6.48).
+51
+
+
+Published as a conference paper at ICLR 2026
+Figure 23: Unconditional AFHQ-v2 64x64 random images generated with RSD training on noisy
+dataset with σ = 0.2 (FID: 5.42).
+52
+
+
+Published as a conference paper at ICLR 2026
+Figure 24: Examples from the training dataset used for the Gaussian blur task with σ = 0.
+53
+
+
+Published as a conference paper at ICLR 2026
+Figure 25: Qualitative results of RSD generation for the Gaussian blur task with σ = 0.
+54
+
+
+Published as a conference paper at ICLR 2026
+Figure 26: Dataset samples for the random inpainting task with p = 0.9 and σ = 0.
+55
+
+
+Published as a conference paper at ICLR 2026
+Figure 27: RSD generation results for the random inpainting task with p = 0.9 and σ = 0.
+56
+
+
+Published as a conference paper at ICLR 2026
+Figure 28: Dataset samples for Super Resolution ×2 Task with σ = 0
+57
+
+
+Published as a conference paper at ICLR 2026
+Figure 29: RSD generation results for Super Resolution ×2 Task with σ = 0
+58
+
+
+Published as a conference paper at ICLR 2026
+Figure 30: Dataset samples for Gaussian Blur with σ = 0.2
+59
+
+
+Published as a conference paper at ICLR 2026
+Figure 31: RSD generation results for Gaussian Blur with σ = 0.2
+60
+
+
+Published as a conference paper at ICLR 2026
+Figure 32: Dataset samples for Random Inpainting with p = 0.9 and σ = 0.2
+61
+
+
+Published as a conference paper at ICLR 2026
+Figure 33: RSD generation results for Random Inpainting with p = 0.9 and σ = 0.2
+62
+
+
+Published as a conference paper at ICLR 2026
+Figure 34: Dataset samples for Super Resolution ×2 Task with σ = 0.2
+63
+
+
+Published as a conference paper at ICLR 2026
+Figure 35: RSD generation results for Super Resolution ×2 Task with σ = 0.2
+64
+
+
+Published as a conference paper at ICLR 2026
+Figure 36: Dataset samples for Random Inpainting with p = 0.8 and σ = 0
+65
+
+
+Published as a conference paper at ICLR 2026
+Figure 37: RSD generation results for Random Inpainting with p = 0.8 and σ = 0
+66
+
+
+Published as a conference paper at ICLR 2026
+Figure 38: Dataset samples for Random Inpainting with p = 0.6 and σ = 0
+67
+
+
+Published as a conference paper at ICLR 2026
+Figure 39: RSD generation results for Random Inpainting with p = 0.6 and σ = 0
+68
