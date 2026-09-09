@@ -1,17 +1,5 @@
-"""
-BM25 keyword retrieval over a chunk JSONL file (chunks_fixed.jsonl or
-chunks_structured.jsonl), using rank_bm25. This is the sparse/keyword
-counterpart to your dense Chroma retrieval — good at exact terms,
-acronyms, and literal phrase matches that embeddings can dilute.
-
-Usage as a library:
-    from bm25_retriever import BM25Retriever
-    retriever = BM25Retriever("data/chunks_fixed.jsonl")
-    results = retriever.search("Low-Rank Adaptation", top_k=5)
-
-Usage as a CLI:
-    python bm25_retriever.py "Low-Rank Adaptation" data/chunks_fixed.jsonl
-"""
+"""BM25 keyword retrieval over a chunk JSONL file (chunks_fixed.jsonl or
+chunks_structured.jsonl)"""
 
 from __future__ import annotations
 
@@ -27,12 +15,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization for BM25 indexing/queries.
-
-    Simple on purpose: BM25 doesn't need the tokenizer to match your
-    embedding model's tokenizer, just to be consistent between indexing
-    and querying.
-    """
+    """Lowercase, alphanumeric-only tokenization for BM25 indexing/queries."""
     return _TOKEN_RE.findall(text.lower())
 
 
@@ -53,9 +36,7 @@ def load_chunks(path: Path) -> List[Dict]:
 
 class BM25Retriever:
     """Wraps a BM25 index built from a chunk JSONL file, keeping the
-    original chunk dicts aligned to BM25's internal document order so
-    results can be mapped back to full chunk metadata.
-    """
+    original chunk dicts aligned to BM25's internal document order"""
 
     def __init__(self, chunks_path: str | Path):
         self.chunks_path = Path(chunks_path)
@@ -69,8 +50,7 @@ class BM25Retriever:
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
         """Return the top-k chunks for `query`, each with a `bm25_score`
         and `rank` (1-indexed) added. Chunks with a zero score (no term
-        overlap at all) are excluded, since a "top-k" of pure noise isn't
-        useful for fusion or display.
+        overlap at all) are excluded.
         """
         tokenized_query = tokenize(query)
         scores = self.bm25.get_scores(tokenized_query)
@@ -82,7 +62,7 @@ class BM25Retriever:
         results = []
         for rank, idx in enumerate(ranked_indices[:top_k], start=1):
             if scores[idx] <= 0:
-                break  # scores are sorted descending; once we hit 0, stop
+                break  # scores are sorted descending
             chunk = dict(self.chunks[idx])
             chunk["bm25_score"] = float(scores[idx])
             chunk["rank"] = rank
